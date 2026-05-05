@@ -1,0 +1,29 @@
+# Build artifacts
+/target/
+/target2/
+/target3/
+/target_check/
+/target_check_2/
+/target_check_3/
+/target_check_4/
+
+# Build logs
+*.log
+build_*.txt
+check.log
+test_*.txt
+test_*.log
+
+# Database files
+*.bin
+*.bloom
+manifest_*.json
+
+# Config with secrets
+omni.toml
+
+# Python scripts
+*.py
+
+# WAL files
+wal.bin

@@ -1,0 +1,54 @@
+[package]
+name = "omni_engine"
+version = "0.1.0"
+edition = "2024"
+authors = ["Balavignesh"]
+description = "A high-performance, fully mutable Database Management System operating at the physical hardware limits of NVMe SSDs."
+
+[dependencies]
+memmap2 = "0.9.10"
+tokio = { version = "1.52.1", features = ["full", "macros"] }
+crossbeam-skiplist = "0.1.3"
+arc-swap = "1.6.0"
+crc32fast = "1.4.2"
+axum = { version = "0.7.5", features = ["macros"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tower-http = { version = "0.5.2", features = ["cors"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["json", "env-filter"] }
+opentelemetry = "0.22.0"
+tracing-opentelemetry = "0.23.0"
+opentelemetry_sdk = "0.22.1"
+hdrhistogram = "7.5.4"
+tower_governor = "0.4.2"
+reqwest = { version = "0.13.3", features = ["json"] }
+lz4_flex = "0.13.0"
+axum-server = { version = "0.8.0", features = ["tls-rustls"] }
+rcgen = "0.14.7"
+rustls = { version = "0.23.40", features = ["ring"] }
+rustls-pemfile = "2.2.0"
+quinn = "0.11.9"
+moka = { version = "0.12", features = ["sync"] }
+toml = "0.8"
+jsonwebtoken = { version = "10.3.0", features = ["rust_crypto"] }
+tar = "0.4.45"
+flate2 = "1.1.9"
+aes-gcm = "0.10.3"
+rand = "0.10.1"
+base64 = "0.22.1"
+pbkdf2 = "0.13.0"
+hmac = "0.13.0"
+sha2 = "0.11.0"
+prometheus = "0.14.0"
+lazy_static = "1.5.0"
+argon2 = "0.5.3"
+password-hash = "0.6.1"
+openraft = { version = "0.9.24", features = ["serde"] }
+[[bin]]
+name = "omni_bench"
+path = "src/bench.rs"
+
+[dev-dependencies]
+omni-client = { path = "omni-client" }
+tempfile = "3.15"

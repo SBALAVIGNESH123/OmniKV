@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128">
+  <defs>
+    <linearGradient id="g" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#3B82F6"/>
+      <stop offset="100%" style="stop-color:#7C3AED"/>
+    </linearGradient>
+  </defs>
+  
+  <rect width="128" height="128" rx="28" fill="#0A0A0F"/>
+  
+  <!-- Infinity left -->
+  <path d="M35 64 C35 42, 60 32, 64 48 C66 54, 66 74, 64 80 C60 96, 35 86, 35 64Z" 
+        fill="none" stroke="url(#g)" stroke-width="5"/>
+  <!-- Infinity right -->
+  <path d="M93 64 C93 42, 68 32, 64 48 C62 54, 62 74, 64 80 C68 96, 93 86, 93 64Z" 
+        fill="none" stroke="url(#g)" stroke-width="5"/>
+  
+  <!-- Center -->
+  <circle cx="64" cy="64" r="7" fill="url(#g)"/>
+  <circle cx="64" cy="64" r="14" fill="url(#g)" opacity="0.12"/>
+  
+  <!-- Particles -->
+  <circle cx="46" cy="52" r="3" fill="#3B82F6" opacity="0.7"/>
+  <circle cx="82" cy="76" r="3" fill="#7C3AED" opacity="0.7"/>
+</svg>

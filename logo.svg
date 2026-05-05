@@ -1,0 +1,54 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 600 200" width="600" height="200">
+  <defs>
+    <linearGradient id="grad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#3B82F6"/>
+      <stop offset="100%" style="stop-color:#7C3AED"/>
+    </linearGradient>
+    <linearGradient id="grad2" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" style="stop-color:#3B82F6;stop-opacity:0.3"/>
+      <stop offset="100%" style="stop-color:#7C3AED;stop-opacity:0.3"/>
+    </linearGradient>
+  </defs>
+  
+  <!-- Background -->
+  <rect width="600" height="200" rx="16" fill="#0A0A0F"/>
+  
+  <!-- Icon: Infinity + DB cylinder -->
+  <!-- Infinity loop left -->
+  <path d="M55 100 C55 72, 85 60, 100 78 C108 88, 108 112, 100 122 C85 140, 55 128, 55 100Z" 
+        fill="none" stroke="url(#grad)" stroke-width="4" opacity="0.9"/>
+  <!-- Infinity loop right -->
+  <path d="M145 100 C145 72, 115 60, 100 78 C92 88, 92 112, 100 122 C115 140, 145 128, 145 100Z" 
+        fill="none" stroke="url(#grad)" stroke-width="4" opacity="0.9"/>
+  
+  <!-- DB cylinder top -->
+  <ellipse cx="100" cy="72" rx="28" ry="8" fill="none" stroke="url(#grad)" stroke-width="3" opacity="0.6"/>
+  <!-- DB cylinder bottom -->
+  <ellipse cx="100" cy="128" rx="28" ry="8" fill="none" stroke="url(#grad)" stroke-width="3" opacity="0.6"/>
+  
+  <!-- Center glow dot -->
+  <circle cx="100" cy="100" r="6" fill="url(#grad)" opacity="0.9"/>
+  <circle cx="100" cy="100" r="12" fill="url(#grad)" opacity="0.15"/>
+  <circle cx="100" cy="100" r="20" fill="url(#grad)" opacity="0.05"/>
+  
+  <!-- Data flow particles -->
+  <circle cx="68" cy="88" r="2.5" fill="#3B82F6" opacity="0.7"/>
+  <circle cx="132" cy="112" r="2.5" fill="#7C3AED" opacity="0.7"/>
+  <circle cx="78" cy="115" r="2" fill="#3B82F6" opacity="0.5"/>
+  <circle cx="122" cy="85" r="2" fill="#7C3AED" opacity="0.5"/>
+  
+  <!-- Text: OmniKV -->
+  <text x="185" y="112" font-family="'Inter', 'SF Pro Display', -apple-system, 'Segoe UI', sans-serif" 
+        font-size="52" font-weight="700" fill="white" letter-spacing="-1">
+    Omni<tspan fill="url(#grad)">KV</tspan>
+  </text>
+  
+  <!-- Tagline -->
+  <text x="188" y="140" font-family="'Inter', 'SF Pro Display', -apple-system, 'Segoe UI', sans-serif" 
+        font-size="13" fill="#6B7280" letter-spacing="3" font-weight="400">
+    EMBEDDABLE · DISTRIBUTED · UNSTOPPABLE
+  </text>
+  
+  <!-- Subtle bottom accent line -->
+  <rect x="185" y="148" width="380" height="1" fill="url(#grad2)" rx="1"/>
+</svg>
