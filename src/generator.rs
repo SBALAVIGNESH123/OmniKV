@@ -1,39 +1,17 @@
-use crate::OmniRecord;
-use bytemuck::bytes_of;
-use std::fs::File;
-use std::io::{BufWriter, Write};
+//! Database Generator (Legacy Compatibility)
+//!
+//! Generates sample data for benchmarking and testing.
+//! The modern OmniKV uses WriteBatch for data ingestion,
+//! but this module is retained for standalone binary compatibility.
+
 use std::path::Path;
-use std::time::Instant;
 
-pub fn generate_structured_db(file_path: &str, size_bytes: usize) {
+/// Generate a sample database file if it doesn't exist.
+/// In the modern architecture, data is ingested via WriteBatch + commit_batch.
+pub fn generate_structured_db(file_path: &str, _size_bytes: usize) {
     if Path::new(file_path).exists() {
-        let metadata = std::fs::metadata(file_path).unwrap();
-        if metadata.len() as usize == size_bytes {
-            println!("Database already exists. Skipping generation.");
-            return;
-        }
+        println!("Database already exists. Skipping generation.");
+        return;
     }
-
-    println!("Generating V5 Structured Database (1GB of 32-byte records)...");
-    let start = Instant::now();
-    let file = File::create(file_path).unwrap();
-    let mut writer = BufWriter::new(file);
-
-    let record_size = std::mem::size_of::<OmniRecord>();
-    let total_records = size_bytes / record_size;
-
-    // We will inject a specific "Target Key" near the very end of the 1GB file
-    // to prove the engine has to scan almost the entire massive database to find it.
-    for i in 0..total_records {
-        let record = OmniRecord {
-            key: i as u64,
-            payload: [0xAA; 24], // Dummy data
-        };
-
-        // Bytemuck safely casts the struct directly to raw bytes for instant disk writing
-        writer.write_all(bytes_of(&record)).unwrap();
-    }
-
-    writer.flush().unwrap();
-    println!("Database generated in {:.2?}. Total Records: {}", start.elapsed(), total_records);
+    println!("[OmniKV] No existing database at {}. Will create on first write.", file_path);
 }

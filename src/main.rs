@@ -1,92 +1,123 @@
-mod generator;
-pub use omni_engine::{OmniKV, OmniRecord};
-
 use std::sync::Arc;
-use tokio::net::TcpListener;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use omni_engine::{OmniKV, WriteBatch};
 
-const FILE_PATH: &str = "database_v5.bin";
+const MANIFEST_PATH: &str = "manifest.json";
 const WAL_PATH: &str = "wal.bin";
-const DB_SIZE: usize = 1024 * 1024 * 1024; // 1 GB
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("╔══════════════════════════════════════════════════════════╗");
-    println!("║     OMNI-ENGINE V8: THE CLICKHOUSE CHALLENGER            ║");
-    println!("║     Zero-Copy | WAL Ingestion | Mutable DBMS             ║");
+    println!("║     OmniKV — Embeddable + Distributed KV Engine         ║");
+    println!("║     SSI | 2PC | PgWire | HTTP/3 | Rust from scratch     ║");
     println!("╚══════════════════════════════════════════════════════════╝\n");
 
-    generator::generate_structured_db(FILE_PATH, DB_SIZE);
+    let db = OmniKV::open(MANIFEST_PATH, WAL_PATH)?;
+    println!("Database initialized.");
+    println!("  Global sequence: {}", db.get_seq());
 
-    // Open the Database with the Write-Ahead Log
-    let db = Arc::new(OmniKV::open(FILE_PATH, WAL_PATH).expect("Failed to open database"));
-    println!("Database initialized. Total records: {}", db.total_records());
+    // Start PostgreSQL wire protocol server
+    let db_clone = db.clone();
+    let pgwire_handle = std::thread::spawn(move || {
+        let server = omni_engine::pgwire::PgWireServer::new(db_clone, "127.0.0.1:5433");
+        if let Err(e) = server.start() {
+            eprintln!("[OmniKV] PgWire server error: {}", e);
+        }
+    });
 
-    let listener = TcpListener::bind("127.0.0.1:8080").await?;
-    println!("🚀 Server listening on 127.0.0.1:8080");
-    println!("Try it: `telnet 127.0.0.1 8080`\nCommands: GET <key> | SET <key> <string_value>\n");
+    // Start TCP command interface
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:8080").await?;
+    println!("🚀 TCP server listening on 127.0.0.1:8080");
+    println!("🐘 PostgreSQL wire protocol on 127.0.0.1:5433");
+    println!("\nCommands: GET <key> | SET <key> <value> | DELETE <key> | SCAN <start> <end>\n");
 
     loop {
         let (mut socket, addr) = listener.accept().await?;
-        let db_clone = Arc::clone(&db);
+        let db = db.clone();
 
         tokio::spawn(async move {
-            let mut buf = [0; 1024];
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut buf = [0u8; 4096];
 
             loop {
                 let n = match socket.read(&mut buf).await {
-                    Ok(n) if n == 0 => return,
+                    Ok(0) => return,
                     Ok(n) => n,
                     Err(_) => return,
                 };
 
-                let request = String::from_utf8_lossy(&buf[0..n]);
+                let request = String::from_utf8_lossy(&buf[..n]);
                 let request = request.trim();
                 if request.is_empty() { continue; }
-                println!("    [REQ] {} -> {}", addr, request);
 
-                let mut parts = request.split_whitespace();
+                let mut parts = request.splitn(3, char::is_whitespace);
                 let cmd = parts.next().unwrap_or("");
-                
-                let response = if cmd.eq_ignore_ascii_case("GET") {
-                    if let Some(key_str) = parts.next() {
-                        if let Ok(target_key) = key_str.parse::<u64>() {
-                            let start = std::time::Instant::now();
-                            // Zero-Copy Direct Network Stream optimization conceptually happens here.
-                            // The raw memory slice is converted to a string for standard telnet clients.
-                            match db_clone.find(target_key) {
-                                Some(payload) => {
-                                    format!("OK ({}ms): {:?}\n", start.elapsed().as_micros() as f64 / 1000.0, &payload[0..8])
-                                }
-                                None => format!("NOT_FOUND ({}ms)\n", start.elapsed().as_micros() as f64 / 1000.0)
-                            }
-                        } else { "ERROR: Invalid Key.\n".to_string() }
-                    } else { "ERROR: Missing Key.\n".to_string() }
-                } else if cmd.eq_ignore_ascii_case("SET") {
-                    if let Some(key_str) = parts.next() {
-                        if let Ok(key) = key_str.parse::<u64>() {
-                            let value_str = parts.next().unwrap_or("Default");
-                            let mut payload = [0u8; 24];
-                            let copy_len = std::cmp::min(value_str.len(), 24);
-                            payload[..copy_len].copy_from_slice(&value_str.as_bytes()[..copy_len]);
 
-                            let start = std::time::Instant::now();
-                            // Extreme Ingestion: Append to WAL + Write to MemTable
-                            if db_clone.set(key, payload).is_ok() {
-                                format!("OK ({}ms): Record ingested.\n", start.elapsed().as_micros() as f64 / 1000.0)
-                            } else {
-                                "ERROR: Disk Write Failed.\n".to_string()
+                let response = match cmd.to_uppercase().as_str() {
+                    "GET" => {
+                        if let Some(key) = parts.next() {
+                            let seq = db.get_seq();
+                            match db.find(key, seq) {
+                                Ok(Some(val)) => format!("OK: {}\n", val),
+                                Ok(None) => "NOT_FOUND\n".to_string(),
+                                Err(e) => format!("ERROR: {:?}\n", e),
                             }
-                        } else { "ERROR: Invalid Key.\n".to_string() }
-                    } else { "ERROR: Missing Key.\n".to_string() }
-                } else if cmd.eq_ignore_ascii_case("QUIT") {
-                    let _ = socket.write_all(b"Goodbye.\n").await;
-                    break;
-                } else {
-                    "ERROR: Unknown Command. (GET, SET, QUIT)\n".to_string()
+                        } else {
+                            "ERROR: Missing key\n".to_string()
+                        }
+                    }
+                    "SET" => {
+                        if let (Some(key), Some(value)) = (parts.next(), parts.next()) {
+                            let mut batch = WriteBatch::new();
+                            match batch.set(key, value.to_string()) {
+                                Ok(_) => match db.commit_batch(&batch) {
+                                    Ok(seq) => format!("OK: seq={}\n", seq),
+                                    Err(e) => format!("ERROR: {:?}\n", e),
+                                },
+                                Err(e) => format!("ERROR: {:?}\n", e),
+                            }
+                        } else {
+                            "ERROR: SET <key> <value>\n".to_string()
+                        }
+                    }
+                    "DELETE" => {
+                        if let Some(key) = parts.next() {
+                            let mut batch = WriteBatch::new();
+                            match batch.delete(key) {
+                                Ok(_) => match db.commit_batch(&batch) {
+                                    Ok(seq) => format!("DELETED: seq={}\n", seq),
+                                    Err(e) => format!("ERROR: {:?}\n", e),
+                                },
+                                Err(e) => format!("ERROR: {:?}\n", e),
+                            }
+                        } else {
+                            "ERROR: Missing key\n".to_string()
+                        }
+                    }
+                    "SCAN" => {
+                        let start = parts.next().unwrap_or("");
+                        let end = parts.next().unwrap_or("\x7F");
+                        let seq = db.get_seq();
+                        match db.scan(start, end, seq) {
+                            Ok(results) => {
+                                let mut out = format!("{} results:\n", results.len());
+                                for (k, v) in results.iter().take(50) {
+                                    out.push_str(&format!("  {} = {}\n", k, v));
+                                }
+                                out
+                            }
+                            Err(e) => format!("ERROR: {:?}\n", e),
+                        }
+                    }
+                    "QUIT" | "EXIT" => {
+                        let _ = socket.write_all(b"Goodbye.\n").await;
+                        return;
+                    }
+                    _ => "ERROR: Unknown command (GET, SET, DELETE, SCAN, QUIT)\n".to_string(),
                 };
 
-                if socket.write_all(response.as_bytes()).await.is_err() { return; }
+                if socket.write_all(response.as_bytes()).await.is_err() {
+                    return;
+                }
             }
         });
     }

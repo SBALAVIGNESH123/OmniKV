@@ -786,7 +786,7 @@ impl OmniKV {
 
         // WAL write (serialized by wal Mutex, NOT by write_mutex)
         {
-            let wal = self.wal.lock().map_err(|_| OmniError::LockPoisoned("wal lock".into()))?;
+            let mut wal = self.wal.lock().map_err(|_| OmniError::LockPoisoned("wal lock".into()))?;
             wal.append_batch(&wal_records)?;
         }
 
