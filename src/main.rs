@@ -1,41 +1,153 @@
+//! OmniKV — Embeddable + Distributed KV Engine
+//!
+//! Production binary that starts:
+//! 1. HTTP/1.1 + HTTP/2 REST API (Axum + axum-server with ALPN TLS)
+//! 2. QUIC/HTTP3 binary protocol (Quinn)
+//! 3. PostgreSQL wire protocol v3 (PgWire)
+//! 4. Prometheus metrics on /metrics
+
+mod api;
+mod auth;
+mod backup;
+mod cluster;
+mod crypto;
+mod quic_server;
+mod raft_impl;
+mod raft_init;
+mod raft_storage;
+
 use std::sync::Arc;
-use omni_engine::{OmniKV, WriteBatch};
+use omni_engine::OmniKV;
 
 const MANIFEST_PATH: &str = "manifest.json";
 const WAL_PATH: &str = "wal.bin";
+const HTTP_ADDR: &str = "0.0.0.0:8443";
+const QUIC_ADDR: &str = "0.0.0.0:4433";
+const PGWIRE_ADDR: &str = "0.0.0.0:5433";
+const TCP_ADDR: &str = "0.0.0.0:8080";
+
+fn print_banner() {
+    println!();
+    println!("  ╔════════════════════════════════════════════════════╗");
+    println!("  ║        ⚡ OmniKV v{}                       ║", env!("CARGO_PKG_VERSION"));
+    println!("  ║  Embeddable · Distributed · Transactional KV      ║");
+    println!("  ╠════════════════════════════════════════════════════╣");
+    println!("  ║  HTTP/1.1 + HTTP/2 (TLS)  → {}           ║", HTTP_ADDR);
+    println!("  ║  QUIC/HTTP3 (binary)      → {}           ║", QUIC_ADDR);
+    println!("  ║  PostgreSQL Wire Protocol → {}           ║", PGWIRE_ADDR);
+    println!("  ║  TCP Command Interface    → {}           ║", TCP_ADDR);
+    println!("  ╠════════════════════════════════════════════════════╣");
+    println!("  ║  Built from scratch in Rust. Every byte is ours.  ║");
+    println!("  ╚════════════════════════════════════════════════════╝");
+    println!();
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    println!("╔══════════════════════════════════════════════════════════╗");
-    println!("║     OmniKV — Embeddable + Distributed KV Engine         ║");
-    println!("║     SSI | 2PC | PgWire | HTTP/3 | Rust from scratch     ║");
-    println!("╚══════════════════════════════════════════════════════════╝\n");
+    // Initialize structured logging
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "info,omni_engine=debug".parse().unwrap()),
+        )
+        .json()
+        .init();
 
+    print_banner();
+
+    // Open the database
     let db = OmniKV::open(MANIFEST_PATH, WAL_PATH)?;
-    println!("Database initialized.");
-    println!("  Global sequence: {}", db.get_seq());
+    tracing::info!(
+        seq = db.get_seq(),
+        sstables = db.sstable_count(),
+        "Database opened"
+    );
 
-    // Start PostgreSQL wire protocol server
-    let db_clone = db.clone();
-    let pgwire_handle = std::thread::spawn(move || {
-        let server = omni_engine::pgwire::PgWireServer::new(db_clone, "127.0.0.1:5433");
-        if let Err(e) = server.start() {
-            eprintln!("[OmniKV] PgWire server error: {}", e);
+    // ─── 1. HTTP/1.1 + HTTP/2 REST API (TLS with ALPN) ────────
+    let app_state = api::AppState {
+        db: db.clone(),
+        jwt_secret: std::env::var("OMNI_JWT_SECRET")
+            .unwrap_or_else(|_| "omnikv-dev-secret-change-in-prod".to_string()),
+        manifest_path: MANIFEST_PATH.to_string(),
+    };
+
+    let router = api::build_router(app_state);
+
+    // Generate self-signed certs for HTTP/2 + QUIC
+    let (certs, key) = quic_server::generate_self_signed_cert()?;
+
+    // HTTP/2 server with TLS (ALPN h2 + http/1.1)
+    let tls_config = axum_server::tls_rustls::RustlsConfig::from_der(
+        certs.iter().map(|c| c.as_ref().to_vec()).collect(),
+        key.secret_der().to_vec(),
+    )
+    .await?;
+
+    let http_addr: std::net::SocketAddr = HTTP_ADDR.parse()?;
+    let http_handle = tokio::spawn(async move {
+        tracing::info!("HTTP/1.1 + HTTP/2 server starting on {}", HTTP_ADDR);
+        if let Err(e) = axum_server::bind_rustls(http_addr, tls_config)
+            .serve(router.into_make_service())
+            .await
+        {
+            tracing::error!("HTTP server error: {}", e);
         }
     });
 
-    // Start TCP command interface
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:8080").await?;
-    println!("🚀 TCP server listening on 127.0.0.1:8080");
-    println!("🐘 PostgreSQL wire protocol on 127.0.0.1:5433");
-    println!("\nCommands: GET <key> | SET <key> <value> | DELETE <key> | SCAN <start> <end>\n");
+    // ─── 2. QUIC/HTTP3 Binary Protocol ─────────────────────────
+    let (quic_certs, quic_key) = quic_server::generate_self_signed_cert()?;
+    let quic_endpoint = quic_server::create_server_endpoint(QUIC_ADDR, quic_certs, quic_key)?;
+    let quic_db = db.clone();
+    let quic_handle = tokio::spawn(async move {
+        quic_server::run_quic_server(quic_endpoint, quic_db).await;
+    });
+
+    // ─── 3. PostgreSQL Wire Protocol ───────────────────────────
+    let pgwire_db = db.clone();
+    let pgwire_handle = std::thread::spawn(move || {
+        let server = omni_engine::pgwire::PgWireServer::new(pgwire_db, PGWIRE_ADDR);
+        tracing::info!("PostgreSQL wire protocol starting on {}", PGWIRE_ADDR);
+        if let Err(e) = server.start() {
+            tracing::error!("PgWire server error: {}", e);
+        }
+    });
+
+    // ─── 4. TCP Command Interface (for telnet/debug) ──────────
+    let tcp_db = db.clone();
+    let tcp_handle = tokio::spawn(async move {
+        if let Err(e) = run_tcp_server(tcp_db, TCP_ADDR).await {
+            tracing::error!("TCP server error: {}", e);
+        }
+    });
+
+    tracing::info!("All servers started. OmniKV is ready.");
+
+    // Wait for any server to exit (they shouldn't)
+    tokio::select! {
+        _ = http_handle => tracing::error!("HTTP server exited"),
+        _ = quic_handle => tracing::error!("QUIC server exited"),
+        _ = tcp_handle => tracing::error!("TCP server exited"),
+    }
+
+    Ok(())
+}
+
+/// Simple TCP command interface for telnet/debugging.
+async fn run_tcp_server(
+    db: Arc<OmniKV>,
+    addr: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use omni_engine::WriteBatch;
+
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    tracing::info!("TCP command interface on {}", addr);
 
     loop {
-        let (mut socket, addr) = listener.accept().await?;
+        let (mut socket, _addr) = listener.accept().await?;
         let db = db.clone();
 
         tokio::spawn(async move {
-            use tokio::io::{AsyncReadExt, AsyncWriteExt};
             let mut buf = [0u8; 4096];
 
             loop {
