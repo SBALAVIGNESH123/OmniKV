@@ -3,7 +3,7 @@
 //! Maps OpenRaft's RaftStorage trait to OmniKV's storage engine.
 //! Raft log entries and state machine snapshots are stored in OmniKV itself.
 
-use omni_engine::{OmniKV, WriteBatch};
+use crate::{OmniKV, WriteBatch};
 use std::sync::Arc;
 use std::sync::Mutex;
 

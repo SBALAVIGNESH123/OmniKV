@@ -39,6 +39,7 @@ pub mod metrics_prometheus;
 pub mod pgwire;
 pub mod prepared;
 pub mod query;
+pub mod raft_storage;
 pub mod schema;
 pub mod secondary_index;
 pub mod sql;

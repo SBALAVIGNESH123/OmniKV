@@ -14,9 +14,9 @@ mod crypto;
 mod quic_server;
 mod raft_impl;
 mod raft_init;
-mod raft_storage;
 
 use omni_engine::OmniKV;
+use omni_engine::raft_storage;
 use std::sync::Arc;
 
 const MANIFEST_PATH: &str = "manifest.json";
