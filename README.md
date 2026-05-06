@@ -136,23 +136,31 @@ tm.commit(&mut txn)?; // Atomic commit — both or neither
 
 | Module | Description | Lines |
 |--------|-------------|-------|
-| `lib.rs` | Core storage engine (LSM-tree, memtable, compaction, MVCC) | ~1500 |
-| `transaction.rs` | SSI transaction manager with conflict detection | ~300 |
-| `query.rs` | SQL parser (SELECT, INSERT, UPDATE, DELETE) | ~250 |
-| `prepared.rs` | Prepared statements with LRU plan cache | ~250 |
-| `secondary_index.rs` | B-tree secondary indexes with composite key support | ~250 |
-| `schema.rs` | Online schema evolution (migrations, backfill) | ~300 |
-| `pgwire.rs` | PostgreSQL wire protocol v3 server | ~400 |
-| `hardening.rs` | Group commit, rate limiting, connection pooling | ~250 |
-| `chaos.rs` | Jepsen-style chaos testing framework | ~450 |
-| `wal.rs` | Write-ahead log with segmented rotation | ~200 |
-| `metrics_prometheus.rs` | Prometheus metrics exporter | ~50 |
-| `raft_network.rs` | QUIC/HTTP transport for Raft consensus | ~80 |
+| `lib.rs` | Core storage engine (LSM-tree, memtable, compaction, MVCC) | ~1525 |
+| `transaction.rs` | SSI transaction manager with conflict detection | ~294 |
+| `dist_txn.rs` | Distributed two-phase commit (2PC) protocol | ~547 |
+| `query.rs` | SQL parser (SELECT, INSERT, UPDATE, DELETE) | ~241 |
+| `prepared.rs` | Prepared statements with LRU plan cache | ~635 |
+| `secondary_index.rs` | B-tree secondary indexes with composite key support | ~542 |
+| `schema.rs` | Online schema evolution (migrations, backfill) | ~503 |
+| `pgwire.rs` | PostgreSQL wire protocol v3 server | ~402 |
+| `hardening.rs` | Group commit, rate limiting, connection pooling | ~285 |
+| `chaos.rs` | Jepsen-style chaos testing framework | ~461 |
+| `wal.rs` | Write-ahead log with segmented rotation | ~150 |
+| `api.rs` | Full REST API (Axum) — CRUD, batch, scan, metrics | ~260 |
+| `quic_server.rs` | QUIC/HTTP3 binary protocol (Quinn) | ~240 |
+| `auth.rs` | JWT authentication + API key validation | ~75 |
+| `crypto.rs` | AES-256-GCM at-rest encryption | ~55 |
+| `backup.rs` | Hot backup with tar+gzip + optional encryption | ~100 |
+| `raft_storage.rs` | OpenRaft storage adapter for OmniKV | ~160 |
+| `raft_init.rs` | Raft cluster bootstrap | ~60 |
+| `raft_network.rs` | Connection pooling for cluster transport | ~85 |
+| `metrics_prometheus.rs` | Prometheus metrics exporter | ~56 |
 
 ## Test Suite
 
 ```
-68 tests, 0 failures
+76 tests, 0 failures
 
 Storage Engine ............ 16 tests
 Query Parser .............. 9 tests
@@ -161,7 +169,7 @@ Secondary Indexes ......... 7 tests
 Prepared Statements ....... 12 tests
 Schema Evolution .......... 9 tests
 Production Hardening ...... 9 tests (group commit, rate limiting, error handling)
-Chaos/Safety .............. 7 tests (crash recovery, write skew, CRC integrity)
+Chaos/Safety .............. 6 tests (crash recovery, write skew, CRC integrity)
 ```
 
 ## Benchmarks
