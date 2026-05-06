@@ -36,6 +36,9 @@ pub mod hardening;
 pub mod chaos;
 pub mod pgwire;
 pub mod dist_txn;
+pub mod catalog;
+pub mod sql;
+pub mod sql_exec;
 
 #[derive(Debug, Clone)]
 pub enum OmniError {
