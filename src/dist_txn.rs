@@ -36,11 +36,11 @@
 //! If any participant detects a conflict → VOTE_ABORT → entire txn aborts.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crate::{OmniKV, WriteBatch, OmniError};
+use crate::{OmniError, OmniKV, WriteBatch};
 
 /// Global transaction ID for distributed transactions.
 /// Format: (coordinator_node_id, local_txn_sequence)
@@ -183,17 +183,27 @@ impl TwoPhaseCoordinator {
         value: Option<String>,
         ttl: u64,
     ) -> Result<(), OmniError> {
-        let mut active = self.active_txns.lock()
+        let mut active = self
+            .active_txns
+            .lock()
             .map_err(|_| OmniError::LockPoisoned("coordinator".into()))?;
 
-        let txn = active.get_mut(&txn_id)
+        let txn = active
+            .get_mut(&txn_id)
             .ok_or_else(|| OmniError::IoError("Transaction not found".into()))?;
 
         if txn.state != DistTxnState::Preparing {
-            return Err(OmniError::IoError("Transaction is not in PREPARING state".into()));
+            return Err(OmniError::IoError(
+                "Transaction is not in PREPARING state".into(),
+            ));
         }
 
-        let write = DistWrite { node_id, key, value, ttl };
+        let write = DistWrite {
+            node_id,
+            key,
+            value,
+            ttl,
+        };
         txn.writes_by_node.entry(node_id).or_default().push(write);
         Ok(())
     }
@@ -201,18 +211,27 @@ impl TwoPhaseCoordinator {
     /// PREPARE PHASE — sends prepare requests to all participants.
     /// Returns the list of participant node IDs that need to be contacted.
     pub fn prepare(&self, txn_id: GlobalTxnId) -> Result<Vec<u64>, OmniError> {
-        let mut active = self.active_txns.lock()
+        let mut active = self
+            .active_txns
+            .lock()
             .map_err(|_| OmniError::LockPoisoned("coordinator".into()))?;
 
-        let txn = active.get_mut(&txn_id)
+        let txn = active
+            .get_mut(&txn_id)
             .ok_or_else(|| OmniError::IoError("Transaction not found".into()))?;
 
         if txn.state != DistTxnState::Preparing {
-            return Err(OmniError::IoError("Transaction is not in PREPARING state".into()));
+            return Err(OmniError::IoError(
+                "Transaction is not in PREPARING state".into(),
+            ));
         }
 
         // Write PREPARE record to coordinator's WAL
-        self.log_state(txn_id, "PREPARE", &txn.writes_by_node.keys().copied().collect::<Vec<_>>())?;
+        self.log_state(
+            txn_id,
+            "PREPARE",
+            &txn.writes_by_node.keys().copied().collect::<Vec<_>>(),
+        )?;
 
         txn.state = DistTxnState::WaitingForVotes;
 
@@ -220,11 +239,18 @@ impl TwoPhaseCoordinator {
     }
 
     /// Record a participant's vote.
-    pub fn receive_vote(&self, txn_id: GlobalTxnId, result: PrepareResult) -> Result<DistTxnState, OmniError> {
-        let mut active = self.active_txns.lock()
+    pub fn receive_vote(
+        &self,
+        txn_id: GlobalTxnId,
+        result: PrepareResult,
+    ) -> Result<DistTxnState, OmniError> {
+        let mut active = self
+            .active_txns
+            .lock()
             .map_err(|_| OmniError::LockPoisoned("coordinator".into()))?;
 
-        let txn = active.get_mut(&txn_id)
+        let txn = active
+            .get_mut(&txn_id)
             .ok_or_else(|| OmniError::IoError("Transaction not found".into()))?;
 
         if txn.state != DistTxnState::WaitingForVotes {
@@ -249,7 +275,9 @@ impl TwoPhaseCoordinator {
                 return Ok(DistTxnState::Committing);
             } else {
                 txn.state = DistTxnState::Aborted;
-                let abort_reasons: Vec<String> = txn.votes.values()
+                let abort_reasons: Vec<String> = txn
+                    .votes
+                    .values()
                     .filter_map(|v| match v {
                         Vote::Abort(reason) => Some(reason.clone()),
                         _ => None,
@@ -259,7 +287,8 @@ impl TwoPhaseCoordinator {
                 drop(active);
                 self.log_state(txn_id, "ABORT", &participants)?;
                 return Err(OmniError::IoError(format!(
-                    "Distributed transaction aborted: {}", abort_reasons.join("; ")
+                    "Distributed transaction aborted: {}",
+                    abort_reasons.join("; ")
                 )));
             }
         }
@@ -269,7 +298,9 @@ impl TwoPhaseCoordinator {
 
     /// COMMIT PHASE — marks the transaction as committed after all ACKs.
     pub fn finalize_commit(&self, txn_id: GlobalTxnId) -> Result<(), OmniError> {
-        let mut active = self.active_txns.lock()
+        let mut active = self
+            .active_txns
+            .lock()
             .map_err(|_| OmniError::LockPoisoned("coordinator".into()))?;
 
         if let Some(txn) = active.get_mut(&txn_id) {
@@ -282,10 +313,13 @@ impl TwoPhaseCoordinator {
 
     /// ABORT — aborts a transaction at any stage.
     pub fn abort(&self, txn_id: GlobalTxnId) -> Result<Vec<u64>, OmniError> {
-        let mut active = self.active_txns.lock()
+        let mut active = self
+            .active_txns
+            .lock()
             .map_err(|_| OmniError::LockPoisoned("coordinator".into()))?;
 
-        let txn = active.get_mut(&txn_id)
+        let txn = active
+            .get_mut(&txn_id)
             .ok_or_else(|| OmniError::IoError("Transaction not found".into()))?;
 
         let participants: Vec<u64> = txn.writes_by_node.keys().copied().collect();
@@ -294,7 +328,9 @@ impl TwoPhaseCoordinator {
         drop(active);
         self.log_state(txn_id, "ABORT", &participants)?;
 
-        let mut active = self.active_txns.lock()
+        let mut active = self
+            .active_txns
+            .lock()
             .map_err(|_| OmniError::LockPoisoned("coordinator".into()))?;
         active.remove(&txn_id);
 
@@ -329,9 +365,14 @@ impl TwoPhaseCoordinator {
     }
 
     /// Get the writes for a specific participant.
-    pub fn get_participant_writes(&self, txn_id: GlobalTxnId, node_id: u64) -> Option<Vec<DistWrite>> {
+    pub fn get_participant_writes(
+        &self,
+        txn_id: GlobalTxnId,
+        node_id: u64,
+    ) -> Option<Vec<DistWrite>> {
         let active = self.active_txns.lock().ok()?;
-        active.get(&txn_id)
+        active
+            .get(&txn_id)
             .and_then(|t| t.writes_by_node.get(&node_id))
             .cloned()
     }
@@ -342,7 +383,12 @@ impl TwoPhaseCoordinator {
     }
 
     /// Write a 2PC state change to the coordinator's recovery log.
-    fn log_state(&self, txn_id: GlobalTxnId, state: &str, participants: &[u64]) -> Result<(), OmniError> {
+    fn log_state(
+        &self,
+        txn_id: GlobalTxnId,
+        state: &str,
+        participants: &[u64],
+    ) -> Result<(), OmniError> {
         let entry = TwoPhaseLogEntry {
             txn_id,
             state: state.to_string(),
@@ -469,11 +515,14 @@ impl TwoPhaseParticipant {
             Ok(prepare_seq) => {
                 // Store the prepared batch for later commit
                 let mut prepared = self.prepared.lock().expect("participant lock");
-                prepared.insert(txn_id, PreparedState {
-                    batch,
-                    prepare_seq,
-                    prepared_at: Instant::now(),
-                });
+                prepared.insert(
+                    txn_id,
+                    PreparedState {
+                        batch,
+                        prepare_seq,
+                        prepared_at: Instant::now(),
+                    },
+                );
 
                 PrepareResult {
                     node_id: self.node_id,
@@ -482,26 +531,28 @@ impl TwoPhaseParticipant {
                     prepare_seq,
                 }
             }
-            Err(e) => {
-                PrepareResult {
-                    node_id: self.node_id,
-                    txn_id,
-                    vote: Vote::Abort(format!("WAL write failed: {}", e)),
-                    prepare_seq: 0,
-                }
-            }
+            Err(e) => PrepareResult {
+                node_id: self.node_id,
+                txn_id,
+                vote: Vote::Abort(format!("WAL write failed: {}", e)),
+                prepare_seq: 0,
+            },
         }
     }
 
     /// COMMIT — apply the previously prepared writes.
     pub fn commit(&self, txn_id: GlobalTxnId) -> Result<u64, OmniError> {
-        let mut prepared = self.prepared.lock()
+        let mut prepared = self
+            .prepared
+            .lock()
             .map_err(|_| OmniError::LockPoisoned("participant prepared".into()))?;
 
-        let state = prepared.remove(&txn_id)
-            .ok_or_else(|| OmniError::IoError(format!(
-                "No prepared transaction {:?} on node {}", txn_id, self.node_id
-            )))?;
+        let state = prepared.remove(&txn_id).ok_or_else(|| {
+            OmniError::IoError(format!(
+                "No prepared transaction {:?} on node {}",
+                txn_id, self.node_id
+            ))
+        })?;
 
         // Commit the prepared batch
         let commit_seq = self.db.commit_batch(&state.batch)?;
@@ -517,7 +568,9 @@ impl TwoPhaseParticipant {
 
     /// ABORT — discard the prepared writes.
     pub fn abort(&self, txn_id: GlobalTxnId) -> Result<(), OmniError> {
-        let mut prepared = self.prepared.lock()
+        let mut prepared = self
+            .prepared
+            .lock()
             .map_err(|_| OmniError::LockPoisoned("participant prepared".into()))?;
 
         prepared.remove(&txn_id);
@@ -539,7 +592,8 @@ impl TwoPhaseParticipant {
     /// Check for stale prepared transactions (for recovery).
     pub fn stale_prepared(&self, max_age: Duration) -> Vec<GlobalTxnId> {
         let prepared = self.prepared.lock().expect("participant lock");
-        prepared.iter()
+        prepared
+            .iter()
             .filter(|(_, state)| state.prepared_at.elapsed() > max_age)
             .map(|(id, _)| *id)
             .collect()

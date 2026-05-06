@@ -3,26 +3,28 @@
 //! Creates consistent point-in-time snapshots of the database as
 //! compressed tar archives, optionally encrypted with AES-256-GCM.
 
+use flate2::Compression;
+use flate2::read::GzDecoder;
+use flate2::write::GzEncoder;
 use std::fs::File;
-use std::io::{Write, Read};
+use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::Arc;
-use flate2::write::GzEncoder;
-use flate2::read::GzDecoder;
-use flate2::Compression;
-use tar::{Builder, Archive};
+use tar::{Archive, Builder};
 
 use omni_engine::OmniKV;
 
 /// Create a compressed backup of the database.
 /// Returns the path to the created backup file.
-pub fn create_backup(db: &Arc<OmniKV>, manifest_path: &str, output_path: &str) -> Result<String, String> {
-    let manifest_dir = Path::new(manifest_path)
-        .parent()
-        .unwrap_or(Path::new("."));
+pub fn create_backup(
+    db: &Arc<OmniKV>,
+    manifest_path: &str,
+    output_path: &str,
+) -> Result<String, String> {
+    let manifest_dir = Path::new(manifest_path).parent().unwrap_or(Path::new("."));
 
-    let file = File::create(output_path)
-        .map_err(|e| format!("Cannot create backup file: {}", e))?;
+    let file =
+        File::create(output_path).map_err(|e| format!("Cannot create backup file: {}", e))?;
 
     let enc = GzEncoder::new(file, Compression::default());
     let mut tar = Builder::new(enc);
@@ -58,8 +60,7 @@ pub fn create_backup(db: &Arc<OmniKV>, manifest_path: &str, output_path: &str) -
 
 /// Restore a database from a compressed backup.
 pub fn restore_backup(backup_path: &str, restore_dir: &str) -> Result<(), String> {
-    let file = File::open(backup_path)
-        .map_err(|e| format!("Cannot open backup: {}", e))?;
+    let file = File::open(backup_path).map_err(|e| format!("Cannot open backup: {}", e))?;
 
     let decoder = GzDecoder::new(file);
     let mut archive = Archive::new(decoder);
@@ -67,7 +68,8 @@ pub fn restore_backup(backup_path: &str, restore_dir: &str) -> Result<(), String
     std::fs::create_dir_all(restore_dir)
         .map_err(|e| format!("Cannot create restore dir: {}", e))?;
 
-    archive.unpack(restore_dir)
+    archive
+        .unpack(restore_dir)
         .map_err(|e| format!("Unpack failed: {}", e))?;
 
     Ok(())

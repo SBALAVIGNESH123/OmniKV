@@ -8,17 +8,17 @@
 //! - JWT authentication middleware
 //! - Health checks
 
-use std::sync::Arc;
 use axum::{
-    Router, Json,
-    extract::{Path, State, Query},
+    Json, Router,
+    extract::{Path, Query, State},
     http::StatusCode,
-    response::IntoResponse,
     middleware,
+    response::IntoResponse,
 };
-use serde::{Serialize, Deserialize};
-use tower_http::cors::CorsLayer;
 use omni_engine::{OmniKV, WriteBatch};
+use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+use tower_http::cors::CorsLayer;
 
 /// Application state shared across all handlers.
 #[derive(Clone)]
@@ -42,7 +42,7 @@ pub struct BatchRequest {
 
 #[derive(Deserialize)]
 pub struct BatchOp {
-    pub op: String,   // "set" or "delete"
+    pub op: String, // "set" or "delete"
     pub key: String,
     pub value: Option<String>,
 }
@@ -56,10 +56,18 @@ pub struct ApiResponse<T: Serialize> {
 
 impl<T: Serialize> ApiResponse<T> {
     pub fn ok(data: T) -> Json<Self> {
-        Json(Self { success: true, data: Some(data), error: None })
+        Json(Self {
+            success: true,
+            data: Some(data),
+            error: None,
+        })
     }
     pub fn err(msg: &str) -> Json<Self> {
-        Json(Self { success: false, data: None, error: Some(msg.to_string()) })
+        Json(Self {
+            success: false,
+            data: None,
+            error: Some(msg.to_string()),
+        })
     }
 }
 
@@ -125,7 +133,10 @@ pub fn build_router(state: AppState) -> Router {
 static START_TIME: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
 
 async fn health_handler(State(state): State<AppState>) -> impl IntoResponse {
-    let uptime = START_TIME.get_or_init(std::time::Instant::now).elapsed().as_secs();
+    let uptime = START_TIME
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_secs();
     ApiResponse::ok(HealthStatus {
         status: "ok".into(),
         version: env!("CARGO_PKG_VERSION").into(),
@@ -134,15 +145,18 @@ async fn health_handler(State(state): State<AppState>) -> impl IntoResponse {
     })
 }
 
-async fn get_handler(
-    State(state): State<AppState>,
-    Path(key): Path<String>,
-) -> impl IntoResponse {
+async fn get_handler(State(state): State<AppState>, Path(key): Path<String>) -> impl IntoResponse {
     let seq = state.db.get_seq();
     match state.db.find(&key, seq) {
-        Ok(Some(val)) => (StatusCode::OK, ApiResponse::ok(KeyValue { key, value: val })),
+        Ok(Some(val)) => (
+            StatusCode::OK,
+            ApiResponse::ok(KeyValue { key, value: val }),
+        ),
         Ok(None) => (StatusCode::NOT_FOUND, ApiResponse::err("Key not found")),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, ApiResponse::err(&format!("{:?}", e))),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            ApiResponse::err(&format!("{:?}", e)),
+        ),
     }
 }
 
@@ -153,17 +167,26 @@ async fn set_handler(
     let mut batch = WriteBatch::new();
     if let Some(ttl) = req.expiry {
         if let Err(e) = batch.set_with_ttl(&req.key, req.value, ttl) {
-            return (StatusCode::BAD_REQUEST, ApiResponse::<WriteResult>::err(&format!("{:?}", e)));
+            return (
+                StatusCode::BAD_REQUEST,
+                ApiResponse::<WriteResult>::err(&format!("{:?}", e)),
+            );
         }
     } else {
         if let Err(e) = batch.set(&req.key, req.value) {
-            return (StatusCode::BAD_REQUEST, ApiResponse::<WriteResult>::err(&format!("{:?}", e)));
+            return (
+                StatusCode::BAD_REQUEST,
+                ApiResponse::<WriteResult>::err(&format!("{:?}", e)),
+            );
         }
     }
 
     match state.db.commit_batch(&batch) {
         Ok(seq) => (StatusCode::CREATED, ApiResponse::ok(WriteResult { seq })),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, ApiResponse::<WriteResult>::err(&format!("{:?}", e))),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            ApiResponse::<WriteResult>::err(&format!("{:?}", e)),
+        ),
     }
 }
 
@@ -175,9 +198,15 @@ async fn delete_handler(
     match batch.delete(&key) {
         Ok(_) => match state.db.commit_batch(&batch) {
             Ok(seq) => (StatusCode::OK, ApiResponse::ok(WriteResult { seq })),
-            Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, ApiResponse::<WriteResult>::err(&format!("{:?}", e))),
+            Err(e) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ApiResponse::<WriteResult>::err(&format!("{:?}", e)),
+            ),
         },
-        Err(e) => (StatusCode::BAD_REQUEST, ApiResponse::<WriteResult>::err(&format!("{:?}", e))),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            ApiResponse::<WriteResult>::err(&format!("{:?}", e)),
+        ),
     }
 }
 
@@ -193,14 +222,24 @@ async fn batch_handler(
                     let _ = batch.set(&op.key, val.clone());
                 }
             }
-            "delete" => { let _ = batch.delete(&op.key); }
-            _ => return (StatusCode::BAD_REQUEST, ApiResponse::<WriteResult>::err(&format!("Unknown op: {}", op.op))),
+            "delete" => {
+                let _ = batch.delete(&op.key);
+            }
+            _ => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    ApiResponse::<WriteResult>::err(&format!("Unknown op: {}", op.op)),
+                );
+            }
         }
     }
 
     match state.db.commit_batch(&batch) {
         Ok(seq) => (StatusCode::OK, ApiResponse::ok(WriteResult { seq })),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, ApiResponse::<WriteResult>::err(&format!("{:?}", e))),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            ApiResponse::<WriteResult>::err(&format!("{:?}", e)),
+        ),
     }
 }
 
@@ -215,19 +254,30 @@ async fn scan_handler(
     match state.db.scan(start, end, seq) {
         Ok(results) => {
             let limit = q.limit.unwrap_or(1000);
-            let items: Vec<KeyValue> = results.into_iter()
+            let items: Vec<KeyValue> = results
+                .into_iter()
                 .take(limit)
                 .map(|(k, v)| KeyValue { key: k, value: v })
                 .collect();
             (StatusCode::OK, ApiResponse::ok(items))
         }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, ApiResponse::<Vec<KeyValue>>::err(&format!("{:?}", e))),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            ApiResponse::<Vec<KeyValue>>::err(&format!("{:?}", e)),
+        ),
     }
 }
 
 async fn metrics_handler() -> impl IntoResponse {
     let text = omni_engine::metrics_prometheus::render_metrics();
-    (StatusCode::OK, [(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4")], text)
+    (
+        StatusCode::OK,
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4",
+        )],
+        text,
+    )
 }
 
 async fn backup_handler(State(state): State<AppState>) -> impl IntoResponse {
@@ -239,14 +289,23 @@ async fn backup_handler(State(state): State<AppState>) -> impl IntoResponse {
 
     match crate::backup::create_backup(&state.db, &state.manifest_path, &backup_path) {
         Ok(path) => (StatusCode::OK, ApiResponse::ok(path)),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, ApiResponse::<String>::err(&e)),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            ApiResponse::<String>::err(&e),
+        ),
     }
 }
 
 async fn compact_handler(State(state): State<AppState>) -> impl IntoResponse {
     match state.db.compact_sstables() {
-        Ok(()) => (StatusCode::OK, ApiResponse::ok("Compaction complete".to_string())),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, ApiResponse::<String>::err(&format!("{:?}", e))),
+        Ok(()) => (
+            StatusCode::OK,
+            ApiResponse::ok("Compaction complete".to_string()),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            ApiResponse::<String>::err(&format!("{:?}", e)),
+        ),
     }
 }
 
@@ -263,6 +322,9 @@ async fn token_handler(
     let role = req.role.as_deref().unwrap_or("read");
     match crate::auth::generate_token(&req.username, role, &state.jwt_secret, 86400) {
         Ok(token) => (StatusCode::OK, ApiResponse::ok(token)),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, ApiResponse::<String>::err(&e)),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            ApiResponse::<String>::err(&e),
+        ),
     }
 }

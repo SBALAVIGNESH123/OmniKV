@@ -89,7 +89,11 @@ pub enum JoinType {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum WhereExpr {
-    Comparison { column: String, op: CmpOp, value: SqlValue },
+    Comparison {
+        column: String,
+        op: CmpOp,
+        value: SqlValue,
+    },
     And(Box<WhereExpr>, Box<WhereExpr>),
     Or(Box<WhereExpr>, Box<WhereExpr>),
     Not(Box<WhereExpr>),
@@ -99,7 +103,15 @@ pub enum WhereExpr {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub enum CmpOp { Eq, Ne, Gt, Lt, Gte, Lte, Like }
+pub enum CmpOp {
+    Eq,
+    Ne,
+    Gt,
+    Lt,
+    Gte,
+    Lte,
+    Like,
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum SqlValue {
@@ -132,7 +144,9 @@ pub struct OrderByItem {
 pub fn parse_sql(input: &str) -> Result<SqlStatement, String> {
     let trimmed = input.trim().trim_end_matches(';');
     let tokens = tokenize(trimmed);
-    if tokens.is_empty() { return Err("Empty query".into()); }
+    if tokens.is_empty() {
+        return Err("Empty query".into());
+    }
 
     match tokens[0].to_uppercase().as_str() {
         "CREATE" => parse_create_table(&tokens),
@@ -178,11 +192,17 @@ fn tokenize(input: &str) -> Vec<String> {
             }
             tokens.push(ch.to_string());
         } else if ch == '!' && chars.peek() == Some(&'=') {
-            if !current.is_empty() { tokens.push(current.clone()); current.clear(); }
+            if !current.is_empty() {
+                tokens.push(current.clone());
+                current.clear();
+            }
             chars.next();
             tokens.push("!=".to_string());
         } else if ch == '<' || ch == '>' {
-            if !current.is_empty() { tokens.push(current.clone()); current.clear(); }
+            if !current.is_empty() {
+                tokens.push(current.clone());
+                current.clear();
+            }
             if chars.peek() == Some(&'=') {
                 chars.next();
                 tokens.push(format!("{}=", ch));
@@ -190,28 +210,46 @@ fn tokenize(input: &str) -> Vec<String> {
                 tokens.push(ch.to_string());
             }
         } else if ch == '=' {
-            if !current.is_empty() { tokens.push(current.clone()); current.clear(); }
+            if !current.is_empty() {
+                tokens.push(current.clone());
+                current.clear();
+            }
             tokens.push("=".to_string());
         } else if ch.is_whitespace() {
-            if !current.is_empty() { tokens.push(current.clone()); current.clear(); }
+            if !current.is_empty() {
+                tokens.push(current.clone());
+                current.clear();
+            }
         } else {
             current.push(ch);
         }
     }
-    if !current.is_empty() { tokens.push(current); }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
     tokens
 }
 
 fn parse_value(token: &str) -> SqlValue {
     if token.starts_with('\'') && token.ends_with('\'') {
-        return SqlValue::Text(token[1..token.len()-1].to_string());
+        return SqlValue::Text(token[1..token.len() - 1].to_string());
     }
     let upper = token.to_uppercase();
-    if upper == "NULL" { return SqlValue::Null; }
-    if upper == "TRUE" { return SqlValue::Boolean(true); }
-    if upper == "FALSE" { return SqlValue::Boolean(false); }
-    if let Ok(i) = token.parse::<i64>() { return SqlValue::Integer(i); }
-    if let Ok(f) = token.parse::<f64>() { return SqlValue::Float(f); }
+    if upper == "NULL" {
+        return SqlValue::Null;
+    }
+    if upper == "TRUE" {
+        return SqlValue::Boolean(true);
+    }
+    if upper == "FALSE" {
+        return SqlValue::Boolean(false);
+    }
+    if let Ok(i) = token.parse::<i64>() {
+        return SqlValue::Integer(i);
+    }
+    if let Ok(f) = token.parse::<f64>() {
+        return SqlValue::Float(f);
+    }
     SqlValue::Text(token.to_string())
 }
 
@@ -224,9 +262,14 @@ fn parse_create_table(tokens: &[String]) -> Result<SqlStatement, String> {
 
     let if_not_exists = if i + 2 < tokens.len()
         && tokens[i].to_uppercase() == "IF"
-        && tokens[i+1].to_uppercase() == "NOT"
-        && tokens[i+2].to_uppercase() == "EXISTS"
-    { i += 3; true } else { false };
+        && tokens[i + 1].to_uppercase() == "NOT"
+        && tokens[i + 2].to_uppercase() == "EXISTS"
+    {
+        i += 3;
+        true
+    } else {
+        false
+    };
 
     let name = tokens.get(i).ok_or("Missing table name")?.clone();
     i += 1;
@@ -238,7 +281,10 @@ fn parse_create_table(tokens: &[String]) -> Result<SqlStatement, String> {
 
     let mut columns = Vec::new();
     while i < tokens.len() && tokens[i] != ")" {
-        if tokens[i] == "," { i += 1; continue; }
+        if tokens[i] == "," {
+            i += 1;
+            continue;
+        }
         let col_name = tokens[i].clone();
         i += 1;
         let col_type = tokens.get(i).ok_or("Missing column type")?.clone();
@@ -252,12 +298,16 @@ fn parse_create_table(tokens: &[String]) -> Result<SqlStatement, String> {
             let upper = tokens[i].to_uppercase();
             if upper == "PRIMARY" {
                 i += 1; // skip KEY
-                if tokens.get(i).map(|t| t.to_uppercase()) == Some("KEY".into()) { i += 1; }
+                if tokens.get(i).map(|t| t.to_uppercase()) == Some("KEY".into()) {
+                    i += 1;
+                }
                 pk = true;
                 nullable = false;
             } else if upper == "NOT" {
                 i += 1; // skip NULL
-                if tokens.get(i).map(|t| t.to_uppercase()) == Some("NULL".into()) { i += 1; }
+                if tokens.get(i).map(|t| t.to_uppercase()) == Some("NULL".into()) {
+                    i += 1;
+                }
                 nullable = false;
             } else if upper == "DEFAULT" {
                 i += 1;
@@ -268,10 +318,20 @@ fn parse_create_table(tokens: &[String]) -> Result<SqlStatement, String> {
             }
         }
 
-        columns.push(SqlColumnDef { name: col_name, col_type, primary_key: pk, nullable, default });
+        columns.push(SqlColumnDef {
+            name: col_name,
+            col_type,
+            primary_key: pk,
+            nullable,
+            default,
+        });
     }
 
-    Ok(SqlStatement::CreateTable { name, columns, if_not_exists })
+    Ok(SqlStatement::CreateTable {
+        name,
+        columns,
+        if_not_exists,
+    })
 }
 
 fn parse_drop_table(tokens: &[String]) -> Result<SqlStatement, String> {
@@ -281,8 +341,13 @@ fn parse_drop_table(tokens: &[String]) -> Result<SqlStatement, String> {
     }
     i += 1;
     let if_exists = if tokens.get(i).map(|t| t.to_uppercase()) == Some("IF".into())
-        && tokens.get(i+1).map(|t| t.to_uppercase()) == Some("EXISTS".into())
-    { i += 2; true } else { false };
+        && tokens.get(i + 1).map(|t| t.to_uppercase()) == Some("EXISTS".into())
+    {
+        i += 2;
+        true
+    } else {
+        false
+    };
 
     let name = tokens.get(i).ok_or("Missing table name")?.clone();
     Ok(SqlStatement::DropTable { name, if_exists })
@@ -302,7 +367,9 @@ fn parse_insert_sql(tokens: &[String]) -> Result<SqlStatement, String> {
     if tokens.get(i).map(|t| t.as_str()) == Some("(") {
         i += 1;
         while i < tokens.len() && tokens[i] != ")" {
-            if tokens[i] != "," { columns.push(tokens[i].clone()); }
+            if tokens[i] != "," {
+                columns.push(tokens[i].clone());
+            }
             i += 1;
         }
         i += 1; // skip )
@@ -319,7 +386,9 @@ fn parse_insert_sql(tokens: &[String]) -> Result<SqlStatement, String> {
             i += 1;
             let mut row = Vec::new();
             while i < tokens.len() && tokens[i] != ")" {
-                if tokens[i] != "," { row.push(parse_value(&tokens[i])); }
+                if tokens[i] != "," {
+                    row.push(parse_value(&tokens[i]));
+                }
                 i += 1;
             }
             i += 1; // skip )
@@ -331,7 +400,11 @@ fn parse_insert_sql(tokens: &[String]) -> Result<SqlStatement, String> {
         }
     }
 
-    Ok(SqlStatement::Insert { table, columns, values: all_values })
+    Ok(SqlStatement::Insert {
+        table,
+        columns,
+        values: all_values,
+    })
 }
 
 fn parse_select_sql(tokens: &[String]) -> Result<SqlStatement, String> {
@@ -341,21 +414,38 @@ fn parse_select_sql(tokens: &[String]) -> Result<SqlStatement, String> {
     // Parse select columns
     while i < tokens.len() {
         let upper = tokens[i].to_uppercase();
-        if upper == "FROM" { break; }
-        if tokens[i] == "," { i += 1; continue; }
+        if upper == "FROM" {
+            break;
+        }
+        if tokens[i] == "," {
+            i += 1;
+            continue;
+        }
         if tokens[i] == "*" {
             columns.push(SelectColumn::Star);
-        } else if upper == "COUNT" || upper == "SUM" || upper == "AVG" || upper == "MIN" || upper == "MAX" {
+        } else if upper == "COUNT"
+            || upper == "SUM"
+            || upper == "AVG"
+            || upper == "MIN"
+            || upper == "MAX"
+        {
             let func = match upper.as_str() {
-                "COUNT" => AggFunc::Count, "SUM" => AggFunc::Sum,
-                "AVG" => AggFunc::Avg, "MIN" => AggFunc::Min,
-                "MAX" => AggFunc::Max, _ => unreachable!(),
+                "COUNT" => AggFunc::Count,
+                "SUM" => AggFunc::Sum,
+                "AVG" => AggFunc::Avg,
+                "MIN" => AggFunc::Min,
+                "MAX" => AggFunc::Max,
+                _ => unreachable!(),
             };
             i += 1; // (
-            if tokens.get(i).map(|t| t.as_str()) == Some("(") { i += 1; }
+            if tokens.get(i).map(|t| t.as_str()) == Some("(") {
+                i += 1;
+            }
             let col = tokens.get(i).cloned().unwrap_or_else(|| "*".to_string());
             i += 1;
-            if tokens.get(i).map(|t| t.as_str()) == Some(")") { i += 1; }
+            if tokens.get(i).map(|t| t.as_str()) == Some(")") {
+                i += 1;
+            }
             columns.push(SelectColumn::Aggregate(func, col));
             continue;
         } else if tokens[i].contains('.') {
@@ -380,12 +470,23 @@ fn parse_select_sql(tokens: &[String]) -> Result<SqlStatement, String> {
         let upper = tokens.get(i).map(|t| t.to_uppercase()).unwrap_or_default();
         if upper == "JOIN" || upper == "INNER" || upper == "LEFT" || upper == "RIGHT" {
             let join_type = match upper.as_str() {
-                "LEFT" => { i += 1; JoinType::Left },
-                "RIGHT" => { i += 1; JoinType::Right },
-                "INNER" => { i += 1; JoinType::Inner },
+                "LEFT" => {
+                    i += 1;
+                    JoinType::Left
+                }
+                "RIGHT" => {
+                    i += 1;
+                    JoinType::Right
+                }
+                "INNER" => {
+                    i += 1;
+                    JoinType::Inner
+                }
                 _ => JoinType::Inner,
             };
-            if tokens.get(i).map(|t| t.to_uppercase()) == Some("JOIN".into()) { i += 1; }
+            if tokens.get(i).map(|t| t.to_uppercase()) == Some("JOIN".into()) {
+                i += 1;
+            }
             let right = tokens.get(i).ok_or("Missing right table")?.clone();
             i += 1;
             if tokens.get(i).map(|t| t.to_uppercase()) != Some("ON".into()) {
@@ -398,10 +499,24 @@ fn parse_select_sql(tokens: &[String]) -> Result<SqlStatement, String> {
             let on_right_full = tokens.get(i).ok_or("Missing join right col")?.clone();
             i += 1;
 
-            let on_left = on_left_full.split('.').last().unwrap_or(&on_left_full).to_string();
-            let on_right = on_right_full.split('.').last().unwrap_or(&on_right_full).to_string();
+            let on_left = on_left_full
+                .split('.')
+                .last()
+                .unwrap_or(&on_left_full)
+                .to_string();
+            let on_right = on_right_full
+                .split('.')
+                .last()
+                .unwrap_or(&on_right_full)
+                .to_string();
 
-            FromClause::Join { left: left_table, right, join_type, on_left, on_right }
+            FromClause::Join {
+                left: left_table,
+                right,
+                join_type,
+                on_left,
+                on_right,
+            }
         } else {
             FromClause::Table(left_table)
         }
@@ -423,11 +538,17 @@ fn parse_select_sql(tokens: &[String]) -> Result<SqlStatement, String> {
     let mut group_by = Vec::new();
     if i < tokens.len() && tokens[i].to_uppercase() == "GROUP" {
         i += 1;
-        if tokens.get(i).map(|t| t.to_uppercase()) == Some("BY".into()) { i += 1; }
+        if tokens.get(i).map(|t| t.to_uppercase()) == Some("BY".into()) {
+            i += 1;
+        }
         while i < tokens.len() {
             let upper = tokens[i].to_uppercase();
-            if upper == "ORDER" || upper == "LIMIT" || upper == "HAVING" { break; }
-            if tokens[i] != "," { group_by.push(tokens[i].clone()); }
+            if upper == "ORDER" || upper == "LIMIT" || upper == "HAVING" {
+                break;
+            }
+            if tokens[i] != "," {
+                group_by.push(tokens[i].clone());
+            }
             i += 1;
         }
     }
@@ -436,17 +557,27 @@ fn parse_select_sql(tokens: &[String]) -> Result<SqlStatement, String> {
     let mut order_by = Vec::new();
     if i < tokens.len() && tokens[i].to_uppercase() == "ORDER" {
         i += 1;
-        if tokens.get(i).map(|t| t.to_uppercase()) == Some("BY".into()) { i += 1; }
+        if tokens.get(i).map(|t| t.to_uppercase()) == Some("BY".into()) {
+            i += 1;
+        }
         while i < tokens.len() {
             let upper = tokens[i].to_uppercase();
-            if upper == "LIMIT" { break; }
-            if tokens[i] == "," { i += 1; continue; }
+            if upper == "LIMIT" {
+                break;
+            }
+            if tokens[i] == "," {
+                i += 1;
+                continue;
+            }
             let col = tokens[i].clone();
             i += 1;
             let desc = if i < tokens.len() && tokens[i].to_uppercase() == "DESC" {
-                i += 1; true
+                i += 1;
+                true
             } else {
-                if i < tokens.len() && tokens[i].to_uppercase() == "ASC" { i += 1; }
+                if i < tokens.len() && tokens[i].to_uppercase() == "ASC" {
+                    i += 1;
+                }
                 false
             };
             order_by.push(OrderByItem { column: col, desc });
@@ -456,11 +587,25 @@ fn parse_select_sql(tokens: &[String]) -> Result<SqlStatement, String> {
     // LIMIT
     let limit = if i < tokens.len() && tokens[i].to_uppercase() == "LIMIT" {
         i += 1;
-        Some(tokens.get(i).ok_or("Missing LIMIT value")?
-            .parse::<usize>().map_err(|_| "Invalid LIMIT")?)
-    } else { None };
+        Some(
+            tokens
+                .get(i)
+                .ok_or("Missing LIMIT value")?
+                .parse::<usize>()
+                .map_err(|_| "Invalid LIMIT")?,
+        )
+    } else {
+        None
+    };
 
-    Ok(SqlStatement::Select { columns, from, where_clause, group_by, order_by, limit })
+    Ok(SqlStatement::Select {
+        columns,
+        from,
+        where_clause,
+        group_by,
+        order_by,
+        limit,
+    })
 }
 
 fn parse_where_expr(tokens: &[String], start: usize) -> Result<(WhereExpr, usize), String> {
@@ -486,7 +631,9 @@ fn parse_where_expr(tokens: &[String], start: usize) -> Result<(WhereExpr, usize
 }
 
 fn parse_where_atom(tokens: &[String], start: usize) -> Result<(WhereExpr, usize), String> {
-    if start >= tokens.len() { return Err("Unexpected end in WHERE".into()); }
+    if start >= tokens.len() {
+        return Err("Unexpected end in WHERE".into());
+    }
 
     let mut i = start;
     if tokens[i].to_uppercase() == "NOT" {
@@ -499,7 +646,9 @@ fn parse_where_atom(tokens: &[String], start: usize) -> Result<(WhereExpr, usize
         i += 1;
         let (expr, ni) = parse_where_expr(tokens, i)?;
         i = ni;
-        if i < tokens.len() && tokens[i] == ")" { i += 1; }
+        if i < tokens.len() && tokens[i] == ")" {
+            i += 1;
+        }
         return Ok((expr, i));
     }
 
@@ -510,7 +659,8 @@ fn parse_where_atom(tokens: &[String], start: usize) -> Result<(WhereExpr, usize
     if i < tokens.len() && tokens[i].to_uppercase() == "IS" {
         i += 1;
         if i < tokens.len() && tokens[i].to_uppercase() == "NOT" {
-            i += 1; i += 1; // skip NULL
+            i += 1;
+            i += 1; // skip NULL
             return Ok((WhereExpr::IsNotNull(col_name), i));
         } else {
             i += 1; // skip NULL
@@ -520,32 +670,53 @@ fn parse_where_atom(tokens: &[String], start: usize) -> Result<(WhereExpr, usize
 
     if i < tokens.len() && tokens[i].to_uppercase() == "IN" {
         i += 1; // skip (
-        if i < tokens.len() && tokens[i] == "(" { i += 1; }
-        let mut vals = Vec::new();
-        while i < tokens.len() && tokens[i] != ")" {
-            if tokens[i] != "," { vals.push(parse_value(&tokens[i])); }
+        if i < tokens.len() && tokens[i] == "(" {
             i += 1;
         }
-        if i < tokens.len() { i += 1; } // skip )
+        let mut vals = Vec::new();
+        while i < tokens.len() && tokens[i] != ")" {
+            if tokens[i] != "," {
+                vals.push(parse_value(&tokens[i]));
+            }
+            i += 1;
+        }
+        if i < tokens.len() {
+            i += 1;
+        } // skip )
         return Ok((WhereExpr::In(col_name, vals), i));
     }
 
-    let op = if i >= tokens.len() { return Err("Missing operator".into()); } else {
+    let op = if i >= tokens.len() {
+        return Err("Missing operator".into());
+    } else {
         match tokens[i].as_str() {
-            "=" => CmpOp::Eq, "!=" => CmpOp::Ne, ">" => CmpOp::Gt,
-            "<" => CmpOp::Lt, ">=" => CmpOp::Gte, "<=" => CmpOp::Lte,
+            "=" => CmpOp::Eq,
+            "!=" => CmpOp::Ne,
+            ">" => CmpOp::Gt,
+            "<" => CmpOp::Lt,
+            ">=" => CmpOp::Gte,
+            "<=" => CmpOp::Lte,
             "LIKE" | "like" => CmpOp::Like,
             other => return Err(format!("Unknown operator: {}", other)),
         }
     };
     i += 1;
 
-    let value = if i >= tokens.len() { return Err("Missing value".into()); } else {
+    let value = if i >= tokens.len() {
+        return Err("Missing value".into());
+    } else {
         parse_value(&tokens[i])
     };
     i += 1;
 
-    Ok((WhereExpr::Comparison { column: col_name, op, value }, i))
+    Ok((
+        WhereExpr::Comparison {
+            column: col_name,
+            op,
+            value,
+        },
+        i,
+    ))
 }
 
 fn parse_update_sql(tokens: &[String]) -> Result<SqlStatement, String> {
@@ -560,8 +731,13 @@ fn parse_update_sql(tokens: &[String]) -> Result<SqlStatement, String> {
     let mut assignments = Vec::new();
     while i < tokens.len() {
         let upper = tokens[i].to_uppercase();
-        if upper == "WHERE" { break; }
-        if tokens[i] == "," { i += 1; continue; }
+        if upper == "WHERE" {
+            break;
+        }
+        if tokens[i] == "," {
+            i += 1;
+            continue;
+        }
         let col = tokens[i].clone();
         i += 1; // skip =
         i += 1;
@@ -574,9 +750,15 @@ fn parse_update_sql(tokens: &[String]) -> Result<SqlStatement, String> {
         i += 1;
         let (expr, _) = parse_where_expr(tokens, i)?;
         Some(expr)
-    } else { None };
+    } else {
+        None
+    };
 
-    Ok(SqlStatement::Update { table, assignments, where_clause })
+    Ok(SqlStatement::Update {
+        table,
+        assignments,
+        where_clause,
+    })
 }
 
 fn parse_delete_sql(tokens: &[String]) -> Result<SqlStatement, String> {
@@ -592,9 +774,14 @@ fn parse_delete_sql(tokens: &[String]) -> Result<SqlStatement, String> {
         i += 1;
         let (expr, _) = parse_where_expr(tokens, i)?;
         Some(expr)
-    } else { None };
+    } else {
+        None
+    };
 
-    Ok(SqlStatement::Delete { table, where_clause })
+    Ok(SqlStatement::Delete {
+        table,
+        where_clause,
+    })
 }
 
 #[cfg(test)]
@@ -603,7 +790,10 @@ mod tests {
 
     #[test]
     fn test_create_table() {
-        let stmt = parse_sql("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL, email TEXT)").unwrap();
+        let stmt = parse_sql(
+            "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL, email TEXT)",
+        )
+        .unwrap();
         match stmt {
             SqlStatement::CreateTable { name, columns, .. } => {
                 assert_eq!(name, "users");
@@ -619,7 +809,11 @@ mod tests {
     fn test_insert() {
         let stmt = parse_sql("INSERT INTO users (id, name) VALUES (1, 'Alice')").unwrap();
         match stmt {
-            SqlStatement::Insert { table, columns, values } => {
+            SqlStatement::Insert {
+                table,
+                columns,
+                values,
+            } => {
                 assert_eq!(table, "users");
                 assert_eq!(columns, vec!["id", "name"]);
                 assert_eq!(values[0][0], SqlValue::Integer(1));
@@ -632,7 +826,10 @@ mod tests {
     fn test_select_join() {
         let stmt = parse_sql("SELECT * FROM users JOIN orders ON users.id = orders.user_id WHERE users.name = 'Alice'").unwrap();
         match stmt {
-            SqlStatement::Select { from: FromClause::Join { left, right, .. }, .. } => {
+            SqlStatement::Select {
+                from: FromClause::Join { left, right, .. },
+                ..
+            } => {
                 assert_eq!(left, "users");
                 assert_eq!(right, "orders");
             }
@@ -644,7 +841,10 @@ mod tests {
     fn test_where_or() {
         let stmt = parse_sql("SELECT * FROM users WHERE name = 'Alice' OR name = 'Bob'").unwrap();
         match stmt {
-            SqlStatement::Select { where_clause: Some(WhereExpr::Or(..)), .. } => {}
+            SqlStatement::Select {
+                where_clause: Some(WhereExpr::Or(..)),
+                ..
+            } => {}
             _ => panic!("Expected OR clause"),
         }
     }
@@ -653,7 +853,9 @@ mod tests {
     fn test_aggregates() {
         let stmt = parse_sql("SELECT COUNT(*), SUM(amount) FROM orders GROUP BY user_id").unwrap();
         match stmt {
-            SqlStatement::Select { columns, group_by, .. } => {
+            SqlStatement::Select {
+                columns, group_by, ..
+            } => {
                 assert_eq!(columns.len(), 2);
                 assert_eq!(group_by, vec!["user_id"]);
             }

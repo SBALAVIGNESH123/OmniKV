@@ -29,11 +29,11 @@
 //!   └── IndexScanner (range queries on indexed fields)
 //! ```
 
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use serde::{Serialize, Deserialize};
 
-use crate::{OmniKV, WriteBatch, OmniError};
+use crate::{OmniError, OmniKV, WriteBatch};
 
 /// Prefix for all index entries in the key space.
 const INDEX_PREFIX: &[u8] = b"\x00IDX\x00";
@@ -84,7 +84,7 @@ impl IndexCatalog {
             field_index: HashMap::new(),
             next_id: 1,
         };
-        
+
         let seq = db.get_seq();
         // Scan all catalog entries
         if let Ok(iter) = db.scan_iter(CATALOG_PREFIX, &format!("{}\x7f", CATALOG_PREFIX), seq) {
@@ -97,7 +97,7 @@ impl IndexCatalog {
                 }
             }
         }
-        
+
         catalog
     }
 
@@ -114,7 +114,8 @@ impl IndexCatalog {
 
     /// Returns all indexes that cover the given collection.
     pub fn indexes_for_collection(&self, collection: &str) -> Vec<&IndexDefinition> {
-        self.indexes.values()
+        self.indexes
+            .values()
             .filter(|idx| idx.collection == collection)
             .collect()
     }
@@ -242,12 +243,17 @@ impl IndexManager {
         fields: Vec<(String, IndexFieldType)>,
         unique: bool,
     ) -> Result<IndexId, OmniError> {
-        let mut catalog = self.catalog.lock()
+        let mut catalog = self
+            .catalog
+            .lock()
             .map_err(|_| OmniError::LockPoisoned("index catalog".into()))?;
 
         // Check for duplicate name
         if catalog.get_by_name(name).is_some() {
-            return Err(OmniError::IoError(format!("Index '{}' already exists", name)));
+            return Err(OmniError::IoError(format!(
+                "Index '{}' already exists",
+                name
+            )));
         }
 
         let id = catalog.next_id;
@@ -263,9 +269,9 @@ impl IndexManager {
 
         // Persist to OmniKV
         let catalog_key = format!("{}{}", CATALOG_PREFIX, id);
-        let catalog_value = serde_json::to_string(&def)
-            .map_err(|e| OmniError::IoError(e.to_string()))?;
-        
+        let catalog_value =
+            serde_json::to_string(&def).map_err(|e| OmniError::IoError(e.to_string()))?;
+
         let mut batch = WriteBatch::new();
         batch.set(&catalog_key, catalog_value)?;
         self.db.commit_batch(&batch)?;
@@ -277,10 +283,13 @@ impl IndexManager {
 
     /// DROP INDEX — removes an index definition and all its entries.
     pub fn drop_index(&self, name: &str) -> Result<(), OmniError> {
-        let mut catalog = self.catalog.lock()
+        let mut catalog = self
+            .catalog
+            .lock()
             .map_err(|_| OmniError::LockPoisoned("index catalog".into()))?;
 
-        let id = catalog.get_by_name(name)
+        let id = catalog
+            .get_by_name(name)
             .map(|d| d.id)
             .ok_or_else(|| OmniError::IoError(format!("Index '{}' not found", name)))?;
 
@@ -325,7 +334,9 @@ impl IndexManager {
         document: &serde_json::Value,
         batch: &mut WriteBatch,
     ) -> Result<(), OmniError> {
-        let catalog = self.catalog.lock()
+        let catalog = self
+            .catalog
+            .lock()
             .map_err(|_| OmniError::LockPoisoned("index catalog".into()))?;
 
         let indexes = catalog.indexes_for_collection(collection);
@@ -360,7 +371,12 @@ impl IndexManager {
                             if existing_pk != primary_key {
                                 return Err(OmniError::IoError(format!(
                                     "UNIQUE CONSTRAINT VIOLATION: index '{}' on {:?}",
-                                    idx_def.name, idx_def.fields.iter().map(|(f, _)| f.as_str()).collect::<Vec<_>>()
+                                    idx_def.name,
+                                    idx_def
+                                        .fields
+                                        .iter()
+                                        .map(|(f, _)| f.as_str())
+                                        .collect::<Vec<_>>()
                                 )));
                             }
                         }
@@ -384,7 +400,9 @@ impl IndexManager {
         old_document: &serde_json::Value,
         batch: &mut WriteBatch,
     ) -> Result<(), OmniError> {
-        let catalog = self.catalog.lock()
+        let catalog = self
+            .catalog
+            .lock()
             .map_err(|_| OmniError::LockPoisoned("index catalog".into()))?;
 
         let indexes = catalog.indexes_for_collection(collection);
@@ -419,20 +437,26 @@ impl IndexManager {
         index_name: &str,
         values: &[serde_json::Value],
     ) -> Result<Vec<String>, OmniError> {
-        let catalog = self.catalog.lock()
+        let catalog = self
+            .catalog
+            .lock()
             .map_err(|_| OmniError::LockPoisoned("index catalog".into()))?;
 
-        let idx_def = catalog.get_by_name(index_name)
+        let idx_def = catalog
+            .get_by_name(index_name)
             .ok_or_else(|| OmniError::IoError(format!("Index '{}' not found", index_name)))?;
 
         if values.len() != idx_def.fields.len() {
             return Err(OmniError::IoError(format!(
                 "Expected {} values for index '{}', got {}",
-                idx_def.fields.len(), index_name, values.len()
+                idx_def.fields.len(),
+                index_name,
+                values.len()
             )));
         }
 
-        let encoded: Vec<Vec<u8>> = values.iter()
+        let encoded: Vec<Vec<u8>> = values
+            .iter()
             .zip(idx_def.fields.iter())
             .map(|(v, (_, ft))| encode_index_value(v, ft))
             .collect();
@@ -459,14 +483,19 @@ impl IndexManager {
         start_value: &serde_json::Value,
         end_value: &serde_json::Value,
     ) -> Result<Vec<String>, OmniError> {
-        let catalog = self.catalog.lock()
+        let catalog = self
+            .catalog
+            .lock()
             .map_err(|_| OmniError::LockPoisoned("index catalog".into()))?;
 
-        let idx_def = catalog.get_by_name(index_name)
+        let idx_def = catalog
+            .get_by_name(index_name)
             .ok_or_else(|| OmniError::IoError(format!("Index '{}' not found", index_name)))?;
 
         if idx_def.fields.len() != 1 {
-            return Err(OmniError::IoError("Range scan only supported on single-field indexes".into()));
+            return Err(OmniError::IoError(
+                "Range scan only supported on single-field indexes".into(),
+            ));
         }
 
         let (_, ref ft) = idx_def.fields[0];
@@ -494,10 +523,13 @@ impl IndexManager {
     /// Scans all keys matching the collection prefix and writes index entries.
     /// Should be called after CREATE INDEX on a collection with existing data.
     pub fn rebuild_index(&self, index_name: &str) -> Result<usize, OmniError> {
-        let catalog = self.catalog.lock()
+        let catalog = self
+            .catalog
+            .lock()
             .map_err(|_| OmniError::LockPoisoned("index catalog".into()))?;
 
-        let idx_def = catalog.get_by_name(index_name)
+        let idx_def = catalog
+            .get_by_name(index_name)
             .ok_or_else(|| OmniError::IoError(format!("Index '{}' not found", index_name)))?
             .clone();
         drop(catalog); // Release lock before scanning
@@ -534,9 +566,14 @@ impl IndexManager {
 
     /// Returns all index definitions for a collection.
     pub fn list_indexes(&self, collection: &str) -> Result<Vec<IndexDefinition>, OmniError> {
-        let catalog = self.catalog.lock()
+        let catalog = self
+            .catalog
+            .lock()
             .map_err(|_| OmniError::LockPoisoned("index catalog".into()))?;
-        Ok(catalog.indexes_for_collection(collection).into_iter().cloned().collect())
+        Ok(catalog
+            .indexes_for_collection(collection)
+            .into_iter()
+            .cloned()
+            .collect())
     }
 }
-

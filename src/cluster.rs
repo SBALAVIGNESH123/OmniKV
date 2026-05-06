@@ -3,9 +3,9 @@
 //! Manages the distributed cluster topology and coordinates
 //! write forwarding between leader and follower nodes.
 
+use omni_engine::WriteBatch;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tokio::sync::{mpsc, oneshot};
-use omni_engine::WriteBatch;
 
 /// A write request forwarded to the Raft leader.
 pub struct WriteRequest {
@@ -41,7 +41,8 @@ impl ClusterState {
 
     pub fn set_leader(&self, leader: u64) {
         self.leader_id.store(leader, Ordering::Relaxed);
-        self.is_leader.store(leader == self.node_id, Ordering::Relaxed);
+        self.is_leader
+            .store(leader == self.node_id, Ordering::Relaxed);
     }
 }
 

@@ -2,9 +2,9 @@
 //!
 //! Provides authenticated encryption for backup files and sensitive data.
 
-use aes_gcm::{Aes256Gcm, Key, Nonce};
 use aes_gcm::aead::{Aead, KeyInit};
-use sha2::{Sha256, Digest};
+use aes_gcm::{Aes256Gcm, Key, Nonce};
+use sha2::{Digest, Sha256};
 
 /// Derive a 256-bit key from a passphrase using SHA-256.
 pub fn derive_key(passphrase: &str) -> [u8; 32] {

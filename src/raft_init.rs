@@ -2,10 +2,10 @@
 //!
 //! Bootstrap a new Raft cluster or join an existing one.
 
-use std::sync::Arc;
-use std::collections::BTreeMap;
-use openraft::{Raft, Config, BasicNode};
 use crate::raft_impl::TypeConfig;
+use openraft::{BasicNode, Config, Raft};
+use std::collections::BTreeMap;
+use std::sync::Arc;
 
 /// Initialize a new single-node Raft cluster.
 pub async fn init_single_node(
@@ -14,7 +14,12 @@ pub async fn init_single_node(
     addr: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut members = BTreeMap::new();
-    members.insert(node_id, BasicNode { addr: addr.to_string() });
+    members.insert(
+        node_id,
+        BasicNode {
+            addr: addr.to_string(),
+        },
+    );
 
     raft.initialize(members).await?;
     tracing::info!("Raft cluster initialized with single node {}", node_id);
@@ -27,7 +32,9 @@ pub async fn add_learner(
     node_id: u64,
     addr: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let node = BasicNode { addr: addr.to_string() };
+    let node = BasicNode {
+        addr: addr.to_string(),
+    };
     raft.add_learner(node_id, node, true).await?;
     tracing::info!("Added learner node {} at {}", node_id, addr);
     Ok(())

@@ -2,8 +2,8 @@
 //!
 //! Core type aliases for OpenRaft integration.
 
-use std::io::Cursor;
 use openraft::BasicNode;
+use std::io::Cursor;
 
 /// The Raft type configuration for OmniKV.
 openraft::declare_raft_types!(

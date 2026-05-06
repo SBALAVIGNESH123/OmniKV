@@ -3,20 +3,25 @@
 //! Provides token-based authentication for the REST API and QUIC protocol.
 //! Supports both API key validation and JWT bearer tokens.
 
-use jsonwebtoken::{encode, decode, Header, Algorithm, Validation, EncodingKey, DecodingKey};
-use serde::{Serialize, Deserialize};
+use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, encode};
+use serde::{Deserialize, Serialize};
 
 /// JWT claims payload.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Claims {
-    pub sub: String,       // Subject (user/service ID)
-    pub role: String,      // "admin", "read", "write"
-    pub exp: u64,          // Expiration (UNIX timestamp)
-    pub iat: u64,          // Issued at
+    pub sub: String,  // Subject (user/service ID)
+    pub role: String, // "admin", "read", "write"
+    pub exp: u64,     // Expiration (UNIX timestamp)
+    pub iat: u64,     // Issued at
 }
 
 /// Generate a signed JWT token.
-pub fn generate_token(sub: &str, role: &str, secret: &str, ttl_secs: u64) -> Result<String, String> {
+pub fn generate_token(
+    sub: &str,
+    role: &str,
+    secret: &str,
+    ttl_secs: u64,
+) -> Result<String, String> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -57,13 +62,17 @@ pub fn validate_api_key(provided: &str, expected: &str) -> bool {
     if provided.len() != expected.len() {
         return false;
     }
-    provided.as_bytes()
+    provided
+        .as_bytes()
         .iter()
         .zip(expected.as_bytes().iter())
-        .fold(0u8, |acc, (a, b)| acc | (a ^ b)) == 0
+        .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+        == 0
 }
 
 /// Extract bearer token from Authorization header.
 pub fn extract_bearer(header_value: &str) -> Option<&str> {
-    header_value.strip_prefix("Bearer ").or_else(|| header_value.strip_prefix("bearer "))
+    header_value
+        .strip_prefix("Bearer ")
+        .or_else(|| header_value.strip_prefix("bearer "))
 }

@@ -14,7 +14,7 @@
 //!
 //! 3. **WRITE**: Writes are buffered in the `write_set` (not yet visible to others).
 //!
-//! 4. **COMMIT**: 
+//! 4. **COMMIT**:
 //!    a. Acquire the global transaction lock (serialization point).
 //!    b. For each key in our write_set, check if any other transaction
 //!       committed a write to that key AFTER our snapshot. If yes → ABORT.
@@ -24,10 +24,10 @@
 //! This guarantees Serializable isolation — the strongest level.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
-use crate::{OmniKV, WriteBatch, OmniError};
+use crate::{OmniError, OmniKV, WriteBatch};
 
 /// Unique transaction identifier.
 pub type TxnId = u64;
@@ -110,10 +110,10 @@ impl TransactionManager {
     pub fn begin(&self) -> Transaction {
         let txn_id = self.next_txn_id.fetch_add(1, Ordering::SeqCst);
         let read_seq = self.db.snapshot();
-        
+
         let mut active = self.active_txns.lock().expect("active_txns lock");
         active.insert(txn_id, read_seq);
-        
+
         Transaction::new(txn_id, read_seq)
     }
 
@@ -146,7 +146,13 @@ impl TransactionManager {
     }
 
     /// SET_WITH_TTL — buffers a write with TTL.
-    pub fn set_with_ttl(&self, txn: &mut Transaction, key: &str, value: String, ttl: u64) -> Result<(), OmniError> {
+    pub fn set_with_ttl(
+        &self,
+        txn: &mut Transaction,
+        key: &str,
+        value: String,
+        ttl: u64,
+    ) -> Result<(), OmniError> {
         if txn.state != TxnState::Active {
             return Err(OmniError::IoError("Transaction is not active".into()));
         }
@@ -182,16 +188,20 @@ impl TransactionManager {
         // ═══════════════════════════════════════════════════════════════
         // SERIALIZATION POINT: acquire commit lock
         // ═══════════════════════════════════════════════════════════════
-        let _guard = self.commit_lock.lock()
+        let _guard = self
+            .commit_lock
+            .lock()
             .map_err(|_| OmniError::LockPoisoned("txn commit lock".into()))?;
 
         // Write-Write and Read-Write Conflict Detection:
         // Check if any transaction that committed AFTER our snapshot wrote
         // to any key in our write or read set.
         let conflict: Option<String> = {
-            let committed = self.committed_txns.lock()
+            let committed = self
+                .committed_txns
+                .lock()
                 .map_err(|_| OmniError::LockPoisoned("committed_txns".into()))?;
-            
+
             let mut found = None;
             'outer: for committed_txn in committed.iter() {
                 if committed_txn.commit_seq > txn.read_seq {
@@ -248,7 +258,9 @@ impl TransactionManager {
 
         // Record this transaction in the committed set for future conflict detection
         {
-            let mut committed = self.committed_txns.lock()
+            let mut committed = self
+                .committed_txns
+                .lock()
                 .map_err(|_| OmniError::LockPoisoned("committed_txns".into()))?;
             committed.push(CommittedTxn {
                 commit_seq,

@@ -3,19 +3,25 @@
 //! Handles table row storage, JOIN execution, WHERE filtering,
 //! GROUP BY aggregation, and ORDER BY sorting.
 
+use crate::catalog::{Catalog, Column, ColumnType, TableDef};
+use crate::sql::*;
+use crate::{OmniKV, WriteBatch};
 use std::collections::HashMap;
 use std::sync::Arc;
-use crate::{OmniKV, WriteBatch};
-use crate::catalog::{Catalog, TableDef, Column, ColumnType};
-use crate::sql::*;
 
 /// Result row: column_name → value
 pub type Row = HashMap<String, String>;
 
 /// Execution result
 pub enum ExecResult {
-    Rows { columns: Vec<String>, rows: Vec<Vec<String>> },
-    Modified { count: usize, command: String },
+    Rows {
+        columns: Vec<String>,
+        rows: Vec<Vec<String>>,
+    },
+    Modified {
+        count: usize,
+        command: String,
+    },
     Ok(String),
 }
 
@@ -31,39 +37,62 @@ impl SqlExecutor {
 
     pub fn execute(&self, stmt: &SqlStatement) -> Result<ExecResult, String> {
         match stmt {
-            SqlStatement::CreateTable { name, columns, if_not_exists } => {
-                self.exec_create_table(name, columns, *if_not_exists)
-            }
-            SqlStatement::DropTable { name, if_exists } => {
-                self.exec_drop_table(name, *if_exists)
-            }
-            SqlStatement::Insert { table, columns, values } => {
-                self.exec_insert(table, columns, values)
-            }
-            SqlStatement::Select { columns, from, where_clause, group_by, order_by, limit } => {
-                self.exec_select(columns, from, where_clause.as_ref(), group_by, order_by, *limit)
-            }
-            SqlStatement::Update { table, assignments, where_clause } => {
-                self.exec_update(table, assignments, where_clause.as_ref())
-            }
-            SqlStatement::Delete { table, where_clause } => {
-                self.exec_delete(table, where_clause.as_ref())
-            }
+            SqlStatement::CreateTable {
+                name,
+                columns,
+                if_not_exists,
+            } => self.exec_create_table(name, columns, *if_not_exists),
+            SqlStatement::DropTable { name, if_exists } => self.exec_drop_table(name, *if_exists),
+            SqlStatement::Insert {
+                table,
+                columns,
+                values,
+            } => self.exec_insert(table, columns, values),
+            SqlStatement::Select {
+                columns,
+                from,
+                where_clause,
+                group_by,
+                order_by,
+                limit,
+            } => self.exec_select(
+                columns,
+                from,
+                where_clause.as_ref(),
+                group_by,
+                order_by,
+                *limit,
+            ),
+            SqlStatement::Update {
+                table,
+                assignments,
+                where_clause,
+            } => self.exec_update(table, assignments, where_clause.as_ref()),
+            SqlStatement::Delete {
+                table,
+                where_clause,
+            } => self.exec_delete(table, where_clause.as_ref()),
             SqlStatement::ShowTables => {
                 let tables = self.catalog.list_tables();
                 let rows: Vec<Vec<String>> = tables.into_iter().map(|t| vec![t]).collect();
-                Ok(ExecResult::Rows { columns: vec!["table_name".into()], rows })
-            }
-            SqlStatement::Explain(inner) => {
                 Ok(ExecResult::Rows {
-                    columns: vec!["plan".into()],
-                    rows: vec![vec![format!("{:?}", inner)]],
+                    columns: vec!["table_name".into()],
+                    rows,
                 })
             }
+            SqlStatement::Explain(inner) => Ok(ExecResult::Rows {
+                columns: vec!["plan".into()],
+                rows: vec![vec![format!("{:?}", inner)]],
+            }),
         }
     }
 
-    fn exec_create_table(&self, name: &str, cols: &[SqlColumnDef], if_not_exists: bool) -> Result<ExecResult, String> {
+    fn exec_create_table(
+        &self,
+        name: &str,
+        cols: &[SqlColumnDef],
+        if_not_exists: bool,
+    ) -> Result<ExecResult, String> {
         if if_not_exists && self.catalog.get_table(name).is_some() {
             return Ok(ExecResult::Ok("Table already exists".into()));
         }
@@ -72,7 +101,9 @@ impl SqlExecutor {
         let mut columns = Vec::new();
         for c in cols {
             let col_type = ColumnType::from_str(&c.col_type)?;
-            if c.primary_key { pk = Some(c.name.clone()); }
+            if c.primary_key {
+                pk = Some(c.name.clone());
+            }
             columns.push(Column {
                 name: c.name.clone(),
                 col_type,
@@ -88,7 +119,9 @@ impl SqlExecutor {
             columns,
             primary_key,
             created_at: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(),
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
         };
 
         self.catalog.create_table(table)?;
@@ -103,12 +136,23 @@ impl SqlExecutor {
         Ok(ExecResult::Ok(format!("DROP TABLE {}", name)))
     }
 
-    fn exec_insert(&self, table_name: &str, col_names: &[String], values: &[Vec<SqlValue>]) -> Result<ExecResult, String> {
-        let table = self.catalog.get_table(table_name)
+    fn exec_insert(
+        &self,
+        table_name: &str,
+        col_names: &[String],
+        values: &[Vec<SqlValue>],
+    ) -> Result<ExecResult, String> {
+        let table = self
+            .catalog
+            .get_table(table_name)
             .ok_or_else(|| format!("Table '{}' does not exist", table_name))?;
 
         let columns = if col_names.is_empty() {
-            table.column_names().into_iter().map(|s| s.to_string()).collect::<Vec<_>>()
+            table
+                .column_names()
+                .into_iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>()
         } else {
             col_names.to_vec()
         };
@@ -118,7 +162,11 @@ impl SqlExecutor {
 
         for row_vals in values {
             if row_vals.len() != columns.len() {
-                return Err(format!("Column count mismatch: expected {}, got {}", columns.len(), row_vals.len()));
+                return Err(format!(
+                    "Column count mismatch: expected {}, got {}",
+                    columns.len(),
+                    row_vals.len()
+                ));
             }
 
             let mut row_map = HashMap::new();
@@ -136,47 +184,80 @@ impl SqlExecutor {
             }
 
             let key = format!("{}{}", table.row_prefix(), pk_val);
-            let value = serde_json::to_string(&row_map)
-                .map_err(|e| format!("Serialize: {}", e))?;
+            let value = serde_json::to_string(&row_map).map_err(|e| format!("Serialize: {}", e))?;
             batch.set(&key, value).map_err(|e| format!("{:?}", e))?;
             count += 1;
         }
 
-        self.db.commit_batch(&batch).map_err(|e| format!("{:?}", e))?;
-        Ok(ExecResult::Modified { count, command: format!("INSERT 0 {}", count) })
+        self.db
+            .commit_batch(&batch)
+            .map_err(|e| format!("{:?}", e))?;
+        Ok(ExecResult::Modified {
+            count,
+            command: format!("INSERT 0 {}", count),
+        })
     }
 
     fn load_table_rows(&self, table: &TableDef) -> Vec<Row> {
         let prefix = table.row_prefix();
         let seq = self.db.get_seq();
-        let results = self.db.scan(&prefix, &format!("{}\x7F", prefix), seq).unwrap_or_default();
+        let results = self
+            .db
+            .scan(&prefix, &format!("{}\x7F", prefix), seq)
+            .unwrap_or_default();
 
-        results.into_iter().filter_map(|(_key, value)| {
-            serde_json::from_str::<Row>(&value).ok()
-        }).collect()
+        results
+            .into_iter()
+            .filter_map(|(_key, value)| serde_json::from_str::<Row>(&value).ok())
+            .collect()
     }
 
-    fn exec_select(&self, columns: &[SelectColumn], from: &FromClause,
-                    where_clause: Option<&WhereExpr>, group_by: &[String],
-                    order_by: &[OrderByItem], limit: Option<usize>) -> Result<ExecResult, String> {
-
+    fn exec_select(
+        &self,
+        columns: &[SelectColumn],
+        from: &FromClause,
+        where_clause: Option<&WhereExpr>,
+        group_by: &[String],
+        order_by: &[OrderByItem],
+        limit: Option<usize>,
+    ) -> Result<ExecResult, String> {
         // Load rows
         let mut rows = match from {
             FromClause::Table(name) => {
-                let table = self.catalog.get_table(name)
+                let table = self
+                    .catalog
+                    .get_table(name)
                     .ok_or_else(|| format!("Table '{}' not found", name))?;
                 self.load_table_rows(&table)
             }
-            FromClause::Join { left, right, join_type, on_left, on_right } => {
-                let lt = self.catalog.get_table(left)
+            FromClause::Join {
+                left,
+                right,
+                join_type,
+                on_left,
+                on_right,
+            } => {
+                let lt = self
+                    .catalog
+                    .get_table(left)
                     .ok_or_else(|| format!("Table '{}' not found", left))?;
-                let rt = self.catalog.get_table(right)
+                let rt = self
+                    .catalog
+                    .get_table(right)
                     .ok_or_else(|| format!("Table '{}' not found", right))?;
 
                 let left_rows = self.load_table_rows(&lt);
                 let right_rows = self.load_table_rows(&rt);
 
-                self.execute_join(&left_rows, &right_rows, left, right, on_left, on_right, join_type)
+                self.execute_join(
+                    &left_rows,
+                    &right_rows,
+                    left,
+                    right,
+                    on_left,
+                    on_right,
+                    join_type,
+                )
             }
         };
 
@@ -191,7 +272,9 @@ impl SqlExecutor {
         }
 
         // Check for aggregate without GROUP BY
-        let has_agg = columns.iter().any(|c| matches!(c, SelectColumn::Aggregate(..)));
+        let has_agg = columns
+            .iter()
+            .any(|c| matches!(c, SelectColumn::Aggregate(..)));
         if has_agg {
             return self.exec_aggregate_no_group(&rows, columns);
         }
@@ -209,17 +292,28 @@ impl SqlExecutor {
         }
 
         // LIMIT
-        if let Some(lim) = limit { rows.truncate(lim); }
+        if let Some(lim) = limit {
+            rows.truncate(lim);
+        }
 
         // Project columns
         let (col_names, result_rows) = self.project(&rows, columns)?;
-        Ok(ExecResult::Rows { columns: col_names, rows: result_rows })
+        Ok(ExecResult::Rows {
+            columns: col_names,
+            rows: result_rows,
+        })
     }
 
-    fn execute_join(&self, left: &[Row], right: &[Row],
-                    left_name: &str, right_name: &str,
-                    on_left: &str, on_right: &str,
-                    join_type: &JoinType) -> Vec<Row> {
+    fn execute_join(
+        &self,
+        left: &[Row],
+        right: &[Row],
+        left_name: &str,
+        right_name: &str,
+        on_left: &str,
+        on_right: &str,
+        join_type: &JoinType,
+    ) -> Vec<Row> {
         let mut result = Vec::new();
 
         // Build hash index on right table
@@ -237,14 +331,25 @@ impl SqlExecutor {
                 (Some(rights), _) => {
                     for rr in rights {
                         let mut combined = Row::new();
-                        for (k, v) in lr { combined.insert(format!("{}.{}", left_name, k), v.clone()); combined.insert(k.clone(), v.clone()); }
-                        for (k, v) in *rr { combined.insert(format!("{}.{}", right_name, k), v.clone()); if !combined.contains_key(k) { combined.insert(k.clone(), v.clone()); } }
+                        for (k, v) in lr {
+                            combined.insert(format!("{}.{}", left_name, k), v.clone());
+                            combined.insert(k.clone(), v.clone());
+                        }
+                        for (k, v) in *rr {
+                            combined.insert(format!("{}.{}", right_name, k), v.clone());
+                            if !combined.contains_key(k) {
+                                combined.insert(k.clone(), v.clone());
+                            }
+                        }
                         result.push(combined);
                     }
                 }
                 (None, JoinType::Left) => {
                     let mut combined = Row::new();
-                    for (k, v) in lr { combined.insert(format!("{}.{}", left_name, k), v.clone()); combined.insert(k.clone(), v.clone()); }
+                    for (k, v) in lr {
+                        combined.insert(format!("{}.{}", left_name, k), v.clone());
+                        combined.insert(k.clone(), v.clone());
+                    }
                     result.push(combined);
                 }
                 _ => {}
@@ -253,14 +358,21 @@ impl SqlExecutor {
         result
     }
 
-    fn exec_group_by(&self, rows: &[Row], columns: &[SelectColumn],
-                      group_by: &[String], order_by: &[OrderByItem],
-                      limit: Option<usize>) -> Result<ExecResult, String> {
+    fn exec_group_by(
+        &self,
+        rows: &[Row],
+        columns: &[SelectColumn],
+        group_by: &[String],
+        order_by: &[OrderByItem],
+        limit: Option<usize>,
+    ) -> Result<ExecResult, String> {
         let mut groups: HashMap<String, Vec<&Row>> = HashMap::new();
         for row in rows {
-            let key: String = group_by.iter()
+            let key: String = group_by
+                .iter()
                 .map(|g| row.get(g).cloned().unwrap_or_default())
-                .collect::<Vec<_>>().join("|");
+                .collect::<Vec<_>>()
+                .join("|");
             groups.entry(key).or_default().push(row);
         }
 
@@ -287,11 +399,20 @@ impl SqlExecutor {
         }
         col_names.truncate(columns.len());
 
-        if let Some(lim) = limit { result_rows.truncate(lim); }
-        Ok(ExecResult::Rows { columns: col_names, rows: result_rows })
+        if let Some(lim) = limit {
+            result_rows.truncate(lim);
+        }
+        Ok(ExecResult::Rows {
+            columns: col_names,
+            rows: result_rows,
+        })
     }
 
-    fn exec_aggregate_no_group(&self, rows: &[Row], columns: &[SelectColumn]) -> Result<ExecResult, String> {
+    fn exec_aggregate_no_group(
+        &self,
+        rows: &[Row],
+        columns: &[SelectColumn],
+    ) -> Result<ExecResult, String> {
         let refs: Vec<&Row> = rows.iter().collect();
         let mut col_names = Vec::new();
         let mut result_row = Vec::new();
@@ -303,19 +424,36 @@ impl SqlExecutor {
                 result_row.push(val);
             }
         }
-        Ok(ExecResult::Rows { columns: col_names, rows: vec![result_row] })
+        Ok(ExecResult::Rows {
+            columns: col_names,
+            rows: vec![result_row],
+        })
     }
 
-    fn project(&self, rows: &[Row], columns: &[SelectColumn]) -> Result<(Vec<String>, Vec<Vec<String>>), String> {
+    fn project(
+        &self,
+        rows: &[Row],
+        columns: &[SelectColumn],
+    ) -> Result<(Vec<String>, Vec<Vec<String>>), String> {
         if columns.iter().any(|c| matches!(c, SelectColumn::Star)) {
             if rows.is_empty() {
                 return Ok((vec![], vec![]));
             }
-            let mut names: Vec<String> = rows[0].keys().filter(|k| !k.contains('.')).cloned().collect();
+            let mut names: Vec<String> = rows[0]
+                .keys()
+                .filter(|k| !k.contains('.'))
+                .cloned()
+                .collect();
             names.sort();
-            let result: Vec<Vec<String>> = rows.iter().map(|r| {
-                names.iter().map(|n| r.get(n).cloned().unwrap_or("NULL".into())).collect()
-            }).collect();
+            let result: Vec<Vec<String>> = rows
+                .iter()
+                .map(|r| {
+                    names
+                        .iter()
+                        .map(|n| r.get(n).cloned().unwrap_or("NULL".into()))
+                        .collect()
+                })
+                .collect();
             return Ok((names, result));
         }
 
@@ -324,25 +462,43 @@ impl SqlExecutor {
             match c {
                 SelectColumn::Named(n) => names.push(n.clone()),
                 SelectColumn::Qualified(_, n) => names.push(n.clone()),
-                SelectColumn::Aggregate(f, t) => names.push(format!("{:?}({})", f, t).to_lowercase()),
+                SelectColumn::Aggregate(f, t) => {
+                    names.push(format!("{:?}({})", f, t).to_lowercase())
+                }
                 SelectColumn::Star => {}
             }
         }
 
-        let result: Vec<Vec<String>> = rows.iter().map(|r| {
-            columns.iter().map(|c| match c {
-                SelectColumn::Named(n) => r.get(n).cloned().unwrap_or("NULL".into()),
-                SelectColumn::Qualified(t, n) => r.get(&format!("{}.{}", t, n)).or_else(|| r.get(n)).cloned().unwrap_or("NULL".into()),
-                _ => "NULL".into(),
-            }).collect()
-        }).collect();
+        let result: Vec<Vec<String>> = rows
+            .iter()
+            .map(|r| {
+                columns
+                    .iter()
+                    .map(|c| match c {
+                        SelectColumn::Named(n) => r.get(n).cloned().unwrap_or("NULL".into()),
+                        SelectColumn::Qualified(t, n) => r
+                            .get(&format!("{}.{}", t, n))
+                            .or_else(|| r.get(n))
+                            .cloned()
+                            .unwrap_or("NULL".into()),
+                        _ => "NULL".into(),
+                    })
+                    .collect()
+            })
+            .collect();
 
         Ok((names, result))
     }
 
-    fn exec_update(&self, table_name: &str, assignments: &[(String, SqlValue)],
-                    where_clause: Option<&WhereExpr>) -> Result<ExecResult, String> {
-        let table = self.catalog.get_table(table_name)
+    fn exec_update(
+        &self,
+        table_name: &str,
+        assignments: &[(String, SqlValue)],
+        where_clause: Option<&WhereExpr>,
+    ) -> Result<ExecResult, String> {
+        let table = self
+            .catalog
+            .get_table(table_name)
             .ok_or_else(|| format!("Table '{}' not found", table_name))?;
         let mut rows = self.load_table_rows(&table);
 
@@ -362,12 +518,25 @@ impl SqlExecutor {
             batch.set(&key, value).map_err(|e| format!("{:?}", e))?;
         }
 
-        if count > 0 { self.db.commit_batch(&batch).map_err(|e| format!("{:?}", e))?; }
-        Ok(ExecResult::Modified { count, command: format!("UPDATE {}", count) })
+        if count > 0 {
+            self.db
+                .commit_batch(&batch)
+                .map_err(|e| format!("{:?}", e))?;
+        }
+        Ok(ExecResult::Modified {
+            count,
+            command: format!("UPDATE {}", count),
+        })
     }
 
-    fn exec_delete(&self, table_name: &str, where_clause: Option<&WhereExpr>) -> Result<ExecResult, String> {
-        let table = self.catalog.get_table(table_name)
+    fn exec_delete(
+        &self,
+        table_name: &str,
+        where_clause: Option<&WhereExpr>,
+    ) -> Result<ExecResult, String> {
+        let table = self
+            .catalog
+            .get_table(table_name)
             .ok_or_else(|| format!("Table '{}' not found", table_name))?;
         let mut rows = self.load_table_rows(&table);
 
@@ -383,8 +552,15 @@ impl SqlExecutor {
             batch.delete(&key).map_err(|e| format!("{:?}", e))?;
         }
 
-        if count > 0 { self.db.commit_batch(&batch).map_err(|e| format!("{:?}", e))?; }
-        Ok(ExecResult::Modified { count, command: format!("DELETE {}", count) })
+        if count > 0 {
+            self.db
+                .commit_batch(&batch)
+                .map_err(|e| format!("{:?}", e))?;
+        }
+        Ok(ExecResult::Modified {
+            count,
+            command: format!("DELETE {}", count),
+        })
     }
 }
 
@@ -402,15 +578,23 @@ fn eval_where(row: &Row, expr: &WhereExpr) -> bool {
                 CmpOp::Lte => smart_cmp(&row_val, &cmp_val) != std::cmp::Ordering::Greater,
                 CmpOp::Like => {
                     let pattern = cmp_val.replace('%', ".*").replace('_', ".");
-                    regex::Regex::new(&format!("^{}$", pattern)).map(|r| r.is_match(&row_val)).unwrap_or(false)
+                    regex::Regex::new(&format!("^{}$", pattern))
+                        .map(|r| r.is_match(&row_val))
+                        .unwrap_or(false)
                 }
             }
         }
         WhereExpr::And(a, b) => eval_where(row, a) && eval_where(row, b),
         WhereExpr::Or(a, b) => eval_where(row, a) || eval_where(row, b),
         WhereExpr::Not(inner) => !eval_where(row, inner),
-        WhereExpr::IsNull(col) => row.get(col).map(|v| v == "NULL" || v.is_empty()).unwrap_or(true),
-        WhereExpr::IsNotNull(col) => row.get(col).map(|v| v != "NULL" && !v.is_empty()).unwrap_or(false),
+        WhereExpr::IsNull(col) => row
+            .get(col)
+            .map(|v| v == "NULL" || v.is_empty())
+            .unwrap_or(true),
+        WhereExpr::IsNotNull(col) => row
+            .get(col)
+            .map(|v| v != "NULL" && !v.is_empty())
+            .unwrap_or(false),
         WhereExpr::In(col, vals) => {
             let row_val = row.get(col).cloned().unwrap_or_default();
             vals.iter().any(|v| v.as_string() == row_val)
@@ -431,30 +615,40 @@ fn compute_aggregate(func: &AggFunc, target: &str, rows: &[&Row]) -> (String, St
     match func {
         AggFunc::Count => (name, rows.len().to_string()),
         AggFunc::Sum => {
-            let sum: f64 = rows.iter()
+            let sum: f64 = rows
+                .iter()
                 .filter_map(|r| r.get(target).and_then(|v| v.parse::<f64>().ok()))
                 .sum();
             (name, sum.to_string())
         }
         AggFunc::Avg => {
-            let vals: Vec<f64> = rows.iter()
+            let vals: Vec<f64> = rows
+                .iter()
                 .filter_map(|r| r.get(target).and_then(|v| v.parse::<f64>().ok()))
                 .collect();
-            let avg = if vals.is_empty() { 0.0 } else { vals.iter().sum::<f64>() / vals.len() as f64 };
+            let avg = if vals.is_empty() {
+                0.0
+            } else {
+                vals.iter().sum::<f64>() / vals.len() as f64
+            };
             (name, format!("{:.2}", avg))
         }
         AggFunc::Min => {
-            let min = rows.iter()
+            let min = rows
+                .iter()
                 .filter_map(|r| r.get(target))
                 .min_by(|a, b| smart_cmp(a, b))
-                .cloned().unwrap_or_default();
+                .cloned()
+                .unwrap_or_default();
             (name, min)
         }
         AggFunc::Max => {
-            let max = rows.iter()
+            let max = rows
+                .iter()
                 .filter_map(|r| r.get(target))
                 .max_by(|a, b| smart_cmp(a, b))
-                .cloned().unwrap_or_default();
+                .cloned()
+                .unwrap_or_default();
             (name, max)
         }
     }

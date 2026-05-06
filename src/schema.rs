@@ -22,11 +22,11 @@
 //!   └── IndexManager    (creates/drops indexes as part of migrations)
 //! ```
 
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use serde::{Serialize, Deserialize};
 
-use crate::{OmniKV, WriteBatch, OmniError};
-use crate::secondary_index::{IndexManager, IndexFieldType};
+use crate::secondary_index::{IndexFieldType, IndexManager};
+use crate::{OmniError, OmniKV, WriteBatch};
 
 /// Prefix for schema metadata stored in OmniKV.
 const SCHEMA_PREFIX: &str = "\x00SCHEMA\x00";
@@ -122,7 +122,8 @@ impl SchemaManager {
     pub fn current_version(&self) -> Result<Version, OmniError> {
         let seq = self.db.get_seq();
         match self.db.find(VERSION_KEY, seq)? {
-            Some(v) => v.parse::<Version>()
+            Some(v) => v
+                .parse::<Version>()
                 .map_err(|e| OmniError::IoError(format!("Invalid schema version: {}", e))),
             None => Ok(0),
         }
@@ -157,7 +158,10 @@ impl SchemaManager {
         // Check idempotency
         if migration.version <= current {
             let log = self.migration_log()?;
-            if log.iter().any(|r| r.version == migration.version && r.state == MigrationState::Applied) {
+            if log
+                .iter()
+                .any(|r| r.version == migration.version && r.state == MigrationState::Applied)
+            {
                 return Ok(()); // Already applied
             }
         }
@@ -213,7 +217,8 @@ impl SchemaManager {
         let current = self.current_version()?;
         if migration.version > current {
             return Err(OmniError::IoError(format!(
-                "Cannot rollback v{}: current version is v{}", migration.version, current
+                "Cannot rollback v{}: current version is v{}",
+                migration.version, current
             )));
         }
 
@@ -231,7 +236,11 @@ impl SchemaManager {
         })?;
 
         // Set version to one below
-        let new_version = if migration.version > 1 { migration.version - 1 } else { 0 };
+        let new_version = if migration.version > 1 {
+            migration.version - 1
+        } else {
+            0
+        };
         self.set_version(new_version)?;
 
         Ok(())
@@ -243,7 +252,8 @@ impl SchemaManager {
 
         if target > current {
             // Apply forward
-            let mut sorted: Vec<&Migration> = migrations.iter()
+            let mut sorted: Vec<&Migration> = migrations
+                .iter()
                 .filter(|m| m.version > current && m.version <= target)
                 .collect();
             sorted.sort_by_key(|m| m.version);
@@ -253,7 +263,8 @@ impl SchemaManager {
             }
         } else if target < current {
             // Rollback
-            let mut sorted: Vec<&Migration> = migrations.iter()
+            let mut sorted: Vec<&Migration> = migrations
+                .iter()
                 .filter(|m| m.version <= current && m.version > target)
                 .collect();
             sorted.sort_by_key(|m| std::cmp::Reverse(m.version));
@@ -272,8 +283,8 @@ impl SchemaManager {
         let seq = self.db.get_seq();
         match self.db.find(&key, seq)? {
             Some(val) => {
-                let record: MigrationRecord = serde_json::from_str(&val)
-                    .map_err(|e| OmniError::IoError(e.to_string()))?;
+                let record: MigrationRecord =
+                    serde_json::from_str(&val).map_err(|e| OmniError::IoError(e.to_string()))?;
                 Ok(Some(record))
             }
             None => Ok(None),
@@ -287,24 +298,33 @@ impl SchemaManager {
     /// Executes a single schema operation.
     fn execute_op(&self, op: &SchemaOp) -> Result<(), OmniError> {
         match op {
-            SchemaOp::CreateIndex { name, collection, fields, unique } => {
-                self.index_manager.create_index(name, collection, fields.clone(), *unique)?;
+            SchemaOp::CreateIndex {
+                name,
+                collection,
+                fields,
+                unique,
+            } => {
+                self.index_manager
+                    .create_index(name, collection, fields.clone(), *unique)?;
                 // Online rebuild: index existing documents in batches
                 self.index_manager.rebuild_index(name)?;
                 Ok(())
             }
-            SchemaOp::DropIndex { name } => {
-                self.index_manager.drop_index(name)
-            }
-            SchemaOp::AddField { collection, field_name, default_value } => {
-                self.backfill_field(collection, field_name, Some(default_value))
-            }
-            SchemaOp::RemoveField { collection, field_name } => {
-                self.backfill_field(collection, field_name, None)
-            }
-            SchemaOp::RenameField { collection, old_name, new_name } => {
-                self.rename_field_online(collection, old_name, new_name)
-            }
+            SchemaOp::DropIndex { name } => self.index_manager.drop_index(name),
+            SchemaOp::AddField {
+                collection,
+                field_name,
+                default_value,
+            } => self.backfill_field(collection, field_name, Some(default_value)),
+            SchemaOp::RemoveField {
+                collection,
+                field_name,
+            } => self.backfill_field(collection, field_name, None),
+            SchemaOp::RenameField {
+                collection,
+                old_name,
+                new_name,
+            } => self.rename_field_online(collection, old_name, new_name),
         }
     }
 
@@ -406,8 +426,7 @@ impl SchemaManager {
     /// Persists a migration record.
     fn save_migration_record(&self, record: &MigrationRecord) -> Result<(), OmniError> {
         let key = format!("{}{:06}", MIGRATION_PREFIX, record.version);
-        let value = serde_json::to_string(record)
-            .map_err(|e| OmniError::IoError(e.to_string()))?;
+        let value = serde_json::to_string(record).map_err(|e| OmniError::IoError(e.to_string()))?;
         let mut batch = WriteBatch::new();
         batch.set(&key, value)?;
         self.db.commit_batch(&batch)?;

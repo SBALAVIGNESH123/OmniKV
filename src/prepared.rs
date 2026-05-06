@@ -27,11 +27,11 @@
 //! ```
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
-use crate::{OmniKV, WriteBatch, OmniError};
 use crate::query::{self, Action, Condition, Operator, Query};
+use crate::{OmniError, OmniKV, WriteBatch};
 
 /// Unique handle for a prepared statement.
 pub type StmtId = u64;
@@ -74,8 +74,8 @@ pub enum PreparedAction {
     SelectAll,
     SelectCount,
     Delete,
-    Insert(ParamRef, ParamRef),  // key, value
-    Update(ParamRef, ParamRef),  // value, key (SET value WHERE key)
+    Insert(ParamRef, ParamRef), // key, value
+    Update(ParamRef, ParamRef), // value, key (SET value WHERE key)
 }
 
 /// A condition with parameter references instead of literal values.
@@ -133,17 +133,22 @@ impl PlanCache {
     fn insert(&mut self, template: String, stmt: PreparedStatement) {
         // Evict least-accessed entry if at capacity
         if self.entries.len() >= self.capacity {
-            let min_key = self.entries.iter()
+            let min_key = self
+                .entries
+                .iter()
                 .min_by_key(|(_, e)| e.access_count)
                 .map(|(k, _)| k.clone());
             if let Some(key) = min_key {
                 self.entries.remove(&key);
             }
         }
-        self.entries.insert(template, CacheEntry {
-            stmt,
-            access_count: 1,
-        });
+        self.entries.insert(
+            template,
+            CacheEntry {
+                stmt,
+                access_count: 1,
+            },
+        );
     }
 
     fn stats(&self) -> (u64, u64, usize) {
@@ -191,9 +196,11 @@ impl QueryEngine {
     /// The parsed plan is cached so identical templates skip parsing on subsequent calls.
     pub fn prepare(&self, query_template: &str) -> Result<PreparedStatement, OmniError> {
         // Check plan cache first
-        let mut cache = self.cache.lock()
+        let mut cache = self
+            .cache
+            .lock()
             .map_err(|_| OmniError::LockPoisoned("plan cache".into()))?;
-        
+
         if let Some(mut cached) = cache.get(query_template) {
             // Re-assign a fresh ID for this handle
             cached.id = self.next_stmt_id.fetch_add(1, Ordering::SeqCst);
@@ -205,7 +212,9 @@ impl QueryEngine {
         let stmt = self.parse_template(query_template)?;
 
         // Cache the parsed plan
-        let mut cache = self.cache.lock()
+        let mut cache = self
+            .cache
+            .lock()
             .map_err(|_| OmniError::LockPoisoned("plan cache".into()))?;
         cache.insert(query_template.to_string(), stmt.clone());
 
@@ -215,7 +224,11 @@ impl QueryEngine {
     /// EXECUTE — runs a prepared statement with bound parameter values.
     ///
     /// Positional params: `execute(&stmt, &["value1", "value2"])`
-    pub fn execute(&self, stmt: &PreparedStatement, params: &[&str]) -> Result<QueryResult, OmniError> {
+    pub fn execute(
+        &self,
+        stmt: &PreparedStatement,
+        params: &[&str],
+    ) -> Result<QueryResult, OmniError> {
         self.execute_with_params(stmt, params, &HashMap::new())
     }
 
@@ -227,7 +240,8 @@ impl QueryEngine {
         stmt: &PreparedStatement,
         named_params: &[(&str, &str)],
     ) -> Result<QueryResult, OmniError> {
-        let map: HashMap<String, String> = named_params.iter()
+        let map: HashMap<String, String> = named_params
+            .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
         self.execute_with_params(stmt, &[], &map)
@@ -259,7 +273,7 @@ impl QueryEngine {
     fn parse_template(&self, template: &str) -> Result<PreparedStatement, OmniError> {
         let id = self.next_stmt_id.fetch_add(1, Ordering::SeqCst);
         let tokens: Vec<&str> = template.split_whitespace().collect();
-        
+
         if tokens.is_empty() {
             return Err(OmniError::IoError("Empty query".into()));
         }
@@ -271,7 +285,9 @@ impl QueryEngine {
         for token in &tokens {
             if token.starts_with('$') {
                 if let Ok(n) = token[1..].parse::<usize>() {
-                    if n > param_count { param_count = n; }
+                    if n > param_count {
+                        param_count = n;
+                    }
                 }
             } else if token.starts_with(':') && token.len() > 1 {
                 let name = token[1..].to_string();
@@ -282,11 +298,22 @@ impl QueryEngine {
         }
 
         match tokens[0].to_uppercase().as_str() {
-            "SELECT" => self.parse_select_template(id, template, &tokens, param_count, named_params),
-            "DELETE" => self.parse_delete_template(id, template, &tokens, param_count, named_params),
-            "INSERT" => self.parse_insert_template(id, template, &tokens, param_count, named_params),
-            "UPDATE" => self.parse_update_template(id, template, &tokens, param_count, named_params),
-            _ => Err(OmniError::IoError(format!("Unsupported command: {}", tokens[0]))),
+            "SELECT" => {
+                self.parse_select_template(id, template, &tokens, param_count, named_params)
+            }
+            "DELETE" => {
+                self.parse_delete_template(id, template, &tokens, param_count, named_params)
+            }
+            "INSERT" => {
+                self.parse_insert_template(id, template, &tokens, param_count, named_params)
+            }
+            "UPDATE" => {
+                self.parse_update_template(id, template, &tokens, param_count, named_params)
+            }
+            _ => Err(OmniError::IoError(format!(
+                "Unsupported command: {}",
+                tokens[0]
+            ))),
         }
     }
 
@@ -303,11 +330,17 @@ impl QueryEngine {
     }
 
     fn parse_select_template(
-        &self, id: StmtId, template: &str, tokens: &[&str],
-        param_count: usize, named_params: Vec<String>,
+        &self,
+        id: StmtId,
+        template: &str,
+        tokens: &[&str],
+        param_count: usize,
+        named_params: Vec<String>,
     ) -> Result<PreparedStatement, OmniError> {
         if tokens.len() < 2 {
-            return Err(OmniError::IoError("Expected * or COUNT after SELECT".into()));
+            return Err(OmniError::IoError(
+                "Expected * or COUNT after SELECT".into(),
+            ));
         }
 
         let action = if tokens[1] == "*" {
@@ -315,7 +348,9 @@ impl QueryEngine {
         } else if tokens[1].to_uppercase() == "COUNT" {
             PreparedAction::SelectCount
         } else {
-            return Err(OmniError::IoError("Expected * or COUNT after SELECT".into()));
+            return Err(OmniError::IoError(
+                "Expected * or COUNT after SELECT".into(),
+            ));
         };
 
         let mut conditions = Vec::new();
@@ -328,8 +363,13 @@ impl QueryEngine {
             i += 1;
             while i < tokens.len() {
                 let upper = tokens[i].to_uppercase();
-                if upper == "AND" { i += 1; continue; }
-                if upper == "LIMIT" || upper == "ORDER" { break; }
+                if upper == "AND" {
+                    i += 1;
+                    continue;
+                }
+                if upper == "LIMIT" || upper == "ORDER" {
+                    break;
+                }
                 if tokens[i].to_lowercase() != "key" {
                     return Err(OmniError::IoError("Can only filter on 'key'".into()));
                 }
@@ -337,21 +377,29 @@ impl QueryEngine {
                     return Err(OmniError::IoError("Incomplete condition".into()));
                 }
 
-                let op = match tokens[i+1] {
+                let op = match tokens[i + 1] {
                     "=" => Operator::Eq,
                     ">=" => Operator::Gte,
                     "<=" => Operator::Lte,
-                    other => return Err(OmniError::IoError(format!("Unsupported operator: {}", other))),
+                    other => {
+                        return Err(OmniError::IoError(format!(
+                            "Unsupported operator: {}",
+                            other
+                        )));
+                    }
                 };
-                let value = Self::parse_param_ref(tokens[i+2]);
-                conditions.push(PreparedCondition { operator: op, value });
+                let value = Self::parse_param_ref(tokens[i + 2]);
+                conditions.push(PreparedCondition {
+                    operator: op,
+                    value,
+                });
                 i += 3;
             }
         }
 
         // Parse ORDER BY
         if i < tokens.len() && tokens[i].to_uppercase() == "ORDER" {
-            if i + 1 < tokens.len() && tokens[i+1].to_uppercase() == "BY" {
+            if i + 1 < tokens.len() && tokens[i + 1].to_uppercase() == "BY" {
                 i += 2;
                 if i < tokens.len() && tokens[i].to_uppercase() == "DESC" {
                     order_desc = true;
@@ -369,28 +417,41 @@ impl QueryEngine {
                 let param = Self::parse_param_ref(tokens[i]);
                 match &param {
                     ParamRef::Literal(v) => {
-                        limit = Some(v.parse::<usize>()
-                            .map_err(|_| OmniError::IoError(format!("Invalid LIMIT: {}", v)))?);
+                        limit =
+                            Some(v.parse::<usize>().map_err(|_| {
+                                OmniError::IoError(format!("Invalid LIMIT: {}", v))
+                            })?);
                     }
                     _ => {
                         // LIMIT with parameter — resolved at execution time
                         // For now, we don't support parameterized LIMIT
-                        return Err(OmniError::IoError("Parameterized LIMIT not yet supported".into()));
+                        return Err(OmniError::IoError(
+                            "Parameterized LIMIT not yet supported".into(),
+                        ));
                     }
                 }
             }
         }
 
         Ok(PreparedStatement {
-            id, query_template: template.to_string(),
-            action, conditions, limit, order_desc,
-            param_count, named_params,
+            id,
+            query_template: template.to_string(),
+            action,
+            conditions,
+            limit,
+            order_desc,
+            param_count,
+            named_params,
         })
     }
 
     fn parse_delete_template(
-        &self, id: StmtId, template: &str, tokens: &[&str],
-        param_count: usize, named_params: Vec<String>,
+        &self,
+        id: StmtId,
+        template: &str,
+        tokens: &[&str],
+        param_count: usize,
+        named_params: Vec<String>,
     ) -> Result<PreparedStatement, OmniError> {
         let mut conditions = Vec::new();
         let mut i = 1;
@@ -402,7 +463,10 @@ impl QueryEngine {
 
         while i < tokens.len() {
             let upper = tokens[i].to_uppercase();
-            if upper == "AND" { i += 1; continue; }
+            if upper == "AND" {
+                i += 1;
+                continue;
+            }
             if tokens[i].to_lowercase() != "key" {
                 return Err(OmniError::IoError("Can only filter on 'key'".into()));
             }
@@ -410,31 +474,50 @@ impl QueryEngine {
                 return Err(OmniError::IoError("Incomplete condition".into()));
             }
 
-            let op = match tokens[i+1] {
+            let op = match tokens[i + 1] {
                 "=" => Operator::Eq,
                 ">=" => Operator::Gte,
                 "<=" => Operator::Lte,
-                other => return Err(OmniError::IoError(format!("Unsupported operator: {}", other))),
+                other => {
+                    return Err(OmniError::IoError(format!(
+                        "Unsupported operator: {}",
+                        other
+                    )));
+                }
             };
-            let value = Self::parse_param_ref(tokens[i+2]);
-            conditions.push(PreparedCondition { operator: op, value });
+            let value = Self::parse_param_ref(tokens[i + 2]);
+            conditions.push(PreparedCondition {
+                operator: op,
+                value,
+            });
             i += 3;
         }
 
         if conditions.is_empty() {
-            return Err(OmniError::IoError("DELETE WHERE requires conditions".into()));
+            return Err(OmniError::IoError(
+                "DELETE WHERE requires conditions".into(),
+            ));
         }
 
         Ok(PreparedStatement {
-            id, query_template: template.to_string(),
-            action: PreparedAction::Delete, conditions, limit: None, order_desc: false,
-            param_count, named_params,
+            id,
+            query_template: template.to_string(),
+            action: PreparedAction::Delete,
+            conditions,
+            limit: None,
+            order_desc: false,
+            param_count,
+            named_params,
         })
     }
 
     fn parse_insert_template(
-        &self, id: StmtId, template: &str, tokens: &[&str],
-        param_count: usize, named_params: Vec<String>,
+        &self,
+        id: StmtId,
+        template: &str,
+        tokens: &[&str],
+        param_count: usize,
+        named_params: Vec<String>,
     ) -> Result<PreparedStatement, OmniError> {
         if tokens.len() < 3 {
             return Err(OmniError::IoError("INSERT requires <key> <value>".into()));
@@ -443,22 +526,35 @@ impl QueryEngine {
         let val_ref = Self::parse_param_ref(tokens[2]);
 
         Ok(PreparedStatement {
-            id, query_template: template.to_string(),
+            id,
+            query_template: template.to_string(),
             action: PreparedAction::Insert(key_ref, val_ref),
-            conditions: Vec::new(), limit: None, order_desc: false,
-            param_count, named_params,
+            conditions: Vec::new(),
+            limit: None,
+            order_desc: false,
+            param_count,
+            named_params,
         })
     }
 
     fn parse_update_template(
-        &self, id: StmtId, template: &str, tokens: &[&str],
-        param_count: usize, named_params: Vec<String>,
+        &self,
+        id: StmtId,
+        template: &str,
+        tokens: &[&str],
+        param_count: usize,
+        named_params: Vec<String>,
     ) -> Result<PreparedStatement, OmniError> {
         // UPDATE SET value = $1 WHERE key = $2
         if tokens.len() < 8 {
-            return Err(OmniError::IoError("UPDATE requires SET value = <val> WHERE key = <key>".into()));
+            return Err(OmniError::IoError(
+                "UPDATE requires SET value = <val> WHERE key = <key>".into(),
+            ));
         }
-        if tokens[1].to_uppercase() != "SET" || tokens[2].to_uppercase() != "VALUE" || tokens[3] != "=" {
+        if tokens[1].to_uppercase() != "SET"
+            || tokens[2].to_uppercase() != "VALUE"
+            || tokens[3] != "="
+        {
             return Err(OmniError::IoError("Expected SET value =".into()));
         }
 
@@ -483,16 +579,22 @@ impl QueryEngine {
             return Err(OmniError::IoError("UPDATE requires WHERE clause".into()));
         }
         i += 1;
-        if i + 2 >= tokens.len() || tokens[i].to_lowercase() != "key" || tokens[i+1] != "=" {
-            return Err(OmniError::IoError("WHERE must be: WHERE key = <key>".into()));
+        if i + 2 >= tokens.len() || tokens[i].to_lowercase() != "key" || tokens[i + 1] != "=" {
+            return Err(OmniError::IoError(
+                "WHERE must be: WHERE key = <key>".into(),
+            ));
         }
-        let key_ref = Self::parse_param_ref(tokens[i+2]);
+        let key_ref = Self::parse_param_ref(tokens[i + 2]);
 
         Ok(PreparedStatement {
-            id, query_template: template.to_string(),
+            id,
+            query_template: template.to_string(),
             action: PreparedAction::Update(val_ref, key_ref),
-            conditions: Vec::new(), limit: None, order_desc: false,
-            param_count, named_params,
+            conditions: Vec::new(),
+            limit: None,
+            order_desc: false,
+            param_count,
+            named_params,
         })
     }
 
@@ -508,16 +610,14 @@ impl QueryEngine {
     ) -> Result<QueryResult, OmniError> {
         let resolve = |p: &ParamRef| -> Result<String, OmniError> {
             match p {
-                ParamRef::Positional(n) => {
-                    positional.get(*n - 1)
-                        .map(|s| s.to_string())
-                        .ok_or_else(|| OmniError::IoError(format!("Missing parameter ${}", n)))
-                }
-                ParamRef::Named(name) => {
-                    named.get(name)
-                        .cloned()
-                        .ok_or_else(|| OmniError::IoError(format!("Missing parameter :{}", name)))
-                }
+                ParamRef::Positional(n) => positional
+                    .get(*n - 1)
+                    .map(|s| s.to_string())
+                    .ok_or_else(|| OmniError::IoError(format!("Missing parameter ${}", n))),
+                ParamRef::Named(name) => named
+                    .get(name)
+                    .cloned()
+                    .ok_or_else(|| OmniError::IoError(format!("Missing parameter :{}", name))),
                 ParamRef::Literal(v) => Ok(v.clone()),
             }
         };
@@ -547,17 +647,15 @@ impl QueryEngine {
                         PreparedAction::SelectCount => {
                             Ok(QueryResult::Count(if val.is_some() { 1 } else { 0 }))
                         }
-                        _ => {
-                            match val {
-                                Some(v) => Ok(QueryResult::Rows(vec![(key, v)])),
-                                None => Ok(QueryResult::Rows(vec![])),
-                            }
-                        }
+                        _ => match val {
+                            Some(v) => Ok(QueryResult::Rows(vec![(key, v)])),
+                            None => Ok(QueryResult::Rows(vec![])),
+                        },
                     }
                 } else {
                     // Range scan
-                    let mut results: Vec<(String, String)> = self.db.scan_iter(&start_key, &end_key, seq)?
-                        .collect();
+                    let mut results: Vec<(String, String)> =
+                        self.db.scan_iter(&start_key, &end_key, seq)?.collect();
 
                     if stmt.order_desc {
                         results.reverse();
@@ -617,9 +715,8 @@ impl QueryEngine {
                     }
                 }
                 if let (Some(s), Some(e)) = (start, end) {
-                    let keys: Vec<String> = self.db.scan_iter(&s, &e, seq)?
-                        .map(|(k, _)| k)
-                        .collect();
+                    let keys: Vec<String> =
+                        self.db.scan_iter(&s, &e, seq)?.map(|(k, _)| k).collect();
                     let mut batch = WriteBatch::new();
                     for k in &keys {
                         batch.delete(k)?;

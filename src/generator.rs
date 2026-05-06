@@ -13,5 +13,8 @@ pub fn generate_structured_db(file_path: &str, _size_bytes: usize) {
         println!("Database already exists. Skipping generation.");
         return;
     }
-    println!("[OmniKV] No existing database at {}. Will create on first write.", file_path);
+    println!(
+        "[OmniKV] No existing database at {}. Will create on first write.",
+        file_path
+    );
 }

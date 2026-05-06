@@ -4,10 +4,10 @@
 //! Raft consensus and cluster communication. Uses Quinn for
 //! UDP-based, TLS 1.3 encrypted transport.
 
-use std::sync::Arc;
-use quinn::{Endpoint, ServerConfig, ClientConfig};
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use omni_engine::{OmniKV, WriteBatch};
+use quinn::{ClientConfig, Endpoint, ServerConfig};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+use std::sync::Arc;
 
 /// Binary protocol command opcodes.
 #[repr(u8)]
@@ -39,18 +39,21 @@ impl OpCode {
 }
 
 /// Generate self-signed TLS certificates for QUIC.
-pub fn generate_self_signed_cert() -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>), String> {
-    let key_pair = rcgen::KeyPair::generate()
-        .map_err(|e| format!("Key generation failed: {}", e))?;
-    
+pub fn generate_self_signed_cert()
+-> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>), String> {
+    let key_pair =
+        rcgen::KeyPair::generate().map_err(|e| format!("Key generation failed: {}", e))?;
+
     let mut params = rcgen::CertificateParams::new(vec!["localhost".into()])
         .map_err(|e| format!("Cert params failed: {}", e))?;
-    
-    let cert = params.self_signed(&key_pair)
+
+    let cert = params
+        .self_signed(&key_pair)
         .map_err(|e| format!("Self-signed cert failed: {}", e))?;
-    
+
     let cert_der = cert.der().clone();
-    let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_pair.serialized_der().to_vec()));
+    let key_der =
+        PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_pair.serialized_der().to_vec()));
 
     Ok((vec![cert_der], key_der))
 }
@@ -73,9 +76,11 @@ pub fn create_server_endpoint(
             .map_err(|e| format!("QUIC server config: {}", e))?,
     ));
 
-    let addr = bind_addr.parse().map_err(|e| format!("Parse addr: {}", e))?;
-    let endpoint = Endpoint::server(server_config, addr)
-        .map_err(|e| format!("QUIC bind: {}", e))?;
+    let addr = bind_addr
+        .parse()
+        .map_err(|e| format!("Parse addr: {}", e))?;
+    let endpoint =
+        Endpoint::server(server_config, addr).map_err(|e| format!("QUIC bind: {}", e))?;
 
     Ok(endpoint)
 }
@@ -103,7 +108,10 @@ pub fn create_client_endpoint() -> Result<Endpoint, String> {
 
 /// Run the QUIC server loop, handling binary protocol requests.
 pub async fn run_quic_server(endpoint: Endpoint, db: Arc<OmniKV>) {
-    tracing::info!("QUIC/HTTP3 server listening on {}", endpoint.local_addr().unwrap());
+    tracing::info!(
+        "QUIC/HTTP3 server listening on {}",
+        endpoint.local_addr().unwrap()
+    );
 
     while let Some(incoming) = endpoint.accept().await {
         let db = db.clone();
@@ -167,9 +175,13 @@ fn handle_binary_request(db: &Arc<OmniKV>, data: &[u8]) -> Vec<u8> {
 
         Some(OpCode::Set) => {
             // Payload format: [key_len: u16][key][value]
-            if payload.len() < 2 { return vec![0xFF]; }
+            if payload.len() < 2 {
+                return vec![0xFF];
+            }
             let key_len = u16::from_le_bytes([payload[0], payload[1]]) as usize;
-            if payload.len() < 2 + key_len { return vec![0xFF]; }
+            if payload.len() < 2 + key_len {
+                return vec![0xFF];
+            }
 
             let key = String::from_utf8_lossy(&payload[2..2 + key_len]).to_string();
             let value = String::from_utf8_lossy(&payload[2 + key_len..]).to_string();

@@ -16,8 +16,8 @@ mod raft_impl;
 mod raft_init;
 mod raft_storage;
 
-use std::sync::Arc;
 use omni_engine::OmniKV;
+use std::sync::Arc;
 
 const MANIFEST_PATH: &str = "manifest.json";
 const WAL_PATH: &str = "wal.bin";
@@ -29,12 +29,18 @@ const TCP_ADDR: &str = "0.0.0.0:8080";
 fn print_banner() {
     println!();
     println!("  ╔════════════════════════════════════════════════════╗");
-    println!("  ║        ⚡ OmniKV v{}                       ║", env!("CARGO_PKG_VERSION"));
+    println!(
+        "  ║        ⚡ OmniKV v{}                       ║",
+        env!("CARGO_PKG_VERSION")
+    );
     println!("  ║  Embeddable · Distributed · Transactional KV      ║");
     println!("  ╠════════════════════════════════════════════════════╣");
     println!("  ║  HTTP/1.1 + HTTP/2 (TLS)  → {}           ║", HTTP_ADDR);
     println!("  ║  QUIC/HTTP3 (binary)      → {}           ║", QUIC_ADDR);
-    println!("  ║  PostgreSQL Wire Protocol → {}           ║", PGWIRE_ADDR);
+    println!(
+        "  ║  PostgreSQL Wire Protocol → {}           ║",
+        PGWIRE_ADDR
+    );
     println!("  ║  TCP Command Interface    → {}           ║", TCP_ADDR);
     println!("  ╠════════════════════════════════════════════════════╣");
     println!("  ║  Built from scratch in Rust. Every byte is ours.  ║");
@@ -133,12 +139,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// Simple TCP command interface for telnet/debugging.
-async fn run_tcp_server(
-    db: Arc<OmniKV>,
-    addr: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+async fn run_tcp_server(db: Arc<OmniKV>, addr: &str) -> Result<(), Box<dyn std::error::Error>> {
     use omni_engine::WriteBatch;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!("TCP command interface on {}", addr);
@@ -159,7 +162,9 @@ async fn run_tcp_server(
 
                 let request = String::from_utf8_lossy(&buf[..n]);
                 let request = request.trim();
-                if request.is_empty() { continue; }
+                if request.is_empty() {
+                    continue;
+                }
 
                 let mut parts = request.splitn(3, char::is_whitespace);
                 let cmd = parts.next().unwrap_or("");

@@ -3,9 +3,9 @@
 //! Maps OpenRaft's RaftStorage trait to OmniKV's storage engine.
 //! Raft log entries and state machine snapshots are stored in OmniKV itself.
 
+use omni_engine::{OmniKV, WriteBatch};
 use std::sync::Arc;
 use std::sync::Mutex;
-use omni_engine::{OmniKV, WriteBatch};
 
 /// Raft log stored in OmniKV with prefix `__raft_log__/`.
 const RAFT_LOG_PREFIX: &str = "__raft_log__/";
@@ -34,9 +34,11 @@ impl OmniRaftStorage {
     pub fn append_log(&self, index: u64, entry: &str) -> Result<u64, String> {
         let key = format!("{}{:020}", RAFT_LOG_PREFIX, index);
         let mut batch = WriteBatch::new();
-        batch.set(&key, entry.to_string())
+        batch
+            .set(&key, entry.to_string())
             .map_err(|e| format!("Raft log set: {:?}", e))?;
-        self.db.commit_batch(&batch)
+        self.db
+            .commit_batch(&batch)
             .map_err(|e| format!("Raft log commit: {:?}", e))
     }
 
@@ -52,7 +54,8 @@ impl OmniRaftStorage {
         let start_key = format!("{}{:020}", RAFT_LOG_PREFIX, start);
         let end_key = format!("{}{:020}", RAFT_LOG_PREFIX, end);
         let seq = self.db.get_seq();
-        self.db.scan(&start_key, &end_key, seq)
+        self.db
+            .scan(&start_key, &end_key, seq)
             .unwrap_or_default()
             .into_iter()
             .filter_map(|(k, v)| {
@@ -70,7 +73,8 @@ impl OmniRaftStorage {
             let key = format!("{}{:020}", RAFT_LOG_PREFIX, idx);
             let _ = batch.delete(&key);
         }
-        self.db.commit_batch(&batch)
+        self.db
+            .commit_batch(&batch)
             .map_err(|e| format!("Raft log delete: {:?}", e))?;
         Ok(())
     }
@@ -78,9 +82,11 @@ impl OmniRaftStorage {
     /// Save the current vote.
     pub fn save_vote(&self, vote_json: &str) -> Result<(), String> {
         let mut batch = WriteBatch::new();
-        batch.set(RAFT_VOTE_KEY, vote_json.to_string())
+        batch
+            .set(RAFT_VOTE_KEY, vote_json.to_string())
             .map_err(|e| format!("Vote set: {:?}", e))?;
-        self.db.commit_batch(&batch)
+        self.db
+            .commit_batch(&batch)
             .map_err(|e| format!("Vote commit: {:?}", e))?;
         Ok(())
     }
@@ -97,9 +103,11 @@ impl OmniRaftStorage {
         if index > *last {
             *last = index;
             let mut batch = WriteBatch::new();
-            batch.set(RAFT_COMMITTED_KEY, index.to_string())
+            batch
+                .set(RAFT_COMMITTED_KEY, index.to_string())
                 .map_err(|e| format!("Committed set: {:?}", e))?;
-            self.db.commit_batch(&batch)
+            self.db
+                .commit_batch(&batch)
                 .map_err(|e| format!("Committed commit: {:?}", e))?;
         }
         Ok(())
@@ -127,16 +135,20 @@ impl OmniRaftStorage {
         match parts.first().map(|s| s.to_uppercase()).as_deref() {
             Some("SET") if parts.len() == 3 => {
                 let mut batch = WriteBatch::new();
-                batch.set(parts[1], parts[2].to_string())
+                batch
+                    .set(parts[1], parts[2].to_string())
                     .map_err(|e| format!("{:?}", e))?;
-                let seq = self.db.commit_batch(&batch)
+                let seq = self
+                    .db
+                    .commit_batch(&batch)
                     .map_err(|e| format!("{:?}", e))?;
                 Ok(format!("OK:{}", seq))
             }
             Some("DELETE") if parts.len() >= 2 => {
                 let mut batch = WriteBatch::new();
                 let _ = batch.delete(parts[1]);
-                self.db.commit_batch(&batch)
+                self.db
+                    .commit_batch(&batch)
                     .map_err(|e| format!("{:?}", e))?;
                 Ok("DELETED".to_string())
             }

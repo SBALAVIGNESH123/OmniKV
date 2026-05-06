@@ -1,6 +1,6 @@
+use crate::{OmniError, OmniRecord};
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Write, BufWriter, BufReader};
-use crate::{OmniRecord, OmniError};
+use std::io::{BufReader, BufWriter, Read, Write};
 
 // =============================================================
 // WRITE-AHEAD LOG (WAL)
@@ -54,9 +54,9 @@ impl WriteAheadLog {
         let mut offset = 0;
 
         while offset + 4 <= all_data.len() {
-            let count = u32::from_le_bytes(
-                all_data[offset..offset + 4].try_into().unwrap_or([0; 4])
-            ) as usize;
+            let count =
+                u32::from_le_bytes(all_data[offset..offset + 4].try_into().unwrap_or([0; 4]))
+                    as usize;
             offset += 4;
 
             let mut batch_records = Vec::with_capacity(count);
@@ -99,7 +99,10 @@ impl WriteAheadLog {
 
     /// Append a batch of records (including the commit marker) atomically.
     /// Called while holding the WAL Mutex in lib.rs, so &mut self is safe.
-    pub fn append_batch(&mut self, records: &[(OmniRecord, Option<Vec<u8>>)]) -> Result<(), OmniError> {
+    pub fn append_batch(
+        &mut self,
+        records: &[(OmniRecord, Option<Vec<u8>>)],
+    ) -> Result<(), OmniError> {
         // Write record count
         let count = records.len() as u32;
         self.writer

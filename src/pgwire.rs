@@ -22,8 +22,8 @@ use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::sync::Arc;
 
-use crate::{OmniKV, WriteBatch};
 use crate::query;
+use crate::{OmniKV, WriteBatch};
 
 /// PostgreSQL wire protocol message types (server -> client)
 const AUTH_OK: u8 = b'R';
@@ -56,7 +56,10 @@ impl PgWireServer {
     /// This blocks and accepts connections in a loop.
     pub fn start(&self) -> std::io::Result<()> {
         let listener = TcpListener::bind(&self.bind_addr)?;
-        eprintln!("[OmniKV] PostgreSQL wire protocol listening on {}", self.bind_addr);
+        eprintln!(
+            "[OmniKV] PostgreSQL wire protocol listening on {}",
+            self.bind_addr
+        );
 
         for stream in listener.incoming() {
             match stream {
@@ -142,7 +145,11 @@ fn read_message_body(stream: &mut std::net::TcpStream) -> std::io::Result<Vec<u8
 }
 
 /// Handle a SQL query and send results back.
-fn handle_query(db: &Arc<OmniKV>, stream: &mut std::net::TcpStream, sql: &str) -> std::io::Result<()> {
+fn handle_query(
+    db: &Arc<OmniKV>,
+    stream: &mut std::net::TcpStream,
+    sql: &str,
+) -> std::io::Result<()> {
     let sql_trimmed = sql.trim().trim_end_matches(';');
 
     if sql_trimmed.is_empty() {
@@ -181,75 +188,81 @@ fn handle_query(db: &Arc<OmniKV>, stream: &mut std::net::TcpStream, sql: &str) -
 }
 
 /// Execute a parsed query and stream results.
-fn execute_query(db: &Arc<OmniKV>, stream: &mut std::net::TcpStream, parsed: &query::Query) -> std::io::Result<()> {
+fn execute_query(
+    db: &Arc<OmniKV>,
+    stream: &mut std::net::TcpStream,
+    parsed: &query::Query,
+) -> std::io::Result<()> {
     let seq = db.get_seq();
-    
+
     match &parsed.action {
         query::Action::SelectAll => {
             // Build scan range from conditions
             let (start_key, end_key) = build_scan_range(&parsed.conditions);
-            
+
             let results = db.scan(&start_key, &end_key, seq).unwrap_or_default();
-            
+
             send_row_description(stream, &[("key", 25), ("value", 25)])?;
-            
+
             let limit = parsed.limit.unwrap_or(usize::MAX);
             let mut count = 0;
-            
+
             let iter: Box<dyn Iterator<Item = &(String, String)>> = if parsed.order_desc {
                 Box::new(results.iter().rev())
             } else {
                 Box::new(results.iter())
             };
-            
+
             for (key, value) in iter {
-                if count >= limit { break; }
+                if count >= limit {
+                    break;
+                }
                 send_data_row(stream, &[key, value])?;
                 count += 1;
             }
-            
+
             send_command_complete(stream, &format!("SELECT {}", count))?;
         }
-        
+
         query::Action::SelectCount => {
             let (start_key, end_key) = build_scan_range(&parsed.conditions);
             let results = db.scan(&start_key, &end_key, seq).unwrap_or_default();
-            
+
             send_row_description(stream, &[("count", 20)])?;
             send_data_row(stream, &[&results.len().to_string()])?;
             send_command_complete(stream, "SELECT 1")?;
         }
-        
+
         query::Action::Insert(key, value) => {
             let mut batch = WriteBatch::new();
             match batch.set(key, value.clone()) {
-                Ok(_) => {
-                    match db.commit_batch(&batch) {
-                        Ok(_) => send_command_complete(stream, "INSERT 0 1")?,
-                        Err(e) => send_error(stream, "ERROR", "XX000", &format!("Insert failed: {}", e))?,
+                Ok(_) => match db.commit_batch(&batch) {
+                    Ok(_) => send_command_complete(stream, "INSERT 0 1")?,
+                    Err(e) => {
+                        send_error(stream, "ERROR", "XX000", &format!("Insert failed: {}", e))?
                     }
-                }
+                },
                 Err(e) => send_error(stream, "ERROR", "XX000", &format!("Batch error: {}", e))?,
             }
         }
-        
+
         query::Action::Update(key, value) => {
             let mut batch = WriteBatch::new();
             match batch.set(key, value.clone()) {
-                Ok(_) => {
-                    match db.commit_batch(&batch) {
-                        Ok(_) => send_command_complete(stream, "UPDATE 1")?,
-                        Err(e) => send_error(stream, "ERROR", "XX000", &format!("Update failed: {}", e))?,
+                Ok(_) => match db.commit_batch(&batch) {
+                    Ok(_) => send_command_complete(stream, "UPDATE 1")?,
+                    Err(e) => {
+                        send_error(stream, "ERROR", "XX000", &format!("Update failed: {}", e))?
                     }
-                }
+                },
                 Err(e) => send_error(stream, "ERROR", "XX000", &format!("Batch error: {}", e))?,
             }
         }
-        
+
         query::Action::Delete => {
             let (start_key, end_key) = build_scan_range(&parsed.conditions);
             let results = db.scan(&start_key, &end_key, seq).unwrap_or_default();
-            
+
             let mut batch = WriteBatch::new();
             let mut deleted = 0;
             for (key, _) in &results {
@@ -257,15 +270,15 @@ fn execute_query(db: &Arc<OmniKV>, stream: &mut std::net::TcpStream, parsed: &qu
                     deleted += 1;
                 }
             }
-            
+
             if deleted > 0 {
                 let _ = db.commit_batch(&batch);
             }
-            
+
             send_command_complete(stream, &format!("DELETE {}", deleted))?;
         }
     }
-    
+
     Ok(())
 }
 
@@ -273,7 +286,7 @@ fn execute_query(db: &Arc<OmniKV>, stream: &mut std::net::TcpStream, parsed: &qu
 fn build_scan_range(conditions: &[query::Condition]) -> (String, String) {
     let mut start = String::new();
     let mut end = String::from("\x7F"); // High ASCII
-    
+
     for cond in conditions {
         match cond {
             query::Condition::Key(query::Operator::Eq, val) => {
@@ -289,7 +302,7 @@ fn build_scan_range(conditions: &[query::Condition]) -> (String, String) {
             }
         }
     }
-    
+
     (start, end)
 }
 
@@ -313,7 +326,11 @@ fn send_ready_for_query(stream: &mut std::net::TcpStream) -> std::io::Result<()>
     stream.write_all(&buf)
 }
 
-fn send_parameter_status(stream: &mut std::net::TcpStream, key: &str, value: &str) -> std::io::Result<()> {
+fn send_parameter_status(
+    stream: &mut std::net::TcpStream,
+    key: &str,
+    value: &str,
+) -> std::io::Result<()> {
     let mut body = Vec::new();
     body.extend_from_slice(key.as_bytes());
     body.push(0);
@@ -327,7 +344,10 @@ fn send_parameter_status(stream: &mut std::net::TcpStream, key: &str, value: &st
     stream.write_all(&buf)
 }
 
-fn send_row_description(stream: &mut std::net::TcpStream, columns: &[(&str, i32)]) -> std::io::Result<()> {
+fn send_row_description(
+    stream: &mut std::net::TcpStream,
+    columns: &[(&str, i32)],
+) -> std::io::Result<()> {
     let mut body = Vec::new();
     body.extend_from_slice(&(columns.len() as i16).to_be_bytes());
 
@@ -336,7 +356,7 @@ fn send_row_description(stream: &mut std::net::TcpStream, columns: &[(&str, i32)
         body.push(0);
         body.extend_from_slice(&0i32.to_be_bytes()); // table OID
         body.extend_from_slice(&0i16.to_be_bytes()); // column #
-        body.extend_from_slice(&oid.to_be_bytes());  // type OID
+        body.extend_from_slice(&oid.to_be_bytes()); // type OID
         body.extend_from_slice(&(-1i16).to_be_bytes()); // type size
         body.extend_from_slice(&0i32.to_be_bytes()); // type modifier
         body.extend_from_slice(&0i16.to_be_bytes()); // format (text)
@@ -378,7 +398,12 @@ fn send_command_complete(stream: &mut std::net::TcpStream, tag: &str) -> std::io
     stream.write_all(&buf)
 }
 
-fn send_error(stream: &mut std::net::TcpStream, severity: &str, code: &str, message: &str) -> std::io::Result<()> {
+fn send_error(
+    stream: &mut std::net::TcpStream,
+    severity: &str,
+    code: &str,
+    message: &str,
+) -> std::io::Result<()> {
     let mut body = Vec::new();
     body.push(b'S');
     body.extend_from_slice(severity.as_bytes());

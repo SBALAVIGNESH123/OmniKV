@@ -11,8 +11,8 @@
 //! 3. **Connection Pool Config** — reqwest client tuning for Raft RPC.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, Condvar};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 /// ═══════════════════════════════════════════════════════════════════════
@@ -81,7 +81,7 @@ impl GroupCommitEngine {
     /// or `false` if the fsync was already done by the leader.
     pub fn join_group(&self) -> GroupCommitGuard {
         let my_epoch = self.epoch.load(Ordering::SeqCst);
-        
+
         let mut state = self.state.lock().expect("group state");
         state.pending_count += 1;
         let is_leader = state.pending_count == 1 && !state.sync_in_progress;
@@ -117,7 +117,7 @@ impl GroupCommitEngine {
     /// Called by the leader after performing the actual fsync.
     pub fn complete_sync(&self) {
         let new_epoch = self.epoch.fetch_add(1, Ordering::SeqCst);
-        
+
         let mut state = self.state.lock().expect("group state");
         state.committed_epoch = new_epoch;
         state.sync_in_progress = false;
@@ -212,7 +212,8 @@ impl RateLimiter {
         // Evict oldest bucket if at capacity
         if buckets.len() >= self.max_users && !buckets.contains_key(user_id) {
             // Simple eviction: remove the user with the oldest last_refill
-            let oldest = buckets.iter()
+            let oldest = buckets
+                .iter()
                 .min_by_key(|(_, b)| b.last_refill)
                 .map(|(k, _)| k.clone());
             if let Some(key) = oldest {

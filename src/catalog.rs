@@ -3,10 +3,10 @@
 //! Stores table definitions (columns, types) inside OmniKV itself
 //! using the key prefix `\x00CATALOG\x00`.
 
+use crate::{OmniError, OmniKV, WriteBatch};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
-use serde::{Serialize, Deserialize};
-use crate::{OmniKV, WriteBatch, OmniError};
 
 const CATALOG_PREFIX: &str = "\x00CATALOG\x00";
 
@@ -35,12 +35,12 @@ impl ColumnType {
 
     pub fn pg_oid(&self) -> i32 {
         match self {
-            Self::Text => 25,      // TEXT
-            Self::Integer => 20,   // INT8
-            Self::Float => 701,    // FLOAT8
-            Self::Boolean => 16,   // BOOL
+            Self::Text => 25,        // TEXT
+            Self::Integer => 20,     // INT8
+            Self::Float => 701,      // FLOAT8
+            Self::Boolean => 16,     // BOOL
             Self::Timestamp => 1114, // TIMESTAMP
-            Self::Json => 114,     // JSON
+            Self::Json => 114,       // JSON
         }
     }
 }
@@ -68,7 +68,9 @@ impl TableDef {
     }
 
     pub fn column_index(&self, name: &str) -> Option<usize> {
-        self.columns.iter().position(|c| c.name.eq_ignore_ascii_case(name))
+        self.columns
+            .iter()
+            .position(|c| c.name.eq_ignore_ascii_case(name))
     }
 
     pub fn column_names(&self) -> Vec<&str> {
@@ -94,7 +96,10 @@ impl Catalog {
 
     fn load_all(&self) {
         let seq = self.db.get_seq();
-        if let Ok(results) = self.db.scan(CATALOG_PREFIX, &format!("{}\x7F", CATALOG_PREFIX), seq) {
+        if let Ok(results) = self
+            .db
+            .scan(CATALOG_PREFIX, &format!("{}\x7F", CATALOG_PREFIX), seq)
+        {
             let mut cache = self.cache.write().unwrap();
             for (_key, value) in results {
                 if let Ok(table) = serde_json::from_str::<TableDef>(&value) {
@@ -114,12 +119,13 @@ impl Catalog {
         }
 
         let key = format!("{}{}", CATALOG_PREFIX, name_lower);
-        let value = serde_json::to_string(&table)
-            .map_err(|e| format!("Serialize: {}", e))?;
+        let value = serde_json::to_string(&table).map_err(|e| format!("Serialize: {}", e))?;
 
         let mut batch = WriteBatch::new();
         batch.set(&key, value).map_err(|e| format!("{:?}", e))?;
-        self.db.commit_batch(&batch).map_err(|e| format!("{:?}", e))?;
+        self.db
+            .commit_batch(&batch)
+            .map_err(|e| format!("{:?}", e))?;
 
         let mut cache = self.cache.write().unwrap();
         cache.insert(name_lower, table);
@@ -130,7 +136,9 @@ impl Catalog {
         let name_lower = name.to_lowercase();
         let table = {
             let cache = self.cache.read().unwrap();
-            cache.get(&name_lower).cloned()
+            cache
+                .get(&name_lower)
+                .cloned()
                 .ok_or_else(|| format!("Table '{}' does not exist", name))?
         };
 
@@ -143,7 +151,9 @@ impl Catalog {
                 let _ = batch.delete(key);
             }
             if !rows.is_empty() {
-                self.db.commit_batch(&batch).map_err(|e| format!("{:?}", e))?;
+                self.db
+                    .commit_batch(&batch)
+                    .map_err(|e| format!("{:?}", e))?;
             }
         }
 
@@ -151,7 +161,9 @@ impl Catalog {
         let cat_key = format!("{}{}", CATALOG_PREFIX, name_lower);
         let mut batch = WriteBatch::new();
         batch.delete(&cat_key).map_err(|e| format!("{:?}", e))?;
-        self.db.commit_batch(&batch).map_err(|e| format!("{:?}", e))?;
+        self.db
+            .commit_batch(&batch)
+            .map_err(|e| format!("{:?}", e))?;
 
         let mut cache = self.cache.write().unwrap();
         cache.remove(&name_lower);
