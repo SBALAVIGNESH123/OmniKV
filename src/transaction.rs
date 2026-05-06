@@ -70,28 +70,46 @@ impl Transaction {
 /// Record of a committed transaction, used for conflict detection.
 #[derive(Debug, Clone)]
 struct CommittedTxn {
+    /// The transaction ID.
+    txn_id: TxnId,
     /// The commit sequence number.
     commit_seq: u64,
     /// Keys written by this transaction.
     write_keys: HashSet<String>,
+    /// Keys read by this transaction.
+    read_keys: HashSet<String>,
+}
+
+/// RW-dependency edge: T_from read a key that T_to later wrote.
+/// PostgreSQL calls these "rw-antidependencies" or "SIREAD locks".
+#[derive(Debug, Clone)]
+struct RWDependency {
+    from_txn: TxnId,
+    to_txn: TxnId,
 }
 
 /// The Transaction Manager — coordinates all in-flight and recently
 /// committed transactions for SSI conflict detection.
+///
+/// ## Dangerous Structure Detection (PostgreSQL-style)
+///
+/// A "dangerous structure" is a cycle of rw-dependencies:
+///   T1 →rw→ T2 →rw→ T3
+/// where T1 committed before T2 started, and T2 committed before T3 started.
+/// This indicates a potential serialization anomaly and the middle
+/// transaction (T2) must be aborted.
 pub struct TransactionManager {
     db: Arc<OmniKV>,
     /// Monotonically increasing transaction ID counter.
     next_txn_id: AtomicU64,
     /// Global commit lock — ensures only one transaction commits at a time.
-    /// This is the serialization point. Held for microseconds (only conflict
-    /// check + WriteBatch commit, no I/O happens under this lock since
-    /// the pipelined write handles I/O separately).
     commit_lock: Mutex<()>,
     /// Recently committed transactions, kept for conflict detection.
-    /// Pruned when all active transactions have read_seq > commit_seq.
     committed_txns: Mutex<Vec<CommittedTxn>>,
     /// Active transactions, indexed by TxnId.
-    active_txns: Mutex<HashMap<TxnId, u64>>, // txn_id -> read_seq
+    active_txns: Mutex<HashMap<TxnId, u64>>,
+    /// RW-dependency graph edges for dangerous structure detection.
+    rw_deps: Mutex<Vec<RWDependency>>,
 }
 
 impl TransactionManager {
@@ -103,6 +121,7 @@ impl TransactionManager {
             commit_lock: Mutex::new(()),
             committed_txns: Mutex::new(Vec::new()),
             active_txns: Mutex::new(HashMap::new()),
+            rw_deps: Mutex::new(Vec::new()),
         }
     }
 
@@ -193,14 +212,19 @@ impl TransactionManager {
             .lock()
             .map_err(|_| OmniError::LockPoisoned("txn commit lock".into()))?;
 
-        // Write-Write and Read-Write Conflict Detection:
-        // Check if any transaction that committed AFTER our snapshot wrote
-        // to any key in our write or read set.
+        // ═══════════════════════════════════════════════════════════════
+        // SSI Conflict Detection with Dangerous Structure Analysis
+        // ═══════════════════════════════════════════════════════════════
         let conflict: Option<String> = {
             let committed = self
                 .committed_txns
                 .lock()
                 .map_err(|_| OmniError::LockPoisoned("committed_txns".into()))?;
+
+            let mut rw_deps = self
+                .rw_deps
+                .lock()
+                .map_err(|_| OmniError::LockPoisoned("rw_deps".into()))?;
 
             let mut found = None;
             'outer: for committed_txn in committed.iter() {
@@ -209,27 +233,58 @@ impl TransactionManager {
                     for key in txn.write_set.keys() {
                         if committed_txn.write_keys.contains(key) {
                             found = Some(format!(
-                                "SSI CONFLICT: key '{}' was modified by txn committed at seq {}",
-                                key, committed_txn.commit_seq
+                                "SSI CONFLICT (WW): key '{}' written by txn {} at seq {}",
+                                key, committed_txn.txn_id, committed_txn.commit_seq
                             ));
                             break 'outer;
                         }
                     }
 
-                    // Read-write anti-dependency check
+                    // Read-write anti-dependency: we read key, they wrote it
+                    // This alone is a conflict — abort (PostgreSQL-compatible)
                     for key in &txn.read_set {
                         if committed_txn.write_keys.contains(key) {
+                            rw_deps.push(RWDependency {
+                                from_txn: txn.id,
+                                to_txn: committed_txn.txn_id,
+                            });
                             found = Some(format!(
-                                "SSI CONFLICT: key '{}' was read but modified by concurrent txn at seq {}",
-                                key, committed_txn.commit_seq
+                                "SSI CONFLICT (RW): key '{}' read by us, written by txn {} at seq {}",
+                                key, committed_txn.txn_id, committed_txn.commit_seq
                             ));
                             break 'outer;
                         }
                     }
+
+                    // Write-read anti-dependency: we wrote key, they read it
+                    for key in txn.write_set.keys() {
+                        if committed_txn.read_keys.contains(key) {
+                            // Record rw-dependency: committed_txn →rw→ txn
+                            rw_deps.push(RWDependency {
+                                from_txn: committed_txn.txn_id,
+                                to_txn: txn.id,
+                            });
+                        }
+                    }
                 }
             }
+
+            // Dangerous structure detection:
+            // If txn has BOTH an incoming AND outgoing rw-dependency,
+            // it's the "pivot" in T1→rw→Txn→rw→T3 — must abort.
+            if found.is_none() {
+                let has_incoming = rw_deps.iter().any(|d| d.to_txn == txn.id);
+                let has_outgoing = rw_deps.iter().any(|d| d.from_txn == txn.id);
+                if has_incoming && has_outgoing {
+                    found = Some(format!(
+                        "SSI CONFLICT (DANGEROUS STRUCTURE): txn {} is pivot in rw-dependency cycle",
+                        txn.id
+                    ));
+                }
+            }
+
             found
-        }; // committed lock released here
+        }; // locks released here
 
         if let Some(conflict_msg) = conflict {
             txn.state = TxnState::Aborted;
@@ -263,8 +318,10 @@ impl TransactionManager {
                 .lock()
                 .map_err(|_| OmniError::LockPoisoned("committed_txns".into()))?;
             committed.push(CommittedTxn {
+                txn_id: txn.id,
                 commit_seq,
                 write_keys: txn.write_set.keys().cloned().collect(),
+                read_keys: txn.read_set.clone(),
             });
         }
 
