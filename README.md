@@ -5,8 +5,8 @@
 </p>
 
 <p align="center">
-  <strong>Embeddable. Distributed. Unstoppable.</strong><br>
-  <em>A production-grade distributed database written from scratch in Rust</em>
+  <strong>Embeddable. Transactional. Distributed.</strong><br>
+  <em>An experimental distributed database engine written from scratch in Rust</em>
 </p>
 
 <p align="center">
@@ -23,15 +23,15 @@
 
 OmniKV is an **embeddable, transactional, distributed key-value store** with:
 
-- 🔒 **SSI Transactions** — PostgreSQL-grade serializable snapshot isolation
+- 🔒 **SSI Transactions** — Serializable snapshot isolation (SSI-inspired, conservative validation)
 - 🌐 **PostgreSQL Wire Protocol** — Connect from any language (psql, JDBC, Python)
 - ⚡ **LSM-Tree Storage** — Custom 3-phase pipelined writes for high throughput
 - 🗜️ **Automatic Compression** — LZ4 for large values, inline for small values
 - 🔍 **Secondary Indexes** — Composite indexes with range scan support
 - 📊 **Prepared Statements** — LRU plan cache eliminates re-parsing overhead
 - 🔄 **Online Schema Evolution** — Zero-downtime migrations with rollback
-- 🧪 **Chaos Testing** — Crash recovery, write skew detection, anomaly prevention demos
-- 🚀 **QUIC Transport** — Modern UDP-based networking for Raft consensus
+- 🧪 **Crash Recovery & Concurrency Testing** — Write skew detection, anomaly prevention demos, CRC verification
+- 🚀 **Experimental QUIC Transport** — UDP-based networking layer (Quinn)
 - 📈 **Prometheus Metrics** — Built-in observability
 
 ## Quick Start
