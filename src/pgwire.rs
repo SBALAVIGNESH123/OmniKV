@@ -173,13 +173,43 @@ fn handle_query(
         return Ok(());
     }
 
-    // Parse with OmniKV's query engine
-    match query::parse_query(sql_trimmed) {
-        Ok(parsed) => {
-            execute_query(db, stream, &parsed)?;
+    // Try SQL v2 parser first (CREATE TABLE, JOIN, aggregates)
+    match crate::sql::parse_sql(sql_trimmed) {
+        Ok(stmt) => {
+            let catalog = std::sync::Arc::new(crate::catalog::Catalog::new(db.clone()));
+            let executor = crate::sql_exec::SqlExecutor::new(db.clone(), catalog);
+            match executor.execute(&stmt) {
+                Ok(crate::sql_exec::ExecResult::Rows { columns, rows }) => {
+                    let col_defs: Vec<(&str, i32)> =
+                        columns.iter().map(|c| (c.as_str(), 25i32)).collect();
+                    send_row_description(stream, &col_defs)?;
+                    for row in &rows {
+                        let refs: Vec<&str> = row.iter().map(|s| s.as_str()).collect();
+                        send_data_row(stream, &refs)?;
+                    }
+                    send_command_complete(stream, &format!("SELECT {}", rows.len()))?;
+                }
+                Ok(crate::sql_exec::ExecResult::Modified { count, command }) => {
+                    send_command_complete(stream, &command)?;
+                }
+                Ok(crate::sql_exec::ExecResult::Ok(msg)) => {
+                    send_command_complete(stream, &msg)?;
+                }
+                Err(e) => {
+                    send_error(stream, "ERROR", "XX000", &format!("Exec error: {}", e))?;
+                }
+            }
         }
-        Err(e) => {
-            send_error(stream, "ERROR", "42601", &format!("Parse error: {}", e))?;
+        Err(_) => {
+            // Fall back to legacy KV query parser
+            match query::parse_query(sql_trimmed) {
+                Ok(parsed) => {
+                    execute_query(db, stream, &parsed)?;
+                }
+                Err(e) => {
+                    send_error(stream, "ERROR", "42601", &format!("Parse error: {}", e))?;
+                }
+            }
         }
     }
 

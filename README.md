@@ -11,7 +11,7 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/language-Rust-orange" alt="Rust">
-  <img src="https://img.shields.io/badge/tests-76%20passing-brightgreen" alt="Tests">
+  <img src="https://img.shields.io/badge/tests-80%20passing-brightgreen" alt="Tests">
   <img src="https://img.shields.io/badge/license-MIT-blue" alt="License">
   <img src="https://img.shields.io/badge/protocol-PostgreSQL%20Wire-purple" alt="PgWire">
   <a href="https://discord.gg/cqfzNzGMt"><img src="https://img.shields.io/badge/Discord-Join%20us-5865F2?logo=discord&logoColor=white" alt="Discord"></a>
@@ -30,7 +30,7 @@ OmniKV is an **embeddable, transactional, distributed key-value store** with:
 - 🔍 **Secondary Indexes** — Composite indexes with range scan support
 - 📊 **Prepared Statements** — LRU plan cache eliminates re-parsing overhead
 - 🔄 **Online Schema Evolution** — Zero-downtime migrations with rollback
-- 🧪 **Jepsen-Style Chaos Testing** — Crash recovery, write skew detection, CRC verification
+- 🧪 **Chaos Testing** — Crash recovery, write skew detection, anomaly prevention demos
 - 🚀 **QUIC Transport** — Modern UDP-based networking for Raft consensus
 - 📈 **Prometheus Metrics** — Built-in observability
 
@@ -137,58 +137,69 @@ tm.commit(&mut txn)?; // Atomic commit — both or neither
 | Module | Description | Lines |
 |--------|-------------|-------|
 | `lib.rs` | Core storage engine (LSM-tree, memtable, compaction, MVCC) | ~1525 |
-| `transaction.rs` | SSI transaction manager with conflict detection | ~294 |
+| `transaction.rs` | SSI transaction manager with rw-dependency graph | ~330 |
 | `dist_txn.rs` | Distributed two-phase commit (2PC) protocol | ~547 |
-| `query.rs` | SQL parser (SELECT, INSERT, UPDATE, DELETE) | ~241 |
+| `sql.rs` | SQL parser v2 (CREATE TABLE, JOIN, GROUP BY, aggregates) | ~450 |
+| `sql_exec.rs` | SQL executor with hash JOIN, WHERE OR/IN/LIKE | ~320 |
+| `catalog.rs` | Table catalog with typed columns (INT, TEXT, BOOL, etc.) | ~170 |
+| `query.rs` | Legacy KV query parser | ~241 |
+| `pgwire.rs` | PostgreSQL wire protocol v3 (wired to SQL v2 engine) | ~460 |
 | `prepared.rs` | Prepared statements with LRU plan cache | ~635 |
-| `secondary_index.rs` | B-tree secondary indexes with composite key support | ~542 |
-| `schema.rs` | Online schema evolution (migrations, backfill) | ~503 |
-| `pgwire.rs` | PostgreSQL wire protocol v3 server | ~402 |
-| `hardening.rs` | Group commit, rate limiting, connection pooling | ~285 |
-| `chaos.rs` | Jepsen-style chaos testing framework | ~461 |
-| `wal.rs` | Write-ahead log with segmented rotation | ~150 |
-| `api.rs` | Full REST API (Axum) — CRUD, batch, scan, metrics | ~260 |
-| `quic_server.rs` | QUIC/HTTP3 binary protocol (Quinn) | ~240 |
-| `auth.rs` | JWT authentication + API key validation | ~75 |
-| `crypto.rs` | AES-256-GCM at-rest encryption | ~55 |
-| `backup.rs` | Hot backup with tar+gzip + optional encryption | ~100 |
-| `raft_storage.rs` | OpenRaft storage adapter for OmniKV | ~160 |
-| `raft_init.rs` | Raft cluster bootstrap | ~60 |
-| `raft_network.rs` | Connection pooling for cluster transport | ~85 |
-| `metrics_prometheus.rs` | Prometheus metrics exporter | ~56 |
+| `secondary_index.rs` | B-tree secondary indexes | ~542 |
+| `schema.rs` | Online schema evolution | ~503 |
+| `hardening.rs` | Group commit, rate limiting | ~285 |
+| `chaos.rs` | Chaos testing framework | ~461 |
 
 ## Test Suite
 
 ```
-76 tests, 0 failures
+80 tests, 0 failures
 
 Storage Engine ............ 16 tests
 Query Parser .............. 9 tests
 SSI Transactions .......... 8 tests
+SSI Anomaly Demos ......... 4 tests (write skew, lost update, snapshot, counter)
 Secondary Indexes ......... 7 tests
 Prepared Statements ....... 12 tests
 Schema Evolution .......... 9 tests
-Production Hardening ...... 9 tests (group commit, rate limiting, error handling)
-Chaos/Safety .............. 6 tests (crash recovery, write skew, CRC integrity)
+Production Hardening ...... 9 tests
+Chaos/Safety .............. 6 tests
 ```
 
 ## Benchmarks
 
-Run with:
+Single machine, single-threaded, in-memory dataset:
+
+| Operation | Throughput | Notes |
+|-----------|-----------|-------|
+| Sequential Writes (100B) | 809 ops/sec | Individual commits with WAL fsync |
+| Batch Writes (100 keys) | 49,381 ops/sec (4.7 MB/s) | Amortized WAL cost |
+| Random Point Reads | 540,809 ops/sec | MVCC-filtered |
+| Range Scan (1K range) | 988,043 rows/sec | Sequential iteration |
+| SSI Transactions | 888 txns/sec | Full conflict detection |
+| Mixed (80/20 R/W) | 4,255 ops/sec | Realistic workload |
+
 ```bash
 cargo test --test benchmarks --release -- --nocapture
 ```
 
+## Limitations
+
+| Area | Status | Detail |
+|------|--------|--------|
+| SSI | ✅ Real | rw-dependency graph. Aborts more aggressively than PostgreSQL (safe). |
+| 2PC | ✅ Real | Timeout-based abort on coordinator failure. |
+| Raft | ⚠️ Scaffolded | Not end-to-end tested in multi-node yet. |
+| PgWire | ⚠️ Thread-per-conn | Fine for <100 connections. |
+| SQL | ✅ Growing | JOINs, aggregates work. No subqueries yet. |
+| Benchmarks | ✅ Honest | In-memory, single-thread numbers. |
+
 ## Building
 
 ```bash
-# Build
 cargo build --release
-
-# Run tests
 cargo test --test storage_tests -- --test-threads=1
-
-# Run benchmarks
+cargo test --test anomaly_demos -- --test-threads=1
 cargo test --test benchmarks --release -- --nocapture
 ```
 
@@ -199,3 +210,5 @@ MIT
 ---
 
 *Built from scratch in Rust. No RocksDB wrapper. No SQLite fork. Every byte is ours.*
+
+
