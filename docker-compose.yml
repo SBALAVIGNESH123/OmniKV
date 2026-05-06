@@ -1,0 +1,86 @@
+version: '3.8'
+
+services:
+  omni-node-1:
+    build: .
+    container_name: omni-node-1
+    ports:
+      - "8443:8443"   # HTTP/2 REST API
+      - "4433:4433"   # QUIC/HTTP3
+      - "5433:5433"   # PostgreSQL Wire Protocol
+      - "8080:8080"   # TCP Command Interface
+    volumes:
+      - omni-data-1:/data
+    environment:
+      OMNI_NODE_ID: "1"
+      OMNI_PEERS: "omni-node-2:4433,omni-node-3:4433"
+      OMNI_JWT_SECRET: "change-me-in-production"
+      RUST_LOG: "info,omni_engine=debug"
+    networks:
+      - omni-cluster
+    restart: unless-stopped
+
+  omni-node-2:
+    build: .
+    container_name: omni-node-2
+    ports:
+      - "8444:8443"
+      - "4434:4433"
+      - "5434:5433"
+    volumes:
+      - omni-data-2:/data
+    environment:
+      OMNI_NODE_ID: "2"
+      OMNI_PEERS: "omni-node-1:4433,omni-node-3:4433"
+      OMNI_JWT_SECRET: "change-me-in-production"
+      RUST_LOG: "info,omni_engine=debug"
+    networks:
+      - omni-cluster
+    restart: unless-stopped
+
+  omni-node-3:
+    build: .
+    container_name: omni-node-3
+    ports:
+      - "8445:8443"
+      - "4435:4433"
+      - "5435:5433"
+    volumes:
+      - omni-data-3:/data
+    environment:
+      OMNI_NODE_ID: "3"
+      OMNI_PEERS: "omni-node-1:4433,omni-node-2:4433"
+      OMNI_JWT_SECRET: "change-me-in-production"
+      RUST_LOG: "info,omni_engine=debug"
+    networks:
+      - omni-cluster
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: omni-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+    networks:
+      - omni-cluster
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: omni-grafana
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+    networks:
+      - omni-cluster
+
+volumes:
+  omni-data-1:
+  omni-data-2:
+  omni-data-3:
+
+networks:
+  omni-cluster:
+    driver: bridge
