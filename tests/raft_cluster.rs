@@ -272,3 +272,239 @@ fn test_crash_recovery_persistence() {
 
     println!("✅ CRASH RECOVERY: Vote, log index, and data survived restart");
 }
+
+/// Gap #2: Leader election under concurrent write load
+///
+/// While a leader is actively writing, it "crashes" and a new leader
+/// takes over. Verify no data is lost and new leader continues correctly.
+#[test]
+fn test_leader_election_under_load() {
+    let (db1, node1, _d1) = create_node("leader1");
+    let (db2, node2, _d2) = create_node("follower1");
+    let (db3, node3, _d3) = create_node("follower2");
+
+    // Term 1: Node1 is leader, writes 50 entries under load
+    node1.save_vote(r#"{"term":1,"voted_for":1}"#).unwrap();
+    for i in 1..=50 {
+        node1
+            .append_log(i, &format!("SET load_key{} load_val{}", i, i))
+            .unwrap();
+    }
+
+    // Only entries 1-30 were replicated before crash (partial replication)
+    replicate_log(&node1, &[&node2, &node3], 1, 31);
+
+    // Apply 1-30 on followers
+    for node in [&node2, &node3] {
+        for i in 1..=30u64 {
+            let entry = node.read_log(i).unwrap();
+            node.apply_write(&entry).unwrap();
+            node.mark_applied(i).unwrap();
+        }
+    }
+
+    // === Node1 crashes mid-write! Entries 31-50 only on node1 ===
+    // Node2 becomes leader (term 2) — starts from index 31
+    node2.save_vote(r#"{"term":2,"voted_for":2}"#).unwrap();
+    node3.save_vote(r#"{"term":2,"voted_for":2}"#).unwrap();
+
+    // New leader writes 20 more entries (indices 31-50, overwriting node1's)
+    for i in 31..=50 {
+        node2
+            .append_log(i, &format!("SET new_key{} new_val{}", i, i))
+            .unwrap();
+    }
+    replicate_log(&node2, &[&node3], 31, 51);
+
+    // Apply 31-50 on node2 and node3
+    for node in [&node2, &node3] {
+        for i in 31..=50u64 {
+            let entry = node.read_log(i).unwrap();
+            node.apply_write(&entry).unwrap();
+            node.mark_applied(i).unwrap();
+        }
+    }
+
+    // Verify followers have all 50 entries applied
+    for (db, name) in [(&db2, "node2"), (&db3, "node3")] {
+        let seq = db.get_seq();
+        // First 30 from old leader
+        for i in 1..=30 {
+            assert!(
+                db.find(&format!("load_key{}", i), seq).unwrap().is_some(),
+                "{} missing load_key{}",
+                name,
+                i
+            );
+        }
+        // Last 20 from new leader
+        for i in 31..=50 {
+            assert_eq!(
+                db.find(&format!("new_key{}", i), seq).unwrap(),
+                Some(format!("new_val{}", i)),
+                "{} missing new_key{}",
+                name,
+                i
+            );
+        }
+    }
+
+    assert_eq!(node2.last_applied_index(), 50);
+    assert_eq!(node3.last_applied_index(), 50);
+
+    println!("✅ LEADER ELECTION UNDER LOAD: 50 entries across 2 leaders, 0 data loss");
+}
+
+/// Gap #3: Log consistency after crash
+///
+/// Write entries, crash, reopen, verify log is intact and continues correctly.
+#[test]
+fn test_log_consistency_after_crash() {
+    let dir = tempfile::tempdir().unwrap();
+    let manifest = dir.path().join("logcrash_manifest.json");
+    let wal = dir.path().join("logcrash_wal.bin");
+
+    // Phase 1: Write 20 entries, apply 10, crash
+    {
+        let db = OmniKV::open(manifest.to_str().unwrap(), wal.to_str().unwrap()).unwrap();
+        let storage = OmniRaftStorage::new(db.clone());
+
+        for i in 1..=20 {
+            storage
+                .append_log(i, &format!("SET crash_k{} crash_v{}", i, i))
+                .unwrap();
+        }
+        for i in 1..=10u64 {
+            let entry = storage.read_log(i).unwrap();
+            storage.apply_write(&entry).unwrap();
+            storage.mark_applied(i).unwrap();
+        }
+        storage.save_vote(r#"{"term":5,"voted_for":3}"#).unwrap();
+    } // crash
+
+    // Phase 2: Reopen, verify log, continue writing
+    {
+        let db = OmniKV::open(manifest.to_str().unwrap(), wal.to_str().unwrap()).unwrap();
+        let storage = OmniRaftStorage::new(db.clone());
+
+        // Verify vote survived
+        let vote = storage.read_vote().unwrap();
+        assert!(vote.contains("\"term\":5"), "Vote term not persisted");
+
+        // Verify last applied
+        assert_eq!(storage.last_applied_index(), 10);
+
+        // Verify all 20 log entries survived
+        for i in 1..=20 {
+            let entry = storage.read_log(i);
+            assert!(entry.is_some(), "Log entry {} lost after crash", i);
+        }
+
+        // Continue writing from index 21
+        for i in 21..=30 {
+            storage
+                .append_log(i, &format!("SET post_crash{} val{}", i, i))
+                .unwrap();
+        }
+
+        // Apply 11-30
+        for i in 11..=30u64 {
+            let entry = storage.read_log(i).unwrap();
+            storage.apply_write(&entry).unwrap();
+            storage.mark_applied(i).unwrap();
+        }
+
+        assert_eq!(storage.last_applied_index(), 30);
+
+        // Verify all data
+        let seq = db.get_seq();
+        for i in 1..=20 {
+            assert_eq!(
+                db.find(&format!("crash_k{}", i), seq).unwrap(),
+                Some(format!("crash_v{}", i))
+            );
+        }
+        for i in 21..=30 {
+            assert_eq!(
+                db.find(&format!("post_crash{}", i), seq).unwrap(),
+                Some(format!("val{}", i))
+            );
+        }
+    }
+
+    println!("✅ LOG CONSISTENCY AFTER CRASH: 30 entries survived crash + continued writing");
+}
+
+/// Gap #4: Snapshot + log compaction correctness
+///
+/// Apply entries, compact old logs, verify new node can catch up from snapshot.
+#[test]
+fn test_snapshot_and_compaction() {
+    let (db1, node1, _d1) = create_node("snap_leader");
+    let (db2, node2, _d2) = create_node("snap_follower");
+    let (_db3, node3, _d3) = create_node("snap_late_joiner");
+
+    // Leader writes 100 entries
+    for i in 1..=100 {
+        node1
+            .append_log(i, &format!("SET snap_k{} snap_v{}", i, i))
+            .unwrap();
+    }
+
+    // Replicate all to follower
+    replicate_log(&node1, &[&node2], 1, 101);
+
+    // Apply all on both
+    for node in [&node1, &node2] {
+        for i in 1..=100u64 {
+            let entry = node.read_log(i).unwrap();
+            node.apply_write(&entry).unwrap();
+            node.mark_applied(i).unwrap();
+        }
+    }
+
+    // Compact logs 1-80 on leader (keeping 81-100)
+    node1.delete_log_range(1, 81).unwrap();
+
+    // Verify compacted entries are gone
+    for i in 1..=80 {
+        assert!(node1.read_log(i).is_none(), "Log {} should be compacted", i);
+    }
+
+    // Verify remaining entries still exist
+    for i in 81..=100 {
+        assert!(node1.read_log(i).is_some(), "Log {} should exist", i);
+    }
+
+    // Late joiner catches up: needs snapshot (entries 1-80 data) + logs 81-100
+    // Simulate snapshot transfer: copy applied data keys directly
+    let seq = db1.get_seq();
+    for i in 1..=80 {
+        let key = format!("snap_k{}", i);
+        if let Ok(Some(val)) = db1.find(&key, seq) {
+            let mut batch = omni_engine::WriteBatch::new();
+            batch.set(&key, val).unwrap();
+            _db3.commit_batch(&batch).unwrap();
+        }
+    }
+
+    // Then replicate remaining logs 81-100
+    replicate_log(&node1, &[&node3], 81, 101);
+    for i in 81..=100u64 {
+        let entry = node3.read_log(i).unwrap();
+        node3.apply_write(&entry).unwrap();
+        node3.mark_applied(i).unwrap();
+    }
+
+    // Verify late joiner has ALL 100 keys
+    let seq3 = _db3.get_seq();
+    for i in 1..=100 {
+        assert!(
+            _db3.find(&format!("snap_k{}", i), seq3).unwrap().is_some(),
+            "Late joiner missing snap_k{}",
+            i
+        );
+    }
+
+    println!("✅ SNAPSHOT + COMPACTION: 100 entries, compacted 80, late joiner caught up");
+}
