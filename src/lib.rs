@@ -50,6 +50,7 @@ pub mod raft_impl;
 pub mod raft_network;
 pub mod raft_init;
 pub mod raft_routes;
+pub mod ops;
 
 
 #[derive(Debug, Clone)]
