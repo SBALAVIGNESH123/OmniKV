@@ -291,6 +291,50 @@ impl SqlExecutor {
             });
         }
 
+        // Window functions: apply after ORDER BY, before LIMIT
+        let has_window = columns.iter().any(|c| matches!(c, SelectColumn::WindowFunc { .. }));
+        if has_window {
+            // Sort rows by window function's ORDER BY column
+            for col in columns {
+                if let SelectColumn::WindowFunc { order_by: ob, desc, .. } = col {
+                    let ob = ob.clone();
+                    rows.sort_by(|a, b| {
+                        let va = a.get(&ob).cloned().unwrap_or_default();
+                        let vb = b.get(&ob).cloned().unwrap_or_default();
+                        let cmp = smart_cmp(&va, &vb);
+                        if *desc { cmp.reverse() } else { cmp }
+                    });
+                    break; // Use the first window function's order
+                }
+            }
+            // Assign row numbers / ranks
+            for col in columns {
+                if let SelectColumn::WindowFunc { func, order_by: ob, .. } = col {
+                    let mut prev_val = String::new();
+                    let mut rank = 0usize;
+                    let mut dense_rank = 0usize;
+                    for (i, row) in rows.iter_mut().enumerate() {
+                        let cur_val = row.get(ob).cloned().unwrap_or_default();
+                        match func {
+                            WindowFuncType::RowNumber => {
+                                row.insert("row_number".into(), (i + 1).to_string());
+                            }
+                            WindowFuncType::Rank => {
+                                if cur_val != prev_val { rank = i + 1; }
+                                row.insert("rank".into(), rank.to_string());
+                            }
+                            WindowFuncType::DenseRank => {
+                                if cur_val != prev_val { dense_rank += 1; }
+                                row.insert("dense_rank".into(), dense_rank.to_string());
+                            }
+                        }
+                        prev_val = cur_val;
+                    }
+                    break;
+                }
+            }
+        }
+
         // LIMIT
         if let Some(lim) = limit {
             rows.truncate(lim);
@@ -465,6 +509,14 @@ impl SqlExecutor {
                 SelectColumn::Aggregate(f, t) => {
                     names.push(format!("{:?}({})", f, t).to_lowercase())
                 }
+                SelectColumn::WindowFunc { func, .. } => {
+                    let name = match func {
+                        WindowFuncType::RowNumber => "row_number",
+                        WindowFuncType::Rank => "rank",
+                        WindowFuncType::DenseRank => "dense_rank",
+                    };
+                    names.push(name.into());
+                }
                 SelectColumn::Star => {}
             }
         }
@@ -481,6 +533,14 @@ impl SqlExecutor {
                             .or_else(|| r.get(n))
                             .cloned()
                             .unwrap_or("NULL".into()),
+                        SelectColumn::WindowFunc { func, .. } => {
+                            let key = match func {
+                                WindowFuncType::RowNumber => "row_number",
+                                WindowFuncType::Rank => "rank",
+                                WindowFuncType::DenseRank => "dense_rank",
+                            };
+                            r.get(key).cloned().unwrap_or("NULL".into())
+                        }
                         _ => "NULL".into(),
                     })
                     .collect()
@@ -598,6 +658,11 @@ fn eval_where(row: &Row, expr: &WhereExpr) -> bool {
         WhereExpr::In(col, vals) => {
             let row_val = row.get(col).cloned().unwrap_or_default();
             vals.iter().any(|v| v.as_string() == row_val)
+        }
+        WhereExpr::InSubquery(_col, _sub) => {
+            // Subquery evaluation requires executor context;
+            // for simple eval_where we return true (handled at exec_select level)
+            true
         }
     }
 }

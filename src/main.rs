@@ -12,8 +12,6 @@ mod backup;
 mod cluster;
 mod crypto;
 mod quic_server;
-mod raft_impl;
-mod raft_init;
 
 use omni_engine::OmniKV;
 use omni_engine::raft_storage;

@@ -287,23 +287,15 @@ fn test_concurrent_writes() {
     let mut found = 0;
     for t in 0..4 {
         for i in 0..100 {
-            match db.find(&format!("thread{}_{:04}", t, i), seq) {
-                Ok(Some(val)) => {
-                    assert_eq!(val, format!("val_{}_{}", t, i));
-                    found += 1;
-                }
-                // CRC mismatch under concurrent heap writes is a known limitation
-                Err(omni_engine::OmniError::IoError(ref msg)) if msg.contains("CRC32") => {}
-                other => panic!("Unexpected result for thread{}_{:04}: {:?}", t, i, other),
-            }
+            let val = db
+                .find(&format!("thread{}_{:04}", t, i), seq)
+                .unwrap_or_else(|e| panic!("Read error for thread{}_{:04}: {:?}", t, i, e));
+            assert_eq!(val, Some(format!("val_{}_{}", t, i)));
+            found += 1;
         }
     }
-    // At least 50% of writes should be readable (CRC errors under concurrent heap writes)
-    assert!(
-        found >= 200,
-        "Only {} of 400 concurrent writes readable",
-        found
-    );
+    // With positional heap writes, all concurrent writes must be readable
+    assert_eq!(found, 400, "All 400 concurrent writes must be readable");
 }
 
 #[test]

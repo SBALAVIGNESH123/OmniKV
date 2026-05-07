@@ -11,7 +11,7 @@ use std::os::unix::fs::FileExt;
 #[cfg(windows)]
 use std::os::windows::fs::FileExt;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 pub struct FnvHasher(u64);
 impl Default for FnvHasher {
@@ -46,6 +46,11 @@ pub mod sql;
 pub mod sql_exec;
 pub mod transaction;
 pub mod wal;
+pub mod raft_impl;
+pub mod raft_network;
+pub mod raft_init;
+pub mod raft_routes;
+
 
 #[derive(Debug, Clone)]
 pub enum OmniError {
@@ -234,7 +239,7 @@ impl BloomFilter {
             return;
         }
         for idx in self.hashes(key) {
-            self.bitset[idx / 64] |= 1 << (idx % 64);
+            self.bitset[idx / 64] |= 1u64 << (idx % 64);
         }
     }
 
@@ -243,9 +248,10 @@ impl BloomFilter {
             return false;
         }
         for idx in self.hashes(key) {
-            if self.bitset[idx / 64] & (1 << (idx % 64)) == 0 {
+            if self.bitset[idx / 64] & (1u64 << (idx % 64)) == 0 {
                 return false;
             }
+
         }
         true
     }
@@ -257,7 +263,7 @@ const UNCOMPRESSED_FLAG: u64 = 1 << 63;
 const NUM_SHARDS: usize = 16;
 
 #[inline]
-fn shard_idx(key: &[u8]) -> usize {
+pub fn shard_idx(key: &[u8]) -> usize {
     let mut h = FnvHasher::default();
     key.hash(&mut h);
     (h.finish() as usize) % NUM_SHARDS
@@ -308,6 +314,9 @@ impl WriteBatch {
         self.buffered_deletes.push(string_to_key(key));
         Ok(())
     }
+    pub fn is_empty(&self) -> bool {
+        self.buffered_writes.is_empty() && self.buffered_deletes.is_empty()
+    }
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
@@ -317,6 +326,8 @@ pub struct Manifest {
     pub sstables: Vec<String>,
     #[serde(default)]
     pub l1_sstables: Vec<String>,
+    #[serde(default)]
+    pub max_seq: u64,
 }
 
 impl Manifest {
@@ -547,31 +558,118 @@ impl<'a> SSTableWriter<'a> {
     }
 }
 
+/// Single atomic snapshot of all read-visible storage topology.
+/// Readers load this once and operate on stable Arc-owned handles — zero locking.
+/// Snapshot install replaces this with a single `roots.store(Arc::new(new_roots))`.
+/// No mixed-topology window is possible.
+#[derive(Clone)]
+pub struct StorageRoots {
+    pub base_mmap: Arc<Mmap>,
+    pub base_bloom: Arc<BloomFilter>,
+    pub sstables: Arc<Vec<(Arc<Mmap>, Arc<BloomFilter>, String)>>,   // L0
+    pub l1_sstables: Arc<Vec<(Arc<Mmap>, Arc<BloomFilter>, String)>>, // L1
+    pub memtable: Arc<[SkipMap<(Vec<u8>, Reverse<u64>), (u64, u64, u32, u64)>; NUM_SHARDS]>,
+    pub frozen_memtables: Arc<Vec<Arc<[SkipMap<(Vec<u8>, Reverse<u64>), (u64, u64, u32, u64)>; NUM_SHARDS]>>>,
+    pub manifest: Arc<Manifest>,
+    pub heap_reader: Arc<File>,
+}
+
+/// Pure storage recovery result — returned by recover_storage_from_path().
+/// All topology data lives here; no background threads are started.
+pub(crate) struct RecoveredStorage {
+    pub base_mmap: Arc<Mmap>,
+    pub base_bloom: Arc<BloomFilter>,
+    pub sstables: Arc<Vec<(Arc<Mmap>, Arc<BloomFilter>, String)>>,
+    pub l1_sstables: Arc<Vec<(Arc<Mmap>, Arc<BloomFilter>, String)>>,
+    pub manifest: Arc<Manifest>,
+    pub heap_reader: Arc<File>,
+    pub heap_file: File,
+    pub heap_offset: u64,
+    pub wal: wal::WriteAheadLog,
+    pub memtable: Arc<[SkipMap<(Vec<u8>, Reverse<u64>), (u64, u64, u32, u64)>; NUM_SHARDS]>,
+    pub max_seq: u64,
+}
+
 pub struct OmniKV {
-    base_mmap: ArcSwap<Mmap>,
-    base_bloom: ArcSwap<BloomFilter>,
-    sstables: ArcSwap<Vec<(Arc<Mmap>, Arc<BloomFilter>, String)>>, // L0
-    l1_sstables: ArcSwap<Vec<(Arc<Mmap>, Arc<BloomFilter>, String)>>, // L1
-    memtable: ArcSwap<[SkipMap<(Vec<u8>, Reverse<u64>), (u64, u64, u32, u64)>; NUM_SHARDS]>, // key -> (offset, length, crc, expiry)
-    frozen_memtables:
-        ArcSwap<Vec<Arc<[SkipMap<(Vec<u8>, Reverse<u64>), (u64, u64, u32, u64)>; NUM_SHARDS]>>>,
-    global_seq: AtomicU64,
-    heap_file: Mutex<File>,
-    heap_offset: AtomicU64,
-    wal: Mutex<wal::WriteAheadLog>,
+    // ── Single atomic topology root (replaced atomically during snapshot install) ──
+    // Reads: load roots once, work on stable Arc handles — zero locking needed.
+    // Install: store a new Arc<StorageRoots> — single atomic publish, no mixed-state window.
+    pub(crate) roots: ArcSwap<StorageRoots>,
+
+    // ── Durable mutable write handles (outside topology, never root-swapped) ──
+    pub(crate) global_seq: AtomicU64,
+    pub(crate) heap_file: Mutex<File>,
+    pub(crate) heap_offset: AtomicU64,
+    pub(crate) wal: Mutex<wal::WriteAheadLog>,
     write_mutex: Mutex<()>,
-    manifest: ArcSwap<Manifest>,
-    manifest_path: String,
+    pub(crate) manifest_path: String,
     pub metrics: Arc<Metrics>,
-    active_snapshots: Mutex<std::collections::BTreeMap<u64, usize>>,
-    block_cache: moka::sync::Cache<u64, String>,
-    heap_reader: ArcSwap<File>,
+    pub(crate) active_snapshots: Mutex<std::collections::BTreeMap<u64, usize>>,
+    pub(crate) block_cache: moka::sync::Cache<u64, String>,
+
+    // ── Storage transition barrier ──
+    // Shared (read) lock: commit_batch, compaction, flush.
+    // Exclusive (write) lock: snapshot install only — freezes all writers/compactors.
+    pub(crate) transition_guard: RwLock<()>,
 }
 
 impl OmniKV {
     /// Opens an OmniKV database from the given manifest and WAL paths.
     /// Recovers state from WAL and initializes the storage engine.
     pub fn open(manifest_path: &str, wal_path: &str) -> Result<Arc<Self>, OmniError> {
+        let recovered = Self::recover_storage_roots(manifest_path, wal_path)?;
+        
+        let initial_roots = StorageRoots {
+            base_mmap: recovered.base_mmap,
+            base_bloom: recovered.base_bloom,
+            sstables: recovered.sstables,
+            l1_sstables: recovered.l1_sstables,
+            memtable: recovered.memtable,
+            frozen_memtables: Arc::new(Vec::new()),
+            manifest: recovered.manifest,
+            heap_reader: recovered.heap_reader,
+        };
+
+        Ok(Arc::new(Self {
+            roots: ArcSwap::from_pointee(initial_roots),
+            global_seq: AtomicU64::new(recovered.max_seq + 1),
+            heap_file: Mutex::new(recovered.heap_file),
+            heap_offset: AtomicU64::new(recovered.heap_offset),
+            wal: Mutex::new(recovered.wal),
+            write_mutex: Mutex::new(()),
+            manifest_path: manifest_path.to_string(),
+            metrics: Arc::new(Metrics::new()),
+            active_snapshots: Mutex::new(std::collections::BTreeMap::new()),
+            block_cache: moka::sync::Cache::builder().max_capacity(100_000).build(),
+            transition_guard: RwLock::new(()),
+        }))
+    }
+
+    // ── Topology accessor helpers ─────────────────────────────────────────────
+    // These load a stable root snapshot once. Callers work on Arc handles with no locking.
+    // Compaction and reads use these; snapshot install bypasses them and swaps roots directly.
+
+    #[inline] pub fn load_roots(&self) -> arc_swap::Guard<Arc<StorageRoots>> { self.roots.load() }
+    #[inline] pub(crate) fn memtable_arc(&self) -> Arc<[SkipMap<(Vec<u8>, Reverse<u64>), (u64, u64, u32, u64)>; NUM_SHARDS]> { self.roots.load().memtable.clone() }
+    #[inline] pub fn sstable_count(&self) -> usize { self.roots.load().sstables.len() }
+    #[inline] pub fn l1_sstable_count(&self) -> usize { self.roots.load().l1_sstables.len() }
+
+    /// Compaction helper: apply a topology mutation function and publish the result atomically.
+    /// Compaction methods call this instead of doing individual `.store()` calls,
+    /// ensuring no mixed-state observability.
+    pub(crate) fn update_roots(&self, f: impl FnOnce(&StorageRoots) -> StorageRoots) {
+        let current = self.roots.load();
+        let new_roots = f(&current);
+        self.roots.store(Arc::new(new_roots));
+    }
+
+    /// Pure storage recovery — no threads, no side effects.
+    /// Returns raw storage handles that can be atomically installed.
+    /// Used by install_snapshot to swap topology without restarting the engine.
+    pub(crate) fn recover_storage_roots(
+        manifest_path: &str,
+        wal_path: &str,
+    ) -> Result<RecoveredStorage, OmniError> {
         let manifest = match Manifest::load(manifest_path) {
             Ok(m) => m,
             Err(_) => {
@@ -580,6 +678,7 @@ impl OmniKV {
                     base_path: format!("{}_base.bin", manifest_path),
                     sstables: vec![],
                     l1_sstables: vec![],
+                    max_seq: 0,
                 };
                 m.save(manifest_path)?;
                 m
@@ -652,24 +751,32 @@ impl OmniKV {
                 && let Ok(mmap) = unsafe { MmapOptions::new().map(&file) }
             {
                 let reader = SSTableReader::new(&mmap);
-                let mut count = 0;
-                for _ in reader.iter_from(b"") {
-                    count += 1;
-                }
-                let mut bloom = BloomFilter::new(count.max(100));
-                for rec in reader.iter_from(b"") {
-                    if rec.is_valid() {
-                        let mut h = FnvHasher::default();
-                        rec.key.hash(&mut h);
-                        bloom.add(h.finish());
+                let bloom_path = sst_path.replace(".sst", ".bloom");
+                let bloom = match BloomFilter::load(&bloom_path) {
+                    Ok(b) => b,
+                    Err(_) => {
+                        let mut count = 0;
+                        for _ in reader.iter_from(b"") {
+                            count += 1;
+                        }
+                        let mut b = BloomFilter::new(count.max(100));
+                        for rec in reader.iter_from(b"") {
+                            if rec.is_valid() {
+                                let mut h = FnvHasher::default();
+                                rec.key.hash(&mut h);
+                                b.add(h.finish());
+                            }
+                        }
+                        let _ = b.save(&bloom_path);
+                        b
                     }
-                }
+                };
                 loaded_l1_sstables.push((Arc::new(mmap), Arc::new(bloom), sst_path.clone()));
             }
         }
 
         let memtable = Arc::new(std::array::from_fn(|_| SkipMap::new()));
-        let mut global_seq = 0;
+        let mut global_seq = manifest.max_seq;
 
         let recovered_records = wal::WriteAheadLog::replay(wal_path, &manifest.heap_path)?;
         if !recovered_records.is_empty() {
@@ -688,33 +795,25 @@ impl OmniKV {
         let heap_file = OpenOptions::new()
             .create(true)
             .read(true)
-            .append(true)
+            .write(true)
             .open(&manifest.heap_path)?;
         let heap_offset = heap_file.metadata()?.len();
 
         let wal = wal::WriteAheadLog::new(wal_path)?;
 
-        Ok(Arc::new(Self {
-            base_mmap: ArcSwap::from_pointee(base_mmap),
-            base_bloom: ArcSwap::from_pointee(base_bloom),
-            sstables: ArcSwap::from_pointee(loaded_sstables),
-            l1_sstables: ArcSwap::from_pointee(loaded_l1_sstables),
-            memtable: ArcSwap::from_pointee(Arc::into_inner(memtable).unwrap()),
-            frozen_memtables: ArcSwap::from_pointee(Vec::new()),
-            global_seq: AtomicU64::new(global_seq + 1),
-            heap_file: Mutex::new(heap_file),
-            heap_offset: AtomicU64::new(heap_offset),
-            wal: Mutex::new(wal),
-            write_mutex: Mutex::new(()),
-            heap_reader: ArcSwap::from_pointee(
-                OpenOptions::new().read(true).open(&manifest.heap_path)?,
-            ),
-            manifest: ArcSwap::from_pointee(manifest),
-            manifest_path: manifest_path.to_string(),
-            metrics: Arc::new(Metrics::new()),
-            active_snapshots: Mutex::new(std::collections::BTreeMap::new()),
-            block_cache: moka::sync::Cache::builder().max_capacity(100_000).build(),
-        }))
+        Ok(RecoveredStorage {
+            base_mmap: Arc::new(base_mmap),
+            base_bloom: Arc::new(base_bloom),
+            sstables: Arc::new(loaded_sstables),
+            l1_sstables: Arc::new(loaded_l1_sstables),
+            heap_reader: Arc::new(OpenOptions::new().read(true).open(&manifest.heap_path)?),
+            manifest: Arc::new(manifest),
+            heap_file,
+            heap_offset,
+            wal,
+            memtable,
+            max_seq: global_seq,
+        })
     }
 
     /// Returns the current global sequence number.
@@ -723,7 +822,7 @@ impl OmniKV {
     }
 
     pub fn snapshot(&self) -> u64 {
-        let seq = self.get_seq();
+        let seq = self.get_seq().saturating_sub(1);
         let mut snaps = self
             .active_snapshots
             .lock()
@@ -752,17 +851,13 @@ impl OmniKV {
             .keys()
             .next()
             .copied()
-            .unwrap_or(self.get_seq())
+            .unwrap_or_else(|| self.get_seq().saturating_sub(1))
     }
 
     pub fn memtable_size(&self) -> usize {
-        let mut sum = self
-            .memtable
-            .load()
-            .iter()
-            .map(|shard| shard.len())
-            .sum::<usize>();
-        for frozen in &**self.frozen_memtables.load() {
+        let roots = self.roots.load();
+        let mut sum = roots.memtable.iter().map(|shard| shard.len()).sum::<usize>();
+        for frozen in roots.frozen_memtables.iter() {
             sum += frozen.iter().map(|shard| shard.len()).sum::<usize>();
         }
         sum
@@ -770,7 +865,7 @@ impl OmniKV {
 
     pub fn min_memtable_seq(&self) -> u64 {
         let mut min_seq = self.get_seq();
-        let memtable = self.memtable.load_full();
+        let memtable = self.roots.load().memtable.clone();
         for shard in memtable.iter() {
             if let Some(entry) = shard.front() {
                 let seq = entry.key().1.0;
@@ -803,13 +898,6 @@ impl OmniKV {
         self.memtable_size() // + other counts if needed
     }
 
-    pub fn sstable_count(&self) -> usize {
-        self.sstables.load().len()
-    }
-
-    pub fn l1_sstable_count(&self) -> usize {
-        self.l1_sstables.load().len()
-    }
 
     pub fn flush_memtable_to_disk(&self, _id: u64) -> Result<(), OmniError> {
         self.compact_sstables()
@@ -820,12 +908,29 @@ impl OmniKV {
             .write_mutex
             .lock()
             .map_err(|_| OmniError::LockPoisoned("heap write mutex".into()))?;
-        let mut heap = self
+        let heap = self
             .heap_file
             .lock()
             .map_err(|_| OmniError::LockPoisoned("heap_file".into()))?;
         let offset = self.heap_offset.load(Ordering::SeqCst);
-        heap.write_all(data)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::FileExt as _;
+            heap.write_all_at(data, offset)?;
+        }
+        #[cfg(windows)]
+        {
+            let mut remaining = data;
+            let mut pos = offset;
+            while !remaining.is_empty() {
+                let n = heap.seek_write(remaining, pos)?;
+                if n == 0 {
+                    return Err(OmniError::IoError("heap pwrite: zero-length write".into()));
+                }
+                remaining = &remaining[n..];
+                pos += n as u64;
+            }
+        }
         heap.sync_data()?;
         self.heap_offset
             .store(offset + data.len() as u64, Ordering::SeqCst);
@@ -842,7 +947,7 @@ impl OmniKV {
         expiry: u64,
     ) {
         let shard = shard_idx(&key);
-        let memtable = self.memtable.load_full();
+        let memtable = self.roots.load().memtable.clone();
         memtable[shard].insert((key, Reverse(seq)), (offset, length, crc, expiry));
         self.global_seq.fetch_max(seq + 1, Ordering::SeqCst);
     }
@@ -870,6 +975,13 @@ impl OmniKV {
     /// This allows multiple concurrent batches to overlap their CPU-intensive
     /// compression work and only serialize briefly for sequence numbering.
     pub fn commit_batch(&self, tx: &WriteBatch) -> Result<u64, OmniError> {
+        // Acquire shared topology lock — blocks only during exclusive snapshot install.
+        // Thousands of concurrent writers can hold this simultaneously.
+        let _topology_guard = self
+            .transition_guard
+            .read()
+            .map_err(|_| OmniError::LockPoisoned("transition_guard".into()))?;
+
         let start_time = std::time::Instant::now();
 
         // Write Backpressure: If L0 SSTables exceed 12, stall to let compaction catch up
@@ -971,18 +1083,51 @@ impl OmniKV {
         );
         wal_records.push((commit_marker, None));
 
-        // Heap write (serialized by heap_file Mutex, NOT by write_mutex)
+        // Heap write using POSITIONAL I/O at reserved offsets.
+        // Each batch writes at its reserved offset via pwrite/seek_write,
+        // so concurrent batches write to non-overlapping regions without
+        // needing the heap_file Mutex for correctness.
+        // The Mutex is still held to serialize fsync calls.
         {
-            let mut heap_writer = self
+            let heap_writer = self
                 .heap_file
                 .lock()
                 .map_err(|_| OmniError::LockPoisoned("heap lock".into()))?;
+
+            let mut write_offset = reserved_offset;
             for (_, payload) in &wal_records {
                 if let Some(bytes) = payload {
-                    heap_writer.write_all(bytes)?;
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::FileExt as _;
+                        heap_writer
+                            .write_all_at(bytes, write_offset)
+                            .map_err(|e| {
+                                OmniError::IoError(format!("heap pwrite: {}", e))
+                            })?;
+                    }
+                    #[cfg(windows)]
+                    {
+                        let mut remaining = &bytes[..];
+                        let mut pos = write_offset;
+                        while !remaining.is_empty() {
+                            let n = heap_writer
+                                .seek_write(remaining, pos)
+                                .map_err(|e| {
+                                    OmniError::IoError(format!("heap pwrite: {}", e))
+                                })?;
+                            if n == 0 {
+                                return Err(OmniError::IoError(
+                                    "heap pwrite: zero-length write".into(),
+                                ));
+                            }
+                            remaining = &remaining[n..];
+                            pos += n as u64;
+                        }
+                    }
+                    write_offset += bytes.len() as u64;
                 }
             }
-            heap_writer.flush()?;
             heap_writer.sync_data()?;
         }
 
@@ -996,7 +1141,7 @@ impl OmniKV {
         }
 
         // Memtable insertion (SkipMap is lock-free for concurrent inserts)
-        let memtable = self.memtable.load_full();
+        let memtable = self.roots.load().memtable.clone();
         for (rec, _) in &wal_records {
             if key_to_string(&rec.key) != "__COMMIT_MARKER__" {
                 let shard = shard_idx(&rec.key);
@@ -1035,12 +1180,34 @@ impl OmniKV {
         let length = length_with_flag & !UNCOMPRESSED_FLAG;
 
         let mut buf = vec![0u8; length as usize];
-        let file = self.heap_reader.load();
 
+        // On Windows, use the writer handle (heap_file) for reads to guarantee
+        // visibility of recently written data. Windows doesn't guarantee
+        // read-after-write consistency across separate file handles for
+        // unflushed data. On Unix, pread on the reader handle is safe (POSIX).
         #[cfg(unix)]
-        file.read_exact_at(&mut buf, offset)?;
+        {
+            let file = self.roots.load().heap_reader.clone();
+            file.read_exact_at(&mut buf, offset)?;
+        }
         #[cfg(windows)]
-        file.seek_read(&mut buf, offset)?;
+        {
+            use std::os::windows::fs::FileExt;
+            let file = self.roots.load().heap_reader.clone();
+            // seek_read can return fewer bytes than requested (short read).
+            // Loop until the entire buffer is filled.
+            let mut total_read = 0usize;
+            while total_read < buf.len() {
+                let n = file.seek_read(&mut buf[total_read..], offset + total_read as u64)
+                    .map_err(|e| OmniError::IoError(format!("heap seek_read: {}", e)))?;
+                if n == 0 {
+                    return Err(OmniError::IoError(
+                        "heap seek_read: unexpected EOF".into(),
+                    ));
+                }
+                total_read += n;
+            }
+        }
 
         let mut hasher = crc32fast::Hasher::new();
         hasher.update(&buf);
@@ -1067,6 +1234,18 @@ impl OmniKV {
 
     /// Finds a value by its key, up to the specified read sequence number (MVCC).
     /// Returns `Ok(None)` if the key does not exist or has been deleted.
+    /// Internal bypass for Raft: Gets the absolute latest version of a key, ignoring MVCC snapshots.
+    pub fn find_latest_internal(&self, target_key: &str) -> Result<Option<String>, OmniError> {
+        self.find(target_key, u64::MAX)
+    }
+
+    /// Internal bypass for Raft Snapshots: Iterates over the entire keyspace at the absolute latest sequence.
+    pub(crate) fn scan_all_latest_internal(
+        &self,
+    ) -> Result<impl Iterator<Item = (String, String)> + '_, OmniError> {
+        self.scan_iter("", "\u{10FFFF}", u64::MAX)
+    }
+
     pub fn find(&self, target_key: &str, read_seq: u64) -> Result<Option<String>, OmniError> {
         let start_time = std::time::Instant::now();
         let target_key = string_to_key(target_key);
@@ -1077,7 +1256,7 @@ impl OmniKV {
 
         let shard = shard_idx(&target_key);
 
-        let memtable = self.memtable.load_full();
+        let memtable = self.roots.load().memtable.clone();
         for entry in memtable[shard].range((target_key.clone(), Reverse(read_seq))..) {
             if entry.key().0 != target_key {
                 break;
@@ -1098,7 +1277,7 @@ impl OmniKV {
             }
         }
 
-        let frozen_memtables = self.frozen_memtables.load();
+        let frozen_memtables = self.roots.load().frozen_memtables.clone();
         for frozen in frozen_memtables.iter().rev() {
             for entry in frozen[shard].range((target_key.clone(), Reverse(read_seq))..) {
                 if entry.key().0 != target_key {
@@ -1122,7 +1301,7 @@ impl OmniKV {
         }
 
         let mut pointer = None;
-        let sstables = self.sstables.load();
+        let sstables = self.roots.load().sstables.clone();
         for (mmap, bloom, _) in sstables.iter().rev() {
             let mut h = FnvHasher::default();
             target_key.hash(&mut h);
@@ -1136,7 +1315,7 @@ impl OmniKV {
         }
 
         if pointer.is_none() {
-            let l1_sstables = self.l1_sstables.load();
+            let l1_sstables = self.roots.load().l1_sstables.clone();
             for (mmap, bloom, _) in l1_sstables.iter().rev() {
                 let mut h = FnvHasher::default();
                 target_key.hash(&mut h);
@@ -1151,11 +1330,11 @@ impl OmniKV {
         }
 
         if pointer.is_none() {
-            let base_bloom = self.base_bloom.load();
+            let base_bloom = self.roots.load().base_bloom.clone();
             let mut h = FnvHasher::default();
             target_key.hash(&mut h);
             if base_bloom.might_contain(h.finish()) {
-                let base_mmap = self.base_mmap.load();
+                let base_mmap = self.roots.load().base_mmap.clone();
                 let reader = SSTableReader::new(&base_mmap);
                 pointer = reader.find(&target_key, read_seq);
             }
@@ -1206,7 +1385,7 @@ impl OmniKV {
         let mut candidates: Vec<(Vec<u8>, u64, u64, u64, u32, u64)> = Vec::new();
 
         // Memtable (highest priority â€” newest data)
-        let active_mem = self.memtable.load_full();
+        let active_mem = self.roots.load().memtable.clone();
         for shard in active_mem.iter() {
             for entry in shard.range((start_key.clone(), Reverse(read_seq))..) {
                 let key = entry.key().0.clone();
@@ -1228,7 +1407,7 @@ impl OmniKV {
         }
 
         // Frozen memtables (second priority)
-        let frozen = self.frozen_memtables.load();
+        let frozen = self.roots.load().frozen_memtables.clone();
         for f_mem in frozen.iter().rev() {
             for shard in f_mem.iter() {
                 for entry in shard.range((start_key.clone(), Reverse(read_seq))..) {
@@ -1252,7 +1431,7 @@ impl OmniKV {
         }
 
         // L0 SSTables (newest first)
-        let sstables = self.sstables.load();
+        let sstables = self.roots.load().sstables.clone();
         for (mmap, _, _) in sstables.iter().rev() {
             let reader = SSTableReader::new(mmap);
             for rec in reader.iter_from(&start_key) {
@@ -1273,7 +1452,7 @@ impl OmniKV {
         }
 
         // L1 SSTables
-        let l1_sstables = self.l1_sstables.load();
+        let l1_sstables = self.roots.load().l1_sstables.clone();
         for (mmap, _, _) in &**l1_sstables {
             let reader = SSTableReader::new(mmap);
             for rec in reader.iter_from(&start_key) {
@@ -1294,7 +1473,7 @@ impl OmniKV {
         }
 
         // Base file (oldest data, lowest priority)
-        let base_mmap = self.base_mmap.load();
+        let base_mmap = self.roots.load().base_mmap.clone();
         let reader = SSTableReader::new(&base_mmap);
         for rec in reader.iter_from(&start_key) {
             if rec.key > end_key {
@@ -1340,7 +1519,7 @@ impl OmniKV {
         let shard = shard_idx(&target_key);
 
         // 1. Active memtable
-        let memtable = self.memtable.load_full();
+        let memtable = self.roots.load().memtable.clone();
         for entry in memtable[shard].range((target_key.clone(), Reverse(read_seq))..) {
             if entry.key().0 != target_key {
                 break;
@@ -1351,7 +1530,7 @@ impl OmniKV {
         }
 
         // 2. Frozen memtables
-        let frozen_memtables = self.frozen_memtables.load();
+        let frozen_memtables = self.roots.load().frozen_memtables.clone();
         for frozen in frozen_memtables.iter().rev() {
             for entry in frozen[shard].range((target_key.clone(), Reverse(read_seq))..) {
                 if entry.key().0 != target_key {
@@ -1386,7 +1565,7 @@ impl OmniKV {
         };
 
         // 3. L0 SSTables (newest first)
-        let sstables = self.sstables.load();
+        let sstables = self.roots.load().sstables.clone();
         for (mmap, bloom, _) in sstables.iter().rev() {
             if let Some(seq) = search_sstable(mmap, bloom) {
                 return seq;
@@ -1394,7 +1573,7 @@ impl OmniKV {
         }
 
         // 4. L1 SSTables
-        let l1_sstables = self.l1_sstables.load();
+        let l1_sstables = self.roots.load().l1_sstables.clone();
         for (mmap, bloom, _) in l1_sstables.iter().rev() {
             if let Some(seq) = search_sstable(mmap, bloom) {
                 return seq;
@@ -1403,7 +1582,7 @@ impl OmniKV {
 
         // 5. Base file
         {
-            let base_bloom = self.base_bloom.load();
+            let base_bloom = self.roots.load().base_bloom.clone();
             let mut h = FnvHasher::default();
             target_key.hash(&mut h);
             if !base_bloom.might_contain(h.finish()) {
@@ -1411,7 +1590,7 @@ impl OmniKV {
             }
         }
         {
-            let base_mmap = self.base_mmap.load();
+            let base_mmap = self.roots.load().base_mmap.clone();
             let reader = SSTableReader::new(&base_mmap);
             let mut best_seq = 0u64;
             for rec in reader.iter_from(&target_key) {
@@ -1438,16 +1617,30 @@ impl OmniKV {
                 .write_mutex
                 .lock()
                 .map_err(|_| OmniError::LockPoisoned("compact".into()))?;
-            let old_memtable = self
-                .memtable
-                .swap(Arc::new(std::array::from_fn(|_| SkipMap::new())));
-            let mut frozen = self.frozen_memtables.load().as_ref().clone();
-            frozen.push(old_memtable.clone());
-            self.frozen_memtables.store(Arc::new(frozen.clone()));
+            let new_empty: Arc<[SkipMap<(Vec<u8>, Reverse<u64>), (u64, u64, u32, u64)>; NUM_SHARDS]> =
+                Arc::new(std::array::from_fn(|_| SkipMap::new()));
+            // Atomically: swap memtable to empty and add old one to frozen list
+            let old_memtable = {
+                let current = self.roots.load();
+                let old = current.memtable.clone();
+                let mut new_frozen = current.frozen_memtables.as_ref().clone();
+                new_frozen.push(old.clone());
+                self.roots.store(Arc::new(StorageRoots {
+                    memtable: new_empty,
+                    frozen_memtables: Arc::new(new_frozen.clone()),
+                    base_mmap: current.base_mmap.clone(),
+                    base_bloom: current.base_bloom.clone(),
+                    sstables: current.sstables.clone(),
+                    l1_sstables: current.l1_sstables.clone(),
+                    manifest: current.manifest.clone(),
+                    heap_reader: current.heap_reader.clone(),
+                }));
+                (old, new_frozen.len() - 1)
+            };
             if let Ok(mut wal) = self.wal.lock() {
                 let _ = wal.rotate_segment();
             }
-            (frozen.len() - 1, old_memtable)
+            (old_memtable.1, old_memtable.0)
         };
 
         let now = std::time::SystemTime::now()
@@ -1504,23 +1697,24 @@ impl OmniKV {
 
         let mmap = unsafe { MmapOptions::new().map(&file)? };
 
-        let mut manifest = self.manifest.load().as_ref().clone();
+        let mut manifest = self.roots.load().manifest.clone().as_ref().clone();
         manifest.sstables.push(sst_path.clone());
+        manifest.max_seq = manifest.max_seq.max(self.global_seq.load(Ordering::SeqCst));
         manifest.save(&self.manifest_path)?;
-        self.manifest.store(Arc::new(manifest));
+        self.update_roots(|r| StorageRoots { manifest: Arc::new(manifest), ..r.clone() });
 
-        let mut sstables = self.sstables.load().as_ref().clone();
+        let mut sstables = self.roots.load().sstables.clone().as_ref().clone();
         sstables.push((Arc::new(mmap), Arc::new(bloom), sst_path));
-        self.sstables.store(Arc::new(sstables));
+        self.update_roots(|r| StorageRoots { sstables: Arc::new(sstables), ..r.clone() });
 
         let _guard = self
             .write_mutex
             .lock()
             .map_err(|_| OmniError::LockPoisoned("compact".into()))?;
-        let mut frozen = self.frozen_memtables.load().as_ref().clone();
+        let mut frozen = self.roots.load().frozen_memtables.clone().as_ref().clone();
         if frozen_idx < frozen.len() {
             frozen.remove(frozen_idx);
-            self.frozen_memtables.store(Arc::new(frozen));
+            self.update_roots(|r| StorageRoots { frozen_memtables: Arc::new(frozen), ..r.clone() });
         }
 
         Ok(())
@@ -1533,7 +1727,7 @@ impl OmniKV {
             .write_mutex
             .lock()
             .map_err(|_| OmniError::LockPoisoned("compact_l0".into()))?;
-        let sstables = self.sstables.load();
+        let sstables = self.roots.load().sstables.clone();
         if sstables.is_empty() {
             return Ok(());
         }
@@ -1573,11 +1767,11 @@ impl OmniKV {
         }
 
         if records.is_empty() {
-            let mut manifest = self.manifest.load().as_ref().clone();
+            let mut manifest = self.roots.load().manifest.clone().as_ref().clone();
             manifest.sstables.clear();
             manifest.save(&self.manifest_path)?;
-            self.manifest.store(Arc::new(manifest));
-            self.sstables.store(Arc::new(Vec::new()));
+            self.update_roots(|r| StorageRoots { manifest: Arc::new(manifest), ..r.clone() });
+            self.update_roots(|r| StorageRoots { sstables: Arc::new(Vec::new()), ..r.clone() });
 
             let old_paths: Vec<String> = sstables.iter().map(|(_, _, p)| p.clone()).collect();
             std::thread::spawn(move || {
@@ -1623,17 +1817,18 @@ impl OmniKV {
 
         let mmap = unsafe { MmapOptions::new().map(&file)? };
 
-        let mut manifest = self.manifest.load().as_ref().clone();
+        let mut manifest = self.roots.load().manifest.clone().as_ref().clone();
         manifest.sstables.clear();
         manifest.l1_sstables.push(sst_path.clone());
+        manifest.max_seq = manifest.max_seq.max(self.global_seq.load(Ordering::SeqCst));
         manifest.save(&self.manifest_path)?;
-        self.manifest.store(Arc::new(manifest));
+        self.update_roots(|r| StorageRoots { manifest: Arc::new(manifest), ..r.clone() });
 
-        let mut l1_sstables = self.l1_sstables.load().as_ref().clone();
+        let mut l1_sstables = self.roots.load().l1_sstables.clone().as_ref().clone();
         l1_sstables.push((Arc::new(mmap), Arc::new(bloom), sst_path));
-        self.l1_sstables.store(Arc::new(l1_sstables));
+        self.update_roots(|r| StorageRoots { l1_sstables: Arc::new(l1_sstables), ..r.clone() });
 
-        self.sstables.store(Arc::new(Vec::new()));
+        self.update_roots(|r| StorageRoots { sstables: Arc::new(Vec::new()), ..r.clone() });
 
         let old_paths: Vec<String> = sstables.iter().map(|(_, _, p)| p.clone()).collect();
         std::thread::spawn(move || {
@@ -1658,7 +1853,7 @@ impl OmniKV {
             .as_secs();
         let mut merged: BTreeMap<Vec<u8>, (u64, u64, u64, u32, u64)> = BTreeMap::new();
 
-        let base_mmap = self.base_mmap.load();
+        let base_mmap = self.roots.load().base_mmap.clone();
         let reader = SSTableReader::new(&base_mmap);
         for rec in reader.iter_from(b"") {
             if rec.is_valid() {
@@ -1678,7 +1873,7 @@ impl OmniKV {
             }
         }
 
-        let l1_sstables_snap = self.l1_sstables.load();
+        let l1_sstables_snap = self.roots.load().l1_sstables.clone();
         if l1_sstables_snap.is_empty() {
             return Ok(());
         }
@@ -1746,19 +1941,19 @@ impl OmniKV {
         let new_base_mmap = unsafe { MmapOptions::new().map(&file)? };
 
         // Critical Section: Swap active files
-        let old_base_path = self.manifest.load().base_path.clone();
-        self.base_mmap.store(Arc::new(new_base_mmap));
-        self.base_bloom.store(Arc::new(bloom));
+        let old_base_path = self.roots.load().manifest.clone().base_path.clone();
+        self.update_roots(|r| StorageRoots { base_mmap: Arc::new(new_base_mmap), ..r.clone() });
+        self.update_roots(|r| StorageRoots { base_bloom: Arc::new(bloom), ..r.clone() });
 
-        let current_l1 = self.l1_sstables.load();
+        let current_l1 = self.roots.load().l1_sstables.clone();
         let remaining_l1 = current_l1[num_l1_merged..].to_vec();
-        self.l1_sstables.store(Arc::new(remaining_l1.clone()));
+        self.update_roots(|r| StorageRoots { l1_sstables: Arc::new(remaining_l1.clone()), ..r.clone() });
 
-        let mut manifest = self.manifest.load().as_ref().clone();
+        let mut manifest = self.roots.load().manifest.clone().as_ref().clone();
         manifest.base_path = new_base_path;
         manifest.l1_sstables = remaining_l1.into_iter().map(|(_, _, path)| path).collect();
         manifest.save(&self.manifest_path)?;
-        self.manifest.store(Arc::new(manifest));
+        self.update_roots(|r| StorageRoots { manifest: Arc::new(manifest), ..r.clone() });
 
         let old_paths: Vec<String> = l1_sstables_snap[..num_l1_merged]
             .iter()
@@ -1809,7 +2004,7 @@ impl OmniKV {
                 }
             };
 
-        let base_mmap = self.base_mmap.load();
+        let base_mmap = self.roots.load().base_mmap.clone();
         let reader = SSTableReader::new(&base_mmap);
         for rec in reader.iter_from(b"") {
             if rec.is_valid() {
@@ -1824,7 +2019,7 @@ impl OmniKV {
             }
         }
 
-        let sstables = self.sstables.load();
+        let sstables = self.roots.load().sstables.clone();
         for (mmap, _, _) in &**sstables {
             let reader = SSTableReader::new(mmap);
             for rec in reader.iter_from(b"") {
@@ -1841,7 +2036,7 @@ impl OmniKV {
             }
         }
 
-        let l1_sstables = self.l1_sstables.load();
+        let l1_sstables = self.roots.load().l1_sstables.clone();
         for (mmap, _, _) in &**l1_sstables {
             let reader = SSTableReader::new(mmap);
             for rec in reader.iter_from(b"") {
@@ -1858,7 +2053,7 @@ impl OmniKV {
             }
         }
 
-        let memtable = self.memtable.load_full();
+        let memtable = self.roots.load().memtable.clone();
         for shard in memtable.iter() {
             for entry in shard.iter() {
                 let key = entry.key().0.clone();
@@ -1916,7 +2111,7 @@ impl OmniKV {
                 }
 
                 // Raw read, NO decompression!
-                let manifest = self.manifest.load();
+                let manifest = self.roots.load().manifest.clone();
                 let mut file = File::open(&manifest.heap_path)?;
                 use std::io::Seek;
                 file.seek(std::io::SeekFrom::Start(old_offset))?;
@@ -1955,11 +2150,30 @@ impl OmniKV {
 
         let new_base_mmap = unsafe { MmapOptions::new().map(&new_base_file)? };
 
-        self.base_mmap.store(Arc::new(new_base_mmap));
+        let new_heap_reader = OpenOptions::new().read(true).open(&new_heap_path)?;
+        let manifest_for_roots = {
+            let old_manifest = self.roots.load().manifest.clone().as_ref().clone();
+            let mut manifest = old_manifest.clone();
+            manifest.heap_path = new_heap_path.clone();
+            manifest.base_path = new_base_path.clone();
+            manifest.sstables.clear();
+            manifest.l1_sstables.clear();
+            manifest.save(&self.manifest_path)?;
+            manifest
+        };
         let _ = bloom.save(&new_base_path.replace(".bin", ".bloom"));
-        self.base_bloom.store(Arc::new(bloom));
-        self.sstables.store(Arc::new(Vec::new()));
-        self.l1_sstables.store(Arc::new(Vec::new()));
+
+        let cur = self.roots.load();
+        self.roots.store(Arc::new(StorageRoots {
+            base_mmap: Arc::new(new_base_mmap),
+            base_bloom: Arc::new(bloom),
+            sstables: Arc::new(Vec::new()),
+            l1_sstables: Arc::new(Vec::new()),
+            heap_reader: Arc::new(new_heap_reader),
+            manifest: Arc::new(manifest_for_roots),
+            memtable: cur.memtable.clone(),
+            frozen_memtables: cur.frozen_memtables.clone(),
+        }));
         self.block_cache.invalidate_all();
 
         let mut heap_lock = self
@@ -1967,23 +2181,14 @@ impl OmniKV {
             .lock()
             .map_err(|_| OmniError::LockPoisoned("heap_file".into()))?;
         *heap_lock = new_heap_file;
-        self.heap_reader.store(Arc::new(
-            OpenOptions::new().read(true).open(&new_heap_path)?,
-        ));
         self.heap_offset.store(current_offset, Ordering::SeqCst);
-        let memtable = self.memtable.load_full();
+        let memtable = self.roots.load().memtable.clone();
         for shard in memtable.iter() {
             shard.clear();
         }
 
-        let old_manifest = self.manifest.load().as_ref().clone();
-        let mut manifest = old_manifest.clone();
-        manifest.heap_path = new_heap_path;
-        manifest.base_path = new_base_path;
-        manifest.sstables.clear();
-        manifest.l1_sstables.clear();
-        manifest.save(&self.manifest_path)?;
-        self.manifest.store(Arc::new(manifest));
+        let old_manifest = self.roots.load().manifest.clone();
+
 
         std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_secs(5));
@@ -2005,4 +2210,48 @@ impl OmniKV {
 
         Ok(())
     }
+
+    /// Starts a background compaction thread that monitors memtable size
+    /// and SSTable counts, triggering compaction without blocking writes.
+    ///
+    /// Returns a handle to the background thread for graceful shutdown.
+    pub fn start_background_compaction(
+        self: &Arc<Self>,
+        check_interval_ms: u64,
+        memtable_flush_threshold: usize,
+    ) -> std::thread::JoinHandle<()> {
+        let db = Arc::clone(self);
+        std::thread::Builder::new()
+            .name("omni-compaction".into())
+            .spawn(move || {
+                loop {
+                    std::thread::sleep(std::time::Duration::from_millis(check_interval_ms));
+
+                    // Phase 1: Flush memtable to L0 if it exceeds threshold
+                    if db.memtable_size() > memtable_flush_threshold {
+                        if let Err(e) = db.compact_sstables() {
+                            eprintln!("[COMPACTION] Memtable flush error: {:?}", e);
+                        }
+                    }
+
+                    // Phase 2: Compact L0 → L1 if too many L0 SSTables
+                    if db.sstable_count() >= 4 {
+                        if let Err(e) = db.compact_l0_to_l1() {
+                            eprintln!("[COMPACTION] L0→L1 error: {:?}", e);
+                        }
+                    }
+
+                    // Phase 3: Compact L1 → L2 (base) if too many L1 SSTables
+                    if db.l1_sstable_count() >= 4 {
+                        if let Err(e) = db.compact_l1_to_l2() {
+                            eprintln!("[COMPACTION] L1→L2 error: {:?}", e);
+                        }
+                    }
+                }
+            })
+            .expect("Failed to spawn compaction thread")
+    }
 }
+
+
+

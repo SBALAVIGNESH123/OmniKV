@@ -46,7 +46,8 @@ impl RaftNetwork<OmniTypeConfig> for OmniNetworkConnection {
         req: AppendEntriesRequest<OmniTypeConfig>,
         _option: openraft::network::RPCOption,
     ) -> Result<AppendEntriesResponse<u64>, RPCError<u64, OmniNode, RaftError<u64>>> {
-        let url = format!("https://{}/raft/append", self.target.addr);
+        let scheme = if self.target.addr.starts_with("127.0.0.1") || self.target.addr.starts_with("localhost") { "http" } else { "https" };
+        let url = format!("{}://{}/raft/append", scheme, self.target.addr);
         let resp = self.client.post(&url).json(&req).send().await
             .map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
         
@@ -60,7 +61,8 @@ impl RaftNetwork<OmniTypeConfig> for OmniNetworkConnection {
         req: InstallSnapshotRequest<OmniTypeConfig>,
         _option: openraft::network::RPCOption,
     ) -> Result<InstallSnapshotResponse<u64>, RPCError<u64, OmniNode, RaftError<u64, InstallSnapshotError>>> {
-        let url = format!("https://{}/raft/snapshot", self.target.addr);
+        let scheme = if self.target.addr.starts_with("127.0.0.1") || self.target.addr.starts_with("localhost") { "http" } else { "https" };
+        let url = format!("{}://{}/raft/snapshot", scheme, self.target.addr);
         let resp = self.client.post(&url).json(&req).send().await
             .map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
         
@@ -74,7 +76,8 @@ impl RaftNetwork<OmniTypeConfig> for OmniNetworkConnection {
         req: VoteRequest<u64>,
         _option: openraft::network::RPCOption,
     ) -> Result<VoteResponse<u64>, RPCError<u64, OmniNode, RaftError<u64>>> {
-        let url = format!("https://{}/raft/vote", self.target.addr);
+        let scheme = if self.target.addr.starts_with("127.0.0.1") || self.target.addr.starts_with("localhost") { "http" } else { "https" };
+        let url = format!("{}://{}/raft/vote", scheme, self.target.addr);
         let resp = self.client.post(&url).json(&req).send().await
             .map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
         

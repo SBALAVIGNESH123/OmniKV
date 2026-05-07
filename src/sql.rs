@@ -57,6 +57,19 @@ pub enum SelectColumn {
     Named(String),
     Qualified(String, String), // table.column
     Aggregate(AggFunc, String),
+    /// Window function: ROW_NUMBER() / RANK() / DENSE_RANK() OVER (ORDER BY col [ASC|DESC])
+    WindowFunc {
+        func: WindowFuncType,
+        order_by: String,
+        desc: bool,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum WindowFuncType {
+    RowNumber,
+    Rank,
+    DenseRank,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -100,6 +113,8 @@ pub enum WhereExpr {
     IsNull(String),
     IsNotNull(String),
     In(String, Vec<SqlValue>),
+    /// Subquery: WHERE column IN (SELECT ...)
+    InSubquery(String, Box<SqlStatement>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -423,6 +438,37 @@ fn parse_select_sql(tokens: &[String]) -> Result<SqlStatement, String> {
         }
         if tokens[i] == "*" {
             columns.push(SelectColumn::Star);
+        } else if upper == "ROW_NUMBER" || upper == "RANK" || upper == "DENSE_RANK" {
+            // Window function: ROW_NUMBER() OVER (ORDER BY col [DESC])
+            let func = match upper.as_str() {
+                "ROW_NUMBER" => WindowFuncType::RowNumber,
+                "RANK" => WindowFuncType::Rank,
+                "DENSE_RANK" => WindowFuncType::DenseRank,
+                _ => unreachable!(),
+            };
+            i += 1;
+            // Skip ( )
+            if tokens.get(i).map(|t| t.as_str()) == Some("(") { i += 1; }
+            if tokens.get(i).map(|t| t.as_str()) == Some(")") { i += 1; }
+            // OVER
+            if tokens.get(i).map(|t| t.to_uppercase()) == Some("OVER".into()) { i += 1; }
+            // (
+            if tokens.get(i).map(|t| t.as_str()) == Some("(") { i += 1; }
+            // ORDER BY
+            if tokens.get(i).map(|t| t.to_uppercase()) == Some("ORDER".into()) { i += 1; }
+            if tokens.get(i).map(|t| t.to_uppercase()) == Some("BY".into()) { i += 1; }
+            let order_col = tokens.get(i).cloned().unwrap_or_default();
+            i += 1;
+            let desc = if tokens.get(i).map(|t| t.to_uppercase()) == Some("DESC".into()) {
+                i += 1; true
+            } else {
+                if tokens.get(i).map(|t| t.to_uppercase()) == Some("ASC".into()) { i += 1; }
+                false
+            };
+            // )
+            if tokens.get(i).map(|t| t.as_str()) == Some(")") { i += 1; }
+            columns.push(SelectColumn::WindowFunc { func, order_by: order_col, desc });
+            continue;
         } else if upper == "COUNT"
             || upper == "SUM"
             || upper == "AVG"
@@ -669,10 +715,31 @@ fn parse_where_atom(tokens: &[String], start: usize) -> Result<(WhereExpr, usize
     }
 
     if i < tokens.len() && tokens[i].to_uppercase() == "IN" {
-        i += 1; // skip (
+        i += 1;
         if i < tokens.len() && tokens[i] == "(" {
             i += 1;
         }
+        // Check if this is a subquery: IN (SELECT ...)
+        if i < tokens.len() && tokens[i].to_uppercase() == "SELECT" {
+            // Collect all tokens until matching )
+            let mut depth = 1;
+            let sub_start = i;
+            let mut sub_end = i;
+            while sub_end < tokens.len() {
+                if tokens[sub_end] == "(" { depth += 1; }
+                if tokens[sub_end] == ")" {
+                    depth -= 1;
+                    if depth == 0 { break; }
+                }
+                sub_end += 1;
+            }
+            let sub_sql = tokens[sub_start..sub_end].join(" ");
+            let sub_stmt = parse_sql(&sub_sql)?;
+            i = sub_end;
+            if i < tokens.len() && tokens[i] == ")" { i += 1; }
+            return Ok((WhereExpr::InSubquery(col_name, Box::new(sub_stmt)), i));
+        }
+        // Regular IN (val1, val2, ...)
         let mut vals = Vec::new();
         while i < tokens.len() && tokens[i] != ")" {
             if tokens[i] != "," {

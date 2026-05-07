@@ -38,10 +38,11 @@ const PARAMETER_STATUS: u8 = b'S';
 const QUERY_MSG: u8 = b'Q';
 const TERMINATE_MSG: u8 = b'X';
 
-/// Represents a PostgreSQL wire protocol server.
+/// Represents a PostgreSQL wire protocol server with connection pooling.
 pub struct PgWireServer {
     db: Arc<OmniKV>,
     bind_addr: String,
+    max_connections: usize,
 }
 
 impl PgWireServer {
@@ -49,26 +50,56 @@ impl PgWireServer {
         Self {
             db,
             bind_addr: bind_addr.to_string(),
+            max_connections: 32,
         }
     }
 
-    /// Starts the PostgreSQL wire protocol server.
-    /// This blocks and accepts connections in a loop.
+    /// Creates a PgWireServer with a custom connection pool size.
+    pub fn with_pool_size(db: Arc<OmniKV>, bind_addr: &str, max_connections: usize) -> Self {
+        Self {
+            db,
+            bind_addr: bind_addr.to_string(),
+            max_connections,
+        }
+    }
+
+    /// Returns the configured max connections.
+    pub fn max_connections(&self) -> usize {
+        self.max_connections
+    }
+
+    /// Starts the PostgreSQL wire protocol server with connection pooling.
+    /// Uses a bounded thread pool to prevent resource exhaustion.
     pub fn start(&self) -> std::io::Result<()> {
         let listener = TcpListener::bind(&self.bind_addr)?;
         eprintln!(
-            "[OmniKV] PostgreSQL wire protocol listening on {}",
-            self.bind_addr
+            "[OmniKV] PostgreSQL wire protocol listening on {} (pool: {} max connections)",
+            self.bind_addr, self.max_connections
         );
+
+        // Bounded connection semaphore using a channel
+        let (permit_tx, permit_rx) = std::sync::mpsc::sync_channel::<()>(self.max_connections);
+        // Pre-fill permits
+        for _ in 0..self.max_connections {
+            let _ = permit_tx.send(());
+        }
 
         for stream in listener.incoming() {
             match stream {
                 Ok(stream) => {
+                    // Wait for a permit (blocks if pool is full)
+                    let permit = permit_rx.recv();
+                    if permit.is_err() {
+                        break;
+                    }
                     let db = self.db.clone();
+                    let release_tx = permit_tx.clone();
                     std::thread::spawn(move || {
                         if let Err(e) = handle_connection(db, stream) {
                             eprintln!("[OmniKV] Connection error: {}", e);
                         }
+                        // Release permit back to pool
+                        let _ = release_tx.send(());
                     });
                 }
                 Err(e) => eprintln!("[OmniKV] Accept error: {}", e),
