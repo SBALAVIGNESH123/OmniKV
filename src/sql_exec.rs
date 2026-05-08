@@ -80,10 +80,28 @@ impl SqlExecutor {
                     rows,
                 })
             }
-            SqlStatement::Explain(inner) => Ok(ExecResult::Rows {
-                columns: vec!["plan".into()],
-                rows: vec![vec![format!("{:?}", inner)]],
-            }),
+            SqlStatement::Explain(inner) => {
+                // Use the cost-based optimizer for real EXPLAIN output
+                let stats = crate::optimizer::gather_stats(&self.catalog, None, &self.db);
+                let optimizer = crate::optimizer::Optimizer::new(stats);
+                match optimizer.optimize(inner) {
+                    Ok(plan) => {
+                        let plan_text = format!("{}", plan);
+                        let rows: Vec<Vec<String>> = plan_text
+                            .lines()
+                            .map(|line| vec![line.to_string()])
+                            .collect();
+                        Ok(ExecResult::Rows {
+                            columns: vec!["QUERY PLAN".into()],
+                            rows,
+                        })
+                    }
+                    Err(_) => Ok(ExecResult::Rows {
+                        columns: vec!["QUERY PLAN".into()],
+                        rows: vec![vec![format!("{:?}", inner)]],
+                    }),
+                }
+            }
         }
     }
 

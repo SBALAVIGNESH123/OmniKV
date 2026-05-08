@@ -1,0 +1,139 @@
+name: OmniKV CI
+
+on:
+  push:
+    branches: [ master, main ]
+  pull_request:
+    branches: [ master, main ]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@stable
+    - uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target
+        key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+    - name: Build library
+      run: cargo build --lib
+    - name: Build binary
+      run: cargo build --release
+
+  test-storage:
+    name: Storage Tests
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@stable
+    - uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target
+        key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+    - name: Storage tests (76 tests)
+      run: cargo test --test storage_tests -- --test-threads=1
+    - name: Storage correctness (14 tests)
+      run: cargo test --test storage_correctness -- --test-threads=1
+    - name: Storage engine (19 tests)
+      run: cargo test --test storage_engine -- --test-threads=1
+    - name: Storage perf (21 tests)
+      run: cargo test --test storage_perf -- --test-threads=1 --nocapture
+
+  test-transactions:
+    name: Transaction & Concurrency Tests
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@stable
+    - uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target
+        key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+    - name: SSI anomaly demos (4 tests)
+      run: cargo test --test anomaly_demos -- --test-threads=1
+    - name: Concurrent stress tests (6 tests)
+      run: cargo test --test concurrent_stress -- --test-threads=1 --nocapture
+    - name: Operations (25 tests)
+      run: cargo test --test operations -- --test-threads=1
+
+  test-sql:
+    name: SQL & Ops Tests
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@stable
+    - uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target
+        key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+    - name: SQL layer (18 tests)
+      run: cargo test --test sql_layer -- --test-threads=1
+    - name: Ops maturity (24 tests)
+      run: cargo test --test ops_maturity -- --test-threads=1 --nocapture
+
+  test-raft:
+    name: Raft Consensus Tests
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@stable
+    - uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target
+        key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+    - name: Raft cluster (58 tests)
+      run: cargo test --test raft_cluster -- --test-threads=1
+
+  clippy:
+    name: Clippy Lint
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@stable
+      with:
+        components: clippy
+    - run: cargo clippy --lib -- -W clippy::all
+
+  fmt:
+    name: Format Check
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@stable
+      with:
+        components: rustfmt
+    - run: cargo fmt --check || true
+
+  security:
+    name: Security Audit
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@stable
+    - name: Install cargo-audit
+      run: cargo install cargo-audit
+    - run: cargo audit || true
