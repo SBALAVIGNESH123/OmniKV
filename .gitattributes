@@ -1,0 +1,23 @@
+# OmniKV — Language detection overrides
+# Mark build artifacts and vendored code so GitHub shows Rust correctly
+
+# Build artifacts (should not have been committed)
+omni-client/target/** linguist-generated
+target/** linguist-generated
+target2/** linguist-generated
+target3/** linguist-generated
+target_check/** linguist-generated
+target_check_2/** linguist-generated
+target_check_3/** linguist-generated
+target_check_4/** linguist-generated
+
+# Client SDK files (separate languages, not the core engine)
+clients/** linguist-vendored
+
+# Build logs
+*.txt linguist-documentation
+*.log linguist-documentation
+
+# Binary/data files
+*.bin linguist-generated
+*.bloom linguist-generated

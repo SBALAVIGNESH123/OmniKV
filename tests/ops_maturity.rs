@@ -128,10 +128,12 @@ fn test_diagnostic_after_compaction() {
 
 #[test]
 fn test_prometheus_metrics_render() {
+    // Force lazy_static metric registration
+    metrics_prometheus::COMMIT_RATE.inc();
     let output = metrics_prometheus::render_metrics();
-    // Should contain our registered metrics
-    assert!(output.contains("omnikv_") || output.is_empty() == false);
-    println!("✅ OPS: Prometheus metrics render ({} bytes)", output.len());
+    assert!(!output.is_empty(), "Prometheus output should not be empty");
+    assert!(output.contains("omnikv_"), "Output should contain omnikv_ metrics");
+    println!("? OPS: Prometheus metrics render ({} bytes)", output.len());
 }
 
 #[test]

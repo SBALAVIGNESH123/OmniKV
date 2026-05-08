@@ -274,65 +274,128 @@ impl SqlExecutor {
         order_by: &[OrderByItem],
         limit: Option<usize>,
     ) -> Result<ExecResult, String> {
-        // Load rows
+        // ═══ Production path: Optimizer → Volcano iterators ═══
+        let has_window = columns.iter().any(|c| matches!(c, SelectColumn::WindowFunc { .. }));
+
+        let stmt = SqlStatement::Select {
+            columns: columns.to_vec(),
+            from: from.clone(),
+            where_clause: where_clause.cloned(),
+            group_by: group_by.to_vec(),
+            order_by: order_by.to_vec(),
+            limit,
+        };
+
+        let stats = crate::optimizer::gather_stats(&self.catalog, None, &self.db);
+        let optimizer = crate::optimizer::Optimizer::new(stats);
+
+        match optimizer.optimize(&stmt) {
+            Ok(plan) => {
+                use crate::volcano::{compile_plan, RowIterator};
+                let mut iter = compile_plan(&plan, &self.db, &self.catalog);
+
+                let mut rows: Vec<Row> = Vec::new();
+                while let Some(row) = iter.next_row() {
+                    rows.push(row);
+                }
+
+                if has_window {
+                    self.apply_window_functions(&mut rows, columns);
+                }
+
+                let (col_names, result_rows) = self.project(&rows, columns)?;
+                Ok(ExecResult::Rows {
+                    columns: col_names,
+                    rows: result_rows,
+                })
+            }
+            Err(_) => {
+                self.exec_select_legacy(columns, from, where_clause, group_by, order_by, limit)
+            }
+        }
+    }
+
+    /// Window function post-processing (ROW_NUMBER, RANK, DENSE_RANK).
+    fn apply_window_functions(&self, rows: &mut Vec<Row>, columns: &[SelectColumn]) {
+        for col in columns {
+            if let SelectColumn::WindowFunc { order_by: ob, desc, .. } = col {
+                let ob = ob.clone();
+                rows.sort_by(|a, b| {
+                    let va = a.get(&ob).cloned().unwrap_or_default();
+                    let vb = b.get(&ob).cloned().unwrap_or_default();
+                    let cmp = smart_cmp(&va, &vb);
+                    if *desc { cmp.reverse() } else { cmp }
+                });
+                break;
+            }
+        }
+        for col in columns {
+            if let SelectColumn::WindowFunc { func, order_by: ob, .. } = col {
+                let mut prev_val = String::new();
+                let mut rank = 0usize;
+                let mut dense_rank = 0usize;
+                for (i, row) in rows.iter_mut().enumerate() {
+                    let cur_val = row.get(ob).cloned().unwrap_or_default();
+                    match func {
+                        WindowFuncType::RowNumber => {
+                            row.insert("row_number".into(), (i + 1).to_string());
+                        }
+                        WindowFuncType::Rank => {
+                            if cur_val != prev_val { rank = i + 1; }
+                            row.insert("rank".into(), rank.to_string());
+                        }
+                        WindowFuncType::DenseRank => {
+                            if cur_val != prev_val { dense_rank += 1; }
+                            row.insert("dense_rank".into(), dense_rank.to_string());
+                        }
+                    }
+                    prev_val = cur_val;
+                }
+                break;
+            }
+        }
+    }
+
+    /// Legacy execution path — fallback for queries the optimizer can't handle.
+    fn exec_select_legacy(
+        &self,
+        columns: &[SelectColumn],
+        from: &FromClause,
+        where_clause: Option<&WhereExpr>,
+        group_by: &[String],
+        order_by: &[OrderByItem],
+        limit: Option<usize>,
+    ) -> Result<ExecResult, String> {
         let mut rows = match from {
             FromClause::Table(name) => {
-                let table = self
-                    .catalog
-                    .get_table(name)
+                let table = self.catalog.get_table(name)
                     .ok_or_else(|| format!("Table '{}' not found", name))?;
                 self.load_table_rows(&table)
             }
-            FromClause::Join {
-                left,
-                right,
-                join_type,
-                on_left,
-                on_right,
-            } => {
-                let lt = self
-                    .catalog
-                    .get_table(left)
+            FromClause::Join { left, right, join_type, on_left, on_right } => {
+                let lt = self.catalog.get_table(left)
                     .ok_or_else(|| format!("Table '{}' not found", left))?;
-                let rt = self
-                    .catalog
-                    .get_table(right)
+                let rt = self.catalog.get_table(right)
                     .ok_or_else(|| format!("Table '{}' not found", right))?;
-
                 let left_rows = self.load_table_rows(&lt);
                 let right_rows = self.load_table_rows(&rt);
-
-                self.execute_join(
-                    &left_rows,
-                    &right_rows,
-                    left,
-                    right,
-                    on_left,
-                    on_right,
-                    join_type,
-                )
+                self.execute_join(&left_rows, &right_rows, left, right, on_left, on_right, join_type)
             }
         };
 
-        // WHERE filter
         if let Some(expr) = where_clause {
             rows.retain(|row| eval_where(row, expr));
         }
 
-        // GROUP BY + aggregates
         if !group_by.is_empty() {
             return self.exec_group_by(&rows, columns, group_by, order_by, limit);
         }
 
-        // Check for aggregate without GROUP BY
-        let has_agg = columns
-            .iter()
-            .any(|c| matches!(c, SelectColumn::Aggregate(..)));
+        let has_agg = columns.iter().any(|c| matches!(c, SelectColumn::Aggregate(..)));
         if has_agg {
             return self.exec_aggregate_no_group(&rows, columns);
         }
 
-        // ORDER BY
         for item in order_by.iter().rev() {
             let col = item.column.clone();
             let desc = item.desc;
@@ -344,56 +407,10 @@ impl SqlExecutor {
             });
         }
 
-        // Window functions: apply after ORDER BY, before LIMIT
-        let has_window = columns.iter().any(|c| matches!(c, SelectColumn::WindowFunc { .. }));
-        if has_window {
-            // Sort rows by window function's ORDER BY column
-            for col in columns {
-                if let SelectColumn::WindowFunc { order_by: ob, desc, .. } = col {
-                    let ob = ob.clone();
-                    rows.sort_by(|a, b| {
-                        let va = a.get(&ob).cloned().unwrap_or_default();
-                        let vb = b.get(&ob).cloned().unwrap_or_default();
-                        let cmp = smart_cmp(&va, &vb);
-                        if *desc { cmp.reverse() } else { cmp }
-                    });
-                    break; // Use the first window function's order
-                }
-            }
-            // Assign row numbers / ranks
-            for col in columns {
-                if let SelectColumn::WindowFunc { func, order_by: ob, .. } = col {
-                    let mut prev_val = String::new();
-                    let mut rank = 0usize;
-                    let mut dense_rank = 0usize;
-                    for (i, row) in rows.iter_mut().enumerate() {
-                        let cur_val = row.get(ob).cloned().unwrap_or_default();
-                        match func {
-                            WindowFuncType::RowNumber => {
-                                row.insert("row_number".into(), (i + 1).to_string());
-                            }
-                            WindowFuncType::Rank => {
-                                if cur_val != prev_val { rank = i + 1; }
-                                row.insert("rank".into(), rank.to_string());
-                            }
-                            WindowFuncType::DenseRank => {
-                                if cur_val != prev_val { dense_rank += 1; }
-                                row.insert("dense_rank".into(), dense_rank.to_string());
-                            }
-                        }
-                        prev_val = cur_val;
-                    }
-                    break;
-                }
-            }
-        }
-
-        // LIMIT
         if let Some(lim) = limit {
             rows.truncate(lim);
         }
 
-        // Project columns
         let (col_names, result_rows) = self.project(&rows, columns)?;
         Ok(ExecResult::Rows {
             columns: col_names,
