@@ -19,6 +19,15 @@ use std::sync::Arc;
 
 // ─── Table Statistics ───────────────────────────────────────────────────────
 
+/// Per-column histogram for selectivity estimation.
+#[derive(Debug, Clone)]
+pub struct ColumnHistogram {
+    pub column: String,
+    pub distinct_count: u64,
+    pub null_fraction: f64,
+    pub most_common: Vec<(String, f64)>, // (value, frequency)
+}
+
 /// Lightweight statistics for cost estimation.
 #[derive(Debug, Clone)]
 pub struct TableStats {
@@ -26,12 +35,20 @@ pub struct TableStats {
     pub row_count: u64,
     pub avg_row_bytes: u64,
     pub indexes: Vec<IndexDefinition>,
+    pub histograms: Vec<ColumnHistogram>,
 }
 
 impl TableStats {
     pub fn estimated_pages(&self) -> u64 {
         let total_bytes = self.row_count * self.avg_row_bytes;
-        (total_bytes / 4096).max(1) // 4KB pages
+        (total_bytes / 4096).max(1)
+    }
+
+    /// Get NDV (number of distinct values) for a column.
+    pub fn ndv(&self, column: &str) -> Option<u64> {
+        self.histograms.iter()
+            .find(|h| h.column.eq_ignore_ascii_case(column))
+            .map(|h| h.distinct_count)
     }
 }
 
@@ -71,6 +88,36 @@ pub fn gather_stats(
                 vec![]
             };
 
+            // Build histograms from sampled data
+            let mut histograms = Vec::new();
+            if row_count > 0 {
+                let sample = db
+                    .scan(&prefix, &format!("{}\x7F", prefix), seq)
+                    .unwrap_or_default();
+                let mut col_values: std::collections::HashMap<String, std::collections::HashSet<String>> = std::collections::HashMap::new();
+                let mut col_nulls: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+                let sample_size = sample.len().min(1000);
+                for (_, value) in sample.iter().take(sample_size) {
+                    if let Ok(row) = serde_json::from_str::<std::collections::HashMap<String, String>>(value) {
+                        for (col, val) in &row {
+                            col_values.entry(col.clone()).or_default().insert(val.clone());
+                            if val == "NULL" || val.is_empty() {
+                                *col_nulls.entry(col.clone()).or_default() += 1;
+                            }
+                        }
+                    }
+                }
+                for (col, vals) in &col_values {
+                    let null_count = col_nulls.get(col).copied().unwrap_or(0);
+                    histograms.push(ColumnHistogram {
+                        column: col.clone(),
+                        distinct_count: vals.len() as u64,
+                        null_fraction: if sample_size > 0 { null_count as f64 / sample_size as f64 } else { 0.0 },
+                        most_common: vec![], // TODO: frequency counting
+                    });
+                }
+            }
+
             stats.insert(
                 table_name.clone(),
                 TableStats {
@@ -78,6 +125,7 @@ pub fn gather_stats(
                     row_count,
                     avg_row_bytes,
                     indexes,
+                    histograms,
                 },
             );
         }
@@ -189,28 +237,177 @@ const FILTER_COST_PER_ROW: f64 = 0.1;
 
 // ─── Selectivity Estimation ─────────────────────────────────────────────────
 
-/// Estimate fraction of rows surviving a WHERE predicate (0.0 to 1.0).
-fn estimate_selectivity(expr: &WhereExpr) -> f64 {
+/// Estimate selectivity, optionally using histogram data.
+pub fn estimate_selectivity(expr: &WhereExpr) -> f64 {
+    estimate_selectivity_with_stats(expr, None)
+}
+
+/// Estimate selectivity using histogram when available.
+pub fn estimate_selectivity_with_stats(expr: &WhereExpr, stats: Option<&TableStats>) -> f64 {
     match expr {
-        WhereExpr::Comparison { op, .. } => match op {
-            CmpOp::Eq => 0.1,     // 10% — equality is selective
-            CmpOp::Ne => 0.9,     // 90% — not-equal keeps most
-            CmpOp::Lt | CmpOp::Gt => 0.33,
-            CmpOp::Lte | CmpOp::Gte => 0.33,
-            CmpOp::Like => 0.25,
-        },
-        WhereExpr::And(a, b) => estimate_selectivity(a) * estimate_selectivity(b),
+        WhereExpr::Comparison { column, op, .. } => {
+            // Use histogram NDV if available
+            if let Some(st) = stats {
+                if let Some(ndv) = st.ndv(column) {
+                    if ndv > 0 {
+                        return match op {
+                            CmpOp::Eq => 1.0 / ndv as f64,        // exact: 1/NDV
+                            CmpOp::Ne => 1.0 - (1.0 / ndv as f64),
+                            CmpOp::Lt | CmpOp::Gt => 1.0 / 3.0,
+                            CmpOp::Lte | CmpOp::Gte => 1.0 / 3.0,
+                            CmpOp::Like => 0.25,
+                        };
+                    }
+                }
+            }
+            // Fallback: hardcoded estimates
+            match op {
+                CmpOp::Eq => 0.1,
+                CmpOp::Ne => 0.9,
+                CmpOp::Lt | CmpOp::Gt => 0.33,
+                CmpOp::Lte | CmpOp::Gte => 0.33,
+                CmpOp::Like => 0.25,
+            }
+        }
+        WhereExpr::And(a, b) => {
+            estimate_selectivity_with_stats(a, stats) * estimate_selectivity_with_stats(b, stats)
+        }
         WhereExpr::Or(a, b) => {
-            let sa = estimate_selectivity(a);
-            let sb = estimate_selectivity(b);
+            let sa = estimate_selectivity_with_stats(a, stats);
+            let sb = estimate_selectivity_with_stats(b, stats);
             (sa + sb - sa * sb).min(1.0)
         }
-        WhereExpr::Not(inner) => 1.0 - estimate_selectivity(inner),
-        WhereExpr::IsNull(_) => 0.05,
-        WhereExpr::IsNotNull(_) => 0.95,
+        WhereExpr::Not(inner) => 1.0 - estimate_selectivity_with_stats(inner, stats),
+        WhereExpr::IsNull(col) => {
+            // Use null_fraction from histogram if available
+            if let Some(st) = stats {
+                if let Some(h) = st.histograms.iter().find(|h| h.column.eq_ignore_ascii_case(col)) {
+                    return h.null_fraction;
+                }
+            }
+            0.05
+        }
+        WhereExpr::IsNotNull(col) => {
+            if let Some(st) = stats {
+                if let Some(h) = st.histograms.iter().find(|h| h.column.eq_ignore_ascii_case(col)) {
+                    return 1.0 - h.null_fraction;
+                }
+            }
+            0.95
+        }
         WhereExpr::In(_, vals) => (vals.len() as f64 * 0.1).min(0.8),
-        WhereExpr::InSubquery(_, _) => 0.5, // unknown
+        WhereExpr::InSubquery(_, _) => 0.5,
     }
+}
+
+// ─── Predicate Pushdown ─────────────────────────────────────────────────────
+
+/// Split a WHERE clause into conjuncts (AND-separated predicates).
+pub fn split_conjuncts(expr: &WhereExpr) -> Vec<WhereExpr> {
+    match expr {
+        WhereExpr::And(a, b) => {
+            let mut parts = split_conjuncts(a);
+            parts.extend(split_conjuncts(b));
+            parts
+        }
+        other => vec![other.clone()],
+    }
+}
+
+/// Rebuild a WHERE from conjuncts (ANDs them back together).
+pub fn conjuncts_to_expr(parts: &[WhereExpr]) -> Option<WhereExpr> {
+    if parts.is_empty() {
+        return None;
+    }
+    let mut result = parts[0].clone();
+    for part in &parts[1..] {
+        result = WhereExpr::And(Box::new(result), Box::new(part.clone()));
+    }
+    Some(result)
+}
+
+/// Classify which table(s) a predicate references.
+fn predicate_tables(expr: &WhereExpr) -> Vec<String> {
+    let cols = extract_where_columns(expr);
+    cols.into_iter()
+        .filter_map(|c| {
+            if c.contains('.') {
+                Some(c.split('.').next().unwrap().to_string())
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// Push predicates down into join sides.
+/// Returns (left_preds, right_preds, remaining_preds).
+pub fn pushdown_join_predicates(
+    where_clause: Option<&WhereExpr>,
+    left_table: &str,
+    right_table: &str,
+) -> (Option<WhereExpr>, Option<WhereExpr>, Option<WhereExpr>) {
+    let expr = match where_clause {
+        Some(e) => e,
+        None => return (None, None, None),
+    };
+
+    let conjuncts = split_conjuncts(expr);
+    let mut left_preds = Vec::new();
+    let mut right_preds = Vec::new();
+    let mut remaining = Vec::new();
+
+    for pred in conjuncts {
+        let tables = predicate_tables(&pred);
+        let _cols = extract_where_columns(&pred);
+
+        if tables.iter().all(|t| t.eq_ignore_ascii_case(left_table)) {
+            left_preds.push(pred);
+        } else if tables.iter().all(|t| t.eq_ignore_ascii_case(right_table)) {
+            right_preds.push(pred);
+        } else if tables.is_empty() {
+            // Unqualified column — try to match by checking column names
+            // Push to both sides (will be a no-op on the wrong side)
+            remaining.push(pred);
+        } else {
+            remaining.push(pred);
+        }
+    }
+
+    (
+        conjuncts_to_expr(&left_preds),
+        conjuncts_to_expr(&right_preds),
+        conjuncts_to_expr(&remaining),
+    )
+}
+
+// ─── Column Extraction (for pruning) ────────────────────────────────────────
+
+/// Extract all column names needed by a SELECT query.
+pub fn extract_needed_columns(columns: &[SelectColumn], where_clause: Option<&WhereExpr>, order_by: &[OrderByItem], group_by: &[String]) -> Vec<String> {
+    let mut needed = Vec::new();
+
+    for col in columns {
+        match col {
+            SelectColumn::Star => return vec![], // need all columns
+            SelectColumn::Named(n) => needed.push(n.clone()),
+            SelectColumn::Qualified(_, n) => needed.push(n.clone()),
+            SelectColumn::Aggregate(_, target) => needed.push(target.clone()),
+            SelectColumn::WindowFunc { order_by: ob, .. } => needed.push(ob.clone()),
+        }
+    }
+
+    if let Some(expr) = where_clause {
+        needed.extend(extract_where_columns(expr));
+    }
+    for item in order_by {
+        needed.push(item.column.clone());
+    }
+    needed.extend(group_by.iter().cloned());
+
+    needed.sort();
+    needed.dedup();
+    needed
 }
 
 // ─── Optimizer ──────────────────────────────────────────────────────────────
@@ -546,12 +743,14 @@ mod tests {
             row_count: 10000,
             avg_row_bytes: 256,
             indexes: vec![],
+            histograms: vec![],
         });
         m.insert("orders".into(), TableStats {
             table_name: "orders".into(),
             row_count: 100000,
             avg_row_bytes: 128,
             indexes: vec![],
+            histograms: vec![],
         });
         m
     }

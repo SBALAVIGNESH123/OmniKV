@@ -52,6 +52,7 @@ pub mod raft_init;
 pub mod raft_routes;
 pub mod ops;
 pub mod optimizer;
+pub mod plan_exec;
 
 
 #[derive(Debug, Clone)]

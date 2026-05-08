@@ -102,6 +102,41 @@ impl SqlExecutor {
                     }),
                 }
             }
+            SqlStatement::ExplainAnalyze(inner) => {
+                // Run the query through the plan executor and collect stats
+                let stats = crate::optimizer::gather_stats(&self.catalog, None, &self.db);
+                let optimizer = crate::optimizer::Optimizer::new(stats);
+                match optimizer.optimize(inner) {
+                    Ok(plan) => {
+                        let plan_exec = crate::plan_exec::PlanExecutor::new(
+                            self.db.clone(), self.catalog.clone()
+                        );
+                        match plan_exec.explain_analyze(&plan) {
+                            Ok((_rows, node_stats)) => {
+                                let mut output = Vec::new();
+                                for (label, ns) in &node_stats {
+                                    output.push(vec![format!(
+                                        "{} (est. rows={}, actual rows={}, time={:.3}ms)",
+                                        label, ns.estimated_rows, ns.actual_rows, ns.actual_time_ms
+                                    )]);
+                                }
+                                Ok(ExecResult::Rows {
+                                    columns: vec!["QUERY PLAN (ANALYZE)".into()],
+                                    rows: output,
+                                })
+                            }
+                            Err(e) => Ok(ExecResult::Rows {
+                                columns: vec!["QUERY PLAN (ANALYZE)".into()],
+                                rows: vec![vec![format!("Error: {}", e)]],
+                            }),
+                        }
+                    }
+                    Err(_) => Ok(ExecResult::Rows {
+                        columns: vec!["QUERY PLAN (ANALYZE)".into()],
+                        rows: vec![vec![format!("{:?}", inner)]],
+                    }),
+                }
+            }
         }
     }
 

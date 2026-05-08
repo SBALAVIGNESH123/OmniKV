@@ -40,6 +40,7 @@ pub enum SqlStatement {
     },
     ShowTables,
     Explain(Box<SqlStatement>),
+    ExplainAnalyze(Box<SqlStatement>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -172,8 +173,13 @@ pub fn parse_sql(input: &str) -> Result<SqlStatement, String> {
         "DELETE" => parse_delete_sql(&tokens),
         "SHOW" => Ok(SqlStatement::ShowTables),
         "EXPLAIN" => {
-            let inner = parse_sql(&tokens[1..].join(" "))?;
-            Ok(SqlStatement::Explain(Box::new(inner)))
+            if tokens.get(1).map(|t| t.to_uppercase()) == Some("ANALYZE".into()) {
+                let inner = parse_sql(&tokens[2..].join(" "))?;
+                Ok(SqlStatement::ExplainAnalyze(Box::new(inner)))
+            } else {
+                let inner = parse_sql(&tokens[1..].join(" "))?;
+                Ok(SqlStatement::Explain(Box::new(inner)))
+            }
         }
         _ => Err(format!("Unsupported: {}", tokens[0])),
     }
