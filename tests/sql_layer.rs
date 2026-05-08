@@ -358,7 +358,7 @@ fn test_explain() {
     exec_sql(&exec, "CREATE TABLE expl_t (id INTEGER PRIMARY KEY)");
 
     let (cols, rows) = exec_rows(&exec, "EXPLAIN SELECT * FROM expl_t");
-    assert_eq!(cols[0], "plan");
+    assert_eq!(cols[0], "QUERY PLAN");
     assert!(!rows.is_empty());
 
     println!("✅ SQL 31c: EXPLAIN produces query plan output");

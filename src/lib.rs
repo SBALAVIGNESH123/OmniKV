@@ -53,6 +53,7 @@ pub mod raft_routes;
 pub mod ops;
 pub mod optimizer;
 pub mod plan_exec;
+pub mod volcano;
 
 
 #[derive(Debug, Clone)]
