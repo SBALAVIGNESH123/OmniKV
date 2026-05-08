@@ -165,36 +165,6 @@ The storage engine is a **full LSM-tree** implementation, not a wrapper around R
 
 ---
 
-## 🏁 How OmniKV Compares
-
-| Feature | OmniKV | SQLite | Redis | etcd | CockroachDB |
-|---------|--------|--------|-------|------|-------------|
-| Written from scratch | ✅ 20K lines Rust | ✅ 150K lines C | ✅ 100K lines C | ✅ Go | ✅ Go |
-| SQL support | ✅ Full | ✅ Full | ❌ None | ❌ None | ✅ Full |
-| Cost-based optimizer | ✅ Yes | ⚠️ Basic | ❌ N/A | ❌ N/A | ✅ Yes |
-| Distributed consensus | ✅ Raft | ❌ None | ❌ None | ✅ Raft | ✅ Raft |
-| MVCC | ✅ Yes | ✅ WAL mode | ❌ None | ✅ MVCC | ✅ Yes |
-| Serializable isolation | ✅ SSI | ✅ SERIALIZABLE | ❌ None | ✅ Serializable | ✅ SSI |
-| PgWire protocol | ✅ Yes | ❌ None | ❌ RESP | ❌ gRPC | ✅ Yes |
-| HTTP API | ✅ Built-in | ❌ None | ❌ None | ✅ HTTP | ❌ Separate |
-| QUIC/HTTP3 | ✅ Yes | ❌ None | ❌ None | ❌ None | ❌ None |
-| Embeddable | ✅ Library | ✅ Library | ❌ Server | ❌ Server | ❌ Server |
-| Compression | ✅ LZ4 | ❌ None | ✅ LZF | ❌ None | ✅ Snappy |
-| Bloom filters | ✅ Yes | ❌ None | ❌ N/A | ❌ None | ✅ Yes |
-
-### Where OmniKV wins
-- **Single binary** — database + API + auth + metrics in one process
-- **Embeddable + distributed** — use as a library or as a cluster (SQLite can't cluster, CockroachDB can't embed)
-- **QUIC/HTTP3** — only database engine with native QUIC support
-- **4 protocols simultaneously** — PgWire + HTTP/2 + QUIC + TCP in one binary
-
-### Where OmniKV is still maturing
-- **Query coverage** — no HAVING, UNION, correlated subqueries yet
-- **Index execution** — optimizer selects indexes but executor still falls back to seq scan
-- **Production deployments** — zero production users (yet)
-
----
-
 ## 📊 Test Suite — 290 Tests
 
 ```
