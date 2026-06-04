@@ -10,7 +10,7 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/language-Rust-orange?style=for-the-badge&logo=rust" alt="Rust">
-  <img src="https://img.shields.io/badge/tests-302%20passing-brightgreen?style=for-the-badge" alt="Tests">
+  <img src="https://img.shields.io/badge/tests-323%20passing-brightgreen?style=for-the-badge" alt="Tests">
   <img src="https://img.shields.io/badge/crash%20cycles-1000%20·%200%20lost-brightgreen?style=for-the-badge" alt="Crash">
   <img src="https://img.shields.io/badge/soak-10%20min%20·%200%20errors-brightgreen?style=for-the-badge" alt="Soak">
   <img src="https://img.shields.io/badge/license-MIT-blue?style=for-the-badge" alt="License">
@@ -87,21 +87,21 @@ OmniKV's MVCC architecture with ArcSwap topology means readers never block write
 
 | Operation | Throughput | p50 Latency | p99 Latency |
 |-----------|-----------|-------------|-------------|
-| Random Reads (hit) | **662,288 ops/s** | 1.1 µs | 9.4 µs |
-| Sequential Reads | **764,065 ops/s** | 0.7 µs | 7.6 µs |
-| Point Read (miss) | **1,607,991 ops/s** | 0.6 µs | 1.0 µs |
-| Range Scan | **1,320,463 rows/s** | — | — |
+| Random Reads (hit) | **696,212 ops/s** | 1.0 µs | 9.3 µs |
+| Sequential Reads | **784,011 ops/s** | 0.7 µs | 5.3 µs |
+| Point Read (miss) | **1,514,835 ops/s** | 0.6 µs | 1.0 µs |
+| Range Scan | **1,299,174 rows/s** | — | — |
 
-At 8 threads, read throughput reaches **3.5 million ops/sec** — a 5.1× improvement over single-threaded performance, demonstrating near-linear scaling.
+At 8 threads, read throughput reaches **3.69 million ops/sec** — a 5.2× improvement over single-threaded performance, demonstrating near-linear scaling.
 
 ### Write Performance
 
 | Operation | Throughput | p50 Latency | p99 Latency |
 |-----------|-----------|-------------|-------------|
-| Sequential Writes | **253 ops/s** | 4,174 µs | 9,955 µs |
-| Batch Writes (100 keys/batch) | **36,465 ops/s** | 2,705 µs | 3,473 µs |
-| Mixed (80% read / 20% write) | **2,124 ops/s** | 5.1 µs | 2,687 µs |
-| SSI Transactions | **459 txns/s** | 2,127 µs | 3,104 µs |
+| Sequential Writes | **445 ops/s** | 2,218 µs | 3,099 µs |
+| Batch Writes (100 keys/batch) | **36,692 ops/s** | 2,636 µs | 3,886 µs |
+| Mixed (80% read / 20% write) | **2,285 ops/s** | 5.1 µs | 2,600 µs |
+| SSI Transactions | **331 txns/s** | 2,481 µs | 5,272 µs |
 
 ### Thread Scaling — Group Commit v2 Proof
 
@@ -109,17 +109,17 @@ Group commit v2 batches concurrent fsyncs without sleeping. The write scaling nu
 
 | Threads | Write ops/sec | Scaling |
 |---------|--------------|---------|
-| 1 | 427 | 1.0× |
-| 2 | 680 | 1.6× |
-| 4 | 1,327 | **3.1×** |
-| 8 | 2,433 | **5.7×** |
+| 1 | 219 | 1.0× |
+| 2 | 409 | 1.9× |
+| 4 | 709 | **3.2×** |
+| 8 | 2,479 | **11.3×** |
 
 | Threads | Read ops/sec | Scaling |
 |---------|-------------|---------|
-| 1 | 696,933 | 1.0× |
-| 2 | 1,911,534 | 2.7× |
-| 4 | 2,389,315 | 3.4× |
-| 8 | 3,533,419 | **5.1×** |
+| 1 | 713,572 | 1.0× |
+| 2 | 1,935,854 | 2.7× |
+| 4 | 2,287,502 | 3.2× |
+| 8 | 3,690,854 | **5.2×** |
 
 Write performance is bounded by fsync durability guarantees. Our group commit engine (v2) batches multiple concurrent fsyncs into a single disk I/O — reducing syscalls by up to N× under concurrent write load while maintaining full crash safety.
 
@@ -241,6 +241,48 @@ The `FilterIter` uses O(1) memory — it never buffers rows. The `HashJoinIter` 
 
 ---
 
+## SQL Feature Coverage
+
+OmniKV's SQL engine covers the features that matter for real applications:
+
+### Query Features
+| Feature | Status | Example |
+|---------|--------|---------|
+| SELECT / INSERT / UPDATE / DELETE | ✅ | Full CRUD |
+| WHERE (AND, OR, NOT, LIKE, IN, IS NULL) | ✅ | Complex predicates |
+| JOINs (INNER, LEFT, RIGHT) | ✅ | Multi-table queries |
+| GROUP BY + Aggregates (COUNT, SUM, AVG, MIN, MAX) | ✅ | Analytics |
+| HAVING | ✅ | `HAVING COUNT(*) > 5` |
+| ORDER BY (ASC/DESC) | ✅ | Sorted output |
+| LIMIT + OFFSET | ✅ | Pagination |
+| Subqueries | ✅ | `WHERE id IN (SELECT ...)` |
+| UNION / UNION ALL | ✅ | Set union |
+| INTERSECT / EXCEPT | ✅ | Set intersection / difference |
+| Window Functions | ✅ | ROW_NUMBER, RANK, DENSE_RANK |
+| EXPLAIN / EXPLAIN ANALYZE | ✅ | Query plan inspection |
+| Prepared Statements | ✅ | Parameterized queries |
+
+### DDL & Schema
+| Feature | Status | Example |
+|---------|--------|---------|
+| CREATE TABLE / DROP TABLE | ✅ | Schema management |
+| ALTER TABLE (ADD/DROP COLUMN) | ✅ | Schema migration |
+| Secondary Indexes | ✅ | B-tree indexes |
+| IF NOT EXISTS / IF EXISTS | ✅ | Idempotent DDL |
+| SHOW TABLES | ✅ | Schema inspection |
+
+### Production Features
+| Feature | Status | Details |
+|---------|--------|---------|
+| Query Timeout | ✅ | 30s default, configurable |
+| Slow Query Log | ✅ | 100ms threshold |
+| MVCC Auto-GC | ✅ | Background compaction-triggered |
+| TOML Config File | ✅ | All settings configurable |
+| Encryption at Rest | ✅ | AES-256-GCM + Argon2id |
+| JWT Authentication | ✅ | Role-based access |
+
+---
+
 ## Deep Dive: Storage Engine
 
 The storage engine is a full LSM-tree implementation with MVCC, built from scratch.
@@ -341,7 +383,7 @@ cargo run --release
 
 ```
   ╔════════════════════════════════════════════════════╗
-  ║        ⚡ OmniKV v0.1.0                           ║
+  ║        ⚡ OmniKV v0.3.0                           ║
   ╠════════════════════════════════════════════════════╣
   ║  HTTPS (TLS 1.3)         → 0.0.0.0:8443          ║
   ║  QUIC / HTTP3            → 0.0.0.0:4433          ║
@@ -407,6 +449,7 @@ Every layer of OmniKV is purpose-built. There are no external storage dependenci
 ├──────────────────────────────────────────────────────────────────┤
 │  SQL ENGINE                                                      │
 │  Recursive-descent parser → Cost-based optimizer → Volcano       │
+│  Subqueries · UNION/INTERSECT/EXCEPT · HAVING · OFFSET           │
 │  Histograms · Predicate pushdown · JOIN reorder · Plan cache     │
 ├──────────────────────────────────────────────────────────────────┤
 │  TRANSACTION ENGINE                                              │
@@ -416,7 +459,7 @@ Every layer of OmniKV is purpose-built. There are no external storage dependenci
 │  STORAGE ENGINE                                                  │
 │  WAL (CRC32) → 16-shard SkipMap → SSTable → Tiered Compaction   │
 │  Heap (CRC32/entry) · Bloom filters · LRU cache · LZ4 · MVCC   │
-│  ArcSwap topology · Group commit v2 · Argon2id encryption        │
+│  ArcSwap topology · Group commit v2 · Argon2id · Auto MVCC GC   │
 ├──────────────────────────────────────────────────────────────────┤
 │  CONSENSUS                                                       │
 │  OpenRaft 0.9 · Leader election · Log replication · Snapshots    │
@@ -429,7 +472,7 @@ Every layer of OmniKV is purpose-built. There are no external storage dependenci
 
 ```
 $ cargo test --all-targets
-302 passed; 0 failed; 0 ignored
+323 passed; 0 failed; 0 ignored
 ```
 
 | Suite | Tests | What It Proves |
@@ -437,12 +480,13 @@ $ cargo test --all-targets
 | Storage Engine | 76 | WAL correctness, CRC integrity, compaction, MVCC, bloom filters |
 | **Raft Cluster** | **58** | **3-node replication, 5-node partitions, leader failover, data convergence** |
 | Operations | 25 | Schema migration, rate limiting, prepared statements |
-| Storage Correctness | 14 | Crash recovery, atomicity, snapshot isolation, torn-write handling |
-| Concurrent Stress | 21 | Multi-threaded contention, write-stall handling |
+| SQL v3 Features | 17 | OFFSET, HAVING, subqueries, UNION/INTERSECT/EXCEPT, config |
 | SQL Layer | 18 | Parser, JOINs, aggregates, optimizer, volcano execution |
+| Concurrent Stress | 21 | Multi-threaded contention, write-stall handling |
+| Storage Correctness | 14 | Crash recovery, atomicity, snapshot isolation, torn-write handling |
 | Durability Evidence | 12 | 1000 crash cycles, corruption detection, backup/restore |
 | Anomaly Demos | 4 | Write skew, phantom reads, SSI conflict detection |
-| Unit + Integration | 74 | Auth, crypto, backup, secondary index, misc |
+| Unit + Integration | 78 | Auth, crypto, config, backup, secondary index, misc |
 
 Every test uses a fresh temporary directory and cleans up after itself. Tests run in isolation.
 
@@ -481,36 +525,38 @@ OmniKV follows a trust-first development model. Each phase must produce evidence
 ## Project Structure
 
 ```
-src/                                    ~12,500 lines
-├── lib.rs              Storage engine core         2,038
-├── sql.rs              SQL parser (recursive descent) 869
+src/                                    ~14,000 lines
+├── lib.rs              Storage engine core         2,340
+├── sql.rs              SQL parser (recursive descent)1,060
 ├── optimizer.rs        Cost-based query optimizer     840
-├── sql_exec.rs         SQL execution engine           729
+├── sql_exec.rs         SQL execution engine         1,000
 ├── transaction.rs      SSI transaction engine         648
-├── volcano.rs          Volcano iterator executor      582
+├── volcano.rs          Volcano iterator executor      620
 ├── raft_storage.rs     Raft consensus storage         536
 ├── secondary_index.rs  B-tree secondary indexes       580
 ├── schema.rs           DDL engine (CREATE/ALTER/DROP) 471
 ├── pgwire.rs           PostgreSQL wire protocol       430
 ├── hardening.rs        Group commit v2, rate limiting 287
+├── config.rs           TOML configuration module      170
 ├── auth.rs             JWT + API key authentication    91
 ├── crypto.rs           AES-256-GCM + Argon2id          97
 ├── wal.rs              Write-ahead log with CRC32     250
 └── ...                 QUIC, chaos testing, backup, metrics
 
-tests/                                  ~12,000+ lines
+tests/                                  ~14,000+ lines
 ├── raft_cluster.rs         Raft consensus cluster  (58 tests)
 ├── storage_tests.rs        Storage engine          (76 tests)
 ├── operations.rs           Schema, auth, ops       (25 tests)
 ├── concurrent_stress.rs    Multi-threaded stress   (21 tests)
 ├── sql_layer.rs            SQL parser & executor   (18 tests)
+├── sql_v3_features.rs      SQL v3: subqueries, UNION, etc (17 tests)
 ├── storage_correctness.rs  Crash safety & MVCC     (14 tests)
 ├── durability_evidence.rs  Crash & corruption      (12 tests)
 ├── anomaly_demos.rs        SSI anomaly detection    (4 tests)
 └── ...                     Unit tests, integration tests
 ```
 
-**~20,000 lines of Rust · 302 verified tests · 0 failures · 0 warnings**
+**~24,000 lines of Rust · 323 verified tests · 0 failures · 0 warnings**
 
 ---
 

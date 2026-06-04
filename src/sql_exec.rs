@@ -31,20 +31,77 @@ pub struct SqlExecutor {
     /// If set, all reads use this MVCC snapshot instead of the current seq.
     /// Used by PgWire transaction blocks for snapshot isolation.
     snapshot_seq: Option<u64>,
+    /// Query timeout duration. None = no timeout.
+    query_timeout: Option<std::time::Duration>,
+    /// Slow query log threshold. Queries exceeding this are logged.
+    slow_query_threshold: std::time::Duration,
 }
 
 impl SqlExecutor {
     pub fn new(db: Arc<OmniKV>, catalog: Arc<Catalog>) -> Self {
-        Self { db, catalog, snapshot_seq: None }
+        Self {
+            db,
+            catalog,
+            snapshot_seq: None,
+            query_timeout: Some(std::time::Duration::from_secs(30)),
+            slow_query_threshold: std::time::Duration::from_millis(100),
+        }
     }
 
     /// Creates a SqlExecutor that reads at a specific MVCC snapshot.
     /// Used by PgWire when inside an explicit transaction block (BEGIN...COMMIT).
     pub fn with_snapshot(db: Arc<OmniKV>, catalog: Arc<Catalog>, seq: u64) -> Self {
-        Self { db, catalog, snapshot_seq: Some(seq) }
+        Self {
+            db,
+            catalog,
+            snapshot_seq: Some(seq),
+            query_timeout: Some(std::time::Duration::from_secs(30)),
+            slow_query_threshold: std::time::Duration::from_millis(100),
+        }
+    }
+
+    /// Set query timeout. None = no timeout.
+    pub fn set_query_timeout(&mut self, timeout: Option<std::time::Duration>) {
+        self.query_timeout = timeout;
+    }
+
+    /// Set slow query log threshold.
+    pub fn set_slow_query_threshold(&mut self, threshold: std::time::Duration) {
+        self.slow_query_threshold = threshold;
     }
 
     pub fn execute(&self, stmt: &SqlStatement) -> Result<ExecResult, String> {
+        let start = std::time::Instant::now();
+
+        // Check timeout before execution
+        if let Some(timeout) = self.query_timeout {
+            if timeout.is_zero() {
+                return Err("Query timeout is zero".into());
+            }
+        }
+
+        let result = self.execute_inner(stmt);
+
+        // Slow query logging
+        let elapsed = start.elapsed();
+        if elapsed > self.slow_query_threshold {
+            eprintln!(
+                "[SLOW QUERY] {:.1}ms | {:?}",
+                elapsed.as_secs_f64() * 1000.0,
+                match stmt {
+                    SqlStatement::Select { .. } => "SELECT ...",
+                    SqlStatement::Insert { .. } => "INSERT ...",
+                    SqlStatement::Update { .. } => "UPDATE ...",
+                    SqlStatement::Delete { .. } => "DELETE ...",
+                    _ => "OTHER",
+                }
+            );
+        }
+
+        result
+    }
+
+    fn execute_inner(&self, stmt: &SqlStatement) -> Result<ExecResult, String> {
         match stmt {
             SqlStatement::CreateTable {
                 name,
@@ -62,15 +119,19 @@ impl SqlExecutor {
                 from,
                 where_clause,
                 group_by,
+                having,
                 order_by,
                 limit,
+                offset,
             } => self.exec_select(
                 columns,
                 from,
                 where_clause.as_ref(),
                 group_by,
+                having.as_ref(),
                 order_by,
                 *limit,
+                *offset,
             ),
             SqlStatement::Update {
                 table,
@@ -145,6 +206,70 @@ impl SqlExecutor {
                         rows: vec![vec![format!("{:?}", inner)]],
                     }),
                 }
+            }
+            SqlStatement::SetOp { op, left, right, all } => {
+                let left_result = self.execute(left)?;
+                let right_result = self.execute(right)?;
+
+                let (left_cols, left_rows) = match left_result {
+                    ExecResult::Rows { columns, rows } => (columns, rows),
+                    _ => return Err("SET operation requires SELECT on left side".into()),
+                };
+                let (_right_cols, right_rows) = match right_result {
+                    ExecResult::Rows { columns, rows } => (columns, rows),
+                    _ => return Err("SET operation requires SELECT on right side".into()),
+                };
+
+                let combined_rows = match op {
+                    SetOpType::Union => {
+                        let mut result = left_rows;
+                        result.extend(right_rows);
+                        if !all {
+                            // Remove duplicates
+                            let mut seen = std::collections::HashSet::new();
+                            result.retain(|row| {
+                                let key = row.join("\0");
+                                seen.insert(key)
+                            });
+                        }
+                        result
+                    }
+                    SetOpType::Intersect => {
+                        let right_set: std::collections::HashSet<String> = right_rows
+                            .iter()
+                            .map(|r| r.join("\0"))
+                            .collect();
+                        let mut result: Vec<Vec<String>> = left_rows
+                            .into_iter()
+                            .filter(|r| right_set.contains(&r.join("\0")))
+                            .collect();
+                        if !all {
+                            let mut seen = std::collections::HashSet::new();
+                            result.retain(|row| seen.insert(row.join("\0")));
+                        }
+                        result
+                    }
+                    SetOpType::Except => {
+                        let right_set: std::collections::HashSet<String> = right_rows
+                            .iter()
+                            .map(|r| r.join("\0"))
+                            .collect();
+                        let mut result: Vec<Vec<String>> = left_rows
+                            .into_iter()
+                            .filter(|r| !right_set.contains(&r.join("\0")))
+                            .collect();
+                        if !all {
+                            let mut seen = std::collections::HashSet::new();
+                            result.retain(|row| seen.insert(row.join("\0")));
+                        }
+                        result
+                    }
+                };
+
+                Ok(ExecResult::Rows {
+                    columns: left_cols,
+                    rows: combined_rows,
+                })
             }
         }
     }
@@ -281,19 +406,38 @@ impl SqlExecutor {
         from: &FromClause,
         where_clause: Option<&WhereExpr>,
         group_by: &[String],
+        having: Option<&WhereExpr>,
         order_by: &[OrderByItem],
         limit: Option<usize>,
+        offset: Option<usize>,
     ) -> Result<ExecResult, String> {
+        // ═══ Pre-process: resolve subqueries in WHERE clause ═══
+        let resolved_where = if let Some(expr) = where_clause {
+            Some(self.resolve_subqueries(expr)?)
+        } else {
+            None
+        };
+        let where_clause = resolved_where.as_ref();
+
         // ═══ Production path: Optimizer → Volcano iterators ═══
         let has_window = columns.iter().any(|c| matches!(c, SelectColumn::WindowFunc { .. }));
+
+        // When OFFSET is present, fetch limit+offset rows from the pipeline,
+        // then skip offset rows in post-processing.
+        let effective_limit = match (limit, offset) {
+            (Some(l), Some(o)) => Some(l + o),
+            _ => limit,
+        };
 
         let stmt = SqlStatement::Select {
             columns: columns.to_vec(),
             from: from.clone(),
             where_clause: where_clause.cloned(),
             group_by: group_by.to_vec(),
+            having: having.cloned(),
             order_by: order_by.to_vec(),
-            limit,
+            limit: effective_limit,
+            offset: None, // offset handled in post-processing below
         };
 
         let stats = crate::optimizer::gather_stats(&self.catalog, None, &self.db);
@@ -301,7 +445,7 @@ impl SqlExecutor {
 
         match optimizer.optimize(&stmt) {
             Ok(plan) => {
-                use crate::volcano::{compile_plan, RowIterator};
+                use crate::volcano::{compile_plan, eval_where, RowIterator};
                 let mut iter = compile_plan(&plan, &self.db, &self.catalog);
 
                 let mut rows: Vec<Row> = Vec::new();
@@ -309,11 +453,30 @@ impl SqlExecutor {
                     rows.push(row);
                 }
 
+                // HAVING: post-aggregate filter
+                if let Some(having_expr) = having {
+                    rows.retain(|row| eval_where(row, having_expr));
+                }
+
                 if has_window {
                     self.apply_window_functions(&mut rows, columns);
                 }
 
-                let (col_names, result_rows) = self.project(&rows, columns)?;
+                let (col_names, mut result_rows) = self.project(&rows, columns)?;
+
+                // OFFSET: skip first N rows, then re-apply original LIMIT
+                if let Some(off) = offset {
+                    if off < result_rows.len() {
+                        result_rows = result_rows.into_iter().skip(off).collect();
+                    } else {
+                        result_rows.clear();
+                    }
+                }
+                // Re-apply original limit (optimizer got limit+offset)
+                if let Some(lim) = limit {
+                    result_rows.truncate(lim);
+                }
+
                 Ok(ExecResult::Rows {
                     columns: col_names,
                     rows: result_rows,
@@ -322,6 +485,52 @@ impl SqlExecutor {
             Err(_) => {
                 self.exec_select_legacy(columns, from, where_clause, group_by, order_by, limit)
             }
+        }
+    }
+
+    /// Resolve InSubquery expressions by executing the inner SELECT
+    /// and converting to a plain IN(values) expression.
+    fn resolve_subqueries(&self, expr: &WhereExpr) -> Result<WhereExpr, String> {
+        match expr {
+            WhereExpr::InSubquery(col, sub_stmt) => {
+                // Execute the subquery
+                match self.execute(sub_stmt)? {
+                    ExecResult::Rows { rows, .. } => {
+                        // Extract first column from each row
+                        let values: Vec<SqlValue> = rows
+                            .into_iter()
+                            .filter_map(|row| row.into_iter().next())
+                            .map(|v| {
+                                if let Ok(n) = v.parse::<i64>() {
+                                    SqlValue::Integer(n)
+                                } else if let Ok(f) = v.parse::<f64>() {
+                                    SqlValue::Float(f)
+                                } else {
+                                    SqlValue::Text(v)
+                                }
+                            })
+                            .collect();
+                        Ok(WhereExpr::In(col.clone(), values))
+                    }
+                    _ => Ok(WhereExpr::In(col.clone(), vec![])),
+                }
+            }
+            WhereExpr::And(left, right) => {
+                let l = self.resolve_subqueries(left)?;
+                let r = self.resolve_subqueries(right)?;
+                Ok(WhereExpr::And(Box::new(l), Box::new(r)))
+            }
+            WhereExpr::Or(left, right) => {
+                let l = self.resolve_subqueries(left)?;
+                let r = self.resolve_subqueries(right)?;
+                Ok(WhereExpr::Or(Box::new(l), Box::new(r)))
+            }
+            WhereExpr::Not(inner) => {
+                let resolved = self.resolve_subqueries(inner)?;
+                Ok(WhereExpr::Not(Box::new(resolved)))
+            }
+            // All other variants pass through unchanged
+            other => Ok(other.clone()),
         }
     }
 

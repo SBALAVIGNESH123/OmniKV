@@ -300,6 +300,11 @@ pub struct HashJoinIter {
     // Buffer for multiple matches on a single probe row
     current_matches: Vec<Row>,
     match_pos: usize,
+    // For RIGHT JOIN: track which build keys were matched
+    matched_build_keys: std::collections::HashSet<String>,
+    right_unmatched: Vec<Row>,
+    right_unmatched_pos: usize,
+    probe_exhausted: bool,
 }
 
 impl HashJoinIter {
@@ -324,6 +329,10 @@ impl HashJoinIter {
             join_type,
             current_matches: Vec::new(),
             match_pos: 0,
+            matched_build_keys: std::collections::HashSet::new(),
+            right_unmatched: Vec::new(),
+            right_unmatched_pos: 0,
+            probe_exhausted: false,
         }
     }
 }
@@ -338,12 +347,40 @@ impl RowIterator for HashJoinIter {
                 return Some(row);
             }
 
+            // For RIGHT JOIN: after probe exhausted, emit unmatched build rows
+            if self.probe_exhausted {
+                if self.right_unmatched_pos < self.right_unmatched.len() {
+                    let row = self.right_unmatched[self.right_unmatched_pos].clone();
+                    self.right_unmatched_pos += 1;
+                    return Some(row);
+                }
+                return None;
+            }
+
             // Get next probe row
-            let probe_row = self.probe.next_row()?;
+            let probe_row = match self.probe.next_row() {
+                Some(r) => r,
+                None => {
+                    // Probe exhausted — for RIGHT JOIN, collect unmatched build rows
+                    self.probe_exhausted = true;
+                    if matches!(self.join_type, JoinType::Right) {
+                        for (key, rows) in &self.hash_table {
+                            if !self.matched_build_keys.contains(key) {
+                                self.right_unmatched.extend(rows.iter().cloned());
+                            }
+                        }
+                    }
+                    continue;
+                }
+            };
             let key = probe_row.get(&self.probe_col).cloned().unwrap_or_default();
 
             match self.hash_table.get(&key) {
                 Some(build_rows) => {
+                    // Track matched keys for RIGHT JOIN
+                    if matches!(self.join_type, JoinType::Right) {
+                        self.matched_build_keys.insert(key.clone());
+                    }
                     self.current_matches.clear();
                     self.match_pos = 0;
                     for build_row in build_rows {
@@ -363,7 +400,7 @@ impl RowIterator for HashJoinIter {
                             self.current_matches = vec![probe_row];
                             self.match_pos = 0;
                         }
-                        _ => continue, // skip non-matching probe rows for INNER join
+                        _ => continue, // skip non-matching probe rows for INNER/RIGHT join
                     }
                 }
             }
@@ -509,7 +546,7 @@ pub fn compile_plan(
 
 // ─── Shared helpers ─────────────────────────────────────────────────────────
 
-fn eval_where(row: &Row, expr: &WhereExpr) -> bool {
+pub fn eval_where(row: &Row, expr: &WhereExpr) -> bool {
     match expr {
         WhereExpr::Comparison { column, op, value } => {
             let row_val = row.get(column).cloned().unwrap_or_default();

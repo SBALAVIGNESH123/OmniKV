@@ -432,6 +432,7 @@ impl Optimizer {
                 group_by,
                 order_by,
                 limit,
+                ..
             } => self.optimize_select(columns, from, where_clause.as_ref(), group_by, order_by, *limit),
             SqlStatement::Explain(inner) => self.optimize(inner),
             _ => Err("Optimizer only handles SELECT queries".into()),

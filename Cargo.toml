@@ -1,6 +1,6 @@
 [package]
 name = "omni_engine"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 authors = ["Balavignesh"]
 description = "A high-performance, fully mutable Database Management System operating at the physical hardware limits of NVMe SSDs."

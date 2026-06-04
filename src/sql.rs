@@ -26,8 +26,10 @@ pub enum SqlStatement {
         from: FromClause,
         where_clause: Option<WhereExpr>,
         group_by: Vec<String>,
+        having: Option<WhereExpr>,
         order_by: Vec<OrderByItem>,
         limit: Option<usize>,
+        offset: Option<usize>,
     },
     Update {
         table: String,
@@ -41,6 +43,20 @@ pub enum SqlStatement {
     ShowTables,
     Explain(Box<SqlStatement>),
     ExplainAnalyze(Box<SqlStatement>),
+    /// UNION / INTERSECT / EXCEPT
+    SetOp {
+        op: SetOpType,
+        left: Box<SqlStatement>,
+        right: Box<SqlStatement>,
+        all: bool,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum SetOpType {
+    Union,
+    Intersect,
+    Except,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -168,7 +184,55 @@ pub fn parse_sql(input: &str) -> Result<SqlStatement, String> {
         "CREATE" => parse_create_table(&tokens),
         "DROP" => parse_drop_table(&tokens),
         "INSERT" => parse_insert_sql(&tokens),
-        "SELECT" => parse_select_sql(&tokens),
+        "SELECT" => {
+            // Check for UNION / INTERSECT / EXCEPT at top level
+            let mut depth = 0;
+            let mut set_op_pos = None;
+            for (idx, tok) in tokens.iter().enumerate() {
+                if tok == "(" { depth += 1; }
+                if tok == ")" { depth -= 1; }
+                if depth == 0 {
+                    let upper = tok.to_uppercase();
+                    if upper == "UNION" || upper == "INTERSECT" || upper == "EXCEPT" {
+                        set_op_pos = Some(idx);
+                        break;
+                    }
+                }
+            }
+
+            if let Some(pos) = set_op_pos {
+                let op_token = tokens[pos].to_uppercase();
+                let mut right_start = pos + 1;
+                let all = if right_start < tokens.len() && tokens[right_start].to_uppercase() == "ALL" {
+                    right_start += 1;
+                    true
+                } else {
+                    false
+                };
+
+                let left_sql = tokens[..pos].join(" ");
+                let right_sql = tokens[right_start..].join(" ");
+
+                let left = parse_sql(&left_sql)?;
+                let right = parse_sql(&right_sql)?;
+
+                let op = match op_token.as_str() {
+                    "UNION" => SetOpType::Union,
+                    "INTERSECT" => SetOpType::Intersect,
+                    "EXCEPT" => SetOpType::Except,
+                    _ => unreachable!(),
+                };
+
+                Ok(SqlStatement::SetOp {
+                    op,
+                    left: Box::new(left),
+                    right: Box::new(right),
+                    all,
+                })
+            } else {
+                parse_select_sql(&tokens)
+            }
+        }
         "UPDATE" => parse_update_sql(&tokens),
         "DELETE" => parse_delete_sql(&tokens),
         "SHOW" => Ok(SqlStatement::ShowTables),
@@ -605,6 +669,16 @@ fn parse_select_sql(tokens: &[String]) -> Result<SqlStatement, String> {
         }
     }
 
+    // HAVING (post-aggregate filter)
+    let having = if i < tokens.len() && tokens[i].to_uppercase() == "HAVING" {
+        i += 1;
+        let (expr, new_i) = parse_where_expr(tokens, i)?;
+        i = new_i;
+        Some(expr)
+    } else {
+        None
+    };
+
     // ORDER BY
     let mut order_by = Vec::new();
     if i < tokens.len() && tokens[i].to_uppercase() == "ORDER" {
@@ -649,14 +723,34 @@ fn parse_select_sql(tokens: &[String]) -> Result<SqlStatement, String> {
     } else {
         None
     };
+    if limit.is_some() {
+        i += 1;
+    }
+
+    // OFFSET
+    let offset = if i < tokens.len() && tokens[i].to_uppercase() == "OFFSET" {
+        i += 1;
+        Some(
+            tokens
+                .get(i)
+                .ok_or("Missing OFFSET value")?
+                .parse::<usize>()
+                .map_err(|_| "Invalid OFFSET")?,
+        )
+    } else {
+        None
+    };
+    let _ = i; // suppress unused warning
 
     Ok(SqlStatement::Select {
         columns,
         from,
         where_clause,
         group_by,
+        having,
         order_by,
         limit,
+        offset,
     })
 }
 
@@ -721,9 +815,30 @@ fn parse_where_atom(tokens: &[String], start: usize) -> Result<(WhereExpr, usize
         return Ok((expr, i));
     }
 
-    let col = tokens[i].clone();
-    let col_name = col.split('.').last().unwrap_or(&col).to_string();
-    i += 1;
+    // Handle aggregate function references in HAVING: COUNT(*), SUM(col), etc.
+    let agg_funcs = ["COUNT", "SUM", "AVG", "MIN", "MAX"];
+    let col_upper = tokens[i].to_uppercase();
+    let (col_name, mut i) = if agg_funcs.contains(&col_upper.as_str())
+        && i + 1 < tokens.len()
+        && tokens[i + 1] == "("
+    {
+        // Consume: FUNC ( arg )
+        let func = tokens[i].to_lowercase();
+        let mut j = i + 2; // skip past '('
+        let mut arg = String::from("*");
+        if j < tokens.len() && tokens[j] != ")" {
+            arg = tokens[j].clone();
+            j += 1;
+        }
+        if j < tokens.len() && tokens[j] == ")" {
+            j += 1;
+        }
+        (format!("{}({})", func, arg), j)
+    } else {
+        let col = tokens[i].clone();
+        let name = col.split('.').last().unwrap_or(&col).to_string();
+        (name, i + 1)
+    };
 
     if i < tokens.len() && tokens[i].to_uppercase() == "IS" {
         i += 1;

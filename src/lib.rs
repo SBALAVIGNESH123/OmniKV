@@ -37,6 +37,7 @@ impl Hasher for FnvHasher {
     }
 }
 pub mod catalog;
+pub mod config;
 pub mod chaos;
 pub mod dist_txn;
 pub mod generator;
@@ -2287,13 +2288,18 @@ impl OmniKV {
         std::thread::Builder::new()
             .name("omni-compaction".into())
             .spawn(move || {
+                let mut gc_counter: u32 = 0;
                 loop {
                     std::thread::sleep(std::time::Duration::from_millis(check_interval_ms));
+
+                    let mut did_compact = false;
 
                     // Phase 1: Flush memtable to L0 if it exceeds threshold
                     if db.memtable_size() > memtable_flush_threshold {
                         if let Err(e) = db.compact_sstables() {
                             eprintln!("[COMPACTION] Memtable flush error: {:?}", e);
+                        } else {
+                            did_compact = true;
                         }
                     }
 
@@ -2301,6 +2307,8 @@ impl OmniKV {
                     if db.sstable_count() >= 4 {
                         if let Err(e) = db.compact_l0_to_l1() {
                             eprintln!("[COMPACTION] L0→L1 error: {:?}", e);
+                        } else {
+                            did_compact = true;
                         }
                     }
 
@@ -2308,6 +2316,18 @@ impl OmniKV {
                     if db.l1_sstable_count() >= 4 {
                         if let Err(e) = db.compact_l1_to_l2() {
                             eprintln!("[COMPACTION] L1→L2 error: {:?}", e);
+                        } else {
+                            did_compact = true;
+                        }
+                    }
+
+                    // Phase 4: MVCC Garbage Collection — every 5th compaction cycle
+                    if did_compact {
+                        gc_counter += 1;
+                        if gc_counter % 5 == 0 {
+                            if let Err(e) = db.run_garbage_collection() {
+                                eprintln!("[GC] MVCC garbage collection error: {:?}", e);
+                            }
                         }
                     }
                 }
