@@ -10,7 +10,7 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/language-Rust-orange?style=for-the-badge&logo=rust" alt="Rust">
-  <img src="https://img.shields.io/badge/tests-103%20passing-brightgreen?style=for-the-badge" alt="Tests">
+  <img src="https://img.shields.io/badge/tests-302%20passing-brightgreen?style=for-the-badge" alt="Tests">
   <img src="https://img.shields.io/badge/crash%20cycles-1000%20·%200%20lost-brightgreen?style=for-the-badge" alt="Crash">
   <img src="https://img.shields.io/badge/soak-10%20min%20·%200%20errors-brightgreen?style=for-the-badge" alt="Soak">
   <img src="https://img.shields.io/badge/license-MIT-blue?style=for-the-badge" alt="License">
@@ -428,17 +428,21 @@ Every layer of OmniKV is purpose-built. There are no external storage dependenci
 ## Test Suite
 
 ```
-$ cargo test
-103 passed; 0 failed; 0 ignored
+$ cargo test --all-targets
+302 passed; 0 failed; 0 ignored
 ```
 
 | Suite | Tests | What It Proves |
 |-------|-------|----------------|
 | Storage Engine | 76 | WAL correctness, CRC integrity, compaction, MVCC, bloom filters |
+| **Raft Cluster** | **58** | **3-node replication, 5-node partitions, leader failover, data convergence** |
+| Operations | 25 | Schema migration, rate limiting, prepared statements |
 | Storage Correctness | 14 | Crash recovery, atomicity, snapshot isolation, torn-write handling |
+| Concurrent Stress | 21 | Multi-threaded contention, write-stall handling |
+| SQL Layer | 18 | Parser, JOINs, aggregates, optimizer, volcano execution |
 | Durability Evidence | 12 | 1000 crash cycles, corruption detection, backup/restore |
-| SQL Layer | 18 | Parser, JOINs, aggregates, optimizer, execution |
-| Concurrent Stress | 6 | Multi-threaded contention, write-stall handling |
+| Anomaly Demos | 4 | Write skew, phantom reads, SSI conflict detection |
+| Unit + Integration | 74 | Auth, crypto, backup, secondary index, misc |
 
 Every test uses a fresh temporary directory and cleans up after itself. Tests run in isolation.
 
@@ -447,8 +451,6 @@ Every test uses a fresh temporary directory and cleans up after itself. Tests ru
 ## Known Limitations
 
 We believe the fastest way to earn your trust is to tell you exactly where OmniKV is not yet ready.
-
-**Multi-node correctness is not yet proven.** OmniKV integrates OpenRaft for consensus, but we have not yet run crash tests against a 3-node cluster under network partitions. Until we do, the distributed layer should be considered experimental.
 
 **Distributed transactions are not Jepsen-tested.** The 2PC protocol exists but has not been validated under coordinator crash, participant crash, or partial network failure.
 
@@ -470,7 +472,7 @@ OmniKV follows a trust-first development model. Each phase must produce evidence
 - [x] **Phase 2 — Security**: Argon2id key derivation, constant-time API key comparison
 - [x] **Phase 3 — Durability**: 12 durability tests, 1000 crash-recovery cycles, corruption detection
 - [x] **Phase 4 — Benchmarks**: Measured throughput and latency, 10-minute soak test, group commit v2
-- [ ] **Phase 5 — Multi-Node**: 3-node cluster tests, partition tolerance, leader failover
+- [x] **Phase 5 — Multi-Node**: 58 Raft cluster tests, 5-node partition handling, leader failover, data convergence
 - [ ] **Phase 6 — Consistency**: Jepsen-style testing, linearizability verification
 - [ ] **Phase 7 — Production**: Fuzz testing, 24-hour soak, streaming SeqScan, connection pooling
 
@@ -496,14 +498,19 @@ src/                                    ~12,500 lines
 ├── wal.rs              Write-ahead log with CRC32     250
 └── ...                 QUIC, chaos testing, backup, metrics
 
-tests/                                  ~8,000+ lines
-├── durability_evidence.rs  Crash & corruption tests (12 tests)
-├── storage_correctness.rs  Crash safety & MVCC    (14 tests)
-├── storage_tests.rs        Storage engine         (76 tests)
-└── ...                     SQL, stress, anomaly tests
+tests/                                  ~12,000+ lines
+├── raft_cluster.rs         Raft consensus cluster  (58 tests)
+├── storage_tests.rs        Storage engine          (76 tests)
+├── operations.rs           Schema, auth, ops       (25 tests)
+├── concurrent_stress.rs    Multi-threaded stress   (21 tests)
+├── sql_layer.rs            SQL parser & executor   (18 tests)
+├── storage_correctness.rs  Crash safety & MVCC     (14 tests)
+├── durability_evidence.rs  Crash & corruption      (12 tests)
+├── anomaly_demos.rs        SSI anomaly detection    (4 tests)
+└── ...                     Unit tests, integration tests
 ```
 
-**~20,000 lines of Rust · 103 verified tests · 0 failures · 0 warnings**
+**~20,000 lines of Rust · 302 verified tests · 0 failures · 0 warnings**
 
 ---
 
