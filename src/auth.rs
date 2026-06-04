@@ -57,15 +57,25 @@ pub fn verify_token(token: &str, secret: &str) -> Result<Claims, String> {
 }
 
 /// Validate a raw API key against the expected key.
+///
+/// Uses hash-then-compare to prevent timing attacks.
+/// Both inputs are hashed to fixed-length digests before byte comparison,
+/// making the operation constant-time regardless of key length or content.
 pub fn validate_api_key(provided: &str, expected: &str) -> bool {
-    // Constant-time comparison to prevent timing attacks
-    if provided.len() != expected.len() {
-        return false;
-    }
-    provided
-        .as_bytes()
+    use sha2::{Digest, Sha256};
+
+    // Hash both values to fixed 32-byte digests.
+    // Comparing hashes instead of raw strings prevents:
+    // 1. Length-based timing leaks (both digests are always 32 bytes)
+    // 2. Content-based timing leaks (XOR fold over fixed-length arrays)
+    let hash_expected = Sha256::digest(expected.as_bytes());
+    let hash_provided = Sha256::digest(provided.as_bytes());
+
+    // Constant-time comparison of the two 32-byte digests
+    hash_expected
+        .as_slice()
         .iter()
-        .zip(expected.as_bytes().iter())
+        .zip(hash_provided.as_slice().iter())
         .fold(0u8, |acc, (a, b)| acc | (a ^ b))
         == 0
 }

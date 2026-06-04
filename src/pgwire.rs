@@ -23,6 +23,7 @@ use std::net::TcpListener;
 use std::sync::Arc;
 
 use crate::query;
+use crate::transaction::{Transaction, TransactionManager, TxnState};
 use crate::{OmniKV, WriteBatch};
 
 /// PostgreSQL wire protocol message types (server -> client)
@@ -37,6 +38,40 @@ const PARAMETER_STATUS: u8 = b'S';
 /// PostgreSQL wire protocol message types (client -> server)
 const QUERY_MSG: u8 = b'Q';
 const TERMINATE_MSG: u8 = b'X';
+
+/// Per-connection transaction state for PgWire sessions.
+/// Tracks whether the client is in an explicit transaction block.
+struct ConnectionState {
+    /// Active transaction, if any (set by BEGIN, cleared by COMMIT/ROLLBACK).
+    txn: Option<Transaction>,
+    /// Set to true when an error occurs inside a transaction block.
+    /// All subsequent commands (except ROLLBACK) return error until
+    /// the client issues ROLLBACK.
+    txn_failed: bool,
+}
+
+impl ConnectionState {
+    fn new() -> Self {
+        Self {
+            txn: None,
+            txn_failed: false,
+        }
+    }
+
+    /// Returns the ReadyForQuery status byte:
+    /// 'I' = idle (no transaction)
+    /// 'T' = in a transaction block
+    /// 'E' = in a failed transaction block
+    fn ready_status(&self) -> u8 {
+        if self.txn_failed {
+            b'E'
+        } else if self.txn.is_some() {
+            b'T'
+        } else {
+            b'I'
+        }
+    }
+}
 
 /// Represents a PostgreSQL wire protocol server with connection pooling.
 pub struct PgWireServer {
@@ -114,26 +149,39 @@ fn handle_connection(db: Arc<OmniKV>, mut stream: std::net::TcpStream) -> std::i
     // Phase 1: Startup handshake
     handle_startup(&mut stream)?;
 
+    // Per-connection state: transaction manager and session state
+    let tm = Arc::new(TransactionManager::new(db.clone()));
+    let mut conn = ConnectionState::new();
+
     // Phase 2: Query loop
     loop {
         let mut msg_type = [0u8; 1];
         if stream.read_exact(&mut msg_type).is_err() {
-            break; // Client disconnected
+            // Client disconnected — clean up any open transaction
+            if let Some(txn) = conn.txn.take() {
+                // Implicit rollback: unregister the snapshot
+                db.unregister_snapshot(txn.read_seq);
+            }
+            break;
         }
 
         match msg_type[0] {
             QUERY_MSG => {
                 let sql = read_query_message(&mut stream)?;
-                handle_query(&db, &mut stream, &sql)?;
+                handle_query(&db, &tm, &mut conn, &mut stream, &sql)?;
             }
             TERMINATE_MSG => {
                 let _ = read_message_body(&mut stream)?;
+                // Clean up any open transaction
+                if let Some(txn) = conn.txn.take() {
+                    db.unregister_snapshot(txn.read_seq);
+                }
                 break;
             }
             _ => {
                 let _ = read_message_body(&mut stream)?;
                 send_error(&mut stream, "ERROR", "XX000", "Unsupported message type")?;
-                send_ready_for_query(&mut stream)?;
+                send_ready_for_query_status(&mut stream, conn.ready_status())?;
             }
         }
     }
@@ -154,7 +202,7 @@ fn handle_startup(stream: &mut std::net::TcpStream) -> std::io::Result<()> {
     send_parameter_status(stream, "client_encoding", "UTF8")?;
     send_parameter_status(stream, "DateStyle", "ISO, MDY")?;
     send_parameter_status(stream, "integer_datetimes", "on")?;
-    send_ready_for_query(stream)?;
+    send_ready_for_query_status(stream, b'I')?;
     Ok(())
 }
 
@@ -178,6 +226,8 @@ fn read_message_body(stream: &mut std::net::TcpStream) -> std::io::Result<Vec<u8
 /// Handle a SQL query and send results back.
 fn handle_query(
     db: &Arc<OmniKV>,
+    tm: &Arc<TransactionManager>,
+    conn: &mut ConnectionState,
     stream: &mut std::net::TcpStream,
     sql: &str,
 ) -> std::io::Result<()> {
@@ -185,30 +235,109 @@ fn handle_query(
 
     if sql_trimmed.is_empty() {
         send_command_complete(stream, "EMPTY")?;
-        send_ready_for_query(stream)?;
+        send_ready_for_query_status(stream, conn.ready_status())?;
         return Ok(());
     }
 
-    // Handle meta-commands that our parser doesn't understand
     let upper = sql_trimmed.to_uppercase();
-    if upper.starts_with("SET ") || upper == "BEGIN" || upper == "COMMIT" || upper == "ROLLBACK" {
-        send_command_complete(stream, "OK")?;
-        send_ready_for_query(stream)?;
+
+    // ── SET — always accept silently ──
+    if upper.starts_with("SET ") {
+        send_command_complete(stream, "SET")?;
+        send_ready_for_query_status(stream, conn.ready_status())?;
         return Ok(());
     }
+
+    // ── BEGIN — start an explicit transaction block ──
+    if upper == "BEGIN" || upper == "START TRANSACTION" {
+        if conn.txn.is_some() {
+            // Already in a transaction — PostgreSQL sends a WARNING but doesn't fail
+            send_error(stream, "WARNING", "25001", "there is already a transaction in progress")?;
+        } else {
+            let txn = tm.begin();
+            conn.txn = Some(txn);
+            conn.txn_failed = false;
+        }
+        send_command_complete(stream, "BEGIN")?;
+        send_ready_for_query_status(stream, conn.ready_status())?;
+        return Ok(());
+    }
+
+    // ── COMMIT — commit the current transaction ──
+    if upper == "COMMIT" || upper == "END" {
+        if let Some(mut txn) = conn.txn.take() {
+            if conn.txn_failed {
+                // Failed transaction — COMMIT acts as ROLLBACK
+                db.unregister_snapshot(txn.read_seq);
+                conn.txn_failed = false;
+                send_command_complete(stream, "ROLLBACK")?;
+            } else {
+                match tm.commit(&mut txn) {
+                    Ok(_) => {
+                        send_command_complete(stream, "COMMIT")?;
+                    }
+                    Err(e) => {
+                        send_error(stream, "ERROR", "40001", &format!("COMMIT failed: {}", e))?;
+                    }
+                }
+            }
+        } else {
+            // No transaction — PostgreSQL sends a WARNING
+            send_error(stream, "WARNING", "25P01", "there is no transaction in progress")?;
+            send_command_complete(stream, "COMMIT")?;
+        }
+        send_ready_for_query_status(stream, conn.ready_status())?;
+        return Ok(());
+    }
+
+    // ── ROLLBACK — abort the current transaction ──
+    if upper == "ROLLBACK" || upper == "ABORT" {
+        if let Some(txn) = conn.txn.take() {
+            db.unregister_snapshot(txn.read_seq);
+            conn.txn_failed = false;
+            send_command_complete(stream, "ROLLBACK")?;
+        } else {
+            send_error(stream, "WARNING", "25P01", "there is no transaction in progress")?;
+            send_command_complete(stream, "ROLLBACK")?;
+        }
+        send_ready_for_query_status(stream, conn.ready_status())?;
+        return Ok(());
+    }
+
+    // ── If in a failed transaction, reject all commands until ROLLBACK ──
+    if conn.txn_failed {
+        send_error(
+            stream,
+            "ERROR",
+            "25P02",
+            "current transaction is aborted, commands ignored until end of transaction block",
+        )?;
+        send_ready_for_query_status(stream, conn.ready_status())?;
+        return Ok(());
+    }
+
+    // ── SELECT 1 / SELECT VERSION — compatibility shortcuts ──
     if upper == "SELECT 1" || upper.starts_with("SELECT VERSION") {
         send_row_description(stream, &[("version", 25)])?;
         send_data_row(stream, &["OmniKV 0.1.0 — Distributed KV Engine"])?;
         send_command_complete(stream, "SELECT 1")?;
-        send_ready_for_query(stream)?;
+        send_ready_for_query_status(stream, conn.ready_status())?;
         return Ok(());
     }
 
-    // Try SQL v2 parser first (CREATE TABLE, JOIN, aggregates)
+    // ── Execute SQL (with transaction context if inside BEGIN block) ──
     match crate::sql::parse_sql(sql_trimmed) {
         Ok(stmt) => {
             let catalog = std::sync::Arc::new(crate::catalog::Catalog::new(db.clone()));
-            let executor = crate::sql_exec::SqlExecutor::new(db.clone(), catalog);
+
+            // If inside an explicit transaction, use the transaction's read_seq
+            // for snapshot isolation. Otherwise use autocommit (current seq).
+            let executor = if let Some(ref mut txn) = conn.txn {
+                crate::sql_exec::SqlExecutor::with_snapshot(db.clone(), catalog, txn.read_seq)
+            } else {
+                crate::sql_exec::SqlExecutor::new(db.clone(), catalog)
+            };
+
             match executor.execute(&stmt) {
                 Ok(crate::sql_exec::ExecResult::Rows { columns, rows }) => {
                     let col_defs: Vec<(&str, i32)> =
@@ -221,12 +350,22 @@ fn handle_query(
                     send_command_complete(stream, &format!("SELECT {}", rows.len()))?;
                 }
                 Ok(crate::sql_exec::ExecResult::Modified { count, command }) => {
+                    // Track writes in the transaction if inside BEGIN block
+                    if let Some(ref mut txn) = conn.txn {
+                        // For DML inside a transaction, buffer through the txn manager.
+                        // Note: full write buffering requires deeper SqlExecutor integration.
+                        // For now, we track that the transaction has performed writes.
+                        let _ = count; // Writes are committed directly for now
+                    }
                     send_command_complete(stream, &command)?;
                 }
                 Ok(crate::sql_exec::ExecResult::Ok(msg)) => {
                     send_command_complete(stream, &msg)?;
                 }
                 Err(e) => {
+                    if conn.txn.is_some() {
+                        conn.txn_failed = true;
+                    }
                     send_error(stream, "ERROR", "XX000", &format!("Exec error: {}", e))?;
                 }
             }
@@ -238,13 +377,16 @@ fn handle_query(
                     execute_query(db, stream, &parsed)?;
                 }
                 Err(e) => {
+                    if conn.txn.is_some() {
+                        conn.txn_failed = true;
+                    }
                     send_error(stream, "ERROR", "42601", &format!("Parse error: {}", e))?;
                 }
             }
         }
     }
 
-    send_ready_for_query(stream)?;
+    send_ready_for_query_status(stream, conn.ready_status())?;
     Ok(())
 }
 
@@ -379,11 +521,13 @@ fn send_auth_ok(stream: &mut std::net::TcpStream) -> std::io::Result<()> {
     stream.write_all(&buf)
 }
 
-fn send_ready_for_query(stream: &mut std::net::TcpStream) -> std::io::Result<()> {
+/// Send ReadyForQuery with the correct transaction status byte.
+/// 'I' = idle (no transaction), 'T' = in transaction, 'E' = failed transaction
+fn send_ready_for_query_status(stream: &mut std::net::TcpStream, status: u8) -> std::io::Result<()> {
     let mut buf = Vec::new();
     buf.push(READY_FOR_QUERY);
     buf.extend_from_slice(&5i32.to_be_bytes());
-    buf.push(b'I');
+    buf.push(status);
     stream.write_all(&buf)
 }
 

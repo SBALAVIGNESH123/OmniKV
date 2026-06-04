@@ -182,6 +182,46 @@ impl WriteAheadLog {
         Ok(())
     }
 
+    /// Write a batch to WAL WITHOUT fsync.
+    /// Used by group commit: multiple batches are written, then a single
+    /// fsync is issued by the group leader via `sync()`.
+    pub fn append_batch_nosync(
+        &mut self,
+        records: &[(OmniRecord, Option<Vec<u8>>)],
+    ) -> Result<(), OmniError> {
+        let mut batch_buf = Vec::new();
+        let count = records.len() as u32;
+        batch_buf.extend_from_slice(&count.to_le_bytes());
+        for (rec, _) in records {
+            let encoded = rec.encode();
+            batch_buf.extend_from_slice(&encoded);
+        }
+        let mut hasher = crc32fast::Hasher::new();
+        hasher.update(&batch_buf);
+        let batch_crc = hasher.finalize();
+
+        self.writer
+            .write_all(&batch_buf)
+            .map_err(|e| OmniError::IoError(format!("WAL write batch: {}", e)))?;
+        self.writer
+            .write_all(&batch_crc.to_le_bytes())
+            .map_err(|e| OmniError::IoError(format!("WAL write CRC: {}", e)))?;
+        self.writer
+            .flush()
+            .map_err(|e| OmniError::IoError(format!("WAL flush: {}", e)))?;
+        Ok(())
+    }
+
+    /// Fsync the WAL file to stable storage.
+    /// Called by group commit leader after all writers in the group have
+    /// appended their batches.
+    pub fn sync(&self) -> Result<(), OmniError> {
+        self.writer
+            .get_ref()
+            .sync_data()
+            .map_err(|e| OmniError::IoError(format!("WAL fsync: {}", e)))
+    }
+
     /// Rotate the WAL — truncate the current segment.
     /// Called after a successful flush to SSTable.
     pub fn rotate_segment(&mut self) -> Result<(), OmniError> {

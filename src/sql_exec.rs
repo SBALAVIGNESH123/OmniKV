@@ -28,11 +28,20 @@ pub enum ExecResult {
 pub struct SqlExecutor {
     pub db: Arc<OmniKV>,
     pub catalog: Arc<Catalog>,
+    /// If set, all reads use this MVCC snapshot instead of the current seq.
+    /// Used by PgWire transaction blocks for snapshot isolation.
+    snapshot_seq: Option<u64>,
 }
 
 impl SqlExecutor {
     pub fn new(db: Arc<OmniKV>, catalog: Arc<Catalog>) -> Self {
-        Self { db, catalog }
+        Self { db, catalog, snapshot_seq: None }
+    }
+
+    /// Creates a SqlExecutor that reads at a specific MVCC snapshot.
+    /// Used by PgWire when inside an explicit transaction block (BEGIN...COMMIT).
+    pub fn with_snapshot(db: Arc<OmniKV>, catalog: Arc<Catalog>, seq: u64) -> Self {
+        Self { db, catalog, snapshot_seq: Some(seq) }
     }
 
     pub fn execute(&self, stmt: &SqlStatement) -> Result<ExecResult, String> {
@@ -253,7 +262,8 @@ impl SqlExecutor {
 
     fn load_table_rows(&self, table: &TableDef) -> Vec<Row> {
         let prefix = table.row_prefix();
-        let seq = self.db.get_seq();
+        // Use transaction snapshot if available, otherwise current seq (autocommit)
+        let seq = self.snapshot_seq.unwrap_or_else(|| self.db.get_seq());
         let results = self
             .db
             .scan(&prefix, &format!("{}\x7F", prefix), seq)

@@ -661,6 +661,27 @@ fn parse_select_sql(tokens: &[String]) -> Result<SqlStatement, String> {
 }
 
 fn parse_where_expr(tokens: &[String], start: usize) -> Result<(WhereExpr, usize), String> {
+    // OR has LOWEST precedence — this is the top-level entry point.
+    // SQL standard: AND binds tighter than OR.
+    // `a AND b OR c` = `(a AND b) OR c`, NOT `a AND (b OR c)`
+    let (mut left, mut i) = parse_where_and(tokens, start)?;
+
+    while i < tokens.len() {
+        let upper = tokens[i].to_uppercase();
+        if upper == "OR" {
+            i += 1;
+            let (right, ni) = parse_where_and(tokens, i)?;
+            i = ni;
+            left = WhereExpr::Or(Box::new(left), Box::new(right));
+        } else {
+            break;
+        }
+    }
+    Ok((left, i))
+}
+
+fn parse_where_and(tokens: &[String], start: usize) -> Result<(WhereExpr, usize), String> {
+    // AND has HIGHER precedence than OR.
     let (mut left, mut i) = parse_where_atom(tokens, start)?;
 
     while i < tokens.len() {
@@ -670,17 +691,13 @@ fn parse_where_expr(tokens: &[String], start: usize) -> Result<(WhereExpr, usize
             let (right, ni) = parse_where_atom(tokens, i)?;
             i = ni;
             left = WhereExpr::And(Box::new(left), Box::new(right));
-        } else if upper == "OR" {
-            i += 1;
-            let (right, ni) = parse_where_atom(tokens, i)?;
-            i = ni;
-            left = WhereExpr::Or(Box::new(left), Box::new(right));
         } else {
             break;
         }
     }
     Ok((left, i))
 }
+
 
 fn parse_where_atom(tokens: &[String], start: usize) -> Result<(WhereExpr, usize), String> {
     if start >= tokens.len() {
