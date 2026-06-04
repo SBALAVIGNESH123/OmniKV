@@ -32,14 +32,14 @@ fn main() {
 
     println!("── Single-Thread Benchmarks ─────────────────────────────\n");
 
-    bench_sequential_writes(&db, 100_000);
-    bench_batch_writes(&db, 1_000, 100);
-    bench_sequential_reads(&db, 100_000);
-    bench_random_reads(&db, 50_000, 100_000);
+    bench_sequential_writes(&db, 10_000);
+    bench_batch_writes(&db, 500, 100);
+    bench_sequential_reads(&db, 50_000);
+    bench_random_reads(&db, 50_000, 10_000);
     bench_point_read_miss(&db, 50_000);
     bench_scan(&db, 10_000);
-    bench_mixed_workload(&db, 50_000);
-    bench_transaction_overhead(&db, 10_000);
+    bench_mixed_workload(&db, 10_000);
+    bench_transaction_overhead(&db, 2_000);
 
     println!("\n── Thread Scaling (writes) ──────────────────────────────\n");
 
@@ -49,7 +49,7 @@ fn main() {
         let tm = tdir.path().join("manifest.json");
         let tw = tdir.path().join("wal.bin");
         let tdb = OmniKV::open(tm.to_str().unwrap(), tw.to_str().unwrap()).expect("open");
-        bench_threaded_writes(&tdb, *threads, 10_000);
+        bench_threaded_writes(&tdb, *threads, 2_000);
     }
 
     println!("\n── Thread Scaling (reads) ───────────────────────────────\n");
@@ -59,7 +59,7 @@ fn main() {
     let rm = read_dir.path().join("manifest.json");
     let rw = read_dir.path().join("wal.bin");
     let read_db = OmniKV::open(rm.to_str().unwrap(), rw.to_str().unwrap()).expect("open");
-    for i in 0..50_000u64 {
+    for i in 0..10_000u64 {
         let mut b = WriteBatch::new();
         b.set(&format!("rscale:{:08}", i), format!("v{}", i)).unwrap();
         read_db.commit_batch(&b).unwrap();

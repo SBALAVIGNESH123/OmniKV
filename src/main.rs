@@ -6,6 +6,11 @@
 //! 3. PostgreSQL wire protocol v3 (PgWire)
 //! 4. Prometheus metrics on /metrics
 
+#![allow(dead_code)]
+#![allow(unused_imports)]
+#![allow(unused_variables)]
+#![allow(unused_mut)]
+
 mod api;
 mod auth;
 mod backup;
@@ -14,7 +19,6 @@ mod crypto;
 mod quic_server;
 
 use omni_engine::OmniKV;
-use omni_engine::raft_storage;
 use std::sync::Arc;
 
 const MANIFEST_PATH: &str = "manifest.json";

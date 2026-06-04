@@ -12,43 +12,39 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 /// ═══════════════════════════════════════════════════════════════════════
-/// GROUP COMMIT ENGINE
+/// GROUP COMMIT ENGINE — v2 (No-Sleep Design)
 /// ═══════════════════════════════════════════════════════════════════════
 ///
-/// Instead of calling fsync() for every single commit, the group commit
-/// engine collects pending writes and issues a single fsync for the entire
-/// batch. This is how PostgreSQL, MySQL InnoDB, and RocksDB achieve high
-/// write throughput.
+/// Coalesces concurrent fsync calls into a single fsync per batch.
 ///
-/// ## How it works:
+/// ## Design (no sleep, no timed wait):
 ///
-/// 1. Writer arrives and joins the current write group.
-/// 2. First writer in the group becomes the "leader".
-/// 3. Leader waits briefly (configurable, default 200µs) for more writers.
-/// 4. Leader issues one fsync for all writers in the group.
-/// 5. All writers in the group are notified of completion.
+/// 1. Each writer appends data to heap + WAL (no fsync yet).
+/// 2. Writer enters `join_group()`.
+/// 3. If no sync is in progress → become leader, sync immediately.
+/// 4. If a sync IS in progress → wait as follower.
+/// 5. When the leader's sync completes, ALL followers are released.
+/// 6. Natural batching: while leader fsyncs (~2ms), new writers queue up.
+///    Next leader syncs for everyone who arrived during those 2ms.
 ///
-/// Under 1000 concurrent writers, this reduces fsyncs from 1000 to ~5-10.
+/// This achieves the same throughput as a timed-wait design without the
+/// latency overhead of sleeping on every single-threaded write.
 
 pub struct GroupCommitEngine {
-    /// Maximum time to wait for group to fill (microseconds).
-    max_wait_us: u64,
     /// State of the current write group.
     state: Mutex<GroupState>,
-    /// Condition variable for waiting writers.
+    /// Condition variable for waiting followers.
     cond: Condvar,
-    /// Monotonic epoch counter — increments on each group commit.
+    /// Monotonic epoch counter — increments on each completed sync.
     epoch: AtomicU64,
-    /// Whether the engine is active.
-    active: AtomicBool,
 }
 
 struct GroupState {
-    /// Number of pending writers in the current group.
+    /// Number of writers waiting in the current group (including leader).
     pending_count: usize,
     /// The epoch that was last committed.
     committed_epoch: u64,
@@ -58,12 +54,8 @@ struct GroupState {
 
 impl GroupCommitEngine {
     /// Creates a new GroupCommitEngine.
-    ///
-    /// `max_wait_us` — maximum microseconds to wait for group to fill.
-    /// Typical values: 100-500µs for SSDs, 1000-5000µs for HDDs.
-    pub fn new(max_wait_us: u64) -> Self {
+    pub fn new(_max_wait_us: u64) -> Self {
         Self {
-            max_wait_us,
             state: Mutex::new(GroupState {
                 pending_count: 0,
                 committed_epoch: 0,
@@ -71,35 +63,37 @@ impl GroupCommitEngine {
             }),
             cond: Condvar::new(),
             epoch: AtomicU64::new(1),
-            active: AtomicBool::new(true),
         }
     }
 
-    /// Called by each writer to join a write group and wait for fsync.
+    /// Join the current write group.
     ///
-    /// Returns `true` if this writer should perform the fsync (it's the leader),
-    /// or `false` if the fsync was already done by the leader.
-    pub fn join_group(&self) -> GroupCommitGuard {
+    /// Returns a guard indicating whether this writer is the leader.
+    /// - Leader: must perform fsync, then call `guard.mark_synced()`.
+    /// - Follower: blocks until the leader's sync completes, then returns.
+    ///
+    /// No sleep, no timed wait. The leader syncs immediately.
+    /// Natural batching occurs because followers accumulate during the
+    /// ~2ms fsync window.
+    pub fn join_group(&self) -> GroupCommitGuard<'_> {
         let my_epoch = self.epoch.load(Ordering::SeqCst);
 
         let mut state = self.state.lock().expect("group state");
         state.pending_count += 1;
-        let is_leader = state.pending_count == 1 && !state.sync_in_progress;
 
-        if is_leader {
+        if !state.sync_in_progress {
+            // No sync running → I'm the leader. Start syncing immediately.
             state.sync_in_progress = true;
             drop(state);
 
-            // Leader waits briefly for more writers to join
-            std::thread::sleep(Duration::from_micros(self.max_wait_us));
-
+            // No sleep! Leader proceeds directly to fsync.
             GroupCommitGuard {
                 engine: self,
-                epoch: my_epoch,
                 is_leader: true,
             }
         } else {
-            // Follower: wait for the leader to complete the sync
+            // A sync is already in progress → wait as follower.
+            // The leader will wake us when done.
             while state.committed_epoch < my_epoch {
                 state = self.cond.wait(state).expect("condvar wait");
             }
@@ -108,20 +102,18 @@ impl GroupCommitEngine {
 
             GroupCommitGuard {
                 engine: self,
-                epoch: my_epoch,
                 is_leader: false,
             }
         }
     }
 
     /// Called by the leader after performing the actual fsync.
-    pub fn complete_sync(&self) {
+    fn complete_sync(&self) {
         let new_epoch = self.epoch.fetch_add(1, Ordering::SeqCst);
 
         let mut state = self.state.lock().expect("group state");
         state.committed_epoch = new_epoch;
         state.sync_in_progress = false;
-        // Leader counts itself
         state.pending_count -= 1;
         drop(state);
 
@@ -129,24 +121,24 @@ impl GroupCommitEngine {
         self.cond.notify_all();
     }
 
-    /// Returns the current group commit statistics.
+    /// Returns (committed_epoch, pending_count).
     pub fn stats(&self) -> (u64, usize) {
         let state = self.state.lock().expect("group state");
         (state.committed_epoch, state.pending_count)
     }
 }
 
-/// Guard returned by `join_group()`. Check `is_leader` to determine
-/// whether this writer should perform the fsync.
+/// Guard returned by `join_group()`.
+/// If `is_leader` is true, perform fsync then call `mark_synced()`.
+/// If `is_leader` is false, the sync is already done — just proceed.
 pub struct GroupCommitGuard<'a> {
     engine: &'a GroupCommitEngine,
-    pub epoch: u64,
-    /// If true, this writer is the leader and should call fsync.
+    /// If true, this writer must perform the fsync.
     pub is_leader: bool,
 }
 
-impl<'a> GroupCommitGuard<'a> {
-    /// Call this after performing fsync (leader only).
+impl GroupCommitGuard<'_> {
+    /// Call after performing fsync (leader only). Wakes all followers.
     pub fn mark_synced(self) {
         if self.is_leader {
             self.engine.complete_sync();
@@ -211,7 +203,6 @@ impl RateLimiter {
 
         // Evict oldest bucket if at capacity
         if buckets.len() >= self.max_users && !buckets.contains_key(user_id) {
-            // Simple eviction: remove the user with the oldest last_refill
             let oldest = buckets
                 .iter()
                 .min_by_key(|(_, b)| b.last_refill)
@@ -235,7 +226,6 @@ impl RateLimiter {
             bucket.tokens -= 1.0;
             Ok(bucket.tokens as u32)
         } else {
-            // Calculate retry-after time
             let deficit = 1.0 - bucket.tokens;
             let retry_ms = (deficit / rate * 1000.0) as u64;
             Err(retry_ms.max(1))

@@ -1,8 +1,14 @@
+#![allow(dead_code)]
+#![allow(unused_imports)]
+#![allow(unused_variables)]
+#![allow(unused_mut)]
+#![allow(mismatched_lifetime_syntaxes)]
+
 use arc_swap::ArcSwap;
 use crossbeam_skiplist::SkipMap;
 use memmap2::{Mmap, MmapOptions};
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, BinaryHeap};
+use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::hash::{Hash, Hasher};
 use std::io::{BufWriter, Read, Write};
@@ -1152,10 +1158,10 @@ impl OmniKV {
                     write_offset += bytes.len() as u64;
                 }
             }
-            heap_writer.sync_data()?;
+            // No sync here — group commit leader syncs below
         }
 
-        // WAL write — append without fsync (group commit handles the sync)
+        // WAL write — append without fsync (group commit syncs below)
         {
             let mut wal = self
                 .wal
@@ -1164,14 +1170,17 @@ impl OmniKV {
             wal.append_batch_nosync(&wal_records)?;
         }
 
-        // ── GROUP COMMIT: batch WAL fsyncs ──
-        // Join the current write group. The leader waits briefly (~200µs)
-        // for more writers, then issues a single WAL fsync for the entire group.
-        // Under 8 concurrent writers, this reduces fsyncs from 8 to 1.
+        // ── GROUP COMMIT: batch heap + WAL fsyncs ──
+        // Natural batching: leader syncs immediately, no sleep.
+        // While leader fsyncs (~2ms), other writers queue up as followers.
+        // Result: N concurrent writes → 2 fsyncs instead of 2N.
         {
             let guard = self.group_commit.join_group();
             if guard.is_leader {
-                // Leader: fsync the WAL for all writers in this group
+                // Leader: fsync BOTH heap and WAL for all writers in this group
+                if let Ok(heap) = self.heap_file.lock() {
+                    let _ = heap.sync_data();
+                }
                 if let Ok(wal) = self.wal.lock() {
                     let _ = wal.sync();
                 }

@@ -6,7 +6,7 @@
 use openraft::BasicNode;
 use std::io::Cursor;
 
-/// The Raft type configuration for OmniKV.
+// The Raft type configuration for OmniKV.
 openraft::declare_raft_types!(
     pub TypeConfig:
         D = String,

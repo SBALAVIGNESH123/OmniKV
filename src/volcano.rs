@@ -406,7 +406,7 @@ impl AggregateIter {
                 .iter()
                 .map(|g| row.get(g).cloned().unwrap_or_default())
                 .collect::<Vec<_>>()
-                .join("|");
+                .join("\x00");
             groups.entry(key).or_default().push(row.clone());
         }
 
@@ -522,7 +522,9 @@ fn eval_where(row: &Row, expr: &WhereExpr) -> bool {
                 CmpOp::Gte => smart_cmp(&row_val, &cmp_val) != std::cmp::Ordering::Less,
                 CmpOp::Lte => smart_cmp(&row_val, &cmp_val) != std::cmp::Ordering::Greater,
                 CmpOp::Like => {
-                    let pattern = cmp_val.replace('%', ".*").replace('_', ".");
+                    // Escape regex metacharacters FIRST, then convert SQL wildcards
+                    let escaped = regex::escape(&cmp_val);
+                    let pattern = escaped.replace("%", ".*").replace("_", ".");
                     regex::Regex::new(&format!("^{}$", pattern))
                         .map(|r| r.is_match(&row_val))
                         .unwrap_or(false)
@@ -538,7 +540,7 @@ fn eval_where(row: &Row, expr: &WhereExpr) -> bool {
             let row_val = row.get(col).cloned().unwrap_or_default();
             vals.iter().any(|v| v.as_string() == row_val)
         }
-        WhereExpr::InSubquery(_, _) => true,
+        WhereExpr::InSubquery(_, _) => false, // Not implemented — reject rather than match everything
     }
 }
 
