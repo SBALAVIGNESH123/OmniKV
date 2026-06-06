@@ -1,4 +1,3 @@
-![OmniKV Logo](docs/omnikv_logo.png)
 
 # OmniKV
 
