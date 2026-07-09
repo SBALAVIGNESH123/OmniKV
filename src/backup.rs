@@ -43,13 +43,14 @@ pub fn create_backup(
     }
 
     // Add SSTable files
-    for entry in std::fs::read_dir(manifest_dir).map_err(|e| format!("Read dir: {}", e))? {
-        if let Ok(entry) = entry {
-            let name = entry.file_name().to_string_lossy().to_string();
-            if name.ends_with(".sst") || name.ends_with(".bloom") {
-                tar.append_path_with_name(entry.path(), &name)
-                    .map_err(|e| format!("Backup SST {}: {}", name, e))?;
-            }
+    for entry in std::fs::read_dir(manifest_dir)
+        .map_err(|e| format!("Read dir: {}", e))?
+        .flatten()
+    {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.ends_with(".sst") || name.ends_with(".bloom") {
+            tar.append_path_with_name(entry.path(), &name)
+                .map_err(|e| format!("Backup SST {}: {}", name, e))?;
         }
     }
 

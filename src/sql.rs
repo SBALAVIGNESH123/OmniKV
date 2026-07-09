@@ -6,6 +6,7 @@
 use crate::catalog::ColumnType;
 
 #[derive(Debug, Clone, PartialEq)]
+#[allow(clippy::large_enum_variant)]
 pub enum SqlStatement {
     CreateTable {
         name: String,
@@ -401,7 +402,7 @@ fn parse_create_table(tokens: &[String]) -> Result<SqlStatement, String> {
                 nullable = false;
             } else if upper == "DEFAULT" {
                 i += 1;
-                default = tokens.get(i).map(|t| t.clone());
+                default = tokens.get(i).cloned();
                 i += 1;
             } else {
                 i += 1;
@@ -643,12 +644,12 @@ fn parse_select_sql(tokens: &[String]) -> Result<SqlStatement, String> {
 
             let on_left = on_left_full
                 .split('.')
-                .last()
+                .next_back()
                 .unwrap_or(&on_left_full)
                 .to_string();
             let on_right = on_right_full
                 .split('.')
-                .last()
+                .next_back()
                 .unwrap_or(&on_right_full)
                 .to_string();
 
@@ -861,7 +862,7 @@ fn parse_where_atom(tokens: &[String], start: usize) -> Result<(WhereExpr, usize
         (format!("{}({})", func, arg), j)
     } else {
         let col = tokens[i].clone();
-        let name = col.split('.').last().unwrap_or(&col).to_string();
+        let name = col.split('.').next_back().unwrap_or(&col).to_string();
         (name, i + 1)
     };
 

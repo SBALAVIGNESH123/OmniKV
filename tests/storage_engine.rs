@@ -288,11 +288,9 @@ fn test_manifest_sequence_tracking() {
     let m = dir.path().join("seq_m.json");
     let w = dir.path().join("seq_w.bin");
 
-    let seq_before;
     {
         let db = OmniKV::open(m.to_str().unwrap(), w.to_str().unwrap()).unwrap();
         write_n(&db, "seqt", 10);
-        seq_before = db.get_seq();
     }
 
     {

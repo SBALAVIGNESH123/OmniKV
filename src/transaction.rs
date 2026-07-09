@@ -17,7 +17,7 @@
 //! 4. **COMMIT**:
 //!    a. Acquire the global transaction lock (serialization point).
 //!    b. For each key in our write_set, check if any other transaction
-//!       committed a write to that key AFTER our snapshot. If yes → ABORT.
+//!    committed a write to that key AFTER our snapshot. If yes → ABORT.
 //!    c. If no conflicts, commit all buffered writes atomically via WriteBatch.
 //!    d. Release the lock.
 //!

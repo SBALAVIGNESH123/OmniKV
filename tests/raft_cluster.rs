@@ -20,7 +20,7 @@ fn replicate_log(leader: &OmniRaftStorage, followers: &[&OmniRaftStorage], start
     for idx in start..end {
         let entry = leader
             .read_log(idx)
-            .expect(&format!("Leader missing log {}", idx));
+            .unwrap_or_else(|| panic!("Leader missing log {}", idx));
         for f in followers {
             f.append_log(idx, &entry).expect("Follower append failed");
         }
@@ -62,7 +62,7 @@ fn test_state_machine_apply() {
     let (db3, node3, _d3) = create_node("follower2");
 
     // Leader writes data through Raft log
-    let entries = vec![
+    let entries = [
         "SET user:1 Alice",
         "SET user:2 Bob",
         "SET user:3 Charlie",
@@ -279,7 +279,7 @@ fn test_crash_recovery_persistence() {
 /// takes over. Verify no data is lost and new leader continues correctly.
 #[test]
 fn test_leader_election_under_load() {
-    let (db1, node1, _d1) = create_node("leader1");
+    let (_db1, node1, _d1) = create_node("leader1");
     let (db2, node2, _d2) = create_node("follower1");
     let (db3, node3, _d3) = create_node("follower2");
 
@@ -441,7 +441,7 @@ fn test_log_consistency_after_crash() {
 #[test]
 fn test_snapshot_and_compaction() {
     let (db1, node1, _d1) = create_node("snap_leader");
-    let (db2, node2, _d2) = create_node("snap_follower");
+    let (_db2, node2, _d2) = create_node("snap_follower");
     let (_db3, node3, _d3) = create_node("snap_late_joiner");
 
     // Leader writes 100 entries
@@ -612,8 +612,8 @@ fn test_symmetric_partition_majority_progresses() {
     // DO NOT apply — these are uncommitted (no quorum)
 
     // Verify: majority partition has entries 21-40 applied
-    for (idx, n) in [2, 3, 4].iter().enumerate() {
-        let db = &cluster[*n].0;
+    for n in [2, 3, 4] {
+        let db = &cluster[n].0;
         let seq = db.get_seq();
         for i in 21..=40 {
             assert_eq!(
@@ -625,7 +625,7 @@ fn test_symmetric_partition_majority_progresses() {
             );
         }
         assert_eq!(
-            nodes[*n].last_applied_index(),
+            nodes[n].last_applied_index(),
             40,
             "Majority node {} should be at applied index 40",
             n + 1
@@ -1614,7 +1614,7 @@ fn test_sequence_divergence_and_convergence() {
 
     // Record sequences after phase 1
     let seq1_after_p1 = db1.get_seq();
-    let seq2_after_p1 = db2.get_seq();
+    let _seq2_after_p1 = db2.get_seq();
 
     // Phase 2: Node1 does 100 EXTRA local writes (outside Raft), causing seq divergence
     // This simulates a node whose clock/counter drifts far ahead
@@ -1951,7 +1951,7 @@ fn test_multi_term_progression_with_extreme_seq_skew() {
 // ═══════════════════════════════════════════════════════════════════════════
 
 use omni_engine::dist_txn::{
-    DistTxnState, DistWrite, PrepareResult, TwoPhaseCoordinator, TwoPhaseParticipant, Vote,
+    DistTxnState, PrepareResult, TwoPhaseCoordinator, TwoPhaseParticipant, Vote,
 };
 
 /// Gap #8a: Happy-path 2PC commit — 3 participants all vote COMMIT
@@ -2502,7 +2502,7 @@ fn test_ssi_write_write_conflict() {
         .unwrap();
 
     // Txn1 commits first — succeeds
-    let seq1 = tm.commit(&mut txn1).unwrap();
+    let _seq1 = tm.commit(&mut txn1).unwrap();
     assert_eq!(txn1.state, TxnState::Committed);
 
     // Txn2 tries to commit — MUST fail (write-write conflict)
@@ -2915,7 +2915,7 @@ fn test_txn_retry_with_backoff_pattern() {
 
     for attempt in 0..3 {
         let mut txn = tm.begin();
-        let current = tm.get(&mut txn, "backoff_key").unwrap();
+        let _current = tm.get(&mut txn, "backoff_key").unwrap();
         tm.set(&mut txn, "backoff_key", format!("attempt_{}", attempt))
             .unwrap();
 
@@ -3239,9 +3239,9 @@ fn test_range_scan_with_deletes() {
 /// Gap #13a: Add new node to 3-node cluster — late joiner catches up
 #[test]
 fn test_membership_add_node_catches_up() {
-    let (db1, n1, _d1) = create_node("mem_n1");
-    let (db2, n2, _d2) = create_node("mem_n2");
-    let (db3, n3, _d3) = create_node("mem_n3");
+    let (_db1, n1, _d1) = create_node("mem_n1");
+    let (_db2, n2, _d2) = create_node("mem_n2");
+    let (_db3, n3, _d3) = create_node("mem_n3");
 
     // 3-node cluster writes 20 entries
     for i in 1..=20 {
@@ -3392,8 +3392,8 @@ fn test_membership_scale_out_3_to_5() {
 /// Gap #13d: Re-add previously removed node — catches up from current leader
 #[test]
 fn test_membership_readd_node() {
-    let (db1, n1, _d1) = create_node("readd_n1");
-    let (db2, n2, _d2) = create_node("readd_n2");
+    let (_db1, n1, _d1) = create_node("readd_n1");
+    let (_db2, n2, _d2) = create_node("readd_n2");
     let (db3, n3, _d3) = create_node("readd_n3");
 
     // Phase 1: All 3 nodes in sync with 10 entries
@@ -3647,7 +3647,7 @@ fn test_rolling_upgrade_continuous_writes() {
 fn test_rolling_upgrade_read_availability() {
     let (db1, n1, _d1) = create_node("avail_n1");
     let (db2, n2, _d2) = create_node("avail_n2");
-    let (db3, n3, _d3) = create_node("avail_n3");
+    let (_db3, n3, _d3) = create_node("avail_n3");
 
     // Populate all nodes
     for i in 1..=10 {

@@ -14,6 +14,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+type ExplainAnalyzeOutput = (Vec<Row>, Vec<(String, NodeStats)>);
+
 /// Execution statistics collected during EXPLAIN ANALYZE.
 #[derive(Debug, Clone)]
 pub struct NodeStats {
@@ -96,10 +98,7 @@ impl PlanExecutor {
     }
 
     /// Execute EXPLAIN ANALYZE — run the plan and collect actual stats.
-    pub fn explain_analyze(
-        &self,
-        plan: &PlanNode,
-    ) -> Result<(Vec<Row>, Vec<(String, NodeStats)>), String> {
+    pub fn explain_analyze(&self, plan: &PlanNode) -> Result<ExplainAnalyzeOutput, String> {
         let mut stats = Vec::new();
         let rows = self.execute_with_stats(plan, &mut stats)?;
         Ok((rows, stats))
@@ -343,7 +342,7 @@ impl PlanExecutor {
         }
 
         let mut result = Vec::new();
-        for (_, group_rows) in &groups {
+        for group_rows in groups.values() {
             let mut row = Row::new();
             for col in columns {
                 match col {

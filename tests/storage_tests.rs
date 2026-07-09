@@ -1724,7 +1724,7 @@ fn test_2pc_participant_abort() {
     let (db, _dir) = create_test_db();
     let coord = TwoPhaseCoordinator::new(1, db.clone(), 5000);
     let p1 = TwoPhaseParticipant::new(2, db.clone());
-    let p2 = TwoPhaseParticipant::new(3, db.clone());
+    let _p2 = TwoPhaseParticipant::new(3, db.clone());
 
     let txn_id = coord.begin();
     coord
@@ -1789,7 +1789,7 @@ fn test_2pc_timeout_detection() {
     // Wait for timeout
     std::thread::sleep(std::time::Duration::from_millis(50));
 
-    let timed_out = coord.check_timeouts();
+    let _timed_out = coord.check_timeouts();
     // Note: timeout detection depends on second-level granularity,
     // so with 1ms timeout and 50ms sleep, it should timeout
     // (but since created_at is in seconds, this may not trigger)

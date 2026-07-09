@@ -63,10 +63,10 @@ impl OmniRaftStorage {
     }
 
     fn read_meta(db: &OmniKV) -> RaftStateMeta {
-        if let Ok(Some(val)) = db.find_latest_internal(RAFT_META_KEY) {
-            if let Ok(meta) = serde_json::from_str(&val) {
-                return meta;
-            }
+        if let Ok(Some(val)) = db.find_latest_internal(RAFT_META_KEY)
+            && let Ok(meta) = serde_json::from_str(&val)
+        {
+            return meta;
         }
         RaftStateMeta::default()
     }
@@ -257,7 +257,7 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
         let mut batch = WriteBatch::new();
         {
             let mut meta = self.meta.lock().unwrap();
-            meta.vote = Some(vote.clone());
+            meta.vote = Some(*vote);
             self.save_meta(&meta, &mut batch);
         }
         self.db.commit_batch(&batch).map_err(|e| StorageError::IO {
@@ -272,7 +272,7 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
 
     async fn read_vote(&mut self) -> Result<Option<Vote<u64>>, StorageError<u64>> {
         let meta = self.meta.lock().unwrap();
-        Ok(meta.vote.clone())
+        Ok(meta.vote)
     }
 
     async fn get_log_state(&mut self) -> Result<LogState<TypeConfig>, StorageError<u64>> {
@@ -340,10 +340,10 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
                     meta.last_log_id = None;
                 } else {
                     let prev_key = format!("{}{:020}", RAFT_LOG_PREFIX, log_id.index - 1);
-                    if let Ok(Some(val)) = self.db.find_latest_internal(&prev_key) {
-                        if let Ok(entry) = serde_json::from_str::<Entry<TypeConfig>>(&val) {
-                            meta.last_log_id = Some(entry.log_id);
-                        }
+                    if let Ok(Some(val)) = self.db.find_latest_internal(&prev_key)
+                        && let Ok(entry) = serde_json::from_str::<Entry<TypeConfig>>(&val)
+                    {
+                        meta.last_log_id = Some(entry.log_id);
                     }
                 }
                 self.save_meta(&meta, &mut batch);
@@ -587,20 +587,16 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
         fs::create_dir_all(&old_dir).ok();
 
         // Move current files to old_dir
-        for entry in fs::read_dir(&data_dir).unwrap() {
-            if let Ok(entry) = entry {
-                let name = entry.file_name().to_string_lossy().to_string();
-                if name != "old_snapshot" {
-                    let _ = fs::rename(entry.path(), old_dir.join(&name));
-                }
+        for entry in fs::read_dir(&data_dir).unwrap().flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name != "old_snapshot" {
+                let _ = fs::rename(entry.path(), old_dir.join(&name));
             }
         }
 
         // Move tmp files to data_dir
-        for entry in fs::read_dir(&tmp_dir).unwrap() {
-            if let Ok(entry) = entry {
-                let _ = fs::rename(entry.path(), data_dir.join(entry.file_name()));
-            }
+        for entry in fs::read_dir(&tmp_dir).unwrap().flatten() {
+            let _ = fs::rename(entry.path(), data_dir.join(entry.file_name()));
         }
 
         let _ = fs::remove_dir_all(&tmp_dir);

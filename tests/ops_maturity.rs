@@ -60,8 +60,10 @@ fn test_config_from_env() {
 
 #[test]
 fn test_config_validation_catches_errors() {
-    let mut cfg = OmniConfig::default();
-    cfg.memtable_flush_threshold = 0;
+    let cfg = OmniConfig {
+        memtable_flush_threshold: 0,
+        ..OmniConfig::default()
+    };
     let result = cfg.validate();
     assert!(result.is_err());
     let errors = result.unwrap_err();
@@ -366,7 +368,7 @@ fn test_hdr_histogram_latency_tracking() {
 
     // Check commit latency histogram
     let hist = db.metrics.commit_latencies.lock().unwrap();
-    assert!(hist.len() > 0, "Should have recorded commit latencies");
+    assert!(!hist.is_empty(), "Should have recorded commit latencies");
     let p50 = hist.value_at_quantile(0.5);
     let p99 = hist.value_at_quantile(0.99);
     assert!(p99 >= p50, "p99 should be >= p50");
@@ -389,7 +391,7 @@ fn test_hdr_histogram_read_latency() {
     }
 
     let hist = db.metrics.read_latencies.lock().unwrap();
-    assert!(hist.len() > 0);
+    assert!(!hist.is_empty());
     println!(
         "✅ OPS: Read latency histogram records {} samples",
         hist.len()

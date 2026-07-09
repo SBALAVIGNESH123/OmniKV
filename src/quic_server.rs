@@ -119,24 +119,19 @@ pub async fn run_quic_server(endpoint: Endpoint, db: Arc<OmniKV>) {
             match incoming.await {
                 Ok(conn) => {
                     tracing::debug!("QUIC connection from {}", conn.remote_address());
-                    loop {
-                        match conn.accept_bi().await {
-                            Ok((mut send, mut recv)) => {
-                                let db = db.clone();
-                                tokio::spawn(async move {
-                                    let mut buf = vec![0u8; 65536];
-                                    match recv.read(&mut buf).await {
-                                        Ok(Some(n)) if n > 0 => {
-                                            let response = handle_binary_request(&db, &buf[..n]);
-                                            let _ = send.write_all(&response).await;
-                                            let _ = send.finish();
-                                        }
-                                        _ => {}
-                                    }
-                                });
+                    while let Ok((mut send, mut recv)) = conn.accept_bi().await {
+                        let db = db.clone();
+                        tokio::spawn(async move {
+                            let mut buf = vec![0u8; 65536];
+                            match recv.read(&mut buf).await {
+                                Ok(Some(n)) if n > 0 => {
+                                    let response = handle_binary_request(&db, &buf[..n]);
+                                    let _ = send.write_all(&response).await;
+                                    let _ = send.finish();
+                                }
+                                _ => {}
                             }
-                            Err(_) => break,
-                        }
+                        });
                     }
                 }
                 Err(e) => {

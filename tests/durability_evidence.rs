@@ -159,7 +159,7 @@ fn test_1000_crash_recovery_cycles() {
 
     for cycle in 0u64..num_cycles {
         // Open engine
-        let db = OmniKV::open(&manifest, &wal).expect(&format!("open cycle {}", cycle));
+        let db = OmniKV::open(&manifest, &wal).unwrap_or_else(|_| panic!("open cycle {}", cycle));
 
         // Verify all previously written keys
         if total_keys > 0 {

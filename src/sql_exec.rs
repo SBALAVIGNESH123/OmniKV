@@ -74,10 +74,10 @@ impl SqlExecutor {
         let start = std::time::Instant::now();
 
         // Check timeout before execution
-        if let Some(timeout) = self.query_timeout {
-            if timeout.is_zero() {
-                return Err("Query timeout is zero".into());
-            }
+        if let Some(timeout) = self.query_timeout
+            && timeout.is_zero()
+        {
+            return Err("Query timeout is zero".into());
         }
 
         let result = self.execute_inner(stmt);
@@ -289,7 +289,7 @@ impl SqlExecutor {
         let mut pk = None;
         let mut columns = Vec::new();
         for c in cols {
-            let col_type = ColumnType::from_str(&c.col_type)?;
+            let col_type = c.col_type.parse::<ColumnType>()?;
             if c.primary_key {
                 pk = Some(c.name.clone());
             }
@@ -402,6 +402,7 @@ impl SqlExecutor {
             .collect()
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn exec_select(
         &self,
         columns: &[SelectColumn],
@@ -539,7 +540,7 @@ impl SqlExecutor {
     }
 
     /// Window function post-processing (ROW_NUMBER, RANK, DENSE_RANK).
-    fn apply_window_functions(&self, rows: &mut Vec<Row>, columns: &[SelectColumn]) {
+    fn apply_window_functions(&self, rows: &mut [Row], columns: &[SelectColumn]) {
         for col in columns {
             if let SelectColumn::WindowFunc {
                 order_by: ob, desc, ..
@@ -673,6 +674,7 @@ impl SqlExecutor {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn execute_join(
         &self,
         left: &[Row],
@@ -748,7 +750,7 @@ impl SqlExecutor {
         let mut col_names = Vec::new();
         let mut result_rows = Vec::new();
 
-        for (_key, group_rows) in &groups {
+        for group_rows in groups.values() {
             let mut result_row = Vec::new();
             for col in columns {
                 match col {

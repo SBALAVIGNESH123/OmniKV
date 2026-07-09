@@ -3,7 +3,7 @@
 //! These tests prove correctness under REAL parallel thread contention —
 //! not simulated single-threaded scenarios.
 
-use omni_engine::transaction::{TransactionManager, TxnState};
+use omni_engine::transaction::TransactionManager;
 use omni_engine::{OmniKV, WriteBatch};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -257,12 +257,9 @@ fn test_concurrent_mixed_read_write() {
                     let mut txn = tm.begin();
                     let key = format!("mixed_{}", (tid * 10 + i) % 50);
                     tm.set(&mut txn, &key, format!("w_{}_{}", tid, i)).unwrap();
-                    match tm.commit(&mut txn) {
-                        Ok(_) => {
-                            writes.fetch_add(1, Ordering::Relaxed);
-                            break;
-                        }
-                        Err(_) => {} // retry
+                    if tm.commit(&mut txn).is_ok() {
+                        writes.fetch_add(1, Ordering::Relaxed);
+                        break;
                     }
                 }
             }
@@ -316,11 +313,8 @@ fn test_concurrent_savepoints() {
                     assert_eq!(v1, Some("before_savepoint".into()));
                     assert_eq!(v2, None);
 
-                    match tm.commit(&mut txn) {
-                        Ok(_) => {
-                            success.fetch_add(1, Ordering::Relaxed);
-                        }
-                        Err(_) => {} // SSI conflict OK
+                    if tm.commit(&mut txn).is_ok() {
+                        success.fetch_add(1, Ordering::Relaxed);
                     }
                 }
             })
@@ -379,9 +373,8 @@ fn test_concurrent_metrics_accuracy() {
                         let n: i64 = val.parse().unwrap();
                         tm.set(&mut txn, "metrics_key", (n + 1).to_string())
                             .unwrap();
-                        match tm.commit(&mut txn) {
-                            Ok(_) => break,
-                            Err(_) => {}
+                        if tm.commit(&mut txn).is_ok() {
+                            break;
                         }
                     }
                 }

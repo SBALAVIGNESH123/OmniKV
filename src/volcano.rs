@@ -469,7 +469,7 @@ impl AggregateIter {
         }
 
         let mut result = Vec::new();
-        for (_, group_rows) in &groups {
+        for group_rows in groups.values() {
             let refs: Vec<&Row> = group_rows.iter().collect();
             let mut row = Row::new();
             for col in &agg_columns {

@@ -173,13 +173,7 @@ fn test_torn_wal_record_is_rejected() {
 // ─────────────────────────────────────────────────────────────────
 #[test]
 fn test_ttl_expired_key_absent() {
-    let (dir, db) = open_fresh();
-    // Write a key that expired 1 second ago (absolute unix timestamp, not TTL seconds)
-    let past_expiry = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs()
-        .saturating_sub(1);
+    let (_dir, db) = open_fresh();
     {
         let mut b = WriteBatch::new();
         // set_with_ttl takes TTL in seconds from now, so use 0 to expire immediately
@@ -424,7 +418,7 @@ fn test_batch_is_atomic() {
 
 #[test]
 fn test_concurrent_read_during_root_swap() {
-    let (dir, db) = open_fresh();
+    let (_dir, db) = open_fresh();
 
     // 1. Write some initial data
     let mut batch1 = WriteBatch::new();

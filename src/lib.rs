@@ -271,6 +271,14 @@ const MAX_VALUE_SIZE: usize = 10 * 1024 * 1024; // 10 MB
 const UNCOMPRESSED_FLAG: u64 = 1 << 63;
 const NUM_SHARDS: usize = 16;
 
+type ValuePointer = (u64, u64, u32, u64);
+type VersionedValuePointers = std::collections::BTreeMap<u64, ValuePointer>;
+type MemtableShard = SkipMap<(Vec<u8>, Reverse<u64>), ValuePointer>;
+type Memtable = [MemtableShard; NUM_SHARDS];
+type SharedMemtable = Arc<Memtable>;
+type SstableHandle = (Arc<Mmap>, Arc<BloomFilter>, String);
+type SharedSstables = Arc<Vec<SstableHandle>>;
+
 #[inline]
 pub fn shard_idx(key: &[u8]) -> usize {
     let mut h = FnvHasher::default();
@@ -465,11 +473,13 @@ impl<'a> SSTableReader<'a> {
                 if rec.key.as_slice() > target_key {
                     break;
                 }
-                if rec.key.as_slice() == target_key && rec.is_valid() && rec.seq <= read_seq {
-                    if best.is_none() || rec.seq > best_seq {
-                        best_seq = rec.seq;
-                        best = Some((rec.offset, rec.length, rec.payload_crc32, rec.expiry));
-                    }
+                if rec.key.as_slice() == target_key
+                    && rec.is_valid()
+                    && rec.seq <= read_seq
+                    && (best.is_none() || rec.seq > best_seq)
+                {
+                    best_seq = rec.seq;
+                    best = Some((rec.offset, rec.length, rec.payload_crc32, rec.expiry));
                 }
             } else {
                 break;
@@ -543,10 +553,10 @@ impl<'a> SSTableWriter<'a> {
         self.writer.write_all(&bytes)?;
         self.offset += bytes.len();
 
-        if let Some(_) = &self.current_block_start_key {
-            if self.offset as u64 - self.index.last().unwrap().1 >= self.block_size as u64 {
-                self.current_block_start_key = None;
-            }
+        if self.current_block_start_key.is_some()
+            && self.offset as u64 - self.index.last().unwrap().1 >= self.block_size as u64
+        {
+            self.current_block_start_key = None;
         }
         Ok(())
     }
@@ -575,11 +585,10 @@ impl<'a> SSTableWriter<'a> {
 pub struct StorageRoots {
     pub base_mmap: Arc<Mmap>,
     pub base_bloom: Arc<BloomFilter>,
-    pub sstables: Arc<Vec<(Arc<Mmap>, Arc<BloomFilter>, String)>>, // L0
-    pub l1_sstables: Arc<Vec<(Arc<Mmap>, Arc<BloomFilter>, String)>>, // L1
-    pub memtable: Arc<[SkipMap<(Vec<u8>, Reverse<u64>), (u64, u64, u32, u64)>; NUM_SHARDS]>,
-    pub frozen_memtables:
-        Arc<Vec<Arc<[SkipMap<(Vec<u8>, Reverse<u64>), (u64, u64, u32, u64)>; NUM_SHARDS]>>>,
+    pub sstables: SharedSstables,    // L0
+    pub l1_sstables: SharedSstables, // L1
+    pub memtable: SharedMemtable,
+    pub frozen_memtables: Arc<Vec<SharedMemtable>>,
     pub manifest: Arc<Manifest>,
     pub heap_reader: Arc<File>,
 }
@@ -589,14 +598,14 @@ pub struct StorageRoots {
 pub(crate) struct RecoveredStorage {
     pub base_mmap: Arc<Mmap>,
     pub base_bloom: Arc<BloomFilter>,
-    pub sstables: Arc<Vec<(Arc<Mmap>, Arc<BloomFilter>, String)>>,
-    pub l1_sstables: Arc<Vec<(Arc<Mmap>, Arc<BloomFilter>, String)>>,
+    pub sstables: SharedSstables,
+    pub l1_sstables: SharedSstables,
     pub manifest: Arc<Manifest>,
     pub heap_reader: Arc<File>,
     pub heap_file: File,
     pub heap_offset: u64,
     pub wal: wal::WriteAheadLog,
-    pub memtable: Arc<[SkipMap<(Vec<u8>, Reverse<u64>), (u64, u64, u32, u64)>; NUM_SHARDS]>,
+    pub memtable: SharedMemtable,
     pub max_seq: u64,
 }
 
@@ -672,9 +681,7 @@ impl OmniKV {
         self.roots.load()
     }
     #[inline]
-    pub(crate) fn memtable_arc(
-        &self,
-    ) -> Arc<[SkipMap<(Vec<u8>, Reverse<u64>), (u64, u64, u32, u64)>; NUM_SHARDS]> {
+    pub(crate) fn memtable_arc(&self) -> SharedMemtable {
         self.roots.load().memtable.clone()
     }
     #[inline]
@@ -719,6 +726,7 @@ impl OmniKV {
 
         let base_file = OpenOptions::new()
             .create(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .open(&manifest.base_path)?;
@@ -826,6 +834,7 @@ impl OmniKV {
 
         let heap_file = OpenOptions::new()
             .create(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .open(&manifest.heap_path)?;
@@ -1615,10 +1624,12 @@ impl OmniKV {
                 if rec.key > target_key {
                     break;
                 }
-                if rec.key == target_key && rec.is_valid() && rec.seq <= read_seq {
-                    if rec.seq > best_seq {
-                        best_seq = rec.seq;
-                    }
+                if rec.key == target_key
+                    && rec.is_valid()
+                    && rec.seq <= read_seq
+                    && rec.seq > best_seq
+                {
+                    best_seq = rec.seq;
                 }
             }
             if best_seq > 0 { Some(best_seq) } else { None }
@@ -1657,10 +1668,12 @@ impl OmniKV {
                 if rec.key > target_key {
                     break;
                 }
-                if rec.key == target_key && rec.is_valid() && rec.seq <= read_seq {
-                    if rec.seq > best_seq {
-                        best_seq = rec.seq;
-                    }
+                if rec.key == target_key
+                    && rec.is_valid()
+                    && rec.seq <= read_seq
+                    && rec.seq > best_seq
+                {
+                    best_seq = rec.seq;
                 }
             }
             if best_seq > 0 {
@@ -1677,9 +1690,7 @@ impl OmniKV {
                 .write_mutex
                 .lock()
                 .map_err(|_| OmniError::LockPoisoned("compact".into()))?;
-            let new_empty: Arc<
-                [SkipMap<(Vec<u8>, Reverse<u64>), (u64, u64, u32, u64)>; NUM_SHARDS],
-            > = Arc::new(std::array::from_fn(|_| SkipMap::new()));
+            let new_empty: SharedMemtable = Arc::new(std::array::from_fn(|_| SkipMap::new()));
             // Atomically: swap memtable to empty and add old one to frozen list
             let old_memtable = {
                 let current = self.roots.load();
@@ -1743,7 +1754,7 @@ impl OmniKV {
         );
         let _ = bloom.save(&sst_path.replace(".sst", ".bloom"));
         let file = OpenOptions::new()
-            .create(true)
+            .create_new(true)
             .write(true)
             .read(true)
             .open(&sst_path)?;
@@ -1880,7 +1891,7 @@ impl OmniKV {
         );
         let _ = bloom.save(&sst_path.replace(".sst", ".bloom"));
         let file = OpenOptions::new()
-            .create(true)
+            .create_new(true)
             .write(true)
             .read(true)
             .open(&sst_path)?;
@@ -2005,7 +2016,7 @@ impl OmniKV {
                 .as_millis()
         );
         let file = OpenOptions::new()
-            .create(true)
+            .create_new(true)
             .write(true)
             .read(true)
             .open(&new_base_path)?;
@@ -2070,8 +2081,7 @@ impl OmniKV {
             .unwrap_or_default()
             .as_secs();
         let min_seq = self.min_active_snapshot();
-        let mut merged: BTreeMap<Vec<u8>, std::collections::BTreeMap<u64, (u64, u64, u32, u64)>> =
-            BTreeMap::new();
+        let mut merged: BTreeMap<Vec<u8>, VersionedValuePointers> = BTreeMap::new();
 
         let mut add_to_merged =
             |key: Vec<u8>, seq: u64, offset: u64, length: u64, crc: u32, expiry: u64| {
@@ -2174,12 +2184,12 @@ impl OmniKV {
         );
 
         let new_heap_file = OpenOptions::new()
-            .create(true)
+            .create_new(true)
             .write(true)
             .read(true)
             .open(&new_heap_path)?;
         let new_base_file = OpenOptions::new()
-            .create(true)
+            .create_new(true)
             .write(true)
             .read(true)
             .open(&new_base_path)?;
@@ -2348,10 +2358,10 @@ impl OmniKV {
                     // Phase 4: MVCC Garbage Collection — every 5th compaction cycle
                     if did_compact {
                         gc_counter += 1;
-                        if gc_counter % 5 == 0 {
-                            if let Err(e) = db.run_garbage_collection() {
-                                eprintln!("[GC] MVCC garbage collection error: {:?}", e);
-                            }
+                        if gc_counter.is_multiple_of(5)
+                            && let Err(e) = db.run_garbage_collection()
+                        {
+                            eprintln!("[GC] MVCC garbage collection error: {:?}", e);
                         }
                     }
                 }

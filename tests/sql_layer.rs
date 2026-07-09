@@ -2,9 +2,9 @@
 // SQL Layer Integration Tests — Gaps #23 through #31
 // ═══════════════════════════════════════════════════════════════════════════
 
+use omni_engine::OmniKV;
 use omni_engine::sql::*;
 use omni_engine::sql_exec::*;
-use omni_engine::{OmniKV, WriteBatch};
 use std::sync::Arc;
 
 /// Helper: create DB + catalog + executor

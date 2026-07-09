@@ -33,7 +33,6 @@ use std::time::{Duration, Instant};
 ///
 /// This achieves the same throughput as a timed-wait design without the
 /// latency overhead of sleeping on every single-threaded write.
-
 pub struct GroupCommitEngine {
     /// State of the current write group.
     state: Mutex<GroupState>,
@@ -160,7 +159,6 @@ impl GroupCommitGuard<'_> {
 /// - Tokens refill at `rate_per_sec` tokens per second.
 /// - Each request consumes 1 token.
 /// - If no tokens available → request is rejected (HTTP 429).
-
 pub struct RateLimiter {
     /// Per-user buckets: user_id → bucket state.
     buckets: Mutex<HashMap<String, TokenBucket>>,
@@ -252,7 +250,7 @@ impl RateLimiter {
 /// Creates a properly tuned reqwest::Client for Raft RPC communication.
 /// Default `reqwest::Client::new()` has no connection pool limits, causing
 /// TCP connection storms under high Raft traffic.
-
+///
 /// Creates a production-grade reqwest client with connection pooling.
 pub fn create_pooled_client(
     pool_max_idle: usize,

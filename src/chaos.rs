@@ -232,6 +232,7 @@ pub fn test_concurrent_ww_conflicts(
 /// - Both see "yes", so both go off call.
 /// - Result: nobody is on call. This is the WRITE SKEW anomaly.
 /// - SSI must detect and abort at least one transaction.
+///
 /// ═══════════════════════════════════════════════════════════════════════
 pub fn test_write_skew_detection(db: Arc<OmniKV>) -> ChaosResult {
     let tm = Arc::new(TransactionManager::new(db.clone()));

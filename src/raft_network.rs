@@ -11,6 +11,12 @@ pub struct OmniNetwork {
     client: reqwest::Client,
 }
 
+impl Default for OmniNetwork {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl OmniNetwork {
     pub fn new() -> Self {
         Self {

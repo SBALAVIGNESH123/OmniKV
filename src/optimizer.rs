@@ -75,7 +75,7 @@ pub fn gather_stats(
                     .unwrap_or_default();
                 let total: u64 = sample.iter().take(100).map(|(_, v)| v.len() as u64).sum();
                 let sampled = sample.len().min(100) as u64;
-                if sampled > 0 { total / sampled } else { 128 }
+                total.checked_div(sampled).unwrap_or(128)
             } else {
                 128
             };
@@ -258,18 +258,17 @@ pub fn estimate_selectivity_with_stats(expr: &WhereExpr, stats: Option<&TableSta
     match expr {
         WhereExpr::Comparison { column, op, .. } => {
             // Use histogram NDV if available
-            if let Some(st) = stats {
-                if let Some(ndv) = st.ndv(column) {
-                    if ndv > 0 {
-                        return match op {
-                            CmpOp::Eq => 1.0 / ndv as f64, // exact: 1/NDV
-                            CmpOp::Ne => 1.0 - (1.0 / ndv as f64),
-                            CmpOp::Lt | CmpOp::Gt => 1.0 / 3.0,
-                            CmpOp::Lte | CmpOp::Gte => 1.0 / 3.0,
-                            CmpOp::Like => 0.25,
-                        };
-                    }
-                }
+            if let Some(st) = stats
+                && let Some(ndv) = st.ndv(column)
+                && ndv > 0
+            {
+                return match op {
+                    CmpOp::Eq => 1.0 / ndv as f64, // exact: 1/NDV
+                    CmpOp::Ne => 1.0 - (1.0 / ndv as f64),
+                    CmpOp::Lt | CmpOp::Gt => 1.0 / 3.0,
+                    CmpOp::Lte | CmpOp::Gte => 1.0 / 3.0,
+                    CmpOp::Like => 0.25,
+                };
             }
             // Fallback: hardcoded estimates
             match op {
@@ -291,26 +290,24 @@ pub fn estimate_selectivity_with_stats(expr: &WhereExpr, stats: Option<&TableSta
         WhereExpr::Not(inner) => 1.0 - estimate_selectivity_with_stats(inner, stats),
         WhereExpr::IsNull(col) => {
             // Use null_fraction from histogram if available
-            if let Some(st) = stats {
-                if let Some(h) = st
+            if let Some(st) = stats
+                && let Some(h) = st
                     .histograms
                     .iter()
                     .find(|h| h.column.eq_ignore_ascii_case(col))
-                {
-                    return h.null_fraction;
-                }
+            {
+                return h.null_fraction;
             }
             0.05
         }
         WhereExpr::IsNotNull(col) => {
-            if let Some(st) = stats {
-                if let Some(h) = st
+            if let Some(st) = stats
+                && let Some(h) = st
                     .histograms
                     .iter()
                     .find(|h| h.column.eq_ignore_ascii_case(col))
-                {
-                    return 1.0 - h.null_fraction;
-                }
+            {
+                return 1.0 - h.null_fraction;
             }
             0.95
         }
@@ -483,18 +480,18 @@ impl Optimizer {
         let mut plan = self.plan_from(from, where_clause)?;
 
         // 2. Add filter if not already pushed into scan
-        if let Some(expr) = where_clause {
-            if !self.filter_pushed_to_scan(from, expr) {
-                let input_rows = plan.estimated_rows();
-                let sel = estimate_selectivity(expr);
-                let est_rows = (input_rows as f64 * sel) as u64;
-                plan = PlanNode::Filter {
-                    estimated_cost: plan.estimated_cost() + input_rows as f64 * FILTER_COST_PER_ROW,
-                    child: Box::new(plan),
-                    predicate: expr.clone(),
-                    estimated_rows: est_rows.max(1),
-                };
-            }
+        if let Some(expr) = where_clause
+            && !self.filter_pushed_to_scan(from, expr)
+        {
+            let input_rows = plan.estimated_rows();
+            let sel = estimate_selectivity(expr);
+            let est_rows = (input_rows as f64 * sel) as u64;
+            plan = PlanNode::Filter {
+                estimated_cost: plan.estimated_cost() + input_rows as f64 * FILTER_COST_PER_ROW,
+                child: Box::new(plan),
+                predicate: expr.clone(),
+                estimated_rows: est_rows.max(1),
+            };
         }
 
         // 3. Aggregate
@@ -687,10 +684,8 @@ impl Optimizer {
                 .iter()
                 .take_while(|(f, _)| columns_used.contains(f))
                 .count();
-            if matched > 0 {
-                if best.as_ref().map(|(_, s)| matched > *s).unwrap_or(true) {
-                    best = Some((idx.clone(), matched));
-                }
+            if matched > 0 && best.as_ref().map(|(_, s)| matched > *s).unwrap_or(true) {
+                best = Some((idx.clone(), matched));
             }
         }
         best.map(|(idx, _)| idx)
@@ -768,9 +763,9 @@ impl PlanNode {
                     "{}→ Hash {:?} Join on {} = {}  (rows={}, cost={:.1})",
                     indent, join_type, on_left_col, on_right_col, estimated_rows, estimated_cost
                 )?;
-                write!(f, "\n")?;
+                writeln!(f)?;
                 left.fmt_indent(f, depth + 1)?;
-                write!(f, "\n")?;
+                writeln!(f)?;
                 right.fmt_indent(f, depth + 1)?;
             }
             Self::Filter {
@@ -784,13 +779,13 @@ impl PlanNode {
                     "{}→ Filter  (rows={}, cost={:.1})\n{}  Predicate: {:?}",
                     indent, estimated_rows, estimated_cost, indent, predicate
                 )?;
-                write!(f, "\n")?;
+                writeln!(f)?;
                 child.fmt_indent(f, depth + 1)?;
             }
             Self::Project { child, columns } => {
                 let cols: Vec<String> = columns.iter().map(|c| format!("{:?}", c)).collect();
                 write!(f, "{}→ Project [{}]", indent, cols.join(", "))?;
-                write!(f, "\n")?;
+                writeln!(f)?;
                 child.fmt_indent(f, depth + 1)?;
             }
             Self::Sort {
@@ -809,12 +804,12 @@ impl PlanNode {
                     keys.join(", "),
                     estimated_cost
                 )?;
-                write!(f, "\n")?;
+                writeln!(f)?;
                 child.fmt_indent(f, depth + 1)?;
             }
             Self::Limit { child, count } => {
                 write!(f, "{}→ Limit {}", indent, count)?;
-                write!(f, "\n")?;
+                writeln!(f)?;
                 child.fmt_indent(f, depth + 1)?;
             }
             Self::Aggregate {
@@ -830,7 +825,7 @@ impl PlanNode {
                     group_by.join(", "),
                     estimated_rows
                 )?;
-                write!(f, "\n")?;
+                writeln!(f)?;
                 child.fmt_indent(f, depth + 1)?;
             }
         }
