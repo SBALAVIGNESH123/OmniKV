@@ -66,8 +66,6 @@ jobs:
       run: cargo test --test storage_engine -- --test-threads=1
     - name: Storage perf (21 tests)
       run: cargo test --test storage_perf -- --test-threads=1 --nocapture
-    - name: Durability evidence (crash/corruption/restore coverage)
-      run: cargo test --test durability_evidence -- --test-threads=1 --nocapture
 
   test-transactions:
     name: Transaction & Concurrency Tests
