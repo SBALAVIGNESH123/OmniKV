@@ -252,7 +252,12 @@ fn handle_query(
     if upper == "BEGIN" || upper == "START TRANSACTION" {
         if conn.txn.is_some() {
             // Already in a transaction — PostgreSQL sends a WARNING but doesn't fail
-            send_error(stream, "WARNING", "25001", "there is already a transaction in progress")?;
+            send_error(
+                stream,
+                "WARNING",
+                "25001",
+                "there is already a transaction in progress",
+            )?;
         } else {
             let txn = tm.begin();
             conn.txn = Some(txn);
@@ -283,7 +288,12 @@ fn handle_query(
             }
         } else {
             // No transaction — PostgreSQL sends a WARNING
-            send_error(stream, "WARNING", "25P01", "there is no transaction in progress")?;
+            send_error(
+                stream,
+                "WARNING",
+                "25P01",
+                "there is no transaction in progress",
+            )?;
             send_command_complete(stream, "COMMIT")?;
         }
         send_ready_for_query_status(stream, conn.ready_status())?;
@@ -297,7 +307,12 @@ fn handle_query(
             conn.txn_failed = false;
             send_command_complete(stream, "ROLLBACK")?;
         } else {
-            send_error(stream, "WARNING", "25P01", "there is no transaction in progress")?;
+            send_error(
+                stream,
+                "WARNING",
+                "25P01",
+                "there is no transaction in progress",
+            )?;
             send_command_complete(stream, "ROLLBACK")?;
         }
         send_ready_for_query_status(stream, conn.ready_status())?;
@@ -523,7 +538,10 @@ fn send_auth_ok(stream: &mut std::net::TcpStream) -> std::io::Result<()> {
 
 /// Send ReadyForQuery with the correct transaction status byte.
 /// 'I' = idle (no transaction), 'T' = in transaction, 'E' = failed transaction
-fn send_ready_for_query_status(stream: &mut std::net::TcpStream, status: u8) -> std::io::Result<()> {
+fn send_ready_for_query_status(
+    stream: &mut std::net::TcpStream,
+    status: u8,
+) -> std::io::Result<()> {
     let mut buf = Vec::new();
     buf.push(READY_FOR_QUERY);
     buf.extend_from_slice(&5i32.to_be_bytes());

@@ -236,11 +236,7 @@ impl SchemaManager {
         })?;
 
         // Set version to one below
-        let new_version = if migration.version > 1 {
-            migration.version - 1
-        } else {
-            0
-        };
+        let new_version = migration.version.saturating_sub(1);
         self.set_version(new_version)?;
 
         Ok(())
@@ -345,30 +341,30 @@ impl SchemaManager {
 
         if let Ok(iter) = self.db.scan_iter(&prefix, &end, seq) {
             for (key, value) in iter {
-                if let Ok(mut doc) = serde_json::from_str::<serde_json::Value>(&value) {
-                    if let Some(obj) = doc.as_object_mut() {
-                        match default_value {
-                            Some(val) => {
-                                // AddField: only add if not already present
-                                if !obj.contains_key(field_name) {
-                                    obj.insert(field_name.to_string(), val.clone());
-                                }
-                            }
-                            None => {
-                                // RemoveField
-                                obj.remove(field_name);
+                if let Ok(mut doc) = serde_json::from_str::<serde_json::Value>(&value)
+                    && let Some(obj) = doc.as_object_mut()
+                {
+                    match default_value {
+                        Some(val) => {
+                            // AddField: only add if not already present
+                            if !obj.contains_key(field_name) {
+                                obj.insert(field_name.to_string(), val.clone());
                             }
                         }
-                        let updated = serde_json::to_string(&doc)
-                            .map_err(|e| OmniError::IoError(e.to_string()))?;
-                        batch.set(&key, updated)?;
-                        count += 1;
+                        None => {
+                            // RemoveField
+                            obj.remove(field_name);
+                        }
+                    }
+                    let updated = serde_json::to_string(&doc)
+                        .map_err(|e| OmniError::IoError(e.to_string()))?;
+                    batch.set(&key, updated)?;
+                    count += 1;
 
-                        // Commit in batches of 500
-                        if count % 500 == 0 {
-                            self.db.commit_batch(&batch)?;
-                            batch = WriteBatch::new();
-                        }
+                    // Commit in batches of 500
+                    if count % 500 == 0 {
+                        self.db.commit_batch(&batch)?;
+                        batch = WriteBatch::new();
                     }
                 }
             }
@@ -397,20 +393,19 @@ impl SchemaManager {
 
         if let Ok(iter) = self.db.scan_iter(&prefix, &end, seq) {
             for (key, value) in iter {
-                if let Ok(mut doc) = serde_json::from_str::<serde_json::Value>(&value) {
-                    if let Some(obj) = doc.as_object_mut() {
-                        if let Some(val) = obj.remove(old_name) {
-                            obj.insert(new_name.to_string(), val);
-                            let updated = serde_json::to_string(&doc)
-                                .map_err(|e| OmniError::IoError(e.to_string()))?;
-                            batch.set(&key, updated)?;
-                            count += 1;
+                if let Ok(mut doc) = serde_json::from_str::<serde_json::Value>(&value)
+                    && let Some(obj) = doc.as_object_mut()
+                    && let Some(val) = obj.remove(old_name)
+                {
+                    obj.insert(new_name.to_string(), val);
+                    let updated = serde_json::to_string(&doc)
+                        .map_err(|e| OmniError::IoError(e.to_string()))?;
+                    batch.set(&key, updated)?;
+                    count += 1;
 
-                            if count % 500 == 0 {
-                                self.db.commit_batch(&batch)?;
-                                batch = WriteBatch::new();
-                            }
-                        }
+                    if count % 500 == 0 {
+                        self.db.commit_batch(&batch)?;
+                        batch = WriteBatch::new();
                     }
                 }
             }

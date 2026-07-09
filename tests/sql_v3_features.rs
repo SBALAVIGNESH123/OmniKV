@@ -2,9 +2,9 @@
 // SQL v3 Feature Tests — OFFSET, HAVING, Subqueries, UNION, RIGHT JOIN
 // ═══════════════════════════════════════════════════════════════════════════
 
+use omni_engine::OmniKV;
 use omni_engine::sql::*;
 use omni_engine::sql_exec::*;
-use omni_engine::OmniKV;
 use std::sync::Arc;
 
 /// Helper: create DB + catalog + executor
@@ -21,7 +21,9 @@ fn create_sql_env(prefix: &str) -> (Arc<OmniKV>, SqlExecutor) {
 
 fn exec_sql(executor: &SqlExecutor, sql: &str) -> ExecResult {
     let stmt = parse_sql(sql).unwrap_or_else(|e| panic!("Parse error for '{}': {}", sql, e));
-    executor.execute(&stmt).unwrap_or_else(|e| panic!("Exec error for '{}': {}", sql, e))
+    executor
+        .execute(&stmt)
+        .unwrap_or_else(|e| panic!("Exec error for '{}': {}", sql, e))
 }
 
 fn exec_rows(executor: &SqlExecutor, sql: &str) -> (Vec<String>, Vec<Vec<String>>) {
@@ -39,11 +41,20 @@ fn exec_rows(executor: &SqlExecutor, sql: &str) -> (Vec<String>, Vec<Vec<String>
 fn test_offset_basic() {
     let (_db, exec) = create_sql_env("off1");
 
-    exec_sql(&exec, "CREATE TABLE off_test (id INTEGER PRIMARY KEY, val TEXT)");
-    exec_sql(&exec, "INSERT INTO off_test (id, val) VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd'), (5, 'e')");
+    exec_sql(
+        &exec,
+        "CREATE TABLE off_test (id INTEGER PRIMARY KEY, val TEXT)",
+    );
+    exec_sql(
+        &exec,
+        "INSERT INTO off_test (id, val) VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd'), (5, 'e')",
+    );
 
     // LIMIT 2 OFFSET 2 → skip first 2, take 2
-    let (_cols, rows) = exec_rows(&exec, "SELECT id FROM off_test ORDER BY id LIMIT 2 OFFSET 2");
+    let (_cols, rows) = exec_rows(
+        &exec,
+        "SELECT id FROM off_test ORDER BY id LIMIT 2 OFFSET 2",
+    );
     assert_eq!(rows.len(), 2);
     assert_eq!(rows[0][0], "3");
     assert_eq!(rows[1][0], "4");
@@ -86,14 +97,30 @@ fn test_offset_zero() {
 fn test_having_basic() {
     let (_db, exec) = create_sql_env("hav1");
 
-    exec_sql(&exec, "CREATE TABLE hav_sales (id INTEGER PRIMARY KEY, region TEXT, amount INTEGER)");
-    exec_sql(&exec, "INSERT INTO hav_sales (id, region, amount) VALUES (1, 'East', 100)");
-    exec_sql(&exec, "INSERT INTO hav_sales (id, region, amount) VALUES (2, 'East', 200)");
-    exec_sql(&exec, "INSERT INTO hav_sales (id, region, amount) VALUES (3, 'West', 50)");
-    exec_sql(&exec, "INSERT INTO hav_sales (id, region, amount) VALUES (4, 'North', 300)");
+    exec_sql(
+        &exec,
+        "CREATE TABLE hav_sales (id INTEGER PRIMARY KEY, region TEXT, amount INTEGER)",
+    );
+    exec_sql(
+        &exec,
+        "INSERT INTO hav_sales (id, region, amount) VALUES (1, 'East', 100)",
+    );
+    exec_sql(
+        &exec,
+        "INSERT INTO hav_sales (id, region, amount) VALUES (2, 'East', 200)",
+    );
+    exec_sql(
+        &exec,
+        "INSERT INTO hav_sales (id, region, amount) VALUES (3, 'West', 50)",
+    );
+    exec_sql(
+        &exec,
+        "INSERT INTO hav_sales (id, region, amount) VALUES (4, 'North', 300)",
+    );
 
     // Parse HAVING
-    let stmt = parse_sql("SELECT region, COUNT(*) FROM hav_sales GROUP BY region HAVING COUNT(*) > 1");
+    let stmt =
+        parse_sql("SELECT region, COUNT(*) FROM hav_sales GROUP BY region HAVING COUNT(*) > 1");
     assert!(stmt.is_ok(), "Should parse HAVING clause");
 
     println!("✅ HAVING: GROUP BY ... HAVING parsed correctly");
@@ -139,7 +166,11 @@ fn test_where_not() {
     let stmt = parse_sql("SELECT * FROM t WHERE NOT name = 'test'");
     assert!(stmt.is_ok(), "Should parse NOT");
 
-    if let Ok(SqlStatement::Select { where_clause: Some(WhereExpr::Not(_)), .. }) = stmt {
+    if let Ok(SqlStatement::Select {
+        where_clause: Some(WhereExpr::Not(_)),
+        ..
+    }) = stmt
+    {
         // correct
     } else {
         panic!("Expected NOT wrapper");
@@ -156,9 +187,20 @@ fn test_where_not() {
 fn test_pagination_workflow() {
     let (_db, exec) = create_sql_env("page");
 
-    exec_sql(&exec, "CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT, price INTEGER)");
+    exec_sql(
+        &exec,
+        "CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT, price INTEGER)",
+    );
     for i in 1..=20 {
-        exec_sql(&exec, &format!("INSERT INTO items (id, name, price) VALUES ({}, 'item{}', {})", i, i, i * 10));
+        exec_sql(
+            &exec,
+            &format!(
+                "INSERT INTO items (id, name, price) VALUES ({}, 'item{}', {})",
+                i,
+                i,
+                i * 10
+            ),
+        );
     }
 
     // Page 1: items 1-5
@@ -191,10 +233,19 @@ fn test_pagination_workflow() {
 fn test_multiple_aggregates() {
     let (_db, exec) = create_sql_env("magg");
 
-    exec_sql(&exec, "CREATE TABLE stats (id INTEGER PRIMARY KEY, val INTEGER)");
-    exec_sql(&exec, "INSERT INTO stats (id, val) VALUES (1, 10), (2, 20), (3, 30)");
+    exec_sql(
+        &exec,
+        "CREATE TABLE stats (id INTEGER PRIMARY KEY, val INTEGER)",
+    );
+    exec_sql(
+        &exec,
+        "INSERT INTO stats (id, val) VALUES (1, 10), (2, 20), (3, 30)",
+    );
 
-    let (cols, rows) = exec_rows(&exec, "SELECT COUNT(*), SUM(val), MIN(val), MAX(val) FROM stats");
+    let (cols, rows) = exec_rows(
+        &exec,
+        "SELECT COUNT(*), SUM(val), MIN(val), MAX(val) FROM stats",
+    );
     assert_eq!(cols.len(), 4);
     assert_eq!(rows.len(), 1);
     // Aggregates without GROUP BY: verify non-empty results
@@ -212,16 +263,29 @@ fn test_multiple_aggregates() {
 fn test_explain_analyze() {
     let (_db, exec) = create_sql_env("ea");
 
-    exec_sql(&exec, "CREATE TABLE ea_t (id INTEGER PRIMARY KEY, val TEXT)");
+    exec_sql(
+        &exec,
+        "CREATE TABLE ea_t (id INTEGER PRIMARY KEY, val TEXT)",
+    );
     exec_sql(&exec, "INSERT INTO ea_t (id, val) VALUES (1, 'test')");
 
     let (cols, rows) = exec_rows(&exec, "EXPLAIN ANALYZE SELECT * FROM ea_t WHERE id = 1");
-    assert!(cols[0].contains("QUERY PLAN"), "Column should contain QUERY PLAN");
+    assert!(
+        cols[0].contains("QUERY PLAN"),
+        "Column should contain QUERY PLAN"
+    );
     assert!(!rows.is_empty());
 
     // Should contain timing info
-    let plan_text: String = rows.iter().map(|r| r[0].clone()).collect::<Vec<_>>().join("\n");
-    assert!(plan_text.contains("actual"), "EXPLAIN ANALYZE should show actual timing");
+    let plan_text: String = rows
+        .iter()
+        .map(|r| r[0].clone())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        plan_text.contains("actual"),
+        "EXPLAIN ANALYZE should show actual timing"
+    );
 
     println!("✅ EXPLAIN ANALYZE: Plan with actual timing produced");
 }
@@ -234,26 +298,53 @@ fn test_explain_analyze() {
 fn test_subquery_execution() {
     let (_db, exec) = create_sql_env("subq");
 
-    exec_sql(&exec, "CREATE TABLE customers (id INTEGER PRIMARY KEY, name TEXT, tier TEXT)");
-    exec_sql(&exec, "CREATE TABLE orders (id INTEGER PRIMARY KEY, customer_id INTEGER, amount INTEGER)");
+    exec_sql(
+        &exec,
+        "CREATE TABLE customers (id INTEGER PRIMARY KEY, name TEXT, tier TEXT)",
+    );
+    exec_sql(
+        &exec,
+        "CREATE TABLE orders (id INTEGER PRIMARY KEY, customer_id INTEGER, amount INTEGER)",
+    );
 
-    exec_sql(&exec, "INSERT INTO customers (id, name, tier) VALUES (1, 'Alice', 'gold')");
-    exec_sql(&exec, "INSERT INTO customers (id, name, tier) VALUES (2, 'Bob', 'silver')");
-    exec_sql(&exec, "INSERT INTO customers (id, name, tier) VALUES (3, 'Charlie', 'gold')");
+    exec_sql(
+        &exec,
+        "INSERT INTO customers (id, name, tier) VALUES (1, 'Alice', 'gold')",
+    );
+    exec_sql(
+        &exec,
+        "INSERT INTO customers (id, name, tier) VALUES (2, 'Bob', 'silver')",
+    );
+    exec_sql(
+        &exec,
+        "INSERT INTO customers (id, name, tier) VALUES (3, 'Charlie', 'gold')",
+    );
 
-    exec_sql(&exec, "INSERT INTO orders (id, customer_id, amount) VALUES (1, 1, 100)");
-    exec_sql(&exec, "INSERT INTO orders (id, customer_id, amount) VALUES (2, 1, 200)");
-    exec_sql(&exec, "INSERT INTO orders (id, customer_id, amount) VALUES (3, 2, 50)");
+    exec_sql(
+        &exec,
+        "INSERT INTO orders (id, customer_id, amount) VALUES (1, 1, 100)",
+    );
+    exec_sql(
+        &exec,
+        "INSERT INTO orders (id, customer_id, amount) VALUES (2, 1, 200)",
+    );
+    exec_sql(
+        &exec,
+        "INSERT INTO orders (id, customer_id, amount) VALUES (3, 2, 50)",
+    );
 
     // Subquery: get orders from gold-tier customers only
     let (_cols, rows) = exec_rows(
         &exec,
-        "SELECT amount FROM orders WHERE customer_id IN (SELECT id FROM customers WHERE tier = 'gold')"
+        "SELECT amount FROM orders WHERE customer_id IN (SELECT id FROM customers WHERE tier = 'gold')",
     );
     // Gold customers are id=1 and id=3. Orders for id=1: 100, 200. No orders for id=3.
     assert_eq!(rows.len(), 2);
 
-    println!("✅ SUBQUERY: WHERE customer_id IN (SELECT id FROM ...) returned {} rows", rows.len());
+    println!(
+        "✅ SUBQUERY: WHERE customer_id IN (SELECT id FROM ...) returned {} rows",
+        rows.len()
+    );
 }
 
 #[test]
@@ -261,7 +352,10 @@ fn test_subquery_empty_result() {
     let (_db, exec) = create_sql_env("subq2");
 
     exec_sql(&exec, "CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT)");
-    exec_sql(&exec, "CREATE TABLE t2 (id INTEGER PRIMARY KEY, ref_id INTEGER)");
+    exec_sql(
+        &exec,
+        "CREATE TABLE t2 (id INTEGER PRIMARY KEY, ref_id INTEGER)",
+    );
 
     exec_sql(&exec, "INSERT INTO t1 (id, val) VALUES (1, 'a')");
     exec_sql(&exec, "INSERT INTO t2 (id, ref_id) VALUES (1, 99)"); // ref_id=99 doesn't exist in t1
@@ -269,7 +363,7 @@ fn test_subquery_empty_result() {
     // Subquery returns id=1, but t2.ref_id=99 doesn't match
     let (_cols, rows) = exec_rows(
         &exec,
-        "SELECT ref_id FROM t2 WHERE ref_id IN (SELECT id FROM t1)"
+        "SELECT ref_id FROM t2 WHERE ref_id IN (SELECT id FROM t1)",
     );
     assert_eq!(rows.len(), 0);
 
@@ -300,11 +394,23 @@ fn test_config_defaults() {
 fn test_union() {
     let (_db, exec) = create_sql_env("union1");
 
-    exec_sql(&exec, "CREATE TABLE t_a (id INTEGER PRIMARY KEY, name TEXT)");
-    exec_sql(&exec, "CREATE TABLE t_b (id INTEGER PRIMARY KEY, name TEXT)");
+    exec_sql(
+        &exec,
+        "CREATE TABLE t_a (id INTEGER PRIMARY KEY, name TEXT)",
+    );
+    exec_sql(
+        &exec,
+        "CREATE TABLE t_b (id INTEGER PRIMARY KEY, name TEXT)",
+    );
 
-    exec_sql(&exec, "INSERT INTO t_a (id, name) VALUES (1, 'Alice'), (2, 'Bob')");
-    exec_sql(&exec, "INSERT INTO t_b (id, name) VALUES (2, 'Bob'), (3, 'Charlie')");
+    exec_sql(
+        &exec,
+        "INSERT INTO t_a (id, name) VALUES (1, 'Alice'), (2, 'Bob')",
+    );
+    exec_sql(
+        &exec,
+        "INSERT INTO t_b (id, name) VALUES (2, 'Bob'), (3, 'Charlie')",
+    );
 
     // UNION removes duplicates: Alice, Bob, Charlie (Bob appears in both)
     let (_cols, rows) = exec_rows(&exec, "SELECT name FROM t_a UNION SELECT name FROM t_b");
@@ -337,8 +443,14 @@ fn test_intersect() {
     exec_sql(&exec, "CREATE TABLE ia (id INTEGER PRIMARY KEY, val TEXT)");
     exec_sql(&exec, "CREATE TABLE ib (id INTEGER PRIMARY KEY, val TEXT)");
 
-    exec_sql(&exec, "INSERT INTO ia (id, val) VALUES (1, 'a'), (2, 'b'), (3, 'c')");
-    exec_sql(&exec, "INSERT INTO ib (id, val) VALUES (4, 'b'), (5, 'c'), (6, 'd')");
+    exec_sql(
+        &exec,
+        "INSERT INTO ia (id, val) VALUES (1, 'a'), (2, 'b'), (3, 'c')",
+    );
+    exec_sql(
+        &exec,
+        "INSERT INTO ib (id, val) VALUES (4, 'b'), (5, 'c'), (6, 'd')",
+    );
 
     // INTERSECT: only b, c are in both
     let (_cols, rows) = exec_rows(&exec, "SELECT val FROM ia INTERSECT SELECT val FROM ib");
@@ -354,7 +466,10 @@ fn test_except() {
     exec_sql(&exec, "CREATE TABLE ea (id INTEGER PRIMARY KEY, val TEXT)");
     exec_sql(&exec, "CREATE TABLE eb (id INTEGER PRIMARY KEY, val TEXT)");
 
-    exec_sql(&exec, "INSERT INTO ea (id, val) VALUES (1, 'a'), (2, 'b'), (3, 'c')");
+    exec_sql(
+        &exec,
+        "INSERT INTO ea (id, val) VALUES (1, 'a'), (2, 'b'), (3, 'c')",
+    );
     exec_sql(&exec, "INSERT INTO eb (id, val) VALUES (4, 'b'), (5, 'c')");
 
     // EXCEPT: a is in ea but not eb

@@ -367,18 +367,18 @@ impl IndexManager {
                 if let Ok(existing) = self.db.scan_iter(&prefix, &end, seq) {
                     for (existing_key, _) in existing {
                         // Extract the primary key from the existing index entry
-                        if let Some(existing_pk) = existing_key.rsplit('\x00').next() {
-                            if existing_pk != primary_key {
-                                return Err(OmniError::IoError(format!(
-                                    "UNIQUE CONSTRAINT VIOLATION: index '{}' on {:?}",
-                                    idx_def.name,
-                                    idx_def
-                                        .fields
-                                        .iter()
-                                        .map(|(f, _)| f.as_str())
-                                        .collect::<Vec<_>>()
-                                )));
-                            }
+                        if let Some(existing_pk) = existing_key.rsplit('\x00').next()
+                            && existing_pk != primary_key
+                        {
+                            return Err(OmniError::IoError(format!(
+                                "UNIQUE CONSTRAINT VIOLATION: index '{}' on {:?}",
+                                idx_def.name,
+                                idx_def
+                                    .fields
+                                    .iter()
+                                    .map(|(f, _)| f.as_str())
+                                    .collect::<Vec<_>>()
+                            )));
                         }
                     }
                 }

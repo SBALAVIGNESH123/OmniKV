@@ -1,0 +1,30 @@
+# OmniKV example configuration.
+#
+# This file is safe to commit and ship in containers: it does not contain
+# secrets. Set OMNI_JWT_SECRET separately through your orchestrator, secret
+# manager, or local environment.
+
+# Storage
+data_dir = "/data"
+
+# Networking
+port = 8080
+pg_port = 5433
+max_connections = 256
+
+# Query limits
+query_timeout_secs = 30
+slow_query_threshold_ms = 100
+max_query_result_rows = 1000000
+
+# Storage engine
+compaction_interval_ms = 500
+memtable_flush_threshold = 4194304
+gc_interval_compactions = 5
+max_write_batch_bytes = 67108864
+
+# Security
+enable_encryption = false
+
+# Logging
+log_level = "info"

@@ -46,7 +46,8 @@ impl TableStats {
 
     /// Get NDV (number of distinct values) for a column.
     pub fn ndv(&self, column: &str) -> Option<u64> {
-        self.histograms.iter()
+        self.histograms
+            .iter()
             .find(|h| h.column.eq_ignore_ascii_case(column))
             .map(|h| h.distinct_count)
     }
@@ -74,7 +75,7 @@ pub fn gather_stats(
                     .unwrap_or_default();
                 let total: u64 = sample.iter().take(100).map(|(_, v)| v.len() as u64).sum();
                 let sampled = sample.len().min(100) as u64;
-                if sampled > 0 { total / sampled } else { 128 }
+                total.checked_div(sampled).unwrap_or(128)
             } else {
                 128
             };
@@ -94,13 +95,22 @@ pub fn gather_stats(
                 let sample = db
                     .scan(&prefix, &format!("{}\x7F", prefix), seq)
                     .unwrap_or_default();
-                let mut col_values: std::collections::HashMap<String, std::collections::HashSet<String>> = std::collections::HashMap::new();
-                let mut col_nulls: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+                let mut col_values: std::collections::HashMap<
+                    String,
+                    std::collections::HashSet<String>,
+                > = std::collections::HashMap::new();
+                let mut col_nulls: std::collections::HashMap<String, u64> =
+                    std::collections::HashMap::new();
                 let sample_size = sample.len().min(1000);
                 for (_, value) in sample.iter().take(sample_size) {
-                    if let Ok(row) = serde_json::from_str::<std::collections::HashMap<String, String>>(value) {
+                    if let Ok(row) =
+                        serde_json::from_str::<std::collections::HashMap<String, String>>(value)
+                    {
                         for (col, val) in &row {
-                            col_values.entry(col.clone()).or_default().insert(val.clone());
+                            col_values
+                                .entry(col.clone())
+                                .or_default()
+                                .insert(val.clone());
                             if val == "NULL" || val.is_empty() {
                                 *col_nulls.entry(col.clone()).or_default() += 1;
                             }
@@ -112,7 +122,11 @@ pub fn gather_stats(
                     histograms.push(ColumnHistogram {
                         column: col.clone(),
                         distinct_count: vals.len() as u64,
-                        null_fraction: if sample_size > 0 { null_count as f64 / sample_size as f64 } else { 0.0 },
+                        null_fraction: if sample_size > 0 {
+                            null_count as f64 / sample_size as f64
+                        } else {
+                            0.0
+                        },
                         most_common: vec![], // TODO: frequency counting
                     });
                 }
@@ -186,10 +200,7 @@ pub enum PlanNode {
         estimated_cost: f64,
     },
     /// Limit output rows.
-    Limit {
-        child: Box<PlanNode>,
-        count: usize,
-    },
+    Limit { child: Box<PlanNode>, count: usize },
     /// Group + aggregate.
     Aggregate {
         child: Box<PlanNode>,
@@ -247,18 +258,17 @@ pub fn estimate_selectivity_with_stats(expr: &WhereExpr, stats: Option<&TableSta
     match expr {
         WhereExpr::Comparison { column, op, .. } => {
             // Use histogram NDV if available
-            if let Some(st) = stats {
-                if let Some(ndv) = st.ndv(column) {
-                    if ndv > 0 {
-                        return match op {
-                            CmpOp::Eq => 1.0 / ndv as f64,        // exact: 1/NDV
-                            CmpOp::Ne => 1.0 - (1.0 / ndv as f64),
-                            CmpOp::Lt | CmpOp::Gt => 1.0 / 3.0,
-                            CmpOp::Lte | CmpOp::Gte => 1.0 / 3.0,
-                            CmpOp::Like => 0.25,
-                        };
-                    }
-                }
+            if let Some(st) = stats
+                && let Some(ndv) = st.ndv(column)
+                && ndv > 0
+            {
+                return match op {
+                    CmpOp::Eq => 1.0 / ndv as f64, // exact: 1/NDV
+                    CmpOp::Ne => 1.0 - (1.0 / ndv as f64),
+                    CmpOp::Lt | CmpOp::Gt => 1.0 / 3.0,
+                    CmpOp::Lte | CmpOp::Gte => 1.0 / 3.0,
+                    CmpOp::Like => 0.25,
+                };
             }
             // Fallback: hardcoded estimates
             match op {
@@ -280,18 +290,24 @@ pub fn estimate_selectivity_with_stats(expr: &WhereExpr, stats: Option<&TableSta
         WhereExpr::Not(inner) => 1.0 - estimate_selectivity_with_stats(inner, stats),
         WhereExpr::IsNull(col) => {
             // Use null_fraction from histogram if available
-            if let Some(st) = stats {
-                if let Some(h) = st.histograms.iter().find(|h| h.column.eq_ignore_ascii_case(col)) {
-                    return h.null_fraction;
-                }
+            if let Some(st) = stats
+                && let Some(h) = st
+                    .histograms
+                    .iter()
+                    .find(|h| h.column.eq_ignore_ascii_case(col))
+            {
+                return h.null_fraction;
             }
             0.05
         }
         WhereExpr::IsNotNull(col) => {
-            if let Some(st) = stats {
-                if let Some(h) = st.histograms.iter().find(|h| h.column.eq_ignore_ascii_case(col)) {
-                    return 1.0 - h.null_fraction;
-                }
+            if let Some(st) = stats
+                && let Some(h) = st
+                    .histograms
+                    .iter()
+                    .find(|h| h.column.eq_ignore_ascii_case(col))
+            {
+                return 1.0 - h.null_fraction;
             }
             0.95
         }
@@ -384,7 +400,12 @@ pub fn pushdown_join_predicates(
 // ─── Column Extraction (for pruning) ────────────────────────────────────────
 
 /// Extract all column names needed by a SELECT query.
-pub fn extract_needed_columns(columns: &[SelectColumn], where_clause: Option<&WhereExpr>, order_by: &[OrderByItem], group_by: &[String]) -> Vec<String> {
+pub fn extract_needed_columns(
+    columns: &[SelectColumn],
+    where_clause: Option<&WhereExpr>,
+    order_by: &[OrderByItem],
+    group_by: &[String],
+) -> Vec<String> {
     let mut needed = Vec::new();
 
     for col in columns {
@@ -433,7 +454,14 @@ impl Optimizer {
                 order_by,
                 limit,
                 ..
-            } => self.optimize_select(columns, from, where_clause.as_ref(), group_by, order_by, *limit),
+            } => self.optimize_select(
+                columns,
+                from,
+                where_clause.as_ref(),
+                group_by,
+                order_by,
+                *limit,
+            ),
             SqlStatement::Explain(inner) => self.optimize(inner),
             _ => Err("Optimizer only handles SELECT queries".into()),
         }
@@ -452,22 +480,26 @@ impl Optimizer {
         let mut plan = self.plan_from(from, where_clause)?;
 
         // 2. Add filter if not already pushed into scan
-        if let Some(expr) = where_clause {
-            if !self.filter_pushed_to_scan(from, expr) {
-                let input_rows = plan.estimated_rows();
-                let sel = estimate_selectivity(expr);
-                let est_rows = (input_rows as f64 * sel) as u64;
-                plan = PlanNode::Filter {
-                    estimated_cost: plan.estimated_cost() + input_rows as f64 * FILTER_COST_PER_ROW,
-                    child: Box::new(plan),
-                    predicate: expr.clone(),
-                    estimated_rows: est_rows.max(1),
-                };
-            }
+        if let Some(expr) = where_clause
+            && !self.filter_pushed_to_scan(from, expr)
+        {
+            let input_rows = plan.estimated_rows();
+            let sel = estimate_selectivity(expr);
+            let est_rows = (input_rows as f64 * sel) as u64;
+            plan = PlanNode::Filter {
+                estimated_cost: plan.estimated_cost() + input_rows as f64 * FILTER_COST_PER_ROW,
+                child: Box::new(plan),
+                predicate: expr.clone(),
+                estimated_rows: est_rows.max(1),
+            };
         }
 
         // 3. Aggregate
-        if !group_by.is_empty() || columns.iter().any(|c| matches!(c, SelectColumn::Aggregate(..))) {
+        if !group_by.is_empty()
+            || columns
+                .iter()
+                .any(|c| matches!(c, SelectColumn::Aggregate(..)))
+        {
             let est_groups = if group_by.is_empty() {
                 1
             } else {
@@ -514,11 +546,19 @@ impl Optimizer {
     }
 
     /// Build access plan for FROM clause.
-    fn plan_from(&self, from: &FromClause, where_clause: Option<&WhereExpr>) -> Result<PlanNode, String> {
+    fn plan_from(
+        &self,
+        from: &FromClause,
+        where_clause: Option<&WhereExpr>,
+    ) -> Result<PlanNode, String> {
         match from {
             FromClause::Table(name) => self.plan_table_scan(name, where_clause),
             FromClause::Join {
-                left, right, join_type, on_left, on_right,
+                left,
+                right,
+                join_type,
+                on_left,
+                on_right,
             } => {
                 let left_plan = self.plan_table_scan(left, where_clause)?;
                 let right_plan = self.plan_table_scan(right, None)?;
@@ -553,7 +593,11 @@ impl Optimizer {
     }
 
     /// Choose access method for a single table.
-    fn plan_table_scan(&self, table_name: &str, where_clause: Option<&WhereExpr>) -> Result<PlanNode, String> {
+    fn plan_table_scan(
+        &self,
+        table_name: &str,
+        where_clause: Option<&WhereExpr>,
+    ) -> Result<PlanNode, String> {
         let stats = self.stats.get(table_name);
         let row_count = stats.map(|s| s.row_count).unwrap_or(1000); // default estimate
 
@@ -608,7 +652,11 @@ impl Optimizer {
     /// Check if WHERE has an equality on the table's primary key.
     fn extract_pk_lookup(&self, _table_name: &str, expr: &WhereExpr) -> Option<String> {
         match expr {
-            WhereExpr::Comparison { column, op: CmpOp::Eq, value } => {
+            WhereExpr::Comparison {
+                column,
+                op: CmpOp::Eq,
+                value,
+            } => {
                 // Heuristic: if column is "id" it's likely the PK
                 if column.eq_ignore_ascii_case("id") {
                     Some(value.as_string())
@@ -616,10 +664,9 @@ impl Optimizer {
                     None
                 }
             }
-            WhereExpr::And(a, b) => {
-                self.extract_pk_lookup(_table_name, a)
-                    .or_else(|| self.extract_pk_lookup(_table_name, b))
-            }
+            WhereExpr::And(a, b) => self
+                .extract_pk_lookup(_table_name, a)
+                .or_else(|| self.extract_pk_lookup(_table_name, b)),
             _ => None,
         }
     }
@@ -637,10 +684,8 @@ impl Optimizer {
                 .iter()
                 .take_while(|(f, _)| columns_used.contains(f))
                 .count();
-            if matched > 0 {
-                if best.as_ref().map(|(_, s)| matched > *s).unwrap_or(true) {
-                    best = Some((idx.clone(), matched));
-                }
+            if matched > 0 && best.as_ref().map(|(_, s)| matched > *s).unwrap_or(true) {
+                best = Some((idx.clone(), matched));
             }
         }
         best.map(|(idx, _)| idx)
@@ -679,51 +724,108 @@ impl PlanNode {
     fn fmt_indent(&self, f: &mut fmt::Formatter<'_>, depth: usize) -> fmt::Result {
         let indent = "  ".repeat(depth);
         match self {
-            Self::Scan { table, access, estimated_rows, estimated_cost, filter } => {
+            Self::Scan {
+                table,
+                access,
+                estimated_rows,
+                estimated_cost,
+                filter,
+            } => {
                 let method = match access {
                     AccessMethod::SeqScan => "Seq Scan".to_string(),
-                    AccessMethod::IndexScan { index_name, .. } => format!("Index Scan ({})", index_name),
-                    AccessMethod::PkLookup { key_value } => format!("PK Lookup (key={})", key_value),
+                    AccessMethod::IndexScan { index_name, .. } => {
+                        format!("Index Scan ({})", index_name)
+                    }
+                    AccessMethod::PkLookup { key_value } => {
+                        format!("PK Lookup (key={})", key_value)
+                    }
                 };
-                write!(f, "{}→ {} on {}  (rows={}, cost={:.1})", indent, method, table, estimated_rows, estimated_cost)?;
+                write!(
+                    f,
+                    "{}→ {} on {}  (rows={}, cost={:.1})",
+                    indent, method, table, estimated_rows, estimated_cost
+                )?;
                 if let Some(flt) = filter {
                     write!(f, "\n{}  Filter: {:?}", indent, flt)?;
                 }
             }
-            Self::HashJoin { left, right, join_type, on_left_col, on_right_col, estimated_rows, estimated_cost } => {
-                write!(f, "{}→ Hash {:?} Join on {} = {}  (rows={}, cost={:.1})", indent, join_type, on_left_col, on_right_col, estimated_rows, estimated_cost)?;
-                write!(f, "\n")?;
+            Self::HashJoin {
+                left,
+                right,
+                join_type,
+                on_left_col,
+                on_right_col,
+                estimated_rows,
+                estimated_cost,
+            } => {
+                write!(
+                    f,
+                    "{}→ Hash {:?} Join on {} = {}  (rows={}, cost={:.1})",
+                    indent, join_type, on_left_col, on_right_col, estimated_rows, estimated_cost
+                )?;
+                writeln!(f)?;
                 left.fmt_indent(f, depth + 1)?;
-                write!(f, "\n")?;
+                writeln!(f)?;
                 right.fmt_indent(f, depth + 1)?;
             }
-            Self::Filter { child, predicate, estimated_rows, estimated_cost } => {
-                write!(f, "{}→ Filter  (rows={}, cost={:.1})\n{}  Predicate: {:?}", indent, estimated_rows, estimated_cost, indent, predicate)?;
-                write!(f, "\n")?;
+            Self::Filter {
+                child,
+                predicate,
+                estimated_rows,
+                estimated_cost,
+            } => {
+                write!(
+                    f,
+                    "{}→ Filter  (rows={}, cost={:.1})\n{}  Predicate: {:?}",
+                    indent, estimated_rows, estimated_cost, indent, predicate
+                )?;
+                writeln!(f)?;
                 child.fmt_indent(f, depth + 1)?;
             }
             Self::Project { child, columns } => {
                 let cols: Vec<String> = columns.iter().map(|c| format!("{:?}", c)).collect();
                 write!(f, "{}→ Project [{}]", indent, cols.join(", "))?;
-                write!(f, "\n")?;
+                writeln!(f)?;
                 child.fmt_indent(f, depth + 1)?;
             }
-            Self::Sort { child, order_by, estimated_cost } => {
-                let keys: Vec<String> = order_by.iter().map(|o| {
-                    format!("{} {}", o.column, if o.desc { "DESC" } else { "ASC" })
-                }).collect();
-                write!(f, "{}→ Sort [{}]  (cost={:.1})", indent, keys.join(", "), estimated_cost)?;
-                write!(f, "\n")?;
+            Self::Sort {
+                child,
+                order_by,
+                estimated_cost,
+            } => {
+                let keys: Vec<String> = order_by
+                    .iter()
+                    .map(|o| format!("{} {}", o.column, if o.desc { "DESC" } else { "ASC" }))
+                    .collect();
+                write!(
+                    f,
+                    "{}→ Sort [{}]  (cost={:.1})",
+                    indent,
+                    keys.join(", "),
+                    estimated_cost
+                )?;
+                writeln!(f)?;
                 child.fmt_indent(f, depth + 1)?;
             }
             Self::Limit { child, count } => {
                 write!(f, "{}→ Limit {}", indent, count)?;
-                write!(f, "\n")?;
+                writeln!(f)?;
                 child.fmt_indent(f, depth + 1)?;
             }
-            Self::Aggregate { child, group_by, estimated_rows, .. } => {
-                write!(f, "{}→ Aggregate [GROUP BY {}]  (rows={})", indent, group_by.join(", "), estimated_rows)?;
-                write!(f, "\n")?;
+            Self::Aggregate {
+                child,
+                group_by,
+                estimated_rows,
+                ..
+            } => {
+                write!(
+                    f,
+                    "{}→ Aggregate [GROUP BY {}]  (rows={})",
+                    indent,
+                    group_by.join(", "),
+                    estimated_rows
+                )?;
+                writeln!(f)?;
                 child.fmt_indent(f, depth + 1)?;
             }
         }
@@ -739,20 +841,26 @@ mod tests {
 
     fn empty_stats() -> std::collections::HashMap<String, TableStats> {
         let mut m = std::collections::HashMap::new();
-        m.insert("users".into(), TableStats {
-            table_name: "users".into(),
-            row_count: 10000,
-            avg_row_bytes: 256,
-            indexes: vec![],
-            histograms: vec![],
-        });
-        m.insert("orders".into(), TableStats {
-            table_name: "orders".into(),
-            row_count: 100000,
-            avg_row_bytes: 128,
-            indexes: vec![],
-            histograms: vec![],
-        });
+        m.insert(
+            "users".into(),
+            TableStats {
+                table_name: "users".into(),
+                row_count: 10000,
+                avg_row_bytes: 256,
+                indexes: vec![],
+                histograms: vec![],
+            },
+        );
+        m.insert(
+            "orders".into(),
+            TableStats {
+                table_name: "orders".into(),
+                row_count: 100000,
+                avg_row_bytes: 128,
+                indexes: vec![],
+                histograms: vec![],
+            },
+        );
         m
     }
 
@@ -779,9 +887,8 @@ mod tests {
     #[test]
     fn test_join_order_small_build() {
         let opt = Optimizer::new(empty_stats());
-        let stmt = parse_sql(
-            "SELECT * FROM orders JOIN users ON orders.user_id = users.id"
-        ).unwrap();
+        let stmt =
+            parse_sql("SELECT * FROM orders JOIN users ON orders.user_id = users.id").unwrap();
         let plan = opt.optimize(&stmt).unwrap();
         let display = format!("{}", plan);
         // users (10K) should be build side, orders (100K) probe side
@@ -804,10 +911,14 @@ mod tests {
     fn test_and_selectivity() {
         let expr = WhereExpr::And(
             Box::new(WhereExpr::Comparison {
-                column: "a".into(), op: CmpOp::Eq, value: SqlValue::Integer(1),
+                column: "a".into(),
+                op: CmpOp::Eq,
+                value: SqlValue::Integer(1),
             }),
             Box::new(WhereExpr::Comparison {
-                column: "b".into(), op: CmpOp::Eq, value: SqlValue::Integer(2),
+                column: "b".into(),
+                op: CmpOp::Eq,
+                value: SqlValue::Integer(2),
             }),
         );
         let sel = estimate_selectivity(&expr);
@@ -817,9 +928,7 @@ mod tests {
     #[test]
     fn test_explain_output_format() {
         let opt = Optimizer::new(empty_stats());
-        let stmt = parse_sql(
-            "SELECT name FROM users WHERE id = 1 ORDER BY name LIMIT 10"
-        ).unwrap();
+        let stmt = parse_sql("SELECT name FROM users WHERE id = 1 ORDER BY name LIMIT 10").unwrap();
         let plan = opt.optimize(&stmt).unwrap();
         let display = format!("{}", plan);
         assert!(display.contains("Project"));
@@ -830,9 +939,7 @@ mod tests {
     #[test]
     fn test_aggregate_plan() {
         let opt = Optimizer::new(empty_stats());
-        let stmt = parse_sql(
-            "SELECT COUNT(*) FROM users"
-        ).unwrap();
+        let stmt = parse_sql("SELECT COUNT(*) FROM users").unwrap();
         let plan = opt.optimize(&stmt).unwrap();
         let display = format!("{}", plan);
         assert!(display.contains("Aggregate"));

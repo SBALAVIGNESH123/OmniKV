@@ -562,7 +562,9 @@ impl TwoPhaseParticipant {
                 // For true cross-node SSI, the coordinator would send its
                 // snapshot_seq and we'd compare against that.
                 let global = self.db.get_seq();
-                if key_seq > prepare_snapshot.saturating_sub(1) && key_seq >= global.saturating_sub(2) {
+                if key_seq > prepare_snapshot.saturating_sub(1)
+                    && key_seq >= global.saturating_sub(2)
+                {
                     // Recent concurrent write detected — but only abort if
                     // the key was written by a DIFFERENT transaction after
                     // the distributed txn was assembled. We detect this by

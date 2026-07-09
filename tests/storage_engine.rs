@@ -17,7 +17,12 @@ fn create_temp_db(prefix: &str) -> (std::sync::Arc<OmniKV>, tempfile::TempDir) {
 fn write_n(db: &OmniKV, prefix: &str, n: usize) -> u64 {
     let mut batch = WriteBatch::new();
     for i in 0..n {
-        batch.set(&format!("{}_k{:04}", prefix, i), format!("{}_v{}", prefix, i)).unwrap();
+        batch
+            .set(
+                &format!("{}_k{:04}", prefix, i),
+                format!("{}_v{}", prefix, i),
+            )
+            .unwrap();
     }
     db.commit_batch(&batch).unwrap()
 }
@@ -31,7 +36,8 @@ fn verify_n(db: &OmniKV, prefix: &str, n: usize) {
         assert_eq!(
             db.find(&key, seq).unwrap(),
             Some(expected),
-            "Missing key: {}", key
+            "Missing key: {}",
+            key
         );
     }
 }
@@ -58,9 +64,18 @@ fn test_compaction_crash_recovery_basic() {
         let db = OmniKV::open(m.to_str().unwrap(), w.to_str().unwrap()).unwrap();
         let seq = u64::MAX - 1; // Use high seq to ensure all versions visible
         // Verify a sample of keys (first, middle, last)
-        assert!(db.find("comp_k0000", seq).unwrap().is_some(), "First key missing");
-        assert!(db.find("comp_k0025", seq).unwrap().is_some(), "Middle key missing");
-        assert!(db.find("comp_k0049", seq).unwrap().is_some(), "Last key missing");
+        assert!(
+            db.find("comp_k0000", seq).unwrap().is_some(),
+            "First key missing"
+        );
+        assert!(
+            db.find("comp_k0025", seq).unwrap().is_some(),
+            "Middle key missing"
+        );
+        assert!(
+            db.find("comp_k0049", seq).unwrap().is_some(),
+            "Last key missing"
+        );
     }
 
     println!("✅ STORAGE 15a: Keys survived compaction + restart");
@@ -144,7 +159,9 @@ fn test_multiple_batches_wal_recovery() {
         let db = OmniKV::open(m.to_str().unwrap(), w.to_str().unwrap()).unwrap();
         for i in 0..5 {
             let mut batch = WriteBatch::new();
-            batch.set(&format!("mb_k{}", i), format!("mb_v{}", i)).unwrap();
+            batch
+                .set(&format!("mb_k{}", i), format!("mb_v{}", i))
+                .unwrap();
             db.commit_batch(&batch).unwrap();
         }
     }
@@ -193,7 +210,8 @@ fn test_wal_corruption_detection() {
         for i in 0..10 {
             assert!(
                 db.find(&format!("wcor_k{:04}", i), seq).unwrap().is_some(),
-                "Key wcor_k{:04} should survive corruption", i
+                "Key wcor_k{:04} should survive corruption",
+                i
             );
         }
     }
@@ -236,15 +254,31 @@ fn test_manifest_consistency_across_restart() {
 
     {
         let db = OmniKV::open(m.to_str().unwrap(), w.to_str().unwrap()).unwrap();
-        assert_eq!(db.sstable_count(), sst_count_before, "SSTable count mismatch");
+        assert_eq!(
+            db.sstable_count(),
+            sst_count_before,
+            "SSTable count mismatch"
+        );
         let seq = u64::MAX - 1;
         // Verify sample keys from SSTable
-        assert!(db.find("man_k0000", seq).unwrap().is_some(), "First key missing");
-        assert!(db.find("man_k0050", seq).unwrap().is_some(), "Middle key missing");
-        assert!(db.find("man_k0099", seq).unwrap().is_some(), "Last key missing");
+        assert!(
+            db.find("man_k0000", seq).unwrap().is_some(),
+            "First key missing"
+        );
+        assert!(
+            db.find("man_k0050", seq).unwrap().is_some(),
+            "Middle key missing"
+        );
+        assert!(
+            db.find("man_k0099", seq).unwrap().is_some(),
+            "Last key missing"
+        );
     }
 
-    println!("✅ STORAGE 18a: Manifest SSTable count consistent: {}", sst_count_before);
+    println!(
+        "✅ STORAGE 18a: Manifest SSTable count consistent: {}",
+        sst_count_before
+    );
 }
 
 /// Gap #18b: Sequence increases across restarts
@@ -254,18 +288,20 @@ fn test_manifest_sequence_tracking() {
     let m = dir.path().join("seq_m.json");
     let w = dir.path().join("seq_w.bin");
 
-    let seq_before;
     {
         let db = OmniKV::open(m.to_str().unwrap(), w.to_str().unwrap()).unwrap();
         write_n(&db, "seqt", 10);
-        seq_before = db.get_seq();
     }
 
     {
         let db = OmniKV::open(m.to_str().unwrap(), w.to_str().unwrap()).unwrap();
         let seq_after = db.get_seq();
         // After WAL replay, seq should be at least close to what it was
-        assert!(seq_after > 0, "Seq should be positive after replay: {}", seq_after);
+        assert!(
+            seq_after > 0,
+            "Seq should be positive after replay: {}",
+            seq_after
+        );
     }
 
     println!("✅ STORAGE 18b: Sequence monotonically increasing across restart");
@@ -310,7 +346,10 @@ fn test_mvcc_snapshot_survives_delete() {
     db.commit_batch(&del_batch).unwrap();
 
     // Old snapshot still sees the value
-    assert_eq!(db.find("mvdel_k", snap_before).unwrap(), Some("alive".into()));
+    assert_eq!(
+        db.find("mvdel_k", snap_before).unwrap(),
+        Some("alive".into())
+    );
     // Current snapshot sees deletion
     assert_eq!(db.find("mvdel_k", db.get_seq()).unwrap(), None);
 
@@ -393,7 +432,10 @@ fn test_mmap_large_values() {
     batch.set("mmap_large", large_val.clone()).unwrap();
     db.commit_batch(&batch).unwrap();
 
-    assert_eq!(db.find("mmap_large", db.get_seq()).unwrap(), Some(large_val));
+    assert_eq!(
+        db.find("mmap_large", db.get_seq()).unwrap(),
+        Some(large_val)
+    );
 
     println!("✅ STORAGE 21a: 10KB value stored and retrieved correctly");
 }

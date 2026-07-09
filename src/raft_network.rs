@@ -1,11 +1,20 @@
 use openraft::error::{InstallSnapshotError, NetworkError, RPCError, RaftError};
 use openraft::network::{RaftNetwork, RaftNetworkFactory};
-use openraft::raft::{AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse, VoteRequest, VoteResponse};
+use openraft::raft::{
+    AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
+    VoteRequest, VoteResponse,
+};
 
 use crate::raft_impl::{OmniNode, OmniTypeConfig};
 
 pub struct OmniNetwork {
     client: reqwest::Client,
+}
+
+impl Default for OmniNetwork {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl OmniNetwork {
@@ -46,12 +55,25 @@ impl RaftNetwork<OmniTypeConfig> for OmniNetworkConnection {
         req: AppendEntriesRequest<OmniTypeConfig>,
         _option: openraft::network::RPCOption,
     ) -> Result<AppendEntriesResponse<u64>, RPCError<u64, OmniNode, RaftError<u64>>> {
-        let scheme = if self.target.addr.starts_with("127.0.0.1") || self.target.addr.starts_with("localhost") { "http" } else { "https" };
+        let scheme = if self.target.addr.starts_with("127.0.0.1")
+            || self.target.addr.starts_with("localhost")
+        {
+            "http"
+        } else {
+            "https"
+        };
         let url = format!("{}://{}/raft/append", scheme, self.target.addr);
-        let resp = self.client.post(&url).json(&req).send().await
+        let resp = self
+            .client
+            .post(&url)
+            .json(&req)
+            .send()
+            .await
             .map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
-        
-        let res = resp.json().await
+
+        let res = resp
+            .json()
+            .await
             .map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
         Ok(res)
     }
@@ -60,13 +82,29 @@ impl RaftNetwork<OmniTypeConfig> for OmniNetworkConnection {
         &mut self,
         req: InstallSnapshotRequest<OmniTypeConfig>,
         _option: openraft::network::RPCOption,
-    ) -> Result<InstallSnapshotResponse<u64>, RPCError<u64, OmniNode, RaftError<u64, InstallSnapshotError>>> {
-        let scheme = if self.target.addr.starts_with("127.0.0.1") || self.target.addr.starts_with("localhost") { "http" } else { "https" };
+    ) -> Result<
+        InstallSnapshotResponse<u64>,
+        RPCError<u64, OmniNode, RaftError<u64, InstallSnapshotError>>,
+    > {
+        let scheme = if self.target.addr.starts_with("127.0.0.1")
+            || self.target.addr.starts_with("localhost")
+        {
+            "http"
+        } else {
+            "https"
+        };
         let url = format!("{}://{}/raft/snapshot", scheme, self.target.addr);
-        let resp = self.client.post(&url).json(&req).send().await
+        let resp = self
+            .client
+            .post(&url)
+            .json(&req)
+            .send()
+            .await
             .map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
-        
-        let res = resp.json().await
+
+        let res = resp
+            .json()
+            .await
             .map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
         Ok(res)
     }
@@ -76,12 +114,25 @@ impl RaftNetwork<OmniTypeConfig> for OmniNetworkConnection {
         req: VoteRequest<u64>,
         _option: openraft::network::RPCOption,
     ) -> Result<VoteResponse<u64>, RPCError<u64, OmniNode, RaftError<u64>>> {
-        let scheme = if self.target.addr.starts_with("127.0.0.1") || self.target.addr.starts_with("localhost") { "http" } else { "https" };
+        let scheme = if self.target.addr.starts_with("127.0.0.1")
+            || self.target.addr.starts_with("localhost")
+        {
+            "http"
+        } else {
+            "https"
+        };
         let url = format!("{}://{}/raft/vote", scheme, self.target.addr);
-        let resp = self.client.post(&url).json(&req).send().await
+        let resp = self
+            .client
+            .post(&url)
+            .json(&req)
+            .send()
+            .await
             .map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
-        
-        let res = resp.json().await
+
+        let res = resp
+            .json()
+            .await
             .map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
         Ok(res)
     }

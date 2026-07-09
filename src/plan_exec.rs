@@ -5,14 +5,16 @@
 
 #![allow(dead_code)]
 
+use crate::OmniKV;
 use crate::catalog::{Catalog, TableDef};
 use crate::optimizer::*;
 use crate::sql::*;
 use crate::sql_exec::Row;
-use crate::OmniKV;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
+
+type ExplainAnalyzeOutput = (Vec<Row>, Vec<(String, NodeStats)>);
 
 /// Execution statistics collected during EXPLAIN ANALYZE.
 #[derive(Debug, Clone)]
@@ -36,17 +38,33 @@ impl PlanExecutor {
     /// Execute a plan node, returning rows.
     pub fn execute_plan(&self, plan: &PlanNode) -> Result<Vec<Row>, String> {
         match plan {
-            PlanNode::Scan { table, access, filter, .. } => {
-                self.exec_scan(table, access, filter.as_ref())
-            }
+            PlanNode::Scan {
+                table,
+                access,
+                filter,
+                ..
+            } => self.exec_scan(table, access, filter.as_ref()),
             PlanNode::HashJoin {
-                left, right, join_type, on_left_col, on_right_col, ..
+                left,
+                right,
+                join_type,
+                on_left_col,
+                on_right_col,
+                ..
             } => {
                 let left_rows = self.execute_plan(left)?;
                 let right_rows = self.execute_plan(right)?;
-                Ok(self.exec_hash_join(&left_rows, &right_rows, on_left_col, on_right_col, join_type))
+                Ok(self.exec_hash_join(
+                    &left_rows,
+                    &right_rows,
+                    on_left_col,
+                    on_right_col,
+                    join_type,
+                ))
             }
-            PlanNode::Filter { child, predicate, .. } => {
+            PlanNode::Filter {
+                child, predicate, ..
+            } => {
                 let mut rows = self.execute_plan(child)?;
                 rows.retain(|row| eval_where(row, predicate));
                 Ok(rows)
@@ -55,7 +73,9 @@ impl PlanExecutor {
                 let rows = self.execute_plan(child)?;
                 Ok(self.exec_project(&rows, columns))
             }
-            PlanNode::Sort { child, order_by, .. } => {
+            PlanNode::Sort {
+                child, order_by, ..
+            } => {
                 let mut rows = self.execute_plan(child)?;
                 self.exec_sort(&mut rows, order_by);
                 Ok(rows)
@@ -65,7 +85,12 @@ impl PlanExecutor {
                 rows.truncate(*count);
                 Ok(rows)
             }
-            PlanNode::Aggregate { child, group_by, aggregates, .. } => {
+            PlanNode::Aggregate {
+                child,
+                group_by,
+                aggregates,
+                ..
+            } => {
                 let rows = self.execute_plan(child)?;
                 self.exec_aggregate(&rows, group_by, aggregates)
             }
@@ -73,7 +98,7 @@ impl PlanExecutor {
     }
 
     /// Execute EXPLAIN ANALYZE — run the plan and collect actual stats.
-    pub fn explain_analyze(&self, plan: &PlanNode) -> Result<(Vec<Row>, Vec<(String, NodeStats)>), String> {
+    pub fn explain_analyze(&self, plan: &PlanNode) -> Result<ExplainAnalyzeOutput, String> {
         let mut stats = Vec::new();
         let rows = self.execute_with_stats(plan, &mut stats)?;
         Ok((rows, stats))
@@ -100,7 +125,13 @@ impl PlanExecutor {
                 };
                 (label, self.execute_plan(plan)?)
             }
-            PlanNode::HashJoin { on_left_col, on_right_col, left, right, .. } => {
+            PlanNode::HashJoin {
+                on_left_col,
+                on_right_col,
+                left,
+                right,
+                ..
+            } => {
                 let _ = self.execute_with_stats(left, stats)?;
                 let _ = self.execute_with_stats(right, stats)?;
                 let label = format!("Hash Join on {} = {}", on_left_col, on_right_col);
@@ -110,14 +141,24 @@ impl PlanExecutor {
                 let _ = self.execute_with_stats(child, stats)?;
                 ("Filter".to_string(), self.execute_plan(plan)?)
             }
-            PlanNode::Sort { child, order_by, .. } => {
+            PlanNode::Sort {
+                child, order_by, ..
+            } => {
                 let _ = self.execute_with_stats(child, stats)?;
                 let keys: Vec<String> = order_by.iter().map(|o| o.column.clone()).collect();
-                (format!("Sort [{}]", keys.join(", ")), self.execute_plan(plan)?)
+                (
+                    format!("Sort [{}]", keys.join(", ")),
+                    self.execute_plan(plan)?,
+                )
             }
-            PlanNode::Aggregate { child, group_by, .. } => {
+            PlanNode::Aggregate {
+                child, group_by, ..
+            } => {
                 let _ = self.execute_with_stats(child, stats)?;
-                (format!("Aggregate [GROUP BY {}]", group_by.join(", ")), self.execute_plan(plan)?)
+                (
+                    format!("Aggregate [GROUP BY {}]", group_by.join(", ")),
+                    self.execute_plan(plan)?,
+                )
             }
             PlanNode::Limit { child, count } => {
                 let _ = self.execute_with_stats(child, stats)?;
@@ -130,11 +171,14 @@ impl PlanExecutor {
         };
 
         let elapsed = start.elapsed().as_secs_f64() * 1000.0;
-        stats.push((label, NodeStats {
-            actual_rows: rows.len() as u64,
-            actual_time_ms: elapsed,
-            estimated_rows: estimated,
-        }));
+        stats.push((
+            label,
+            NodeStats {
+                actual_rows: rows.len() as u64,
+                actual_time_ms: elapsed,
+                estimated_rows: estimated,
+            },
+        ));
 
         Ok(rows)
     }
@@ -147,7 +191,9 @@ impl PlanExecutor {
         access: &AccessMethod,
         filter: Option<&WhereExpr>,
     ) -> Result<Vec<Row>, String> {
-        let table = self.catalog.get_table(table_name)
+        let table = self
+            .catalog
+            .get_table(table_name)
             .ok_or_else(|| format!("Table '{}' not found", table_name))?;
 
         let mut rows = match access {
@@ -162,9 +208,7 @@ impl PlanExecutor {
                     .filter_map(|(_, value)| serde_json::from_str::<Row>(&value).ok())
                     .collect()
             }
-            AccessMethod::IndexScan { .. } | AccessMethod::SeqScan => {
-                self.load_table_rows(&table)
-            }
+            AccessMethod::IndexScan { .. } | AccessMethod::SeqScan => self.load_table_rows(&table),
         };
 
         if let Some(expr) = filter {
@@ -198,7 +242,8 @@ impl PlanExecutor {
                 if needed_cols.is_empty() {
                     return Some(full);
                 }
-                let pruned: Row = full.into_iter()
+                let pruned: Row = full
+                    .into_iter()
                     .filter(|(k, _)| needed_cols.iter().any(|c| c.eq_ignore_ascii_case(k)))
                     .collect();
                 Some(pruned)
@@ -270,7 +315,11 @@ impl PlanExecutor {
         group_by: &[String],
         columns: &[SelectColumn],
     ) -> Result<Vec<Row>, String> {
-        if group_by.is_empty() && columns.iter().any(|c| matches!(c, SelectColumn::Aggregate(..))) {
+        if group_by.is_empty()
+            && columns
+                .iter()
+                .any(|c| matches!(c, SelectColumn::Aggregate(..)))
+        {
             let mut result = Row::new();
             for col in columns {
                 if let SelectColumn::Aggregate(func, target) = col {
@@ -284,7 +333,8 @@ impl PlanExecutor {
 
         let mut groups: HashMap<String, Vec<&Row>> = HashMap::new();
         for row in rows {
-            let key: String = group_by.iter()
+            let key: String = group_by
+                .iter()
                 .map(|g| row.get(g).cloned().unwrap_or_default())
                 .collect::<Vec<_>>()
                 .join("|");
@@ -292,7 +342,7 @@ impl PlanExecutor {
         }
 
         let mut result = Vec::new();
-        for (_, group_rows) in &groups {
+        for group_rows in groups.values() {
             let mut row = Row::new();
             for col in columns {
                 match col {
@@ -319,31 +369,38 @@ impl PlanExecutor {
         if columns.iter().any(|c| matches!(c, SelectColumn::Star)) {
             return rows.to_vec();
         }
-        rows.iter().map(|row| {
-            let mut projected = Row::new();
-            for col in columns {
-                match col {
-                    SelectColumn::Named(n) => {
-                        if let Some(v) = row.get(n) {
-                            projected.insert(n.clone(), v.clone());
+        rows.iter()
+            .map(|row| {
+                let mut projected = Row::new();
+                for col in columns {
+                    match col {
+                        SelectColumn::Named(n) => {
+                            if let Some(v) = row.get(n) {
+                                projected.insert(n.clone(), v.clone());
+                            }
                         }
-                    }
-                    SelectColumn::Qualified(t, n) => {
-                        let key = format!("{}.{}", t, n);
-                        let val = row.get(&key).or_else(|| row.get(n)).cloned().unwrap_or_default();
-                        projected.insert(n.clone(), val);
-                    }
-                    SelectColumn::Aggregate(func, target) => {
-                        let name = format!("{}({})", format!("{:?}", func).to_lowercase(), target);
-                        if let Some(v) = row.get(&name) {
-                            projected.insert(name, v.clone());
+                        SelectColumn::Qualified(t, n) => {
+                            let key = format!("{}.{}", t, n);
+                            let val = row
+                                .get(&key)
+                                .or_else(|| row.get(n))
+                                .cloned()
+                                .unwrap_or_default();
+                            projected.insert(n.clone(), val);
                         }
+                        SelectColumn::Aggregate(func, target) => {
+                            let name =
+                                format!("{}({})", format!("{:?}", func).to_lowercase(), target);
+                            if let Some(v) = row.get(&name) {
+                                projected.insert(name, v.clone());
+                            }
+                        }
+                        _ => {}
                     }
-                    _ => {}
                 }
-            }
-            projected
-        }).collect()
+                projected
+            })
+            .collect()
     }
 }
 
@@ -372,8 +429,14 @@ fn eval_where(row: &Row, expr: &WhereExpr) -> bool {
         WhereExpr::And(a, b) => eval_where(row, a) && eval_where(row, b),
         WhereExpr::Or(a, b) => eval_where(row, a) || eval_where(row, b),
         WhereExpr::Not(inner) => !eval_where(row, inner),
-        WhereExpr::IsNull(col) => row.get(col).map(|v| v == "NULL" || v.is_empty()).unwrap_or(true),
-        WhereExpr::IsNotNull(col) => row.get(col).map(|v| v != "NULL" && !v.is_empty()).unwrap_or(false),
+        WhereExpr::IsNull(col) => row
+            .get(col)
+            .map(|v| v == "NULL" || v.is_empty())
+            .unwrap_or(true),
+        WhereExpr::IsNotNull(col) => row
+            .get(col)
+            .map(|v| v != "NULL" && !v.is_empty())
+            .unwrap_or(false),
         WhereExpr::In(col, vals) => {
             let row_val = row.get(col).cloned().unwrap_or_default();
             vals.iter().any(|v| v.as_string() == row_val)
@@ -395,26 +458,40 @@ fn compute_aggregate(func: &AggFunc, target: &str, rows: &[&Row]) -> (String, St
     match func {
         AggFunc::Count => (name, rows.len().to_string()),
         AggFunc::Sum => {
-            let sum: f64 = rows.iter()
+            let sum: f64 = rows
+                .iter()
                 .filter_map(|r| r.get(target).and_then(|v| v.parse::<f64>().ok()))
                 .sum();
             (name, sum.to_string())
         }
         AggFunc::Avg => {
-            let vals: Vec<f64> = rows.iter()
+            let vals: Vec<f64> = rows
+                .iter()
                 .filter_map(|r| r.get(target).and_then(|v| v.parse::<f64>().ok()))
                 .collect();
-            let avg = if vals.is_empty() { 0.0 } else { vals.iter().sum::<f64>() / vals.len() as f64 };
+            let avg = if vals.is_empty() {
+                0.0
+            } else {
+                vals.iter().sum::<f64>() / vals.len() as f64
+            };
             (name, format!("{:.2}", avg))
         }
         AggFunc::Min => {
-            let min = rows.iter().filter_map(|r| r.get(target))
-                .min_by(|a, b| smart_cmp(a, b)).cloned().unwrap_or_default();
+            let min = rows
+                .iter()
+                .filter_map(|r| r.get(target))
+                .min_by(|a, b| smart_cmp(a, b))
+                .cloned()
+                .unwrap_or_default();
             (name, min)
         }
         AggFunc::Max => {
-            let max = rows.iter().filter_map(|r| r.get(target))
-                .max_by(|a, b| smart_cmp(a, b)).cloned().unwrap_or_default();
+            let max = rows
+                .iter()
+                .filter_map(|r| r.get(target))
+                .max_by(|a, b| smart_cmp(a, b))
+                .cloned()
+                .unwrap_or_default();
             (name, max)
         }
     }
@@ -439,7 +516,10 @@ impl PlanCache {
     /// Get a cached plan for a query string.
     pub fn get(&self, query: &str) -> Option<PlanNode> {
         let cache = self.cache.lock().ok()?;
-        cache.iter().find(|(q, _)| q == query).map(|(_, p)| p.clone())
+        cache
+            .iter()
+            .find(|(q, _)| q == query)
+            .map(|(_, p)| p.clone())
     }
 
     /// Insert a plan into the cache, evicting oldest if full.

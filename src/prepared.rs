@@ -283,14 +283,16 @@ impl QueryEngine {
 
         // Count parameters
         for token in &tokens {
-            if token.starts_with('$') {
-                if let Ok(n) = token[1..].parse::<usize>() {
-                    if n > param_count {
-                        param_count = n;
-                    }
+            if let Some(stripped) = token.strip_prefix('$') {
+                if let Ok(n) = stripped.parse::<usize>()
+                    && n > param_count
+                {
+                    param_count = n;
                 }
-            } else if token.starts_with(':') && token.len() > 1 {
-                let name = token[1..].to_string();
+            } else if let Some(stripped) = token.strip_prefix(':')
+                && !stripped.is_empty()
+            {
+                let name = stripped.to_string();
                 if !named_params.contains(&name) {
                     named_params.push(name);
                 }
@@ -318,13 +320,15 @@ impl QueryEngine {
     }
 
     fn parse_param_ref(token: &str) -> ParamRef {
-        if token.starts_with('$') {
-            if let Ok(n) = token[1..].parse::<usize>() {
-                return ParamRef::Positional(n);
-            }
+        if let Some(stripped) = token.strip_prefix('$')
+            && let Ok(n) = stripped.parse::<usize>()
+        {
+            return ParamRef::Positional(n);
         }
-        if token.starts_with(':') && token.len() > 1 {
-            return ParamRef::Named(token[1..].to_string());
+        if let Some(stripped) = token.strip_prefix(':')
+            && !stripped.is_empty()
+        {
+            return ParamRef::Named(stripped.to_string());
         }
         ParamRef::Literal(token.to_string())
     }
@@ -398,15 +402,17 @@ impl QueryEngine {
         }
 
         // Parse ORDER BY
-        if i < tokens.len() && tokens[i].to_uppercase() == "ORDER" {
-            if i + 1 < tokens.len() && tokens[i + 1].to_uppercase() == "BY" {
-                i += 2;
-                if i < tokens.len() && tokens[i].to_uppercase() == "DESC" {
-                    order_desc = true;
-                    i += 1;
-                } else if i < tokens.len() && tokens[i].to_uppercase() == "ASC" {
-                    i += 1;
-                }
+        if i < tokens.len()
+            && tokens[i].to_uppercase() == "ORDER"
+            && i + 1 < tokens.len()
+            && tokens[i + 1].to_uppercase() == "BY"
+        {
+            i += 2;
+            if i < tokens.len() && tokens[i].to_uppercase() == "DESC" {
+                order_desc = true;
+                i += 1;
+            } else if i < tokens.len() && tokens[i].to_uppercase() == "ASC" {
+                i += 1;
             }
         }
 

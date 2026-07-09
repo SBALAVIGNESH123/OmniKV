@@ -9,7 +9,6 @@
 ///   6. Compaction: L0→L1→L2 always produces identical results
 ///   7. CRC32 heap corruption: detected and rejected on read
 ///   8. Recovery determinism: same data always recovered
-
 use omni_engine::{OmniKV, WriteBatch};
 use std::fs;
 use std::io::Write;
@@ -18,7 +17,11 @@ use tempfile::TempDir;
 /// Helper: open a fresh engine in a temp directory.
 fn open_fresh() -> (TempDir, std::sync::Arc<OmniKV>) {
     let dir = TempDir::new().expect("tmpdir");
-    let manifest = dir.path().join("manifest.json").to_string_lossy().to_string();
+    let manifest = dir
+        .path()
+        .join("manifest.json")
+        .to_string_lossy()
+        .to_string();
     let wal = dir.path().join("data.wal").to_string_lossy().to_string();
     let db = OmniKV::open(&manifest, &wal).expect("open");
     (dir, db)
@@ -26,7 +29,11 @@ fn open_fresh() -> (TempDir, std::sync::Arc<OmniKV>) {
 
 /// Helper: reopen an existing engine (simulates restart after crash).
 fn reopen(dir: &TempDir) -> std::sync::Arc<OmniKV> {
-    let manifest = dir.path().join("manifest.json").to_string_lossy().to_string();
+    let manifest = dir
+        .path()
+        .join("manifest.json")
+        .to_string_lossy()
+        .to_string();
     let wal = dir.path().join("data.wal").to_string_lossy().to_string();
     OmniKV::open(&manifest, &wal).expect("reopen")
 }
@@ -43,7 +50,14 @@ fn assert_get(db: &OmniKV, key: &str, expected: &str) {
     let snap = db.snapshot();
     let got = db.find(key, snap).expect("find").unwrap_or_default();
     db.unregister_snapshot(snap);
-    assert_eq!(got.as_str(), expected, "key='{}' expected='{}' got='{}'", key, expected, got);
+    assert_eq!(
+        got.as_str(),
+        expected,
+        "key='{}' expected='{}' got='{}'",
+        key,
+        expected,
+        got
+    );
 }
 
 /// Helper: assert a key does NOT exist.
@@ -51,7 +65,12 @@ fn assert_missing(db: &OmniKV, key: &str) {
     let snap = db.snapshot();
     let got = db.find(key, snap).expect("find");
     db.unregister_snapshot(snap);
-    assert!(got.is_none(), "key='{}' should be absent but got {:?}", key, got);
+    assert!(
+        got.is_none(),
+        "key='{}' should be absent but got {:?}",
+        key,
+        got
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -136,7 +155,9 @@ fn test_torn_wal_record_is_rejected() {
         .open(&wal_path)
         .expect("open wal for corruption");
     // Write a truncated record: just a partial header, no payload, no CRC
-    wal_file.write_all(&[0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x00]).unwrap();
+    wal_file
+        .write_all(&[0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x00])
+        .unwrap();
     drop(wal_file);
 
     // Engine must open cleanly — torn record is ignored, not panicked
@@ -152,13 +173,7 @@ fn test_torn_wal_record_is_rejected() {
 // ─────────────────────────────────────────────────────────────────
 #[test]
 fn test_ttl_expired_key_absent() {
-    let (dir, db) = open_fresh();
-    // Write a key that expired 1 second ago (absolute unix timestamp, not TTL seconds)
-    let past_expiry = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs()
-        .saturating_sub(1);
+    let (_dir, db) = open_fresh();
     {
         let mut b = WriteBatch::new();
         // set_with_ttl takes TTL in seconds from now, so use 0 to expire immediately
@@ -174,7 +189,8 @@ fn test_ttl_expired_key_absent() {
     // Instead verify set_with_ttl with a 1-hour future TTL works.
     {
         let mut b = WriteBatch::new();
-        b.set_with_ttl("future_ttl_key", "alive".to_string(), 3600).unwrap();
+        b.set_with_ttl("future_ttl_key", "alive".to_string(), 3600)
+            .unwrap();
         db.commit_batch(&b).expect("commit future ttl");
     }
     assert_get(&db, "future_ttl_key", "alive");
@@ -191,7 +207,8 @@ fn test_ttl_non_expired_key_present() {
     {
         let mut b = WriteBatch::new();
         // set_with_ttl takes seconds-from-now as TTL
-        b.set_with_ttl("live_key", "live_value".to_string(), 3600).unwrap();
+        b.set_with_ttl("live_key", "live_value".to_string(), 3600)
+            .unwrap();
         db.commit_batch(&b).expect("commit ttl");
     }
 
@@ -268,14 +285,23 @@ fn test_mvcc_old_snapshot_isolation() {
     put(&db, "mvcc_key", "updated");
 
     // Old snapshot must still see "original"
-    let old_val = db.find("mvcc_key", old_snap).expect("find old").unwrap_or_default();
-    assert_eq!(old_val, "original", "old snapshot should see original value");
+    let old_val = db
+        .find("mvcc_key", old_snap)
+        .expect("find old")
+        .unwrap_or_default();
+    assert_eq!(
+        old_val, "original",
+        "old snapshot should see original value"
+    );
 
     db.unregister_snapshot(old_snap);
 
     // New snapshot must see "updated"
     let new_snap = db.snapshot();
-    let new_val = db.find("mvcc_key", new_snap).expect("find new").unwrap_or_default();
+    let new_val = db
+        .find("mvcc_key", new_snap)
+        .expect("find new")
+        .unwrap_or_default();
     assert_eq!(new_val, "updated", "new snapshot should see updated value");
     db.unregister_snapshot(new_snap);
 }
@@ -318,8 +344,10 @@ fn test_heap_crc_corruption_detected() {
     match result {
         Ok(Some(val)) => {
             // If it returns Ok with a value, it must match the original (not corrupted bytes)
-            assert_eq!(val, "important_value",
-                "CRITICAL: Corrupted heap returned wrong data without error!");
+            assert_eq!(
+                val, "important_value",
+                "CRITICAL: Corrupted heap returned wrong data without error!"
+            );
         }
         Ok(None) => {
             // Acceptable: corruption detected, key treated as absent
@@ -390,7 +418,7 @@ fn test_batch_is_atomic() {
 
 #[test]
 fn test_concurrent_read_during_root_swap() {
-    let (dir, db) = open_fresh();
+    let (_dir, db) = open_fresh();
 
     // 1. Write some initial data
     let mut batch1 = WriteBatch::new();
@@ -415,12 +443,12 @@ fn test_concurrent_read_during_root_swap() {
     // 4. The reader holding the old roots should STILL see the old topology:
     // It should see NO sstables, and it should see "key1" in the memtable, but NOT "key2".
     assert_eq!(roots.sstables.len(), 0);
-    
+
     // We can directly inspect the old memtable
     let memtable = roots.memtable.clone();
     let shard1 = omni_engine::shard_idx(b"key1");
     let shard2 = omni_engine::shard_idx(b"key2");
-    
+
     let mut found_key1 = false;
     for entry in memtable[shard1].iter() {
         if entry.key().0 == b"key1" {
@@ -442,7 +470,7 @@ fn test_concurrent_read_during_root_swap() {
     let val1 = db.find("key1", snap).unwrap().unwrap();
     let val2 = db.find("key2", snap).unwrap().unwrap();
     db.unregister_snapshot(snap);
-    
+
     assert_eq!(val1, "val1");
     assert_eq!(val2, "val2");
 

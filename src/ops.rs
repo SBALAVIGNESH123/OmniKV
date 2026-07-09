@@ -105,25 +105,69 @@ impl OmniConfig {
     pub fn from_env() -> Self {
         let mut cfg = Self::default();
 
-        if let Ok(v) = std::env::var("OMNI_DATA_DIR") { cfg.data_dir = v.clone(); cfg.manifest_path = format!("{}/manifest.json", v); cfg.wal_path = format!("{}/wal.bin", v); }
-        if let Ok(v) = std::env::var("OMNI_MANIFEST_PATH") { cfg.manifest_path = v; }
-        if let Ok(v) = std::env::var("OMNI_WAL_PATH") { cfg.wal_path = v; }
-        if let Ok(v) = std::env::var("OMNI_MEMTABLE_FLUSH") { cfg.memtable_flush_threshold = v.parse().unwrap_or(cfg.memtable_flush_threshold); }
-        if let Ok(v) = std::env::var("OMNI_L0_TRIGGER") { cfg.l0_compaction_trigger = v.parse().unwrap_or(cfg.l0_compaction_trigger); }
-        if let Ok(v) = std::env::var("OMNI_L1_TRIGGER") { cfg.l1_compaction_trigger = v.parse().unwrap_or(cfg.l1_compaction_trigger); }
-        if let Ok(v) = std::env::var("OMNI_BLOCK_CACHE") { cfg.block_cache_capacity = v.parse().unwrap_or(cfg.block_cache_capacity); }
-        if let Ok(v) = std::env::var("OMNI_HTTP_ADDR") { cfg.http_addr = v; }
-        if let Ok(v) = std::env::var("OMNI_QUIC_ADDR") { cfg.quic_addr = v; }
-        if let Ok(v) = std::env::var("OMNI_PGWIRE_ADDR") { cfg.pgwire_addr = v; }
-        if let Ok(v) = std::env::var("OMNI_TCP_ADDR") { cfg.tcp_addr = v; }
-        if let Ok(v) = std::env::var("OMNI_JWT_SECRET") { cfg.jwt_secret = v; }
-        if let Ok(v) = std::env::var("OMNI_LOG_LEVEL") { cfg.log_level = v; }
-        if let Ok(v) = std::env::var("OMNI_LOG_FORMAT") { cfg.log_format = if v == "pretty" { LogFormat::Pretty } else { LogFormat::Json }; }
-        if let Ok(v) = std::env::var("OMNI_TXN_TIMEOUT_SECS") { cfg.txn_timeout = Duration::from_secs(v.parse().unwrap_or(30)); }
-        if let Ok(v) = std::env::var("OMNI_RATE_LIMIT") { cfg.rate_limit_per_sec = v.parse().unwrap_or(cfg.rate_limit_per_sec); }
-        if let Ok(v) = std::env::var("OMNI_RATE_BURST") { cfg.rate_limit_burst = v.parse().unwrap_or(cfg.rate_limit_burst); }
-        if let Ok(v) = std::env::var("OMNI_GROUP_COMMIT_US") { cfg.group_commit_wait_us = v.parse().unwrap_or(cfg.group_commit_wait_us); }
-        if let Ok(v) = std::env::var("OMNI_POOL_SIZE") { cfg.connection_pool_size = v.parse().unwrap_or(cfg.connection_pool_size); }
+        if let Ok(v) = std::env::var("OMNI_DATA_DIR") {
+            cfg.data_dir = v.clone();
+            cfg.manifest_path = format!("{}/manifest.json", v);
+            cfg.wal_path = format!("{}/wal.bin", v);
+        }
+        if let Ok(v) = std::env::var("OMNI_MANIFEST_PATH") {
+            cfg.manifest_path = v;
+        }
+        if let Ok(v) = std::env::var("OMNI_WAL_PATH") {
+            cfg.wal_path = v;
+        }
+        if let Ok(v) = std::env::var("OMNI_MEMTABLE_FLUSH") {
+            cfg.memtable_flush_threshold = v.parse().unwrap_or(cfg.memtable_flush_threshold);
+        }
+        if let Ok(v) = std::env::var("OMNI_L0_TRIGGER") {
+            cfg.l0_compaction_trigger = v.parse().unwrap_or(cfg.l0_compaction_trigger);
+        }
+        if let Ok(v) = std::env::var("OMNI_L1_TRIGGER") {
+            cfg.l1_compaction_trigger = v.parse().unwrap_or(cfg.l1_compaction_trigger);
+        }
+        if let Ok(v) = std::env::var("OMNI_BLOCK_CACHE") {
+            cfg.block_cache_capacity = v.parse().unwrap_or(cfg.block_cache_capacity);
+        }
+        if let Ok(v) = std::env::var("OMNI_HTTP_ADDR") {
+            cfg.http_addr = v;
+        }
+        if let Ok(v) = std::env::var("OMNI_QUIC_ADDR") {
+            cfg.quic_addr = v;
+        }
+        if let Ok(v) = std::env::var("OMNI_PGWIRE_ADDR") {
+            cfg.pgwire_addr = v;
+        }
+        if let Ok(v) = std::env::var("OMNI_TCP_ADDR") {
+            cfg.tcp_addr = v;
+        }
+        if let Ok(v) = std::env::var("OMNI_JWT_SECRET") {
+            cfg.jwt_secret = v;
+        }
+        if let Ok(v) = std::env::var("OMNI_LOG_LEVEL") {
+            cfg.log_level = v;
+        }
+        if let Ok(v) = std::env::var("OMNI_LOG_FORMAT") {
+            cfg.log_format = if v == "pretty" {
+                LogFormat::Pretty
+            } else {
+                LogFormat::Json
+            };
+        }
+        if let Ok(v) = std::env::var("OMNI_TXN_TIMEOUT_SECS") {
+            cfg.txn_timeout = Duration::from_secs(v.parse().unwrap_or(30));
+        }
+        if let Ok(v) = std::env::var("OMNI_RATE_LIMIT") {
+            cfg.rate_limit_per_sec = v.parse().unwrap_or(cfg.rate_limit_per_sec);
+        }
+        if let Ok(v) = std::env::var("OMNI_RATE_BURST") {
+            cfg.rate_limit_burst = v.parse().unwrap_or(cfg.rate_limit_burst);
+        }
+        if let Ok(v) = std::env::var("OMNI_GROUP_COMMIT_US") {
+            cfg.group_commit_wait_us = v.parse().unwrap_or(cfg.group_commit_wait_us);
+        }
+        if let Ok(v) = std::env::var("OMNI_POOL_SIZE") {
+            cfg.connection_pool_size = v.parse().unwrap_or(cfg.connection_pool_size);
+        }
 
         cfg
     }
@@ -148,16 +192,24 @@ impl OmniConfig {
             errors.push("rate_limit_per_sec must be > 0".into());
         }
 
-        if errors.is_empty() { Ok(()) } else { Err(errors) }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
     }
 
     /// Returns a summary string for startup logging.
     pub fn summary(&self) -> String {
         format!(
             "OmniConfig {{ data_dir: {:?}, memtable_flush: {}, l0_trigger: {}, l1_trigger: {}, cache: {}, rate_limit: {}/s, txn_timeout: {:?} }}",
-            self.data_dir, self.memtable_flush_threshold, self.l0_compaction_trigger,
-            self.l1_compaction_trigger, self.block_cache_capacity,
-            self.rate_limit_per_sec, self.txn_timeout
+            self.data_dir,
+            self.memtable_flush_threshold,
+            self.l0_compaction_trigger,
+            self.l1_compaction_trigger,
+            self.block_cache_capacity,
+            self.rate_limit_per_sec,
+            self.txn_timeout
         )
     }
 }
@@ -186,7 +238,11 @@ pub struct DiagnosticConfig {
 
 impl DiagnosticReport {
     /// Generate a diagnostic report from the live database.
-    pub fn from_db(db: &std::sync::Arc<crate::OmniKV>, start_time: std::time::Instant, config: &OmniConfig) -> Self {
+    pub fn from_db(
+        db: &std::sync::Arc<crate::OmniKV>,
+        start_time: std::time::Instant,
+        config: &OmniConfig,
+    ) -> Self {
         Self {
             version: env!("CARGO_PKG_VERSION").into(),
             uptime_secs: start_time.elapsed().as_secs(),

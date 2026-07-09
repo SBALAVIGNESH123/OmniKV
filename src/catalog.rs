@@ -6,6 +6,7 @@
 use crate::{OmniError, OmniKV, WriteBatch};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::str::FromStr;
 use std::sync::Arc;
 
 const CATALOG_PREFIX: &str = "\x00CATALOG\x00";
@@ -20,8 +21,10 @@ pub enum ColumnType {
     Json,
 }
 
-impl ColumnType {
-    pub fn from_str(s: &str) -> Result<Self, String> {
+impl FromStr for ColumnType {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_uppercase().as_str() {
             "TEXT" | "VARCHAR" | "STRING" | "CHAR" => Ok(Self::Text),
             "INT" | "INTEGER" | "BIGINT" | "SMALLINT" => Ok(Self::Integer),
@@ -32,7 +35,9 @@ impl ColumnType {
             _ => Err(format!("Unknown type: {}", s)),
         }
     }
+}
 
+impl ColumnType {
     pub fn pg_oid(&self) -> i32 {
         match self {
             Self::Text => 25,        // TEXT

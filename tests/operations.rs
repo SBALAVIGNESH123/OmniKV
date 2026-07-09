@@ -2,8 +2,8 @@
 // Operations & Edge Case Tests — Gaps #32 through #47
 // ═══════════════════════════════════════════════════════════════════════════
 
-use omni_engine::{OmniKV, WriteBatch};
 use omni_engine::transaction::TransactionManager;
+use omni_engine::{OmniKV, WriteBatch};
 
 /// Helper: create a temp OmniKV instance
 fn create_temp_db(prefix: &str) -> (std::sync::Arc<OmniKV>, tempfile::TempDir) {
@@ -26,18 +26,24 @@ fn test_concurrent_writers() {
     let w = dir.path().join("cw_w.bin");
     let db = OmniKV::open(m.to_str().unwrap(), w.to_str().unwrap()).unwrap();
 
-    let handles: Vec<_> = (0..4).map(|t| {
-        let db = db.clone();
-        std::thread::spawn(move || {
-            let mut batch = WriteBatch::new();
-            for i in 0..25 {
-                batch.set(&format!("t{}_k{}", t, i), format!("v{}", i)).unwrap();
-            }
-            db.commit_batch(&batch).unwrap();
+    let handles: Vec<_> = (0..4)
+        .map(|t| {
+            let db = db.clone();
+            std::thread::spawn(move || {
+                let mut batch = WriteBatch::new();
+                for i in 0..25 {
+                    batch
+                        .set(&format!("t{}_k{}", t, i), format!("v{}", i))
+                        .unwrap();
+                }
+                db.commit_batch(&batch).unwrap();
+            })
         })
-    }).collect();
+        .collect();
 
-    for h in handles { h.join().unwrap(); }
+    for h in handles {
+        h.join().unwrap();
+    }
 
     let seq = db.get_seq();
     let mut count = 0;
@@ -68,7 +74,10 @@ fn test_large_value_1mb() {
     batch.set("large_1mb", val.clone()).unwrap();
     db.commit_batch(&batch).unwrap();
 
-    assert_eq!(db.find("large_1mb", db.get_seq()).unwrap().unwrap().len(), 1_000_000);
+    assert_eq!(
+        db.find("large_1mb", db.get_seq()).unwrap().unwrap().len(),
+        1_000_000
+    );
 
     println!("✅ OPS 33a: 1MB value stored and retrieved correctly");
 }
@@ -114,7 +123,10 @@ fn test_long_key() {
     batch.set(&long_key, "long_key_val".into()).unwrap();
     db.commit_batch(&batch).unwrap();
 
-    assert_eq!(db.find(&long_key, db.get_seq()).unwrap(), Some("long_key_val".into()));
+    assert_eq!(
+        db.find(&long_key, db.get_seq()).unwrap(),
+        Some("long_key_val".into())
+    );
 
     println!("✅ OPS 34b: 1000-char key works");
 }
@@ -140,7 +152,9 @@ fn test_large_batch() {
     let (db, _dir) = create_temp_db("lb");
     let mut batch = WriteBatch::new();
     for i in 0..500 {
-        batch.set(&format!("lb_k{:04}", i), format!("v{}", i)).unwrap();
+        batch
+            .set(&format!("lb_k{:04}", i), format!("v{}", i))
+            .unwrap();
     }
     db.commit_batch(&batch).unwrap();
 
@@ -170,7 +184,10 @@ fn test_sstable_overwrite_merge() {
     b2.set("ow_key", "version2".into()).unwrap();
     db.commit_batch(&b2).unwrap();
 
-    assert_eq!(db.find("ow_key", db.get_seq()).unwrap(), Some("version2".into()));
+    assert_eq!(
+        db.find("ow_key", db.get_seq()).unwrap(),
+        Some("version2".into())
+    );
 
     println!("✅ OPS 36a: Overwritten key shows latest value after compaction");
 }
@@ -194,8 +211,11 @@ fn test_bloom_filter_no_false_negatives() {
     // All keys should be findable (no false negatives)
     let seq = db.get_seq();
     for i in 0..100 {
-        assert!(db.find(&format!("bf_k{}", i), seq).unwrap().is_some(),
-            "Bloom filter false negative on bf_k{}", i);
+        assert!(
+            db.find(&format!("bf_k{}", i), seq).unwrap().is_some(),
+            "Bloom filter false negative on bf_k{}",
+            i
+        );
     }
 
     println!("✅ OPS 37a: 100 keys — zero bloom filter false negatives");
@@ -211,10 +231,15 @@ fn test_ttl_far_future_visible() {
     let (db, _dir) = create_temp_db("ttl");
 
     let mut batch = WriteBatch::new();
-    batch.set_with_ttl("ttl_key", "ttl_val".into(), 86400).unwrap(); // 24h TTL
+    batch
+        .set_with_ttl("ttl_key", "ttl_val".into(), 86400)
+        .unwrap(); // 24h TTL
     db.commit_batch(&batch).unwrap();
 
-    assert_eq!(db.find("ttl_key", db.get_seq()).unwrap(), Some("ttl_val".into()));
+    assert_eq!(
+        db.find("ttl_key", db.get_seq()).unwrap(),
+        Some("ttl_val".into())
+    );
 
     println!("✅ OPS 38a: TTL key with 24h expiry is visible now");
 }
@@ -228,7 +253,10 @@ fn test_no_ttl_persists() {
     batch.set("persist_key", "forever".into()).unwrap();
     db.commit_batch(&batch).unwrap();
 
-    assert_eq!(db.find("persist_key", db.get_seq()).unwrap(), Some("forever".into()));
+    assert_eq!(
+        db.find("persist_key", db.get_seq()).unwrap(),
+        Some("forever".into())
+    );
 
     println!("✅ OPS 38b: Non-TTL key persists (no expiry)");
 }
@@ -290,7 +318,9 @@ fn test_wal_rotation() {
 
     let mut batch = WriteBatch::new();
     for i in 0..50 {
-        batch.set(&format!("walr_k{}", i), format!("v{}", i)).unwrap();
+        batch
+            .set(&format!("walr_k{}", i), format!("v{}", i))
+            .unwrap();
     }
     db.commit_batch(&batch).unwrap();
 
@@ -340,7 +370,9 @@ fn test_sequential_writes() {
 
     let mut batch = WriteBatch::new();
     for i in 0..200 {
-        batch.set(&format!("seq_{:06}", i), format!("v{}", i)).unwrap();
+        batch
+            .set(&format!("seq_{:06}", i), format!("v{}", i))
+            .unwrap();
     }
     db.commit_batch(&batch).unwrap();
 
@@ -356,7 +388,9 @@ fn test_sequential_writes() {
 fn test_random_pattern_writes() {
     let (db, _dir) = create_temp_db("rnd");
 
-    let keys = ["zebra", "apple", "mango", "banana", "kiwi", "grape", "fig", "date", "cherry", "apricot"];
+    let keys = [
+        "zebra", "apple", "mango", "banana", "kiwi", "grape", "fig", "date", "cherry", "apricot",
+    ];
     let mut batch = WriteBatch::new();
     for k in &keys {
         batch.set(k, format!("{}_val", k)).unwrap();
@@ -382,7 +416,9 @@ fn test_read_consistency_across_compaction() {
 
     let mut batch = WriteBatch::new();
     for i in 0..50 {
-        batch.set(&format!("rdc_k{:03}", i), format!("v{}", i)).unwrap();
+        batch
+            .set(&format!("rdc_k{:03}", i), format!("v{}", i))
+            .unwrap();
     }
     db.commit_batch(&batch).unwrap();
 
@@ -418,7 +454,10 @@ fn test_scan_ordering() {
     sorted.sort();
     assert_eq!(keys, sorted);
 
-    println!("✅ OPS 44a: Scan returns {} keys in lexicographic order", results.len());
+    println!(
+        "✅ OPS 44a: Scan returns {} keys in lexicographic order",
+        results.len()
+    );
 }
 
 /// Gap #44b: Scan with empty range returns empty
@@ -444,14 +483,22 @@ fn test_memtable_size_tracking() {
     let size_before = db.memtable_size();
     let mut batch = WriteBatch::new();
     for i in 0..50 {
-        batch.set(&format!("met_k{}", i), format!("val_{}", i)).unwrap();
+        batch
+            .set(&format!("met_k{}", i), format!("val_{}", i))
+            .unwrap();
     }
     db.commit_batch(&batch).unwrap();
 
     let size_after = db.memtable_size();
-    assert!(size_after > size_before, "Memtable should grow after writes");
+    assert!(
+        size_after > size_before,
+        "Memtable should grow after writes"
+    );
 
-    println!("✅ OPS 45a: Memtable size {} → {} after 50 writes", size_before, size_after);
+    println!(
+        "✅ OPS 45a: Memtable size {} → {} after 50 writes",
+        size_before, size_after
+    );
 }
 
 /// Gap #45b: Sequence number monotonically increases
@@ -465,7 +512,12 @@ fn test_seq_monotonic() {
         batch.set(&format!("seqm_k{}", i), "v".into()).unwrap();
         db.commit_batch(&batch).unwrap();
         let current = db.get_seq();
-        assert!(current > prev, "Seq should increase: {} <= {}", current, prev);
+        assert!(
+            current > prev,
+            "Seq should increase: {} <= {}",
+            current,
+            prev
+        );
         prev = current;
     }
 
@@ -486,7 +538,9 @@ fn test_multi_restart_durability() {
     for cycle in 0..5 {
         let db = OmniKV::open(m.to_str().unwrap(), w.to_str().unwrap()).unwrap();
         let mut batch = WriteBatch::new();
-        batch.set(&format!("dur_k{}", cycle), format!("cycle_{}", cycle)).unwrap();
+        batch
+            .set(&format!("dur_k{}", cycle), format!("cycle_{}", cycle))
+            .unwrap();
         db.commit_batch(&batch).unwrap();
     }
 
@@ -528,8 +582,10 @@ fn test_ssi_transaction_e2e() {
     let b_val: i64 = b.parse().unwrap();
 
     // Transfer 200 from A to B
-    tm.set(&mut txn, "ssi_account_a", (a_val - 200).to_string()).unwrap();
-    tm.set(&mut txn, "ssi_account_b", (b_val + 200).to_string()).unwrap();
+    tm.set(&mut txn, "ssi_account_a", (a_val - 200).to_string())
+        .unwrap();
+    tm.set(&mut txn, "ssi_account_b", (b_val + 200).to_string())
+        .unwrap();
 
     let commit_seq = tm.commit(&mut txn).unwrap();
     assert!(commit_seq > 0);
@@ -561,8 +617,10 @@ fn test_ssi_conflict_abort() {
     let _ = tm.get(&mut txn2, "ssic_key");
 
     // Both write to same key
-    tm.set(&mut txn1, "ssic_key", "txn1_wins".to_string()).unwrap();
-    tm.set(&mut txn2, "ssic_key", "txn2_wins".to_string()).unwrap();
+    tm.set(&mut txn1, "ssic_key", "txn1_wins".to_string())
+        .unwrap();
+    tm.set(&mut txn2, "ssic_key", "txn2_wins".to_string())
+        .unwrap();
 
     // First commit succeeds
     assert!(tm.commit(&mut txn1).is_ok());

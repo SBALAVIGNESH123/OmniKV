@@ -3,10 +3,10 @@
 //! These tests prove correctness under REAL parallel thread contention —
 //! not simulated single-threaded scenarios.
 
-use omni_engine::transaction::{TransactionManager, TxnState};
+use omni_engine::transaction::TransactionManager;
 use omni_engine::{OmniKV, WriteBatch};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 
 fn create_test_db() -> (Arc<OmniKV>, tempfile::TempDir) {
@@ -118,7 +118,11 @@ fn test_concurrent_disjoint_keys_no_conflicts() {
     }
 
     let total_conflicts = conflicts.load(Ordering::Relaxed);
-    assert_eq!(total_conflicts, 0, "Disjoint keys should have 0 conflicts, got {}", total_conflicts);
+    assert_eq!(
+        total_conflicts, 0,
+        "Disjoint keys should have 0 conflicts, got {}",
+        total_conflicts
+    );
 
     // Verify all 400 keys exist
     let seq = db.get_seq();
@@ -168,8 +172,12 @@ fn test_concurrent_hot_key_contention() {
                     tm.set(&mut txn, &k1, format!("t{}_{}", tid, i)).unwrap();
                     tm.set(&mut txn, &k2, format!("t{}_{}", tid, i)).unwrap();
                     match tm.commit(&mut txn) {
-                        Ok(_) => { commits.fetch_add(1, Ordering::Relaxed); }
-                        Err(_) => { aborts.fetch_add(1, Ordering::Relaxed); }
+                        Ok(_) => {
+                            commits.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Err(_) => {
+                            aborts.fetch_add(1, Ordering::Relaxed);
+                        }
                     }
                 }
             })
@@ -209,7 +217,9 @@ fn test_concurrent_mixed_read_write() {
     // Populate initial data
     let mut batch = WriteBatch::new();
     for i in 0..50 {
-        batch.set(&format!("mixed_{}", i), format!("init_{}", i)).unwrap();
+        batch
+            .set(&format!("mixed_{}", i), format!("init_{}", i))
+            .unwrap();
     }
     db.commit_batch(&batch).unwrap();
 
@@ -247,12 +257,9 @@ fn test_concurrent_mixed_read_write() {
                     let mut txn = tm.begin();
                     let key = format!("mixed_{}", (tid * 10 + i) % 50);
                     tm.set(&mut txn, &key, format!("w_{}_{}", tid, i)).unwrap();
-                    match tm.commit(&mut txn) {
-                        Ok(_) => {
-                            writes.fetch_add(1, Ordering::Relaxed);
-                            break;
-                        }
-                        Err(_) => {} // retry
+                    if tm.commit(&mut txn).is_ok() {
+                        writes.fetch_add(1, Ordering::Relaxed);
+                        break;
                     }
                 }
             }
@@ -269,7 +276,10 @@ fn test_concurrent_mixed_read_write() {
     assert_eq!(reads, 400, "All 400 read txns should complete");
     assert_eq!(writes, 200, "All 200 write txns should complete");
 
-    println!("✅ STRESS 4: 4 readers × 100 + 4 writers × 50 = {} reads, {} writes", reads, writes);
+    println!(
+        "✅ STRESS 4: 4 readers × 100 + 4 writers × 50 = {} reads, {} writes",
+        reads, writes
+    );
 }
 
 /// Stress test 5: Savepoint correctness under concurrent load.
@@ -303,9 +313,8 @@ fn test_concurrent_savepoints() {
                     assert_eq!(v1, Some("before_savepoint".into()));
                     assert_eq!(v2, None);
 
-                    match tm.commit(&mut txn) {
-                        Ok(_) => { success.fetch_add(1, Ordering::Relaxed); }
-                        Err(_) => {} // SSI conflict OK
+                    if tm.commit(&mut txn).is_ok() {
+                        success.fetch_add(1, Ordering::Relaxed);
                     }
                 }
             })
@@ -317,7 +326,10 @@ fn test_concurrent_savepoints() {
     }
 
     let total = success.load(Ordering::Relaxed);
-    assert_eq!(total, 100, "All 100 savepoint txns should commit (disjoint keys)");
+    assert_eq!(
+        total, 100,
+        "All 100 savepoint txns should commit (disjoint keys)"
+    );
 
     // Verify: _a keys exist, _b keys do NOT
     let seq = db.get_seq();
@@ -326,7 +338,11 @@ fn test_concurrent_savepoints() {
             let k1 = format!("sp_{}_{}_a", tid, i);
             let k2 = format!("sp_{}_{}_b", tid, i);
             assert!(db.find(&k1, seq).unwrap().is_some(), "{} should exist", k1);
-            assert!(db.find(&k2, seq).unwrap().is_none(), "{} should NOT exist", k2);
+            assert!(
+                db.find(&k2, seq).unwrap().is_none(),
+                "{} should NOT exist",
+                k2
+            );
         }
     }
 
@@ -350,12 +366,15 @@ fn test_concurrent_metrics_accuracy() {
                 for _ in 0..50 {
                     loop {
                         let mut txn = tm.begin();
-                        let val = tm.get(&mut txn, "metrics_key").unwrap().unwrap_or("0".into());
+                        let val = tm
+                            .get(&mut txn, "metrics_key")
+                            .unwrap()
+                            .unwrap_or("0".into());
                         let n: i64 = val.parse().unwrap();
-                        tm.set(&mut txn, "metrics_key", (n + 1).to_string()).unwrap();
-                        match tm.commit(&mut txn) {
-                            Ok(_) => break,
-                            Err(_) => {}
+                        tm.set(&mut txn, "metrics_key", (n + 1).to_string())
+                            .unwrap();
+                        if tm.commit(&mut txn).is_ok() {
+                            break;
                         }
                     }
                 }
@@ -376,7 +395,11 @@ fn test_concurrent_metrics_accuracy() {
     assert_eq!(committed, 200, "Exactly 200 commits (4×50)");
     assert!(started >= 200, "At least 200 starts");
     assert_eq!(aborted, conflicts, "Aborts should equal conflicts");
-    assert_eq!(started, committed + aborted, "started = committed + aborted");
+    assert_eq!(
+        started,
+        committed + aborted,
+        "started = committed + aborted"
+    );
 
     println!(
         "✅ STRESS 6: Metrics accurate — started={}, committed={}, aborted={}, conflicts={}",

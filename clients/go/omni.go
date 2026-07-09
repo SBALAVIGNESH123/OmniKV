@@ -26,19 +26,50 @@ type Client struct {
 	token      string
 }
 
+// Option customizes a Client created by New.
+type Option func(*Client)
+
+// WithHTTPClient injects a caller-managed HTTP client.
+func WithHTTPClient(httpClient *http.Client) Option {
+	return func(c *Client) {
+		if httpClient != nil {
+			c.httpClient = httpClient
+		}
+	}
+}
+
+// WithInsecureSkipVerify allows self-signed development certificates.
+//
+// Do not use this option in production. The default client verifies TLS
+// certificates normally.
+func WithInsecureSkipVerify() Option {
+	return func(c *Client) {
+		c.httpClient.Transport = &http.Transport{
+			TLSClientConfig:     &tls.Config{InsecureSkipVerify: true}, //nolint:gosec // explicit local-dev opt-in
+			MaxIdleConnsPerHost: 10,
+			ForceAttemptHTTP2:   true,
+		}
+	}
+}
+
 // New creates a new OmniKV client.
-func New(baseURL string) *Client {
-	return &Client{
+func New(baseURL string, opts ...Option) *Client {
+	client := &Client{
 		baseURL: baseURL,
 		httpClient: &http.Client{
 			Timeout: 30 * time.Second,
 			Transport: &http.Transport{
-				TLSClientConfig:     &tls.Config{InsecureSkipVerify: true},
 				MaxIdleConnsPerHost: 10,
 				ForceAttemptHTTP2:   true,
 			},
 		},
 	}
+
+	for _, opt := range opts {
+		opt(client)
+	}
+
+	return client
 }
 
 // WithToken sets the JWT bearer token for authenticated requests.

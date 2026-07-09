@@ -91,9 +91,8 @@ impl WriteAheadLog {
 
             // Verify per-batch CRC32 checksum
             if batch_ok && offset + 4 <= all_data.len() {
-                let stored_crc = u32::from_le_bytes(
-                    all_data[offset..offset + 4].try_into().unwrap_or([0; 4]),
-                );
+                let stored_crc =
+                    u32::from_le_bytes(all_data[offset..offset + 4].try_into().unwrap_or([0; 4]));
                 offset += 4;
 
                 // Compute CRC over the batch data (from record_count through all records)
