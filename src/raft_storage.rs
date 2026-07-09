@@ -587,16 +587,30 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
         fs::create_dir_all(&old_dir).ok();
 
         // Move current files to old_dir
-        for entry in fs::read_dir(&data_dir).unwrap().flatten() {
+        for entry in
+            fs::read_dir(&data_dir).map_err(|e| io_err(&format!("read data dir: {}", e)))?
+        {
+            let entry = entry.map_err(|e| io_err(&format!("read data dir entry: {}", e)))?;
             let name = entry.file_name().to_string_lossy().to_string();
             if name != "old_snapshot" {
-                let _ = fs::rename(entry.path(), old_dir.join(&name));
+                fs::rename(entry.path(), old_dir.join(&name))
+                    .map_err(|e| io_err(&format!("move current snapshot file {}: {}", name, e)))?;
             }
         }
 
         // Move tmp files to data_dir
-        for entry in fs::read_dir(&tmp_dir).unwrap().flatten() {
-            let _ = fs::rename(entry.path(), data_dir.join(entry.file_name()));
+        for entry in
+            fs::read_dir(&tmp_dir).map_err(|e| io_err(&format!("read temp snapshot dir: {}", e)))?
+        {
+            let entry = entry.map_err(|e| io_err(&format!("read temp snapshot entry: {}", e)))?;
+            let name = entry.file_name();
+            fs::rename(entry.path(), data_dir.join(&name)).map_err(|e| {
+                io_err(&format!(
+                    "install snapshot file {}: {}",
+                    name.to_string_lossy(),
+                    e
+                ))
+            })?;
         }
 
         let _ = fs::remove_dir_all(&tmp_dir);
