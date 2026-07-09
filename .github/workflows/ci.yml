@@ -22,6 +22,7 @@ jobs:
   build:
     name: Build
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
     - uses: actions/checkout@v5
       with:
@@ -38,6 +39,8 @@ jobs:
       run: cargo build --lib
     - name: Build binary
       run: cargo build --release
+    - name: Build all targets
+      run: cargo build --all-targets
 
   test-storage:
     name: Storage Tests
@@ -105,6 +108,8 @@ jobs:
         key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
     - name: SQL layer (18 tests)
       run: cargo test --test sql_layer -- --test-threads=1
+    - name: SQL v3 feature coverage
+      run: cargo test --test sql_v3_features -- --test-threads=1
     - name: Ops maturity (24 tests)
       run: cargo test --test ops_maturity -- --test-threads=1 --nocapture
 
@@ -128,7 +133,7 @@ jobs:
       run: cargo test --test raft_cluster -- --test-threads=1
 
   clippy:
-    name: Clippy Lint
+    name: Clippy Lint (All Targets)
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v5
@@ -137,7 +142,26 @@ jobs:
     - uses: dtolnay/rust-toolchain@stable
       with:
         components: clippy
-    - run: cargo clippy --lib -- -D warnings
+    - run: cargo clippy --all-targets -- -D warnings
+
+  benchmark-smoke:
+    name: Benchmark Smoke
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+    - uses: actions/checkout@v5
+      with:
+        persist-credentials: false
+    - uses: dtolnay/rust-toolchain@stable
+    - uses: actions/cache@v5
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target
+        key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+    - name: Benchmark suite smoke test
+      run: cargo test --test benchmarks --release -- --test-threads=1 --nocapture
 
   fmt:
     name: Format Check
