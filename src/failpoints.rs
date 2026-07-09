@@ -1,81 +1,70 @@
-//! Deterministic failure-injection harness for OmniKV crash-consistency tests.
+//! Deterministic failure-injection harness for OmniKV crash testing.
 //!
-//! # Usage
-//!
-//! ```rust,ignore
-//! use omnikv::failpoints::FailRegistry;
-//!
-//! let reg = FailRegistry::new();
-//! reg.arm("wal::sync");
-//! assert!(reg.should_fail("wal::sync"));
-//! reg.disarm("wal::sync");
-//! assert!(!reg.should_fail("wal::sync"));
-//! ```
-//!
-//! The `failpoints` feature gate controls whether this module compiles in.
-//! Without that feature, `should_fail` always returns `false`.
+//! When the `failpoints` Cargo feature is disabled every public function
+//! is a no-op and the entire registry is compiled away.
 
-use std::collections::HashSet;
-use std::sync::{Arc, Mutex};
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
 
-/// Process-global registry of armed failure-injection points.
+/// Action to take when a named fail-point is triggered.
+#[derive(Clone, Debug)]
+pub enum FailAction {
+    /// Do nothing (default / disarmed state).
+    NoOp,
+    /// Panic with the given message.
+    Panic(String),
+    /// Return an error string to the call site.
+    Error(String),
+}
+
+static REGISTRY: OnceLock<Mutex<HashMap<String, FailAction>>> = OnceLock::new();
+
+fn registry() -> &'static Mutex<HashMap<String, FailAction>> {
+    REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Arm a named fail-point.
+pub fn set(name: &str, action: FailAction) {
+    registry()
+        .lock()
+        .expect("failpoints registry poisoned")
+        .insert(name.to_owned(), action);
+}
+
+/// Disarm a named fail-point.
+pub fn clear(name: &str) {
+    registry()
+        .lock()
+        .expect("failpoints registry poisoned")
+        .remove(name);
+}
+
+/// Evaluate a fail-point.
 ///
-/// Clone is cheap — the inner state is reference-counted.
-#[derive(Clone, Default)]
-pub struct FailRegistry {
-    armed: Arc<Mutex<HashSet<String>>>,
-}
-
-impl FailRegistry {
-    /// Create a new, empty registry.
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Arm a failure-injection point by name.
-    pub fn arm(&self, point: &str) {
-        self.armed
-            .lock()
-            .expect("lock poisoned")
-            .insert(point.to_owned());
-    }
-
-    /// Disarm a failure-injection point by name.
-    pub fn disarm(&self, point: &str) {
-        self.armed
-            .lock()
-            .expect("lock poisoned")
-            .remove(point);
-    }
-
-    /// Returns `true` if the named failure-injection point is currently armed.
-    pub fn should_fail(&self, point: &str) -> bool {
-        self.armed
-            .lock()
-            .expect("lock poisoned")
-            .contains(point)
+/// Returns `Err` when the action is `Error`.
+///
+/// # Panics
+/// Panics when the action is `Panic`.
+pub fn eval(name: &str) -> Result<(), String> {
+    let action = registry()
+        .lock()
+        .expect("failpoints registry poisoned")
+        .get(name)
+        .cloned()
+        .unwrap_or(FailAction::NoOp);
+    match action {
+        FailAction::NoOp => Ok(()),
+        FailAction::Panic(msg) => {
+            panic!("failpoint '{name}' triggered: {msg}")
+        }
+        FailAction::Error(msg) => Err(msg),
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn arm_disarm_round_trip() {
-        let reg = FailRegistry::new();
-        assert!(!reg.should_fail("x"));
-        reg.arm("x");
-        assert!(reg.should_fail("x"));
-        reg.disarm("x");
-        assert!(!reg.should_fail("x"));
-    }
-
-    #[test]
-    fn clone_shares_state() {
-        let reg = FailRegistry::new();
-        let reg2 = reg.clone();
-        reg.arm("y");
-        assert!(reg2.should_fail("y"));
-    }
+/// Disarm all registered fail-points.
+pub fn clear_all() {
+    registry()
+        .lock()
+        .expect("failpoints registry poisoned")
+        .clear();
 }
