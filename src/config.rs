@@ -94,16 +94,39 @@ impl OmniConfig {
                     "data_dir" => config.data_dir = value.into(),
                     "port" => config.port = value.parse().unwrap_or(config.port),
                     "pg_port" => config.pg_port = value.parse().unwrap_or(config.pg_port),
-                    "max_connections" => config.max_connections = value.parse().unwrap_or(config.max_connections),
-                    "query_timeout_secs" => config.query_timeout_secs = value.parse().unwrap_or(config.query_timeout_secs),
-                    "slow_query_threshold_ms" => config.slow_query_threshold_ms = value.parse().unwrap_or(config.slow_query_threshold_ms),
-                    "gc_interval_compactions" => config.gc_interval_compactions = value.parse().unwrap_or(config.gc_interval_compactions),
-                    "max_write_batch_bytes" => config.max_write_batch_bytes = value.parse().unwrap_or(config.max_write_batch_bytes),
-                    "max_query_result_rows" => config.max_query_result_rows = value.parse().unwrap_or(config.max_query_result_rows),
+                    "max_connections" => {
+                        config.max_connections = value.parse().unwrap_or(config.max_connections)
+                    }
+                    "query_timeout_secs" => {
+                        config.query_timeout_secs =
+                            value.parse().unwrap_or(config.query_timeout_secs)
+                    }
+                    "slow_query_threshold_ms" => {
+                        config.slow_query_threshold_ms =
+                            value.parse().unwrap_or(config.slow_query_threshold_ms)
+                    }
+                    "gc_interval_compactions" => {
+                        config.gc_interval_compactions =
+                            value.parse().unwrap_or(config.gc_interval_compactions)
+                    }
+                    "max_write_batch_bytes" => {
+                        config.max_write_batch_bytes =
+                            value.parse().unwrap_or(config.max_write_batch_bytes)
+                    }
+                    "max_query_result_rows" => {
+                        config.max_query_result_rows =
+                            value.parse().unwrap_or(config.max_query_result_rows)
+                    }
                     "enable_encryption" => config.enable_encryption = value == "true",
                     "log_level" => config.log_level = value.into(),
-                    "compaction_interval_ms" => config.compaction_interval_ms = value.parse().unwrap_or(config.compaction_interval_ms),
-                    "memtable_flush_threshold" => config.memtable_flush_threshold = value.parse().unwrap_or(config.memtable_flush_threshold),
+                    "compaction_interval_ms" => {
+                        config.compaction_interval_ms =
+                            value.parse().unwrap_or(config.compaction_interval_ms)
+                    }
+                    "memtable_flush_threshold" => {
+                        config.memtable_flush_threshold =
+                            value.parse().unwrap_or(config.memtable_flush_threshold)
+                    }
                     _ => {} // Ignore unknown keys
                 }
             }
@@ -141,7 +164,8 @@ enable_encryption = false
 
 # Logging
 log_level = "info"
-"#.into()
+"#
+        .into()
     }
 }
 

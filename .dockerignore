@@ -1,0 +1,10 @@
+.git
+.github
+target
+**/target
+Cargo.lock.bak
+*.pdb
+*.rlib
+*.rmeta
+*.log
+*.tmp

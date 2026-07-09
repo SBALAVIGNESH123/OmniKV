@@ -150,13 +150,34 @@ impl TxnMetrics {
     /// Returns a snapshot of all metrics as a HashMap for export.
     pub fn snapshot(&self) -> HashMap<String, u64> {
         let mut m = HashMap::new();
-        m.insert("txns_started".into(), self.txns_started.load(Ordering::Relaxed));
-        m.insert("txns_committed".into(), self.txns_committed.load(Ordering::Relaxed));
-        m.insert("txns_aborted".into(), self.txns_aborted.load(Ordering::Relaxed));
-        m.insert("conflicts_detected".into(), self.conflicts_detected.load(Ordering::Relaxed));
-        m.insert("savepoints_created".into(), self.savepoints_created.load(Ordering::Relaxed));
-        m.insert("savepoints_rolled_back".into(), self.savepoints_rolled_back.load(Ordering::Relaxed));
-        m.insert("txns_timed_out".into(), self.txns_timed_out.load(Ordering::Relaxed));
+        m.insert(
+            "txns_started".into(),
+            self.txns_started.load(Ordering::Relaxed),
+        );
+        m.insert(
+            "txns_committed".into(),
+            self.txns_committed.load(Ordering::Relaxed),
+        );
+        m.insert(
+            "txns_aborted".into(),
+            self.txns_aborted.load(Ordering::Relaxed),
+        );
+        m.insert(
+            "conflicts_detected".into(),
+            self.conflicts_detected.load(Ordering::Relaxed),
+        );
+        m.insert(
+            "savepoints_created".into(),
+            self.savepoints_created.load(Ordering::Relaxed),
+        );
+        m.insert(
+            "savepoints_rolled_back".into(),
+            self.savepoints_rolled_back.load(Ordering::Relaxed),
+        );
+        m.insert(
+            "txns_timed_out".into(),
+            self.txns_timed_out.load(Ordering::Relaxed),
+        );
         m
     }
 }
@@ -206,9 +227,7 @@ impl TransactionManager {
 
     /// Creates a new TransactionManager with a custom transaction timeout.
     pub fn with_timeout(db: Arc<OmniKV>, timeout: Duration) -> Self {
-        let stripes = (0..COMMIT_STRIPE_COUNT)
-            .map(|_| Mutex::new(()))
-            .collect();
+        let stripes = (0..COMMIT_STRIPE_COUNT).map(|_| Mutex::new(())).collect();
         Self {
             db,
             next_txn_id: AtomicU64::new(1),
@@ -311,7 +330,9 @@ impl TransactionManager {
             read_set_snapshot: txn.read_set.clone(),
         });
 
-        self.metrics.savepoints_created.fetch_add(1, Ordering::Relaxed);
+        self.metrics
+            .savepoints_created
+            .fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
@@ -332,9 +353,7 @@ impl TransactionManager {
             .savepoints
             .iter()
             .rposition(|sp| sp.name == name)
-            .ok_or_else(|| {
-                OmniError::IoError(format!("Savepoint '{}' not found", name))
-            })?;
+            .ok_or_else(|| OmniError::IoError(format!("Savepoint '{}' not found", name)))?;
 
         // Restore write_set and read_set from the savepoint
         let savepoint = txn.savepoints[pos].clone();
@@ -352,11 +371,7 @@ impl TransactionManager {
 
     /// RELEASE SAVEPOINT — removes a savepoint without rolling back.
     /// This is an optimization — the savepoint's state is no longer needed.
-    pub fn release_savepoint(
-        &self,
-        txn: &mut Transaction,
-        name: &str,
-    ) -> Result<(), OmniError> {
+    pub fn release_savepoint(&self, txn: &mut Transaction, name: &str) -> Result<(), OmniError> {
         if txn.state != TxnState::Active {
             return Err(OmniError::IoError("Transaction is not active".into()));
         }
@@ -365,9 +380,7 @@ impl TransactionManager {
             .savepoints
             .iter()
             .rposition(|sp| sp.name == name)
-            .ok_or_else(|| {
-                OmniError::IoError(format!("Savepoint '{}' not found", name))
-            })?;
+            .ok_or_else(|| OmniError::IoError(format!("Savepoint '{}' not found", name)))?;
 
         txn.savepoints.remove(pos);
         Ok(())
@@ -517,7 +530,9 @@ impl TransactionManager {
             drop(committed); // release before cleanup
             txn.state = TxnState::Aborted;
             self.cleanup_txn(txn.id, txn.read_seq);
-            self.metrics.conflicts_detected.fetch_add(1, Ordering::Relaxed);
+            self.metrics
+                .conflicts_detected
+                .fetch_add(1, Ordering::Relaxed);
             self.metrics.txns_aborted.fetch_add(1, Ordering::Relaxed);
             return Err(OmniError::IoError(conflict_msg));
         }
@@ -639,8 +654,7 @@ impl TransactionManager {
         if !pruned_txn_ids.is_empty() {
             let mut rw_deps = self.rw_deps.lock().expect("rw_deps");
             rw_deps.retain(|dep| {
-                !pruned_txn_ids.contains(&dep.from_txn)
-                    && !pruned_txn_ids.contains(&dep.to_txn)
+                !pruned_txn_ids.contains(&dep.from_txn) && !pruned_txn_ids.contains(&dep.to_txn)
             });
         }
     }

@@ -1,17 +1,17 @@
-use crate::raft_impl::{OmniNode, TypeConfig};
 use crate::OmniKV;
 use crate::WriteBatch;
+use crate::raft_impl::{OmniNode, TypeConfig};
 use openraft::{
-    storage::{LogState, RaftLogReader, RaftSnapshotBuilder, RaftStorage, Snapshot},
     AnyError, Entry, EntryPayload, LogId, OptionalSend, RaftTypeConfig, SnapshotMeta, StorageError,
     StorageIOError, StoredMembership, Vote,
+    storage::{LogState, RaftLogReader, RaftSnapshotBuilder, RaftStorage, Snapshot},
 };
+use serde::{Deserialize, Serialize};
 use std::fmt::Debug;
-use std::ops::RangeBounds;
-use std::sync::{Arc, Mutex};
-use std::sync::atomic::Ordering;
 use std::io::Cursor;
-use serde::{Serialize, Deserialize};
+use std::ops::RangeBounds;
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex};
 
 const RAFT_LOG_PREFIX: &str = "__sys__/raft/log/";
 const RAFT_META_KEY: &str = "__sys__/raft/meta";
@@ -118,7 +118,8 @@ impl OmniRaftStorage {
     pub fn mark_applied(&self, index: u64) -> Result<(), crate::OmniError> {
         let mut meta = self.meta.lock().unwrap();
         // For the test helper, the exact leader_id is not critical — only the index matters.
-        let leader_id = meta.last_applied
+        let leader_id = meta
+            .last_applied
             .map(|existing| existing.leader_id)
             .unwrap_or_else(|| openraft::CommittedLeaderId::new(0, 0));
         meta.last_applied = Some(LogId::new(leader_id, index));
@@ -234,7 +235,11 @@ impl RaftSnapshotBuilder<TypeConfig> for OmniRaftStorage {
             entries,
         };
         let serialized = serde_json::to_vec(&envelope).map_err(|e| StorageError::IO {
-            source: StorageIOError::new(openraft::ErrorSubject::Store, openraft::ErrorVerb::Write, AnyError::error(e.to_string())),
+            source: StorageIOError::new(
+                openraft::ErrorSubject::Store,
+                openraft::ErrorVerb::Write,
+                AnyError::error(e.to_string()),
+            ),
         })?;
 
         Ok(Snapshot {
@@ -256,7 +261,11 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
             self.save_meta(&meta, &mut batch);
         }
         self.db.commit_batch(&batch).map_err(|e| StorageError::IO {
-            source: StorageIOError::new(openraft::ErrorSubject::Store, openraft::ErrorVerb::Write, AnyError::error(e.to_string())),
+            source: StorageIOError::new(
+                openraft::ErrorSubject::Store,
+                openraft::ErrorVerb::Write,
+                AnyError::error(e.to_string()),
+            ),
         })?;
         Ok(())
     }
@@ -298,12 +307,19 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
         }
 
         self.db.commit_batch(&batch).map_err(|e| StorageError::IO {
-            source: StorageIOError::new(openraft::ErrorSubject::Store, openraft::ErrorVerb::Write, AnyError::error(e.to_string())),
+            source: StorageIOError::new(
+                openraft::ErrorSubject::Store,
+                openraft::ErrorVerb::Write,
+                AnyError::error(e.to_string()),
+            ),
         })?;
         Ok(())
     }
 
-    async fn delete_conflict_logs_since(&mut self, log_id: LogId<u64>) -> Result<(), StorageError<u64>> {
+    async fn delete_conflict_logs_since(
+        &mut self,
+        log_id: LogId<u64>,
+    ) -> Result<(), StorageError<u64>> {
         let mut batch = WriteBatch::new();
         let mut idx = log_id.index;
         loop {
@@ -335,14 +351,18 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
         }
 
         self.db.commit_batch(&batch).map_err(|e| StorageError::IO {
-            source: StorageIOError::new(openraft::ErrorSubject::Store, openraft::ErrorVerb::Write, AnyError::error(e.to_string())),
+            source: StorageIOError::new(
+                openraft::ErrorSubject::Store,
+                openraft::ErrorVerb::Write,
+                AnyError::error(e.to_string()),
+            ),
         })?;
         Ok(())
     }
 
     async fn purge_logs_upto(&mut self, log_id: LogId<u64>) -> Result<(), StorageError<u64>> {
         let mut batch = WriteBatch::new();
-        
+
         let start_idx = {
             let meta = self.meta.lock().unwrap();
             meta.last_purged_log_id.map(|id| id.index + 1).unwrap_or(1)
@@ -360,7 +380,11 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
         }
 
         self.db.commit_batch(&batch).map_err(|e| StorageError::IO {
-            source: StorageIOError::new(openraft::ErrorSubject::Store, openraft::ErrorVerb::Write, AnyError::error(e.to_string())),
+            source: StorageIOError::new(
+                openraft::ErrorSubject::Store,
+                openraft::ErrorVerb::Write,
+                AnyError::error(e.to_string()),
+            ),
         })?;
         Ok(())
     }
@@ -422,7 +446,11 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
         }
 
         self.db.commit_batch(&batch).map_err(|e| StorageError::IO {
-            source: StorageIOError::new(openraft::ErrorSubject::Store, openraft::ErrorVerb::Write, AnyError::error(e.to_string())),
+            source: StorageIOError::new(
+                openraft::ErrorSubject::Store,
+                openraft::ErrorVerb::Write,
+                AnyError::error(e.to_string()),
+            ),
         })?;
 
         Ok(res)
@@ -473,7 +501,10 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
                 .unwrap_or(std::path::Path::new("."))
                 .to_path_buf();
             let tmp_dir = data_dir.join("tmp_snapshot_install");
-            (self.db.manifest_path.clone(), format!("{}/raft_snapshot.wal", tmp_dir.display()))
+            (
+                self.db.manifest_path.clone(),
+                format!("{}/raft_snapshot.wal", tmp_dir.display()),
+            )
         };
 
         // ── Phase A: Acquire EXCLUSIVE transition lock (freezes all writers) ──
@@ -487,7 +518,13 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
             .parent()
             .unwrap_or(std::path::Path::new("."))
             .to_path_buf();
-        let tmp_dir = std::env::temp_dir().join(format!("omni_snapshot_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "omni_snapshot_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
         if tmp_dir.exists() {
             fs::remove_dir_all(&tmp_dir).map_err(|e| io_err(&format!("rm tmp dir: {}", e)))?;
         }
@@ -506,7 +543,8 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
             l1_sstables: vec![],
             max_seq: 0,
         };
-        tmp_manifest.save(&tmp_manifest_path)
+        tmp_manifest
+            .save(&tmp_manifest_path)
             .map_err(|e| io_err(&format!("save tmp manifest: {}", e)))?;
 
         let tmp_db = OmniKV::open(&tmp_manifest_path, &tmp_wal_path)
@@ -514,7 +552,9 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
 
         let mut batch = crate::WriteBatch::new();
         for (k, v) in &envelope.entries {
-            batch.set(k, v.clone()).map_err(|e| io_err(&format!("batch set: {}", e)))?;
+            batch
+                .set(k, v.clone())
+                .map_err(|e| io_err(&format!("batch set: {}", e)))?;
         }
 
         // ── Atomically include Raft metadata in the snapshot build ──
@@ -524,13 +564,17 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
         meta.membership = snap_meta.last_membership.clone();
         meta.last_purged_log_id = snap_meta.last_log_id;
         let json = serde_json::to_string(&*meta).unwrap();
-        batch.set(RAFT_META_KEY, json).map_err(|e| io_err(&format!("meta set: {}", e)))?;
+        batch
+            .set(RAFT_META_KEY, json)
+            .map_err(|e| io_err(&format!("meta set: {}", e)))?;
         drop(meta);
 
         if !batch.is_empty() {
-            tmp_db.commit_batch(&batch)
+            tmp_db
+                .commit_batch(&batch)
                 .map_err(|e| io_err(&format!("commit snapshot batch: {}", e)))?;
-            tmp_db.compact_sstables()
+            tmp_db
+                .compact_sstables()
                 .map_err(|e| io_err(&format!("compact snapshot: {}", e)))?;
         }
         drop(tmp_db);
@@ -558,7 +602,7 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
                 let _ = fs::rename(entry.path(), data_dir.join(entry.file_name()));
             }
         }
-        
+
         let _ = fs::remove_dir_all(&tmp_dir);
 
         // ── Phase E: Recover fresh storage from installed snapshot ──
@@ -582,12 +626,16 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
         // ── Phase G: Swap mutable write handles ──
         *self.db.heap_file.lock().unwrap() = recovered.heap_file;
         *self.db.wal.lock().unwrap() = recovered.wal;
-        self.db.heap_offset.store(recovered.heap_offset, Ordering::Release);
+        self.db
+            .heap_offset
+            .store(recovered.heap_offset, Ordering::Release);
 
         // CRITICAL: Advance global_seq to at least snapshot max_seq.
         let cur_seq = self.db.global_seq.load(Ordering::SeqCst);
         if envelope.max_seq >= cur_seq {
-            self.db.global_seq.store(envelope.max_seq + 1, Ordering::SeqCst);
+            self.db
+                .global_seq
+                .store(envelope.max_seq + 1, Ordering::SeqCst);
         }
 
         // ── Phase I: Release exclusive lock (writers resume on new topology) ──

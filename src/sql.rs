@@ -189,8 +189,12 @@ pub fn parse_sql(input: &str) -> Result<SqlStatement, String> {
             let mut depth = 0;
             let mut set_op_pos = None;
             for (idx, tok) in tokens.iter().enumerate() {
-                if tok == "(" { depth += 1; }
-                if tok == ")" { depth -= 1; }
+                if tok == "(" {
+                    depth += 1;
+                }
+                if tok == ")" {
+                    depth -= 1;
+                }
                 if depth == 0 {
                     let upper = tok.to_uppercase();
                     if upper == "UNION" || upper == "INTERSECT" || upper == "EXCEPT" {
@@ -203,12 +207,13 @@ pub fn parse_sql(input: &str) -> Result<SqlStatement, String> {
             if let Some(pos) = set_op_pos {
                 let op_token = tokens[pos].to_uppercase();
                 let mut right_start = pos + 1;
-                let all = if right_start < tokens.len() && tokens[right_start].to_uppercase() == "ALL" {
-                    right_start += 1;
-                    true
-                } else {
-                    false
-                };
+                let all =
+                    if right_start < tokens.len() && tokens[right_start].to_uppercase() == "ALL" {
+                        right_start += 1;
+                        true
+                    } else {
+                        false
+                    };
 
                 let left_sql = tokens[..pos].join(" ");
                 let right_sql = tokens[right_start..].join(" ");
@@ -518,26 +523,47 @@ fn parse_select_sql(tokens: &[String]) -> Result<SqlStatement, String> {
             };
             i += 1;
             // Skip ( )
-            if tokens.get(i).map(|t| t.as_str()) == Some("(") { i += 1; }
-            if tokens.get(i).map(|t| t.as_str()) == Some(")") { i += 1; }
+            if tokens.get(i).map(|t| t.as_str()) == Some("(") {
+                i += 1;
+            }
+            if tokens.get(i).map(|t| t.as_str()) == Some(")") {
+                i += 1;
+            }
             // OVER
-            if tokens.get(i).map(|t| t.to_uppercase()) == Some("OVER".into()) { i += 1; }
+            if tokens.get(i).map(|t| t.to_uppercase()) == Some("OVER".into()) {
+                i += 1;
+            }
             // (
-            if tokens.get(i).map(|t| t.as_str()) == Some("(") { i += 1; }
+            if tokens.get(i).map(|t| t.as_str()) == Some("(") {
+                i += 1;
+            }
             // ORDER BY
-            if tokens.get(i).map(|t| t.to_uppercase()) == Some("ORDER".into()) { i += 1; }
-            if tokens.get(i).map(|t| t.to_uppercase()) == Some("BY".into()) { i += 1; }
+            if tokens.get(i).map(|t| t.to_uppercase()) == Some("ORDER".into()) {
+                i += 1;
+            }
+            if tokens.get(i).map(|t| t.to_uppercase()) == Some("BY".into()) {
+                i += 1;
+            }
             let order_col = tokens.get(i).cloned().unwrap_or_default();
             i += 1;
             let desc = if tokens.get(i).map(|t| t.to_uppercase()) == Some("DESC".into()) {
-                i += 1; true
+                i += 1;
+                true
             } else {
-                if tokens.get(i).map(|t| t.to_uppercase()) == Some("ASC".into()) { i += 1; }
+                if tokens.get(i).map(|t| t.to_uppercase()) == Some("ASC".into()) {
+                    i += 1;
+                }
                 false
             };
             // )
-            if tokens.get(i).map(|t| t.as_str()) == Some(")") { i += 1; }
-            columns.push(SelectColumn::WindowFunc { func, order_by: order_col, desc });
+            if tokens.get(i).map(|t| t.as_str()) == Some(")") {
+                i += 1;
+            }
+            columns.push(SelectColumn::WindowFunc {
+                func,
+                order_by: order_col,
+                desc,
+            });
             continue;
         } else if upper == "COUNT"
             || upper == "SUM"
@@ -792,7 +818,6 @@ fn parse_where_and(tokens: &[String], start: usize) -> Result<(WhereExpr, usize)
     Ok((left, i))
 }
 
-
 fn parse_where_atom(tokens: &[String], start: usize) -> Result<(WhereExpr, usize), String> {
     if start >= tokens.len() {
         return Err("Unexpected end in WHERE".into());
@@ -864,17 +889,23 @@ fn parse_where_atom(tokens: &[String], start: usize) -> Result<(WhereExpr, usize
             let sub_start = i;
             let mut sub_end = i;
             while sub_end < tokens.len() {
-                if tokens[sub_end] == "(" { depth += 1; }
+                if tokens[sub_end] == "(" {
+                    depth += 1;
+                }
                 if tokens[sub_end] == ")" {
                     depth -= 1;
-                    if depth == 0 { break; }
+                    if depth == 0 {
+                        break;
+                    }
                 }
                 sub_end += 1;
             }
             let sub_sql = tokens[sub_start..sub_end].join(" ");
             let sub_stmt = parse_sql(&sub_sql)?;
             i = sub_end;
-            if i < tokens.len() && tokens[i] == ")" { i += 1; }
+            if i < tokens.len() && tokens[i] == ")" {
+                i += 1;
+            }
             return Ok((WhereExpr::InSubquery(col_name, Box::new(sub_stmt)), i));
         }
         // Regular IN (val1, val2, ...)

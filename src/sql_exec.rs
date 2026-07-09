@@ -179,7 +179,8 @@ impl SqlExecutor {
                 match optimizer.optimize(inner) {
                     Ok(plan) => {
                         let plan_exec = crate::plan_exec::PlanExecutor::new(
-                            self.db.clone(), self.catalog.clone()
+                            self.db.clone(),
+                            self.catalog.clone(),
                         );
                         match plan_exec.explain_analyze(&plan) {
                             Ok((_rows, node_stats)) => {
@@ -207,7 +208,12 @@ impl SqlExecutor {
                     }),
                 }
             }
-            SqlStatement::SetOp { op, left, right, all } => {
+            SqlStatement::SetOp {
+                op,
+                left,
+                right,
+                all,
+            } => {
                 let left_result = self.execute(left)?;
                 let right_result = self.execute(right)?;
 
@@ -235,10 +241,8 @@ impl SqlExecutor {
                         result
                     }
                     SetOpType::Intersect => {
-                        let right_set: std::collections::HashSet<String> = right_rows
-                            .iter()
-                            .map(|r| r.join("\0"))
-                            .collect();
+                        let right_set: std::collections::HashSet<String> =
+                            right_rows.iter().map(|r| r.join("\0")).collect();
                         let mut result: Vec<Vec<String>> = left_rows
                             .into_iter()
                             .filter(|r| right_set.contains(&r.join("\0")))
@@ -250,10 +254,8 @@ impl SqlExecutor {
                         result
                     }
                     SetOpType::Except => {
-                        let right_set: std::collections::HashSet<String> = right_rows
-                            .iter()
-                            .map(|r| r.join("\0"))
-                            .collect();
+                        let right_set: std::collections::HashSet<String> =
+                            right_rows.iter().map(|r| r.join("\0")).collect();
                         let mut result: Vec<Vec<String>> = left_rows
                             .into_iter()
                             .filter(|r| !right_set.contains(&r.join("\0")))
@@ -420,7 +422,9 @@ impl SqlExecutor {
         let where_clause = resolved_where.as_ref();
 
         // ═══ Production path: Optimizer → Volcano iterators ═══
-        let has_window = columns.iter().any(|c| matches!(c, SelectColumn::WindowFunc { .. }));
+        let has_window = columns
+            .iter()
+            .any(|c| matches!(c, SelectColumn::WindowFunc { .. }));
 
         // When OFFSET is present, fetch limit+offset rows from the pipeline,
         // then skip offset rows in post-processing.
@@ -445,7 +449,7 @@ impl SqlExecutor {
 
         match optimizer.optimize(&stmt) {
             Ok(plan) => {
-                use crate::volcano::{compile_plan, eval_where, RowIterator};
+                use crate::volcano::{RowIterator, compile_plan, eval_where};
                 let mut iter = compile_plan(&plan, &self.db, &self.catalog);
 
                 let mut rows: Vec<Row> = Vec::new();
@@ -537,7 +541,10 @@ impl SqlExecutor {
     /// Window function post-processing (ROW_NUMBER, RANK, DENSE_RANK).
     fn apply_window_functions(&self, rows: &mut Vec<Row>, columns: &[SelectColumn]) {
         for col in columns {
-            if let SelectColumn::WindowFunc { order_by: ob, desc, .. } = col {
+            if let SelectColumn::WindowFunc {
+                order_by: ob, desc, ..
+            } = col
+            {
                 let ob = ob.clone();
                 rows.sort_by(|a, b| {
                     let va = a.get(&ob).cloned().unwrap_or_default();
@@ -549,7 +556,10 @@ impl SqlExecutor {
             }
         }
         for col in columns {
-            if let SelectColumn::WindowFunc { func, order_by: ob, .. } = col {
+            if let SelectColumn::WindowFunc {
+                func, order_by: ob, ..
+            } = col
+            {
                 let mut prev_val = String::new();
                 let mut rank = 0usize;
                 let mut dense_rank = 0usize;
@@ -560,11 +570,15 @@ impl SqlExecutor {
                             row.insert("row_number".into(), (i + 1).to_string());
                         }
                         WindowFuncType::Rank => {
-                            if cur_val != prev_val { rank = i + 1; }
+                            if cur_val != prev_val {
+                                rank = i + 1;
+                            }
                             row.insert("rank".into(), rank.to_string());
                         }
                         WindowFuncType::DenseRank => {
-                            if cur_val != prev_val { dense_rank += 1; }
+                            if cur_val != prev_val {
+                                dense_rank += 1;
+                            }
                             row.insert("dense_rank".into(), dense_rank.to_string());
                         }
                     }
@@ -587,18 +601,38 @@ impl SqlExecutor {
     ) -> Result<ExecResult, String> {
         let mut rows = match from {
             FromClause::Table(name) => {
-                let table = self.catalog.get_table(name)
+                let table = self
+                    .catalog
+                    .get_table(name)
                     .ok_or_else(|| format!("Table '{}' not found", name))?;
                 self.load_table_rows(&table)
             }
-            FromClause::Join { left, right, join_type, on_left, on_right } => {
-                let lt = self.catalog.get_table(left)
+            FromClause::Join {
+                left,
+                right,
+                join_type,
+                on_left,
+                on_right,
+            } => {
+                let lt = self
+                    .catalog
+                    .get_table(left)
                     .ok_or_else(|| format!("Table '{}' not found", left))?;
-                let rt = self.catalog.get_table(right)
+                let rt = self
+                    .catalog
+                    .get_table(right)
                     .ok_or_else(|| format!("Table '{}' not found", right))?;
                 let left_rows = self.load_table_rows(&lt);
                 let right_rows = self.load_table_rows(&rt);
-                self.execute_join(&left_rows, &right_rows, left, right, on_left, on_right, join_type)
+                self.execute_join(
+                    &left_rows,
+                    &right_rows,
+                    left,
+                    right,
+                    on_left,
+                    on_right,
+                    join_type,
+                )
             }
         };
 
@@ -610,7 +644,9 @@ impl SqlExecutor {
             return self.exec_group_by(&rows, columns, group_by, order_by, limit);
         }
 
-        let has_agg = columns.iter().any(|c| matches!(c, SelectColumn::Aggregate(..)));
+        let has_agg = columns
+            .iter()
+            .any(|c| matches!(c, SelectColumn::Aggregate(..)));
         if has_agg {
             return self.exec_aggregate_no_group(&rows, columns);
         }

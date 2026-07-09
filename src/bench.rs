@@ -8,8 +8,8 @@
 //!   cargo run --bin omni_bench --release -- --soak 600   # 10-min soak
 
 use omni_engine::{OmniKV, WriteBatch};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 fn main() {
@@ -21,14 +21,17 @@ fn main() {
         .and_then(|s| s.parse::<u64>().ok());
 
     println!("╔══════════════════════════════════════════════════════════╗");
-    println!("║          OmniKV Benchmark Suite v{}               ║", env!("CARGO_PKG_VERSION"));
+    println!(
+        "║          OmniKV Benchmark Suite v{}               ║",
+        env!("CARGO_PKG_VERSION")
+    );
     println!("╚══════════════════════════════════════════════════════════╝\n");
 
     let dir = tempfile::tempdir().expect("tmpdir");
     let manifest = dir.path().join("manifest.json");
     let wal = dir.path().join("wal.bin");
-    let db = OmniKV::open(manifest.to_str().unwrap(), wal.to_str().unwrap())
-        .expect("Failed to open DB");
+    let db =
+        OmniKV::open(manifest.to_str().unwrap(), wal.to_str().unwrap()).expect("Failed to open DB");
 
     println!("── Single-Thread Benchmarks ─────────────────────────────\n");
 
@@ -61,7 +64,8 @@ fn main() {
     let read_db = OmniKV::open(rm.to_str().unwrap(), rw.to_str().unwrap()).expect("open");
     for i in 0..10_000u64 {
         let mut b = WriteBatch::new();
-        b.set(&format!("rscale:{:08}", i), format!("v{}", i)).unwrap();
+        b.set(&format!("rscale:{:08}", i), format!("v{}", i))
+            .unwrap();
         read_db.commit_batch(&b).unwrap();
     }
 
@@ -70,7 +74,10 @@ fn main() {
     }
 
     if let Some(secs) = soak_secs {
-        println!("\n── Soak Test ({} seconds) ───────────────────────────────\n", secs);
+        println!(
+            "\n── Soak Test ({} seconds) ───────────────────────────────\n",
+            secs
+        );
         let soak_dir = tempfile::tempdir().expect("tmpdir");
         let sm = soak_dir.path().join("manifest.json");
         let sw = soak_dir.path().join("wal.bin");
@@ -91,7 +98,9 @@ struct LatencyTracker {
 
 impl LatencyTracker {
     fn new() -> Self {
-        Self { samples: Vec::with_capacity(100_000) }
+        Self {
+            samples: Vec::with_capacity(100_000),
+        }
     }
 
     fn record(&mut self, duration: Duration) {
@@ -136,7 +145,9 @@ fn bench_sequential_writes(db: &Arc<OmniKV>, count: u64) {
     for i in 0..count {
         let start = Instant::now();
         let mut batch = WriteBatch::new();
-        batch.set(&format!("seq_w:{:08}", i), format!("value_{}", i)).unwrap();
+        batch
+            .set(&format!("seq_w:{:08}", i), format!("value_{}", i))
+            .unwrap();
         db.commit_batch(&batch).unwrap();
         lat.record(start.elapsed());
     }
@@ -150,10 +161,9 @@ fn bench_batch_writes(db: &Arc<OmniKV>, batches: u64, per_batch: u64) {
         let start = Instant::now();
         let mut batch = WriteBatch::new();
         for j in 0..per_batch {
-            batch.set(
-                &format!("batch:{}:{:06}", i, j),
-                format!("payload_{}", j),
-            ).unwrap();
+            batch
+                .set(&format!("batch:{}:{:06}", i, j), format!("payload_{}", j))
+                .unwrap();
         }
         db.commit_batch(&batch).unwrap();
         lat.record(start.elapsed());
@@ -166,11 +176,15 @@ fn bench_batch_writes(db: &Arc<OmniKV>, batches: u64, per_batch: u64) {
     let p99 = lat.percentile(99.0);
     println!(
         "{:<22} {:>8} ops  {:>7.2}s  {:>10.0} ops/sec  p50={:>6.1}µs  p95={:>7.1}µs  p99={:>7.1}µs  ({}×{})",
-        "Batch Writes", total, elapsed.as_secs_f64(), ops,
+        "Batch Writes",
+        total,
+        elapsed.as_secs_f64(),
+        ops,
         p50.as_nanos() as f64 / 1000.0,
         p95.as_nanos() as f64 / 1000.0,
         p99.as_nanos() as f64 / 1000.0,
-        batches, per_batch,
+        batches,
+        per_batch,
     );
 }
 
@@ -193,7 +207,10 @@ fn bench_sequential_reads(db: &Arc<OmniKV>, count: u64) {
     let p99 = lat.percentile(99.0);
     println!(
         "{:<22} {:>8} ops  {:>7.2}s  {:>10.0} ops/sec  p50={:>6.1}µs  p95={:>7.1}µs  p99={:>7.1}µs  (hit: {})",
-        "Sequential Reads", count, elapsed.as_secs_f64(), ops,
+        "Sequential Reads",
+        count,
+        elapsed.as_secs_f64(),
+        ops,
         p50.as_nanos() as f64 / 1000.0,
         p95.as_nanos() as f64 / 1000.0,
         p99.as_nanos() as f64 / 1000.0,
@@ -221,7 +238,10 @@ fn bench_random_reads(db: &Arc<OmniKV>, count: u64, keyspace: u64) {
     let p99 = lat.percentile(99.0);
     println!(
         "{:<22} {:>8} ops  {:>7.2}s  {:>10.0} ops/sec  p50={:>6.1}µs  p95={:>7.1}µs  p99={:>7.1}µs  (hit: {})",
-        "Random Reads", count, elapsed.as_secs_f64(), ops,
+        "Random Reads",
+        count,
+        elapsed.as_secs_f64(),
+        ops,
         p50.as_nanos() as f64 / 1000.0,
         p95.as_nanos() as f64 / 1000.0,
         p99.as_nanos() as f64 / 1000.0,
@@ -244,7 +264,8 @@ fn bench_point_read_miss(db: &Arc<OmniKV>, count: u64) {
 fn bench_scan(db: &Arc<OmniKV>, range_size: u64) {
     let seq = db.get_seq();
     let start = Instant::now();
-    let results = db.scan("seq_w:00000000", &format!("seq_w:{:08}", range_size), seq)
+    let results = db
+        .scan("seq_w:00000000", &format!("seq_w:{:08}", range_size), seq)
         .unwrap_or_default();
     let elapsed = start.elapsed();
     println!(
@@ -263,7 +284,9 @@ fn bench_mixed_workload(db: &Arc<OmniKV>, ops: u64) {
         let start = Instant::now();
         if i % 5 == 0 {
             let mut batch = WriteBatch::new();
-            batch.set(&format!("mixed:{:08}", i), format!("v{}", i)).unwrap();
+            batch
+                .set(&format!("mixed:{:08}", i), format!("v{}", i))
+                .unwrap();
             db.commit_batch(&batch).unwrap();
         } else {
             let seq = db.get_seq();
@@ -282,7 +305,8 @@ fn bench_transaction_overhead(db: &Arc<OmniKV>, count: u64) {
     for i in 0..count {
         let start = Instant::now();
         let mut txn = tm.begin();
-        tm.set(&mut txn, &format!("txn:{:06}", i), format!("v{}", i)).unwrap();
+        tm.set(&mut txn, &format!("txn:{:06}", i), format!("v{}", i))
+            .unwrap();
         tm.commit(&mut txn).unwrap();
         lat.record(start.elapsed());
     }
@@ -304,10 +328,9 @@ fn bench_threaded_writes(db: &Arc<OmniKV>, num_threads: usize, ops_per_thread: u
             std::thread::spawn(move || {
                 for i in 0..ops_per_thread {
                     let mut batch = WriteBatch::new();
-                    batch.set(
-                        &format!("tw:{}:{:08}", tid, i),
-                        format!("v{}", i),
-                    ).unwrap();
+                    batch
+                        .set(&format!("tw:{}:{:08}", tid, i), format!("v{}", i))
+                        .unwrap();
                     if db.commit_batch(&batch).is_ok() {
                         total.fetch_add(1, Ordering::Relaxed);
                     }
@@ -325,7 +348,11 @@ fn bench_threaded_writes(db: &Arc<OmniKV>, num_threads: usize, ops_per_thread: u
     let ops = completed as f64 / elapsed.as_secs_f64();
     println!(
         "  {:>2} threads × {:>6} ops = {:>8} total  {:>7.2}s  {:>10.0} ops/sec",
-        num_threads, ops_per_thread, completed, elapsed.as_secs_f64(), ops,
+        num_threads,
+        ops_per_thread,
+        completed,
+        elapsed.as_secs_f64(),
+        ops,
     );
 }
 
@@ -359,7 +386,11 @@ fn bench_threaded_reads(db: &Arc<OmniKV>, num_threads: usize, total_keys: u64) {
     let ops = completed as f64 / elapsed.as_secs_f64();
     println!(
         "  {:>2} threads × {:>6} ops = {:>8} total  {:>7.2}s  {:>10.0} ops/sec",
-        num_threads, ops_per_thread, completed, elapsed.as_secs_f64(), ops,
+        num_threads,
+        ops_per_thread,
+        completed,
+        elapsed.as_secs_f64(),
+        ops,
     );
 }
 
@@ -385,13 +416,16 @@ fn run_soak_test(db: &Arc<OmniKV>, duration: Duration) {
                 let mut i = 0u64;
                 while !stop.load(Ordering::Relaxed) {
                     let mut batch = WriteBatch::new();
-                    batch.set(
-                        &format!("soak:{}:{:010}", tid, i),
-                        format!("v_{}", i),
-                    ).unwrap();
+                    batch
+                        .set(&format!("soak:{}:{:010}", tid, i), format!("v_{}", i))
+                        .unwrap();
                     match db.commit_batch(&batch) {
-                        Ok(_) => { writes.fetch_add(1, Ordering::Relaxed); }
-                        Err(_) => { errors.fetch_add(1, Ordering::Relaxed); }
+                        Ok(_) => {
+                            writes.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Err(_) => {
+                            errors.fetch_add(1, Ordering::Relaxed);
+                        }
                     }
                     i += 1;
                 }
@@ -484,9 +518,24 @@ fn run_soak_test(db: &Arc<OmniKV>, duration: Duration) {
 
     println!("\n  ── Soak Results ──");
     println!("  Duration:     {:>10.1}s", elapsed.as_secs_f64());
-    println!("  Writes:       {:>10} ({:.0}/s)", w, w as f64 / elapsed.as_secs_f64());
-    println!("  Reads:        {:>10} ({:.0}/s)", r, r as f64 / elapsed.as_secs_f64());
+    println!(
+        "  Writes:       {:>10} ({:.0}/s)",
+        w,
+        w as f64 / elapsed.as_secs_f64()
+    );
+    println!(
+        "  Reads:        {:>10} ({:.0}/s)",
+        r,
+        r as f64 / elapsed.as_secs_f64()
+    );
     println!("  Compactions:  {:>10}", compactions);
     println!("  Errors:       {:>10}", e);
-    println!("  Verdict:      {}", if e == 0 { "✅ PASS — zero errors" } else { "❌ FAIL — errors detected" });
+    println!(
+        "  Verdict:      {}",
+        if e == 0 {
+            "✅ PASS — zero errors"
+        } else {
+            "❌ FAIL — errors detected"
+        }
+    );
 }

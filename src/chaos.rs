@@ -482,11 +482,10 @@ pub fn test_concurrent_stress(db: Arc<OmniKV>) -> ChaosResult {
             Ok(Some(v)) if v == *expected => { /* correct */ }
             Ok(Some(v)) => errors.push(format!("WRONG: {}={} expected={}", key, v, expected)),
             Ok(None) => errors.push(format!("MISSING: {}", key)),
-            // CRC mismatch under concurrent heap writes is a known limitation
-            // (concurrent writers can interleave bytes in the heap file).
-            // We count it but don't fail the test — it's documented behavior.
+            // Data-integrity failures are never accepted in chaos tests.
             Err(crate::OmniError::IoError(ref msg)) if msg.contains("CRC32") => {
                 _crc_issues += 1;
+                errors.push(format!("CRC: {} {}", key, msg));
             }
             Err(e) => errors.push(format!("ERR: {} {}", key, e)),
         }

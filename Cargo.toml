@@ -3,7 +3,9 @@ name = "omni_engine"
 version = "0.3.0"
 edition = "2024"
 authors = ["Balavignesh"]
-description = "A high-performance, fully mutable Database Management System operating at the physical hardware limits of NVMe SSDs."
+license = "MIT"
+repository = "https://github.com/SBALAVIGNESH123/OmniKV"
+description = "A Rust transactional SQL and key-value engine with WAL durability, MVCC, and Raft-oriented replication experiments."
 
 [dependencies]
 memmap2 = "0.9.10"
@@ -27,11 +29,10 @@ lz4_flex = "0.13.0"
 axum-server = { version = "0.8.0", features = ["tls-rustls"] }
 rcgen = "0.14.7"
 rustls = { version = "0.23.40", features = ["ring"] }
-rustls-pemfile = "2.2.0"
 quinn = "0.11.9"
 moka = { version = "0.12", features = ["sync"] }
 toml = "0.8"
-jsonwebtoken = { version = "10.3.0", features = ["rust_crypto"] }
+jsonwebtoken = { version = "10.4.0", default-features = false, features = ["hmac", "sha2"] }
 tar = "0.4.45"
 flate2 = "1.1.9"
 aes-gcm = "0.10.3"

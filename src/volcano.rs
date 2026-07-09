@@ -24,11 +24,11 @@
 
 #![allow(dead_code)]
 
+use crate::OmniKV;
 use crate::catalog::{Catalog, TableDef};
 use crate::optimizer::*;
 use crate::sql::*;
 use crate::sql_exec::Row;
-use crate::OmniKV;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -132,7 +132,10 @@ impl PkLookupIter {
             .into_iter()
             .next()
             .and_then(|(_, value)| serde_json::from_str::<Row>(&value).ok());
-        Self { row, consumed: false }
+        Self {
+            row,
+            consumed: false,
+        }
     }
 }
 
@@ -206,7 +209,11 @@ impl RowIterator for ProjectIter {
                 }
                 SelectColumn::Qualified(t, n) => {
                     let key = format!("{}.{}", t, n);
-                    let val = row.get(&key).or_else(|| row.get(n)).cloned().unwrap_or_default();
+                    let val = row
+                        .get(&key)
+                        .or_else(|| row.get(n))
+                        .cloned()
+                        .unwrap_or_default();
                     projected.insert(n.clone(), val);
                 }
                 SelectColumn::Aggregate(func, target) => {
@@ -233,7 +240,11 @@ pub struct LimitIter {
 
 impl LimitIter {
     pub fn new(child: Box<dyn RowIterator>, limit: usize) -> Self {
-        Self { child, limit, emitted: 0 }
+        Self {
+            child,
+            limit,
+            emitted: 0,
+        }
     }
 }
 
@@ -270,7 +281,10 @@ impl SortIter {
                 if desc { cmp.reverse() } else { cmp }
             });
         }
-        Self { sorted: rows, pos: 0 }
+        Self {
+            sorted: rows,
+            pos: 0,
+        }
     }
 }
 
@@ -424,7 +438,11 @@ impl AggregateIter {
     ) -> Self {
         let all_rows = child.collect_all();
 
-        if group_by.is_empty() && agg_columns.iter().any(|c| matches!(c, SelectColumn::Aggregate(..))) {
+        if group_by.is_empty()
+            && agg_columns
+                .iter()
+                .any(|c| matches!(c, SelectColumn::Aggregate(..)))
+        {
             // Aggregate without GROUP BY — single result row
             let refs: Vec<&Row> = all_rows.iter().collect();
             let mut row = Row::new();
@@ -434,7 +452,10 @@ impl AggregateIter {
                     row.insert(name, val);
                 }
             }
-            return Self { result: vec![row], pos: 0 };
+            return Self {
+                result: vec![row],
+                pos: 0,
+            };
         }
 
         let mut groups: HashMap<String, Vec<Row>> = HashMap::new();
@@ -493,8 +514,15 @@ pub fn compile_plan(
     catalog: &Arc<Catalog>,
 ) -> Box<dyn RowIterator> {
     match plan {
-        PlanNode::Scan { table, access, filter, .. } => {
-            let table_def = catalog.get_table(table).expect("Table not found in catalog");
+        PlanNode::Scan {
+            table,
+            access,
+            filter,
+            ..
+        } => {
+            let table_def = catalog
+                .get_table(table)
+                .expect("Table not found in catalog");
             let base: Box<dyn RowIterator> = match access {
                 AccessMethod::PkLookup { key_value } => {
                     Box::new(PkLookupIter::new(db, &table_def, key_value))
@@ -509,7 +537,12 @@ pub fn compile_plan(
             }
         }
         PlanNode::HashJoin {
-            left, right, join_type, on_left_col, on_right_col, ..
+            left,
+            right,
+            join_type,
+            on_left_col,
+            on_right_col,
+            ..
         } => {
             let left_iter = compile_plan(left, db, catalog);
             let right_iter = compile_plan(right, db, catalog);
@@ -521,7 +554,9 @@ pub fn compile_plan(
                 join_type.clone(),
             ))
         }
-        PlanNode::Filter { child, predicate, .. } => {
+        PlanNode::Filter {
+            child, predicate, ..
+        } => {
             let child_iter = compile_plan(child, db, catalog);
             Box::new(FilterIter::new(child_iter, predicate.clone()))
         }
@@ -529,7 +564,9 @@ pub fn compile_plan(
             let child_iter = compile_plan(child, db, catalog);
             Box::new(ProjectIter::new(child_iter, columns.clone()))
         }
-        PlanNode::Sort { child, order_by, .. } => {
+        PlanNode::Sort {
+            child, order_by, ..
+        } => {
             let child_iter = compile_plan(child, db, catalog);
             Box::new(SortIter::new(child_iter, order_by.clone()))
         }
@@ -537,9 +574,18 @@ pub fn compile_plan(
             let child_iter = compile_plan(child, db, catalog);
             Box::new(LimitIter::new(child_iter, *count))
         }
-        PlanNode::Aggregate { child, group_by, aggregates, .. } => {
+        PlanNode::Aggregate {
+            child,
+            group_by,
+            aggregates,
+            ..
+        } => {
             let child_iter = compile_plan(child, db, catalog);
-            Box::new(AggregateIter::new(child_iter, group_by.clone(), aggregates.clone()))
+            Box::new(AggregateIter::new(
+                child_iter,
+                group_by.clone(),
+                aggregates.clone(),
+            ))
         }
     }
 }
@@ -571,8 +617,14 @@ pub fn eval_where(row: &Row, expr: &WhereExpr) -> bool {
         WhereExpr::And(a, b) => eval_where(row, a) && eval_where(row, b),
         WhereExpr::Or(a, b) => eval_where(row, a) || eval_where(row, b),
         WhereExpr::Not(inner) => !eval_where(row, inner),
-        WhereExpr::IsNull(col) => row.get(col).map(|v| v == "NULL" || v.is_empty()).unwrap_or(true),
-        WhereExpr::IsNotNull(col) => row.get(col).map(|v| v != "NULL" && !v.is_empty()).unwrap_or(false),
+        WhereExpr::IsNull(col) => row
+            .get(col)
+            .map(|v| v == "NULL" || v.is_empty())
+            .unwrap_or(true),
+        WhereExpr::IsNotNull(col) => row
+            .get(col)
+            .map(|v| v != "NULL" && !v.is_empty())
+            .unwrap_or(false),
         WhereExpr::In(col, vals) => {
             let row_val = row.get(col).cloned().unwrap_or_default();
             vals.iter().any(|v| v.as_string() == row_val)
@@ -594,26 +646,40 @@ fn compute_aggregate(func: &AggFunc, target: &str, rows: &[&Row]) -> (String, St
     match func {
         AggFunc::Count => (name, rows.len().to_string()),
         AggFunc::Sum => {
-            let sum: f64 = rows.iter()
+            let sum: f64 = rows
+                .iter()
                 .filter_map(|r| r.get(target).and_then(|v| v.parse::<f64>().ok()))
                 .sum();
             (name, sum.to_string())
         }
         AggFunc::Avg => {
-            let vals: Vec<f64> = rows.iter()
+            let vals: Vec<f64> = rows
+                .iter()
                 .filter_map(|r| r.get(target).and_then(|v| v.parse::<f64>().ok()))
                 .collect();
-            let avg = if vals.is_empty() { 0.0 } else { vals.iter().sum::<f64>() / vals.len() as f64 };
+            let avg = if vals.is_empty() {
+                0.0
+            } else {
+                vals.iter().sum::<f64>() / vals.len() as f64
+            };
             (name, format!("{:.2}", avg))
         }
         AggFunc::Min => {
-            let min = rows.iter().filter_map(|r| r.get(target))
-                .min_by(|a, b| smart_cmp(a, b)).cloned().unwrap_or_default();
+            let min = rows
+                .iter()
+                .filter_map(|r| r.get(target))
+                .min_by(|a, b| smart_cmp(a, b))
+                .cloned()
+                .unwrap_or_default();
             (name, min)
         }
         AggFunc::Max => {
-            let max = rows.iter().filter_map(|r| r.get(target))
-                .max_by(|a, b| smart_cmp(a, b)).cloned().unwrap_or_default();
+            let max = rows
+                .iter()
+                .filter_map(|r| r.get(target))
+                .max_by(|a, b| smart_cmp(a, b))
+                .cloned()
+                .unwrap_or_default();
             (name, max)
         }
     }

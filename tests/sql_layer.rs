@@ -22,7 +22,9 @@ fn create_sql_env(prefix: &str) -> (Arc<OmniKV>, SqlExecutor) {
 
 fn exec_sql(executor: &SqlExecutor, sql: &str) -> ExecResult {
     let stmt = parse_sql(sql).unwrap_or_else(|e| panic!("Parse error for '{}': {}", sql, e));
-    executor.execute(&stmt).unwrap_or_else(|e| panic!("Exec error for '{}': {}", sql, e))
+    executor
+        .execute(&stmt)
+        .unwrap_or_else(|e| panic!("Exec error for '{}': {}", sql, e))
 }
 
 fn exec_rows(executor: &SqlExecutor, sql: &str) -> (Vec<String>, Vec<Vec<String>>) {
@@ -71,12 +73,17 @@ fn test_regular_in_still_works() {
 /// Gap #24a: Parse ROW_NUMBER() OVER (ORDER BY col)
 #[test]
 fn test_window_func_parse_row_number() {
-    let stmt = parse_sql("SELECT name, ROW_NUMBER() OVER (ORDER BY score DESC) FROM players").unwrap();
+    let stmt =
+        parse_sql("SELECT name, ROW_NUMBER() OVER (ORDER BY score DESC) FROM players").unwrap();
     if let SqlStatement::Select { columns, .. } = stmt {
         assert_eq!(columns.len(), 2);
-        assert!(matches!(columns[1], SelectColumn::WindowFunc {
-            func: WindowFuncType::RowNumber, ..
-        }));
+        assert!(matches!(
+            columns[1],
+            SelectColumn::WindowFunc {
+                func: WindowFuncType::RowNumber,
+                ..
+            }
+        ));
     }
 
     println!("✅ SQL 24a: ROW_NUMBER() OVER (ORDER BY score DESC) parsed");
@@ -87,16 +94,24 @@ fn test_window_func_parse_row_number() {
 fn test_window_func_parse_rank() {
     let stmt = parse_sql("SELECT RANK() OVER (ORDER BY score) FROM t").unwrap();
     if let SqlStatement::Select { columns, .. } = stmt {
-        assert!(matches!(columns[0], SelectColumn::WindowFunc {
-            func: WindowFuncType::Rank, ..
-        }));
+        assert!(matches!(
+            columns[0],
+            SelectColumn::WindowFunc {
+                func: WindowFuncType::Rank,
+                ..
+            }
+        ));
     }
 
     let stmt2 = parse_sql("SELECT DENSE_RANK() OVER (ORDER BY score) FROM t").unwrap();
     if let SqlStatement::Select { columns, .. } = stmt2 {
-        assert!(matches!(columns[0], SelectColumn::WindowFunc {
-            func: WindowFuncType::DenseRank, ..
-        }));
+        assert!(matches!(
+            columns[0],
+            SelectColumn::WindowFunc {
+                func: WindowFuncType::DenseRank,
+                ..
+            }
+        ));
     }
 
     println!("✅ SQL 24b: RANK() and DENSE_RANK() parsed correctly");
@@ -107,13 +122,31 @@ fn test_window_func_parse_rank() {
 fn test_window_func_execution() {
     let (_db, exec) = create_sql_env("wf");
 
-    exec_sql(&exec, "CREATE TABLE scores (id INTEGER PRIMARY KEY, name TEXT, score INTEGER)");
-    exec_sql(&exec, "INSERT INTO scores (id, name, score) VALUES (1, 'Alice', 90)");
-    exec_sql(&exec, "INSERT INTO scores (id, name, score) VALUES (2, 'Bob', 85)");
-    exec_sql(&exec, "INSERT INTO scores (id, name, score) VALUES (3, 'Charlie', 90)");
-    exec_sql(&exec, "INSERT INTO scores (id, name, score) VALUES (4, 'Diana', 80)");
+    exec_sql(
+        &exec,
+        "CREATE TABLE scores (id INTEGER PRIMARY KEY, name TEXT, score INTEGER)",
+    );
+    exec_sql(
+        &exec,
+        "INSERT INTO scores (id, name, score) VALUES (1, 'Alice', 90)",
+    );
+    exec_sql(
+        &exec,
+        "INSERT INTO scores (id, name, score) VALUES (2, 'Bob', 85)",
+    );
+    exec_sql(
+        &exec,
+        "INSERT INTO scores (id, name, score) VALUES (3, 'Charlie', 90)",
+    );
+    exec_sql(
+        &exec,
+        "INSERT INTO scores (id, name, score) VALUES (4, 'Diana', 80)",
+    );
 
-    let (cols, rows) = exec_rows(&exec, "SELECT name, ROW_NUMBER() OVER (ORDER BY score DESC) FROM scores");
+    let (cols, rows) = exec_rows(
+        &exec,
+        "SELECT name, ROW_NUMBER() OVER (ORDER BY score DESC) FROM scores",
+    );
     assert_eq!(cols.len(), 2);
     assert_eq!(cols[1], "row_number");
     assert!(!rows.is_empty());
@@ -135,12 +168,27 @@ fn test_window_func_execution() {
 fn test_group_by_aggregate() {
     let (_db, exec) = create_sql_env("gb");
 
-    exec_sql(&exec, "CREATE TABLE sales (id INTEGER PRIMARY KEY, region TEXT, amount INTEGER)");
-    exec_sql(&exec, "INSERT INTO sales (id, region, amount) VALUES (1, 'East', 100)");
-    exec_sql(&exec, "INSERT INTO sales (id, region, amount) VALUES (2, 'East', 200)");
-    exec_sql(&exec, "INSERT INTO sales (id, region, amount) VALUES (3, 'West', 150)");
+    exec_sql(
+        &exec,
+        "CREATE TABLE sales (id INTEGER PRIMARY KEY, region TEXT, amount INTEGER)",
+    );
+    exec_sql(
+        &exec,
+        "INSERT INTO sales (id, region, amount) VALUES (1, 'East', 100)",
+    );
+    exec_sql(
+        &exec,
+        "INSERT INTO sales (id, region, amount) VALUES (2, 'East', 200)",
+    );
+    exec_sql(
+        &exec,
+        "INSERT INTO sales (id, region, amount) VALUES (3, 'West', 150)",
+    );
 
-    let (cols, rows) = exec_rows(&exec, "SELECT region, SUM(amount) FROM sales GROUP BY region");
+    let (cols, rows) = exec_rows(
+        &exec,
+        "SELECT region, SUM(amount) FROM sales GROUP BY region",
+    );
     assert_eq!(cols.len(), 2);
     assert!(!rows.is_empty());
 
@@ -156,9 +204,18 @@ fn test_group_by_aggregate() {
 fn test_update_with_where() {
     let (_db, exec) = create_sql_env("upd");
 
-    exec_sql(&exec, "CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT, price INTEGER)");
-    exec_sql(&exec, "INSERT INTO items (id, name, price) VALUES (1, 'Widget', 10)");
-    exec_sql(&exec, "INSERT INTO items (id, name, price) VALUES (2, 'Gadget', 20)");
+    exec_sql(
+        &exec,
+        "CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT, price INTEGER)",
+    );
+    exec_sql(
+        &exec,
+        "INSERT INTO items (id, name, price) VALUES (1, 'Widget', 10)",
+    );
+    exec_sql(
+        &exec,
+        "INSERT INTO items (id, name, price) VALUES (2, 'Gadget', 20)",
+    );
 
     exec_sql(&exec, "UPDATE items SET price = 15 WHERE id = 1");
 
@@ -173,7 +230,10 @@ fn test_update_with_where() {
 fn test_delete_with_where() {
     let (_db, exec) = create_sql_env("del");
 
-    exec_sql(&exec, "CREATE TABLE temp (id INTEGER PRIMARY KEY, val TEXT)");
+    exec_sql(
+        &exec,
+        "CREATE TABLE temp (id INTEGER PRIMARY KEY, val TEXT)",
+    );
     exec_sql(&exec, "INSERT INTO temp (id, val) VALUES (1, 'keep')");
     exec_sql(&exec, "INSERT INTO temp (id, val) VALUES (2, 'remove')");
 
@@ -196,7 +256,10 @@ fn test_create_table_if_not_exists() {
 
     exec_sql(&exec, "CREATE TABLE ine_test (id INTEGER PRIMARY KEY)");
     // Should not error
-    exec_sql(&exec, "CREATE TABLE IF NOT EXISTS ine_test (id INTEGER PRIMARY KEY)");
+    exec_sql(
+        &exec,
+        "CREATE TABLE IF NOT EXISTS ine_test (id INTEGER PRIMARY KEY)",
+    );
 
     println!("✅ SQL 27a: CREATE TABLE IF NOT EXISTS is idempotent");
 }
@@ -223,7 +286,10 @@ fn test_drop_table_if_exists() {
 fn test_like_operator() {
     let (_db, exec) = create_sql_env("like");
 
-    exec_sql(&exec, "CREATE TABLE names (id INTEGER PRIMARY KEY, name TEXT)");
+    exec_sql(
+        &exec,
+        "CREATE TABLE names (id INTEGER PRIMARY KEY, name TEXT)",
+    );
     exec_sql(&exec, "INSERT INTO names (id, name) VALUES (1, 'Alice')");
     exec_sql(&exec, "INSERT INTO names (id, name) VALUES (2, 'Bob')");
     exec_sql(&exec, "INSERT INTO names (id, name) VALUES (3, 'Alex')");
@@ -239,7 +305,10 @@ fn test_like_operator() {
 fn test_is_null() {
     let (_db, exec) = create_sql_env("isn");
 
-    exec_sql(&exec, "CREATE TABLE nullable (id INTEGER PRIMARY KEY, val TEXT)");
+    exec_sql(
+        &exec,
+        "CREATE TABLE nullable (id INTEGER PRIMARY KEY, val TEXT)",
+    );
     exec_sql(&exec, "INSERT INTO nullable (id, val) VALUES (1, 'hello')");
     exec_sql(&exec, "INSERT INTO nullable (id, val) VALUES (2, NULL)");
 
@@ -259,8 +328,14 @@ fn test_is_null() {
 fn test_multi_value_insert() {
     let (_db, exec) = create_sql_env("mvi");
 
-    exec_sql(&exec, "CREATE TABLE batch_test (id INTEGER PRIMARY KEY, val TEXT)");
-    exec_sql(&exec, "INSERT INTO batch_test (id, val) VALUES (1, 'a'), (2, 'b'), (3, 'c')");
+    exec_sql(
+        &exec,
+        "CREATE TABLE batch_test (id INTEGER PRIMARY KEY, val TEXT)",
+    );
+    exec_sql(
+        &exec,
+        "INSERT INTO batch_test (id, val) VALUES (1, 'a'), (2, 'b'), (3, 'c')",
+    );
 
     let (_cols, rows) = exec_rows(&exec, "SELECT * FROM batch_test");
     assert_eq!(rows.len(), 3);
@@ -277,15 +352,30 @@ fn test_multi_value_insert() {
 fn test_inner_join() {
     let (_db, exec) = create_sql_env("join");
 
-    exec_sql(&exec, "CREATE TABLE users2 (id INTEGER PRIMARY KEY, name TEXT)");
-    exec_sql(&exec, "CREATE TABLE orders2 (id INTEGER PRIMARY KEY, user_id INTEGER, product TEXT)");
+    exec_sql(
+        &exec,
+        "CREATE TABLE users2 (id INTEGER PRIMARY KEY, name TEXT)",
+    );
+    exec_sql(
+        &exec,
+        "CREATE TABLE orders2 (id INTEGER PRIMARY KEY, user_id INTEGER, product TEXT)",
+    );
 
     exec_sql(&exec, "INSERT INTO users2 (id, name) VALUES (1, 'Alice')");
     exec_sql(&exec, "INSERT INTO users2 (id, name) VALUES (2, 'Bob')");
-    exec_sql(&exec, "INSERT INTO orders2 (id, user_id, product) VALUES (1, 1, 'Widget')");
-    exec_sql(&exec, "INSERT INTO orders2 (id, user_id, product) VALUES (2, 1, 'Gadget')");
+    exec_sql(
+        &exec,
+        "INSERT INTO orders2 (id, user_id, product) VALUES (1, 1, 'Widget')",
+    );
+    exec_sql(
+        &exec,
+        "INSERT INTO orders2 (id, user_id, product) VALUES (2, 1, 'Gadget')",
+    );
 
-    let (_cols, rows) = exec_rows(&exec, "SELECT users2.name, orders2.product FROM users2 JOIN orders2 ON users2.id = orders2.user_id");
+    let (_cols, rows) = exec_rows(
+        &exec,
+        "SELECT users2.name, orders2.product FROM users2 JOIN orders2 ON users2.id = orders2.user_id",
+    );
     assert_eq!(rows.len(), 2); // Alice has 2 orders
 
     println!("✅ SQL 30a: INNER JOIN returned 2 matched rows");
@@ -296,14 +386,26 @@ fn test_inner_join() {
 fn test_left_join() {
     let (_db, exec) = create_sql_env("lj");
 
-    exec_sql(&exec, "CREATE TABLE lj_users (id INTEGER PRIMARY KEY, name TEXT)");
-    exec_sql(&exec, "CREATE TABLE lj_orders (id INTEGER PRIMARY KEY, user_id INTEGER, item TEXT)");
+    exec_sql(
+        &exec,
+        "CREATE TABLE lj_users (id INTEGER PRIMARY KEY, name TEXT)",
+    );
+    exec_sql(
+        &exec,
+        "CREATE TABLE lj_orders (id INTEGER PRIMARY KEY, user_id INTEGER, item TEXT)",
+    );
 
     exec_sql(&exec, "INSERT INTO lj_users (id, name) VALUES (1, 'Alice')");
     exec_sql(&exec, "INSERT INTO lj_users (id, name) VALUES (2, 'Bob')");
-    exec_sql(&exec, "INSERT INTO lj_orders (id, user_id, item) VALUES (1, 1, 'Book')");
+    exec_sql(
+        &exec,
+        "INSERT INTO lj_orders (id, user_id, item) VALUES (1, 1, 'Book')",
+    );
 
-    let (_cols, rows) = exec_rows(&exec, "SELECT lj_users.name FROM lj_users LEFT JOIN lj_orders ON lj_users.id = lj_orders.user_id");
+    let (_cols, rows) = exec_rows(
+        &exec,
+        "SELECT lj_users.name FROM lj_users LEFT JOIN lj_orders ON lj_users.id = lj_orders.user_id",
+    );
     assert_eq!(rows.len(), 2); // Both Alice and Bob (Bob unmatched)
 
     println!("✅ SQL 30b: LEFT JOIN preserved unmatched Bob");
@@ -318,7 +420,10 @@ fn test_left_join() {
 fn test_numeric_comparison() {
     let (_db, exec) = create_sql_env("ncmp");
 
-    exec_sql(&exec, "CREATE TABLE nums (id INTEGER PRIMARY KEY, val INTEGER)");
+    exec_sql(
+        &exec,
+        "CREATE TABLE nums (id INTEGER PRIMARY KEY, val INTEGER)",
+    );
     exec_sql(&exec, "INSERT INTO nums (id, val) VALUES (1, 10)");
     exec_sql(&exec, "INSERT INTO nums (id, val) VALUES (2, 20)");
     exec_sql(&exec, "INSERT INTO nums (id, val) VALUES (3, 30)");
@@ -337,12 +442,18 @@ fn test_numeric_comparison() {
 fn test_order_by_limit() {
     let (_db, exec) = create_sql_env("obl");
 
-    exec_sql(&exec, "CREATE TABLE ranked (id INTEGER PRIMARY KEY, score INTEGER)");
+    exec_sql(
+        &exec,
+        "CREATE TABLE ranked (id INTEGER PRIMARY KEY, score INTEGER)",
+    );
     exec_sql(&exec, "INSERT INTO ranked (id, score) VALUES (1, 50)");
     exec_sql(&exec, "INSERT INTO ranked (id, score) VALUES (2, 90)");
     exec_sql(&exec, "INSERT INTO ranked (id, score) VALUES (3, 70)");
 
-    let (_cols, rows) = exec_rows(&exec, "SELECT score FROM ranked ORDER BY score DESC LIMIT 2");
+    let (_cols, rows) = exec_rows(
+        &exec,
+        "SELECT score FROM ranked ORDER BY score DESC LIMIT 2",
+    );
     assert_eq!(rows.len(), 2);
     assert_eq!(rows[0][0], "90");
     assert_eq!(rows[1][0], "70");

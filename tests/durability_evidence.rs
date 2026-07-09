@@ -12,7 +12,6 @@
 ///
 /// A database that passes all these tests has earned durability trust.
 /// A database that fails any of them should not be used in production.
-
 use omni_engine::{OmniKV, WriteBatch};
 use std::fs;
 use std::io::Write;
@@ -25,14 +24,22 @@ use tempfile::TempDir;
 
 fn open_fresh() -> (TempDir, Arc<OmniKV>) {
     let dir = TempDir::new().expect("tmpdir");
-    let manifest = dir.path().join("manifest.json").to_string_lossy().to_string();
+    let manifest = dir
+        .path()
+        .join("manifest.json")
+        .to_string_lossy()
+        .to_string();
     let wal = dir.path().join("data.wal").to_string_lossy().to_string();
     let db = OmniKV::open(&manifest, &wal).expect("open");
     (dir, db)
 }
 
 fn reopen(dir: &TempDir) -> Arc<OmniKV> {
-    let manifest = dir.path().join("manifest.json").to_string_lossy().to_string();
+    let manifest = dir
+        .path()
+        .join("manifest.json")
+        .to_string_lossy()
+        .to_string();
     let wal = dir.path().join("data.wal").to_string_lossy().to_string();
     OmniKV::open(&manifest, &wal).expect("reopen")
 }
@@ -140,7 +147,11 @@ fn test_recovery_after_crash_during_compaction() {
 #[test]
 fn test_1000_crash_recovery_cycles() {
     let dir = TempDir::new().expect("tmpdir");
-    let manifest = dir.path().join("manifest.json").to_string_lossy().to_string();
+    let manifest = dir
+        .path()
+        .join("manifest.json")
+        .to_string_lossy()
+        .to_string();
     let wal = dir.path().join("data.wal").to_string_lossy().to_string();
 
     let num_cycles = 1000;
@@ -453,7 +464,11 @@ fn test_wal_corruption_partial_recovery() {
 #[test]
 fn test_multi_stage_crash_compaction_recovery() {
     let dir = TempDir::new().expect("tmpdir");
-    let manifest = dir.path().join("manifest.json").to_string_lossy().to_string();
+    let manifest = dir
+        .path()
+        .join("manifest.json")
+        .to_string_lossy()
+        .to_string();
     let wal = dir.path().join("data.wal").to_string_lossy().to_string();
 
     // Stage 1: Write 200 keys, compact, crash
@@ -576,11 +591,8 @@ fn test_large_batch_atomicity_across_crash() {
     {
         let mut b = WriteBatch::new();
         for i in 0u64..500 {
-            b.set(
-                &format!("committed:{:06}", i),
-                format!("val_{}", i),
-            )
-            .unwrap();
+            b.set(&format!("committed:{:06}", i), format!("val_{}", i))
+                .unwrap();
         }
         db.commit_batch(&b).expect("commit large batch");
     }
@@ -642,7 +654,11 @@ fn test_gc_does_not_lose_inflight_data() {
 #[test]
 fn test_full_lsm_lifecycle_with_restarts() {
     let dir = TempDir::new().expect("tmpdir");
-    let manifest = dir.path().join("manifest.json").to_string_lossy().to_string();
+    let manifest = dir
+        .path()
+        .join("manifest.json")
+        .to_string_lossy()
+        .to_string();
     let wal = dir.path().join("data.wal").to_string_lossy().to_string();
 
     let mut total_keys: u64 = 0;

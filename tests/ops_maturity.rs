@@ -65,7 +65,11 @@ fn test_config_validation_catches_errors() {
     let result = cfg.validate();
     assert!(result.is_err());
     let errors = result.unwrap_err();
-    assert!(errors.iter().any(|e| e.contains("memtable_flush_threshold")));
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.contains("memtable_flush_threshold"))
+    );
     println!("✅ OPS: Config validation catches invalid settings");
 }
 
@@ -121,7 +125,10 @@ fn test_diagnostic_after_compaction() {
 
     let report = DiagnosticReport::from_db(&db, start, &cfg);
     assert!(report.l0_sstable_count >= 1);
-    println!("✅ OPS: Diagnostics reflect compaction state (L0={})", report.l0_sstable_count);
+    println!(
+        "✅ OPS: Diagnostics reflect compaction state (L0={})",
+        report.l0_sstable_count
+    );
 }
 
 // ─── Prometheus Metrics ─────────────────────────────────────
@@ -132,7 +139,10 @@ fn test_prometheus_metrics_render() {
     metrics_prometheus::COMMIT_RATE.inc();
     let output = metrics_prometheus::render_metrics();
     assert!(!output.is_empty(), "Prometheus output should not be empty");
-    assert!(output.contains("omnikv_"), "Output should contain omnikv_ metrics");
+    assert!(
+        output.contains("omnikv_"),
+        "Output should contain omnikv_ metrics"
+    );
     println!("? OPS: Prometheus metrics render ({} bytes)", output.len());
 }
 
@@ -167,7 +177,9 @@ fn test_rate_limiter_allows_within_burst() {
 fn test_rate_limiter_per_user_isolation() {
     let rl = RateLimiter::new(10.0, 3, 100);
     // User1 exhausts their tokens
-    for _ in 0..3 { rl.try_acquire("user1").unwrap(); }
+    for _ in 0..3 {
+        rl.try_acquire("user1").unwrap();
+    }
     assert!(rl.try_acquire("user1").is_err());
 
     // User2 still has tokens
@@ -358,7 +370,10 @@ fn test_hdr_histogram_latency_tracking() {
     let p50 = hist.value_at_quantile(0.5);
     let p99 = hist.value_at_quantile(0.99);
     assert!(p99 >= p50, "p99 should be >= p50");
-    println!("✅ OPS: HdrHistogram latency tracking — p50={}µs p99={}µs", p50, p99);
+    println!(
+        "✅ OPS: HdrHistogram latency tracking — p50={}µs p99={}µs",
+        p50, p99
+    );
 }
 
 #[test]
@@ -375,7 +390,10 @@ fn test_hdr_histogram_read_latency() {
 
     let hist = db.metrics.read_latencies.lock().unwrap();
     assert!(hist.len() > 0);
-    println!("✅ OPS: Read latency histogram records {} samples", hist.len());
+    println!(
+        "✅ OPS: Read latency histogram records {} samples",
+        hist.len()
+    );
 }
 
 // ─── Error Handling ─────────────────────────────────────────
@@ -403,7 +421,8 @@ fn test_error_types_display() {
 fn test_batch_too_large_rejected() {
     let mut b = WriteBatch::new();
     for i in 0..10_001 {
-        if let Err(omni_engine::OmniError::BatchTooLarge(_)) = b.set(&format!("k{}", i), "v".into()) {
+        if let Err(omni_engine::OmniError::BatchTooLarge(_)) = b.set(&format!("k{}", i), "v".into())
+        {
             println!("✅ OPS: BatchTooLarge rejected at {} entries", i);
             return;
         }

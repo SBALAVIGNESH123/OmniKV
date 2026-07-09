@@ -72,10 +72,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // ─── 1. HTTP/1.1 + HTTP/2 REST API (TLS with ALPN) ────────
+    let jwt_secret = std::env::var("OMNI_JWT_SECRET").unwrap_or_else(|_| {
+        tracing::warn!("OMNI_JWT_SECRET is not set; using a development-only JWT secret");
+        "omnikv-dev-secret-change-in-prod".to_string()
+    });
+
     let app_state = api::AppState {
         db: db.clone(),
-        jwt_secret: std::env::var("OMNI_JWT_SECRET")
-            .unwrap_or_else(|_| "omnikv-dev-secret-change-in-prod".to_string()),
+        jwt_secret,
         manifest_path: MANIFEST_PATH.to_string(),
     };
 

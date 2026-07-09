@@ -8,14 +8,13 @@
 //! Each handler deserializes the request, forwards it to the local Raft node,
 //! and returns the serialized response.
 
+use axum::Json;
 use axum::extract::State;
 use axum::response::IntoResponse;
-use axum::Json;
 
 use crate::raft_impl::{OmniRaft, TypeConfig};
 use openraft::raft::{
-    AppendEntriesRequest, AppendEntriesResponse,
-    InstallSnapshotRequest, InstallSnapshotResponse,
+    AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
     VoteRequest, VoteResponse,
 };
 use std::sync::Arc;

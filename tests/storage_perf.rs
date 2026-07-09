@@ -22,7 +22,8 @@ fn test_sequential_write_throughput() {
     let start = Instant::now();
     for i in 0..n {
         let mut b = WriteBatch::new();
-        b.set(&format!("seq_{:08}", i), format!("val_{}", i)).unwrap();
+        b.set(&format!("seq_{:08}", i), format!("val_{}", i))
+            .unwrap();
         db.commit_batch(&b).unwrap();
     }
     let ops = n as f64 / start.elapsed().as_secs_f64();
@@ -39,14 +40,18 @@ fn test_batch_write_throughput() {
     for i in 0..batches {
         let mut b = WriteBatch::new();
         for j in 0..per {
-            b.set(&format!("batch_{}_{:06}", i, j), format!("p_{}", j)).unwrap();
+            b.set(&format!("batch_{}_{:06}", i, j), format!("p_{}", j))
+                .unwrap();
         }
         db.commit_batch(&b).unwrap();
     }
     let total = batches * per;
     let ops = total as f64 / start.elapsed().as_secs_f64();
     assert!(ops > 500.0, "Batch writes too slow: {:.0} ops/sec", ops);
-    println!("✅ PERF: Batch writes = {:.0} ops/sec ({}×{})", ops, batches, per);
+    println!(
+        "✅ PERF: Batch writes = {:.0} ops/sec ({}×{})",
+        ops, batches, per
+    );
 }
 
 #[test]
@@ -80,7 +85,8 @@ fn test_point_read_throughput() {
     // Seed data
     for i in 0..5000 {
         let mut b = WriteBatch::new();
-        b.set(&format!("read_{:06}", i), format!("v_{}", i)).unwrap();
+        b.set(&format!("read_{:06}", i), format!("v_{}", i))
+            .unwrap();
         db.commit_batch(&b).unwrap();
     }
     let seq = db.get_seq();
@@ -102,7 +108,8 @@ fn test_random_read_throughput() {
     let (db, _d) = create_db();
     for i in 0..5000 {
         let mut b = WriteBatch::new();
-        b.set(&format!("rand_{:06}", i), format!("v_{}", i)).unwrap();
+        b.set(&format!("rand_{:06}", i), format!("v_{}", i))
+            .unwrap();
         db.commit_batch(&b).unwrap();
     }
     let seq = db.get_seq();
@@ -111,7 +118,9 @@ fn test_random_read_throughput() {
     let mut found = 0u64;
     for i in 0..n {
         let key = format!("rand_{:06}", (i * 7919) % 5000);
-        if db.find(&key, seq).unwrap().is_some() { found += 1; }
+        if db.find(&key, seq).unwrap().is_some() {
+            found += 1;
+        }
     }
     let ops = n as f64 / start.elapsed().as_secs_f64();
     assert_eq!(found, n);
@@ -124,7 +133,8 @@ fn test_scan_throughput() {
     let (db, _d) = create_db();
     let mut b = WriteBatch::new();
     for i in 0..1000 {
-        b.set(&format!("scan_{:06}", i), format!("payload_{}", i)).unwrap();
+        b.set(&format!("scan_{:06}", i), format!("payload_{}", i))
+            .unwrap();
     }
     db.commit_batch(&b).unwrap();
 
@@ -134,7 +144,11 @@ fn test_scan_throughput() {
     let elapsed = start.elapsed();
     assert_eq!(results.len(), 1000);
     let rows_per_sec = 1000.0 / elapsed.as_secs_f64();
-    assert!(rows_per_sec > 5000.0, "Scan too slow: {:.0} rows/sec", rows_per_sec);
+    assert!(
+        rows_per_sec > 5000.0,
+        "Scan too slow: {:.0} rows/sec",
+        rows_per_sec
+    );
     println!("✅ PERF: Scan 1K rows = {:.0} rows/sec", rows_per_sec);
 }
 
@@ -153,7 +167,10 @@ fn test_missing_key_read() {
         assert!(r.is_none());
     }
     let ops = n as f64 / start.elapsed().as_secs_f64();
-    println!("✅ PERF: Missing key reads = {:.0} ops/sec (bloom filter skip)", ops);
+    println!(
+        "✅ PERF: Missing key reads = {:.0} ops/sec (bloom filter skip)",
+        ops
+    );
 }
 
 // ─── Compaction ─────────────────────────────────────────────
@@ -163,7 +180,8 @@ fn test_memtable_flush_to_l0() {
     let (db, _d) = create_db();
     for i in 0..500 {
         let mut b = WriteBatch::new();
-        b.set(&format!("flush_{:06}", i), format!("v_{}", i)).unwrap();
+        b.set(&format!("flush_{:06}", i), format!("v_{}", i))
+            .unwrap();
         db.commit_batch(&b).unwrap();
     }
     assert!(db.memtable_size() > 0);
@@ -175,7 +193,11 @@ fn test_memtable_flush_to_l0() {
     let seq = db.get_seq();
     assert!(db.find("flush_000000", seq).unwrap().is_some());
     assert!(db.find("flush_000499", seq).unwrap().is_some());
-    println!("✅ PERF: Memtable flush ({} records) = {:.1}ms", 500, elapsed.as_secs_f64() * 1000.0);
+    println!(
+        "✅ PERF: Memtable flush ({} records) = {:.1}ms",
+        500,
+        elapsed.as_secs_f64() * 1000.0
+    );
 }
 
 #[test]
@@ -185,7 +207,8 @@ fn test_l0_to_l1_compaction() {
     for round in 0..4 {
         for i in 0..200 {
             let mut b = WriteBatch::new();
-            b.set(&format!("l0l1_{}_{:06}", round, i), format!("v_{}", i)).unwrap();
+            b.set(&format!("l0l1_{}_{:06}", round, i), format!("v_{}", i))
+                .unwrap();
             db.commit_batch(&b).unwrap();
         }
         db.compact_sstables().unwrap();
@@ -200,7 +223,10 @@ fn test_l0_to_l1_compaction() {
     let seq = db.get_seq();
     assert!(db.find("l0l1_0_000000", seq).unwrap().is_some());
     assert!(db.find("l0l1_3_000199", seq).unwrap().is_some());
-    println!("✅ PERF: L0→L1 compaction = {:.1}ms", elapsed.as_secs_f64() * 1000.0);
+    println!(
+        "✅ PERF: L0→L1 compaction = {:.1}ms",
+        elapsed.as_secs_f64() * 1000.0
+    );
 }
 
 #[test]
@@ -210,7 +236,11 @@ fn test_full_compaction_cycle() {
     for round in 0..4 {
         for i in 0..100 {
             let mut b = WriteBatch::new();
-            b.set(&format!("full_{}_{:04}", round, i), format!("r{}v{}", round, i)).unwrap();
+            b.set(
+                &format!("full_{}_{:04}", round, i),
+                format!("r{}v{}", round, i),
+            )
+            .unwrap();
             db.commit_batch(&b).unwrap();
         }
         db.compact_sstables().unwrap();
@@ -228,7 +258,10 @@ fn test_full_compaction_cycle() {
             assert!(v.is_some(), "Missing full_{}_{:04}", round, i);
         }
     }
-    println!("✅ PERF: L1→L2 (base) compaction = {:.1}ms", elapsed.as_secs_f64() * 1000.0);
+    println!(
+        "✅ PERF: L1→L2 (base) compaction = {:.1}ms",
+        elapsed.as_secs_f64() * 1000.0
+    );
 }
 
 // ─── Compression ────────────────────────────────────────────
@@ -263,7 +296,9 @@ fn test_compression_ratio_tracking() {
     let (db, _d) = create_db();
     // Write repetitive data (high compression ratio)
     let repetitive = "ABCDEFGHIJ".repeat(1000); // 10KB, very compressible
-    let random_ish: String = (0..10000).map(|i| (b'A' + (i % 26) as u8) as char).collect();
+    let random_ish: String = (0..10000)
+        .map(|i| (b'A' + (i % 26) as u8) as char)
+        .collect();
 
     let mut b = WriteBatch::new();
     b.set("repetitive", repetitive.clone()).unwrap();
@@ -283,7 +318,8 @@ fn test_block_cache_hit_rate() {
     let (db, _d) = create_db();
     let mut b = WriteBatch::new();
     for i in 0..100 {
-        b.set(&format!("cache_{:04}", i), format!("value_{}", i)).unwrap();
+        b.set(&format!("cache_{:04}", i), format!("value_{}", i))
+            .unwrap();
     }
     db.commit_batch(&b).unwrap();
     let seq = db.get_seq();
@@ -321,7 +357,8 @@ fn test_write_stall_at_l0_threshold() {
     for _ in 0..15 {
         let mut b = WriteBatch::new();
         for j in 0..10 {
-            b.set(&format!("stall_{}_{}", created, j), format!("v_{}", j)).unwrap();
+            b.set(&format!("stall_{}_{}", created, j), format!("v_{}", j))
+                .unwrap();
         }
         db.commit_batch(&b).unwrap();
         if db.compact_sstables().is_ok() {
@@ -338,7 +375,10 @@ fn test_write_stall_at_l0_threshold() {
         b.set("stall_final", "value".into()).unwrap();
         match db.commit_batch(&b) {
             Err(omni_engine::OmniError::WriteStall) => {
-                println!("✅ PERF: Write stall triggered at {} L0 SSTables", db.sstable_count());
+                println!(
+                    "✅ PERF: Write stall triggered at {} L0 SSTables",
+                    db.sstable_count()
+                );
             }
             _ => {
                 println!("✅ PERF: Write stall check passed (compaction kept up)");
@@ -346,7 +386,10 @@ fn test_write_stall_at_l0_threshold() {
         }
     } else {
         // Compaction kept L0 count low — that's fine, mechanism works
-        println!("✅ PERF: Write backpressure active (L0 count managed at {})", db.sstable_count());
+        println!(
+            "✅ PERF: Write backpressure active (L0 count managed at {})",
+            db.sstable_count()
+        );
     }
 }
 
@@ -363,8 +406,14 @@ fn test_ttl_expiry_during_compaction() {
     std::thread::sleep(std::time::Duration::from_secs(2));
 
     let seq = db.get_seq();
-    assert!(db.find("expires_soon", seq).unwrap().is_none(), "Expired key should be gone");
-    assert!(db.find("permanent", seq).unwrap().is_some(), "Permanent key should exist");
+    assert!(
+        db.find("expires_soon", seq).unwrap().is_none(),
+        "Expired key should be gone"
+    );
+    assert!(
+        db.find("permanent", seq).unwrap().is_some(),
+        "Permanent key should exist"
+    );
     println!("✅ PERF: TTL expiry works correctly");
 }
 
@@ -435,7 +484,8 @@ fn test_concurrent_read_write_perf() {
     // Seed
     let mut b = WriteBatch::new();
     for i in 0..1000 {
-        b.set(&format!("conc_{:06}", i), format!("v_{}", i)).unwrap();
+        b.set(&format!("conc_{:06}", i), format!("v_{}", i))
+            .unwrap();
     }
     db.commit_batch(&b).unwrap();
 
@@ -443,7 +493,8 @@ fn test_concurrent_read_write_perf() {
     let writer = std::thread::spawn(move || {
         for i in 0..500 {
             let mut b = WriteBatch::new();
-            b.set(&format!("conc_new_{:06}", i), format!("new_{}", i)).unwrap();
+            b.set(&format!("conc_new_{:06}", i), format!("new_{}", i))
+                .unwrap();
             db2.commit_batch(&b).unwrap();
         }
     });

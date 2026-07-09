@@ -37,31 +37,30 @@ impl Hasher for FnvHasher {
     }
 }
 pub mod catalog;
-pub mod config;
 pub mod chaos;
+pub mod config;
 pub mod dist_txn;
 pub mod generator;
 pub mod hardening;
 pub mod metrics_prometheus;
+pub mod ops;
+pub mod optimizer;
 pub mod pgwire;
+pub mod plan_exec;
 pub mod prepared;
 pub mod query;
+pub mod raft_impl;
+pub mod raft_init;
+pub mod raft_network;
+pub mod raft_routes;
 pub mod raft_storage;
 pub mod schema;
 pub mod secondary_index;
 pub mod sql;
 pub mod sql_exec;
 pub mod transaction;
-pub mod wal;
-pub mod raft_impl;
-pub mod raft_network;
-pub mod raft_init;
-pub mod raft_routes;
-pub mod ops;
-pub mod optimizer;
-pub mod plan_exec;
 pub mod volcano;
-
+pub mod wal;
 
 #[derive(Debug, Clone)]
 pub enum OmniError {
@@ -262,7 +261,6 @@ impl BloomFilter {
             if self.bitset[idx / 64] & (1u64 << (idx % 64)) == 0 {
                 return false;
             }
-
         }
         true
     }
@@ -577,10 +575,11 @@ impl<'a> SSTableWriter<'a> {
 pub struct StorageRoots {
     pub base_mmap: Arc<Mmap>,
     pub base_bloom: Arc<BloomFilter>,
-    pub sstables: Arc<Vec<(Arc<Mmap>, Arc<BloomFilter>, String)>>,   // L0
+    pub sstables: Arc<Vec<(Arc<Mmap>, Arc<BloomFilter>, String)>>, // L0
     pub l1_sstables: Arc<Vec<(Arc<Mmap>, Arc<BloomFilter>, String)>>, // L1
     pub memtable: Arc<[SkipMap<(Vec<u8>, Reverse<u64>), (u64, u64, u32, u64)>; NUM_SHARDS]>,
-    pub frozen_memtables: Arc<Vec<Arc<[SkipMap<(Vec<u8>, Reverse<u64>), (u64, u64, u32, u64)>; NUM_SHARDS]>>>,
+    pub frozen_memtables:
+        Arc<Vec<Arc<[SkipMap<(Vec<u8>, Reverse<u64>), (u64, u64, u32, u64)>; NUM_SHARDS]>>>,
     pub manifest: Arc<Manifest>,
     pub heap_reader: Arc<File>,
 }
@@ -634,7 +633,7 @@ impl OmniKV {
     /// Recovers state from WAL and initializes the storage engine.
     pub fn open(manifest_path: &str, wal_path: &str) -> Result<Arc<Self>, OmniError> {
         let recovered = Self::recover_storage_roots(manifest_path, wal_path)?;
-        
+
         let initial_roots = StorageRoots {
             base_mmap: recovered.base_mmap,
             base_bloom: recovered.base_bloom,
@@ -668,10 +667,24 @@ impl OmniKV {
     // These load a stable root snapshot once. Callers work on Arc handles with no locking.
     // Compaction and reads use these; snapshot install bypasses them and swaps roots directly.
 
-    #[inline] pub fn load_roots(&self) -> arc_swap::Guard<Arc<StorageRoots>> { self.roots.load() }
-    #[inline] pub(crate) fn memtable_arc(&self) -> Arc<[SkipMap<(Vec<u8>, Reverse<u64>), (u64, u64, u32, u64)>; NUM_SHARDS]> { self.roots.load().memtable.clone() }
-    #[inline] pub fn sstable_count(&self) -> usize { self.roots.load().sstables.len() }
-    #[inline] pub fn l1_sstable_count(&self) -> usize { self.roots.load().l1_sstables.len() }
+    #[inline]
+    pub fn load_roots(&self) -> arc_swap::Guard<Arc<StorageRoots>> {
+        self.roots.load()
+    }
+    #[inline]
+    pub(crate) fn memtable_arc(
+        &self,
+    ) -> Arc<[SkipMap<(Vec<u8>, Reverse<u64>), (u64, u64, u32, u64)>; NUM_SHARDS]> {
+        self.roots.load().memtable.clone()
+    }
+    #[inline]
+    pub fn sstable_count(&self) -> usize {
+        self.roots.load().sstables.len()
+    }
+    #[inline]
+    pub fn l1_sstable_count(&self) -> usize {
+        self.roots.load().l1_sstables.len()
+    }
 
     /// Compaction helper: apply a topology mutation function and publish the result atomically.
     /// Compaction methods call this instead of doing individual `.store()` calls,
@@ -875,7 +888,11 @@ impl OmniKV {
 
     pub fn memtable_size(&self) -> usize {
         let roots = self.roots.load();
-        let mut sum = roots.memtable.iter().map(|shard| shard.len()).sum::<usize>();
+        let mut sum = roots
+            .memtable
+            .iter()
+            .map(|shard| shard.len())
+            .sum::<usize>();
         for frozen in roots.frozen_memtables.iter() {
             sum += frozen.iter().map(|shard| shard.len()).sum::<usize>();
         }
@@ -916,7 +933,6 @@ impl OmniKV {
     pub fn total_records(&self) -> usize {
         self.memtable_size() // + other counts if needed
     }
-
 
     pub fn flush_memtable_to_disk(&self, _id: u64) -> Result<(), OmniError> {
         self.compact_sstables()
@@ -1133,9 +1149,7 @@ impl OmniKV {
                         use std::os::unix::fs::FileExt as _;
                         heap_writer
                             .write_all_at(bytes, write_offset)
-                            .map_err(|e| {
-                                OmniError::IoError(format!("heap pwrite: {}", e))
-                            })?;
+                            .map_err(|e| OmniError::IoError(format!("heap pwrite: {}", e)))?;
                     }
                     #[cfg(windows)]
                     {
@@ -1144,9 +1158,7 @@ impl OmniKV {
                         while !remaining.is_empty() {
                             let n = heap_writer
                                 .seek_write(remaining, pos)
-                                .map_err(|e| {
-                                    OmniError::IoError(format!("heap pwrite: {}", e))
-                                })?;
+                                .map_err(|e| OmniError::IoError(format!("heap pwrite: {}", e)))?;
                             if n == 0 {
                                 return Err(OmniError::IoError(
                                     "heap pwrite: zero-length write".into(),
@@ -1247,12 +1259,11 @@ impl OmniKV {
             // Loop until the entire buffer is filled.
             let mut total_read = 0usize;
             while total_read < buf.len() {
-                let n = file.seek_read(&mut buf[total_read..], offset + total_read as u64)
+                let n = file
+                    .seek_read(&mut buf[total_read..], offset + total_read as u64)
                     .map_err(|e| OmniError::IoError(format!("heap seek_read: {}", e)))?;
                 if n == 0 {
-                    return Err(OmniError::IoError(
-                        "heap seek_read: unexpected EOF".into(),
-                    ));
+                    return Err(OmniError::IoError("heap seek_read: unexpected EOF".into()));
                 }
                 total_read += n;
             }
@@ -1666,8 +1677,9 @@ impl OmniKV {
                 .write_mutex
                 .lock()
                 .map_err(|_| OmniError::LockPoisoned("compact".into()))?;
-            let new_empty: Arc<[SkipMap<(Vec<u8>, Reverse<u64>), (u64, u64, u32, u64)>; NUM_SHARDS]> =
-                Arc::new(std::array::from_fn(|_| SkipMap::new()));
+            let new_empty: Arc<
+                [SkipMap<(Vec<u8>, Reverse<u64>), (u64, u64, u32, u64)>; NUM_SHARDS],
+            > = Arc::new(std::array::from_fn(|_| SkipMap::new()));
             // Atomically: swap memtable to empty and add old one to frozen list
             let old_memtable = {
                 let current = self.roots.load();
@@ -1769,7 +1781,10 @@ impl OmniKV {
         let mut frozen = self.roots.load().frozen_memtables.clone().as_ref().clone();
         if frozen_idx < frozen.len() {
             frozen.remove(frozen_idx);
-            self.update_roots(|r| StorageRoots { frozen_memtables: Arc::new(frozen), ..r.clone() });
+            self.update_roots(|r| StorageRoots {
+                frozen_memtables: Arc::new(frozen),
+                ..r.clone()
+            });
         }
 
         Ok(())
@@ -1825,8 +1840,14 @@ impl OmniKV {
             let mut manifest = self.roots.load().manifest.clone().as_ref().clone();
             manifest.sstables.clear();
             manifest.save(&self.manifest_path)?;
-            self.update_roots(|r| StorageRoots { manifest: Arc::new(manifest), ..r.clone() });
-            self.update_roots(|r| StorageRoots { sstables: Arc::new(Vec::new()), ..r.clone() });
+            self.update_roots(|r| StorageRoots {
+                manifest: Arc::new(manifest),
+                ..r.clone()
+            });
+            self.update_roots(|r| StorageRoots {
+                sstables: Arc::new(Vec::new()),
+                ..r.clone()
+            });
 
             let old_paths: Vec<String> = sstables.iter().map(|(_, _, p)| p.clone()).collect();
             std::thread::spawn(move || {
@@ -2006,7 +2027,11 @@ impl OmniKV {
 
         let mut manifest = self.roots.load().manifest.clone().as_ref().clone();
         manifest.base_path = new_base_path;
-        manifest.l1_sstables = remaining_l1.clone().into_iter().map(|(_, _, path)| path).collect();
+        manifest.l1_sstables = remaining_l1
+            .clone()
+            .into_iter()
+            .map(|(_, _, path)| path)
+            .collect();
         manifest.save(&self.manifest_path)?;
 
         self.update_roots(|r| StorageRoots {
@@ -2253,7 +2278,6 @@ impl OmniKV {
 
         let old_manifest = self.roots.load().manifest.clone();
 
-
         std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_secs(5));
             let _ = std::fs::remove_file(&old_manifest.heap_path);
@@ -2335,6 +2359,3 @@ impl OmniKV {
             .expect("Failed to spawn compaction thread")
     }
 }
-
-
-

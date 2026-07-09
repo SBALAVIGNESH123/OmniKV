@@ -93,4 +93,3 @@ pub fn decrypt(data: &[u8], passphrase: &str) -> Result<Vec<u8>, String> {
         .decrypt(nonce, ciphertext)
         .map_err(|e| format!("Decryption failed: {}", e))
 }
-

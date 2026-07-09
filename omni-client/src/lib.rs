@@ -15,6 +15,14 @@ pub struct OmniClient {
     token: Option<String>,
 }
 
+/// Builder for [`OmniClient`].
+pub struct OmniClientBuilder {
+    base_url: String,
+    timeout: Duration,
+    accept_invalid_certs: bool,
+    token: Option<String>,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct KvPair {
     pub key: String,
@@ -88,14 +96,29 @@ impl From<reqwest::Error> for OmniClientError {
 impl OmniClient {
     /// Create a new client pointing to the given base URL.
     pub fn new(base_url: &str) -> Self {
-        Self {
+        Self::builder(base_url)
+            .build()
+            .expect("Failed to build OmniKV HTTP client")
+    }
+
+    /// Create a new client that accepts self-signed TLS certificates.
+    ///
+    /// This is intended for local development only. Production clients should
+    /// use [`OmniClient::new`] or [`OmniClient::builder`] so certificates are
+    /// verified by default.
+    pub fn new_insecure_for_local_dev(base_url: &str) -> Self {
+        Self::builder(base_url)
+            .accept_invalid_certs_for_local_dev(true)
+            .build()
+            .expect("Failed to build OmniKV HTTP client")
+    }
+
+    /// Start building a client with explicit options.
+    pub fn builder(base_url: &str) -> OmniClientBuilder {
+        OmniClientBuilder {
             base_url: base_url.trim_end_matches('/').to_string(),
-            client: Client::builder()
-                .timeout(Duration::from_secs(30))
-                .pool_max_idle_per_host(10)
-                .danger_accept_invalid_certs(true) // for self-signed TLS
-                .build()
-                .expect("Failed to build HTTP client"),
+            timeout: Duration::from_secs(30),
+            accept_invalid_certs: false,
             token: None,
         }
     }
@@ -203,5 +226,42 @@ impl OmniClient {
         let url = format!("{}/metrics", self.base_url);
         let resp = self.client.get(&url).send().await?;
         Ok(resp.text().await?)
+    }
+}
+
+impl OmniClientBuilder {
+    /// Set the request timeout.
+    pub fn timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
+
+    /// Set the JWT bearer token for authenticated requests.
+    pub fn token(mut self, token: &str) -> Self {
+        self.token = Some(token.to_string());
+        self
+    }
+
+    /// Accept invalid TLS certificates for local development.
+    ///
+    /// Do not enable this in production.
+    pub fn accept_invalid_certs_for_local_dev(mut self, accept: bool) -> Self {
+        self.accept_invalid_certs = accept;
+        self
+    }
+
+    /// Build the configured client.
+    pub fn build(self) -> Result<OmniClient, OmniClientError> {
+        let client = Client::builder()
+            .timeout(self.timeout)
+            .pool_max_idle_per_host(10)
+            .danger_accept_invalid_certs(self.accept_invalid_certs)
+            .build()?;
+
+        Ok(OmniClient {
+            base_url: self.base_url,
+            client,
+            token: self.token,
+        })
     }
 }
