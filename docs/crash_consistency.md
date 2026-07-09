@@ -22,8 +22,9 @@ crash-consistency test suite.
 ## Failure Injection Harness
 
 The harness lives in `src/failpoints.rs`. It uses a process-global registry
-gated by the `failpoints` Cargo feature, so there is zero overhead in release
-builds.
+gated by the `failpoints` Cargo feature. When the feature is disabled (the default
+for release builds), all injection points compile away to no-ops. If you build
+with `--features failpoints`, the hooks are compiled in regardless of profile.
 
 ### Usage
 
