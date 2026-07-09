@@ -23,6 +23,7 @@ The primary goal is correctness and durability. The project includes crash-recov
 - SQL engine: recursive-descent parser, cost-based optimizer, and iterator-based execution work.
 - Consensus: Raft integration for multi-node replication and leader failover experiments.
 - Operations: health checks, metrics, diagnostics, Docker packaging, and example config.
+- Recovery: portable plain/encrypted backup and restore APIs with restore-time metadata validation.
 
 ## Quick start
 
@@ -74,6 +75,10 @@ cargo test --all-targets
 
 On Windows/MSVC, full debug test linking can require significant free disk space because large PDB/debug artifacts are generated. If you hit linker errors such as `LNK1140` or `os error 112`, free disk space or run smaller test groups from `CONTRIBUTING.md`.
 
+## Operations docs
+
+- [Backup and restore](docs/backup_restore.md)
+
 ## Known limitations
 
 - Distributed transactions are not Jepsen-tested. The 2PC protocol is implemented, but has not been rigorously tested against network partitions or coordinator crashes.
@@ -90,7 +95,7 @@ On Windows/MSVC, full debug test linking can require significant free disk space
 - [x] Phase 4 - Benchmarks: throughput measurements and short soak tests.
 - [x] Phase 5 - Multi-node: Raft cluster tests and partition-handling experiments.
 - [ ] Phase 6 - Consistency: Jepsen-style testing and failure-model documentation.
-- [ ] Phase 7 - Production: fuzz testing, 24-hour soak, operational runbooks, backups, and migration guarantees.
+- [ ] Phase 7 - Production: fuzz testing, 24-hour soak, operational runbooks, repeated restore drills, and migration guarantees.
 
 ## Contributing
 

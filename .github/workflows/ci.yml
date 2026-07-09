@@ -64,6 +64,8 @@ jobs:
       run: cargo test --test storage_correctness -- --test-threads=1
     - name: Storage engine (19 tests)
       run: cargo test --test storage_engine -- --test-threads=1
+    - name: Backup/restore contract
+      run: cargo test --test backup_restore -- --test-threads=1
     - name: Storage perf (21 tests)
       run: cargo test --test storage_perf -- --test-threads=1 --nocapture
 

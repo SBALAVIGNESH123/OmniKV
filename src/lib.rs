@@ -36,9 +36,11 @@ impl Hasher for FnvHasher {
         }
     }
 }
+pub mod backup;
 pub mod catalog;
 pub mod chaos;
 pub mod config;
+pub mod crypto;
 pub mod dist_txn;
 pub mod generator;
 pub mod hardening;

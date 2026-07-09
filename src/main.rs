@@ -13,9 +13,7 @@
 
 mod api;
 mod auth;
-mod backup;
 mod cluster;
-mod crypto;
 mod quic_server;
 
 use omni_engine::OmniKV;
@@ -81,6 +79,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         db: db.clone(),
         jwt_secret,
         manifest_path: MANIFEST_PATH.to_string(),
+        wal_path: WAL_PATH.to_string(),
     };
 
     let router = api::build_router(app_state);
