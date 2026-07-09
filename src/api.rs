@@ -26,6 +26,7 @@ pub struct AppState {
     pub db: Arc<OmniKV>,
     pub jwt_secret: String,
     pub manifest_path: String,
+    pub wal_path: String,
 }
 
 #[derive(Deserialize)]
@@ -287,7 +288,12 @@ async fn backup_handler(State(state): State<AppState>) -> impl IntoResponse {
         .as_secs();
     let backup_path = format!("backup_{}.tar.gz", timestamp);
 
-    match crate::backup::create_backup(&state.db, &state.manifest_path, &backup_path) {
+    match omni_engine::backup::create_backup_with_wal(
+        &state.db,
+        &state.manifest_path,
+        &state.wal_path,
+        &backup_path,
+    ) {
         Ok(path) => (StatusCode::OK, ApiResponse::ok(path)),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
