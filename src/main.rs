@@ -19,12 +19,7 @@ mod quic_server;
 use omni_engine::OmniKV;
 use std::sync::Arc;
 
-const MANIFEST_PATH: &str = "manifest.json";
-const WAL_PATH: &str = "wal.bin";
-const HTTP_ADDR: &str = "0.0.0.0:8443";
-const QUIC_ADDR: &str = "0.0.0.0:4433";
-const PGWIRE_ADDR: &str = "0.0.0.0:5433";
-const TCP_ADDR: &str = "0.0.0.0:8080";
+use omni_engine::config::ServerConfig;
 
 fn print_banner() {
     println!();
@@ -35,13 +30,13 @@ fn print_banner() {
     );
     println!("  ║  Embeddable · Distributed · Transactional KV      ║");
     println!("  ╠════════════════════════════════════════════════════╣");
-    println!("  ║  HTTP/1.1 + HTTP/2 (TLS)  → {}           ║", HTTP_ADDR);
-    println!("  ║  QUIC/HTTP3 (binary)      → {}           ║", QUIC_ADDR);
+    println!("  ║  HTTP/1.1 + HTTP/2 (TLS)  → {}           ║", &cfg.http_addr);
+    println!("  ║  QUIC/HTTP3 (binary)      → {}           ║", &cfg.quic_addr);
     println!(
         "  ║  PostgreSQL Wire Protocol → {}           ║",
-        PGWIRE_ADDR
+        &cfg.pgwire_addr
     );
-    println!("  ║  TCP Command Interface    → {}           ║", TCP_ADDR);
+    println!("  ║  TCP Command Interface    → {}           ║", &cfg.tcp_addr);
     println!("  ╠════════════════════════════════════════════════════╣");
     println!("  ║  Built from scratch in Rust. Every byte is ours.  ║");
     println!("  ╚════════════════════════════════════════════════════╝");
@@ -61,19 +56,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     print_banner();
 
-    // Open the database
-    let db = OmniKV::open(MANIFEST_PATH, WAL_PATH)?;
+    // Load configuration (development mode; switch to ServerConfig::load_production()
+    // before any production deployment).
+    let cfg = ServerConfig::load_dev();
+    tracing::info!(
+        mode = ?cfg.mode,
+        http_addr = %cfg.http_addr,
+        manifest = ?cfg.storage.manifest_path,
+        "Configuration loaded"
+    );
+
+    // Open the database using configured paths.
+    let db = OmniKV::open(
+        cfg.storage.manifest_path.to_str().unwrap_or("manifest.json"),
+        cfg.storage.wal_path.to_str().unwrap_or("wal.bin"),
+    )?;
     tracing::info!(
         seq = db.get_seq(),
         sstables = db.sstable_count(),
         "Database opened"
     );
 
-    // ─── 1. HTTP/1.1 + HTTP/2 REST API (TLS with ALPN) ────────
-    let jwt_secret = std::env::var("OMNI_JWT_SECRET").unwrap_or_else(|_| {
-        tracing::warn!("OMNI_JWT_SECRET is not set; using a development-only JWT secret");
-        "omnikv-dev-secret-change-in-prod".to_string()
-    });
+    let jwt_secret = cfg.jwt_secret.clone();
 
     let app_state = api::AppState {
         db: db.clone(),
@@ -94,9 +98,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )
     .await?;
 
-    let http_addr: std::net::SocketAddr = HTTP_ADDR.parse()?;
+    let http_addr: std::net::SocketAddr = &cfg.http_addr.parse()?;
     let http_handle = tokio::spawn(async move {
-        tracing::info!("HTTP/1.1 + HTTP/2 server starting on {}", HTTP_ADDR);
+        tracing::info!("HTTP/1.1 + HTTP/2 server starting on {}", &cfg.http_addr);
         if let Err(e) = axum_server::bind_rustls(http_addr, tls_config)
             .serve(router.into_make_service())
             .await
@@ -107,7 +111,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ─── 2. QUIC/HTTP3 Binary Protocol ─────────────────────────
     let (quic_certs, quic_key) = quic_server::generate_self_signed_cert()?;
-    let quic_endpoint = quic_server::create_server_endpoint(QUIC_ADDR, quic_certs, quic_key)?;
+    let quic_endpoint = quic_server::create_server_endpoint(&cfg.quic_addr, quic_certs, quic_key)?;
     let quic_db = db.clone();
     let quic_handle = tokio::spawn(async move {
         quic_server::run_quic_server(quic_endpoint, quic_db).await;
@@ -116,8 +120,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ─── 3. PostgreSQL Wire Protocol ───────────────────────────
     let pgwire_db = db.clone();
     let pgwire_handle = std::thread::spawn(move || {
-        let server = omni_engine::pgwire::PgWireServer::new(pgwire_db, PGWIRE_ADDR);
-        tracing::info!("PostgreSQL wire protocol starting on {}", PGWIRE_ADDR);
+        let server = omni_engine::pgwire::PgWireServer::new(pgwire_db, &cfg.pgwire_addr);
+        tracing::info!("PostgreSQL wire protocol starting on {}", &cfg.pgwire_addr);
         if let Err(e) = server.start() {
             tracing::error!("PgWire server error: {}", e);
         }
@@ -126,7 +130,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ─── 4. TCP Command Interface (for telnet/debug) ──────────
     let tcp_db = db.clone();
     let tcp_handle = tokio::spawn(async move {
-        if let Err(e) = run_tcp_server(tcp_db, TCP_ADDR).await {
+        if let Err(e) = run_tcp_server(tcp_db, &cfg.tcp_addr).await {
             tracing::error!("TCP server error: {}", e);
         }
     });
