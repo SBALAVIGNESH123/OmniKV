@@ -1,195 +1,183 @@
-//! Production-grade configuration for OmniKV.
+//! OmniKV server configuration.
 //!
-//! Loads config from a TOML file (`omnikv.toml` by default) and then applies
-//! environment-variable overrides.  A strict **production mode** refuses to
-//! start when the default JWT secret is present or TLS is unconfigured.
+//! Loads settings from an optional `omnikv.toml` file, then applies
+//! environment-variable overrides. Two convenience constructors are provided:
+//! [`ServerConfig::load_dev`] (always succeeds) and
+//! [`ServerConfig::load_production`] (fails fast when security constraints
+//! are not met).
 //!
 //! # Quick start (development)
 //! ```
+//! use omni_engine::config::ServerConfig;
 //! let cfg = ServerConfig::load_dev();
 //! ```
 //!
 //! # Quick start (production)
-//! Set the required env vars and call:
 //! ```no_run
+//! use omni_engine::config::ServerConfig;
 //! let cfg = ServerConfig::load_production().expect("invalid production config");
 //! ```
 
-use std::path::PathBuf;
-use std::str::FromStr;
-
 use serde::{Deserialize, Serialize};
+use std::fmt;
 
-/// The development-only JWT secret.  Production mode hard-rejects this value.
-pub const DEV_JWT_SECRET: &str = "omnikv-dev-secret-change-in-prod";
+/// The well-known development JWT secret. Rejected in production mode.
+pub const DEV_JWT_SECRET: &str = "omnikv-dev-secret-do-not-use-in-production";
 
-/// Runtime mode selection.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// Runtime operation mode.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum ServerMode {
+    #[default]
     Development,
     Production,
 }
 
-impl Default for ServerMode {
-    fn default() -> Self {
-        Self::Development
-    }
-}
-
-impl FromStr for ServerMode {
-    type Err = String;
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_lowercase().as_str() {
-            "production" | "prod" => Ok(Self::Production),
-            "development" | "dev" => Ok(Self::Development),
-            other => Err(format!("unknown mode: {other}")),
+impl fmt::Display for ServerMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ServerMode::Development => write!(f, "development"),
+            ServerMode::Production => write!(f, "production"),
         }
     }
 }
 
-/// Log level.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum LogLevel {
-    Trace,
-    Debug,
-    Info,
-    Warn,
-    Error,
-}
-
-impl Default for LogLevel {
-    fn default() -> Self {
-        Self::Info
+impl std::str::FromStr for ServerMode {
+    type Err = ConfigError;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "development" | "dev" => Ok(ServerMode::Development),
+            "production" | "prod" => Ok(ServerMode::Production),
+            other => Err(ConfigError::InvalidValue {
+                key: "OMNIKV_MODE".into(),
+                value: other.into(),
+                reason: "must be development or production".into(),
+            }),
+        }
     }
 }
 
-impl std::fmt::Display for LogLevel {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let s = match self {
-            Self::Trace => "trace",
-            Self::Debug => "debug",
-            Self::Info => "info",
-            Self::Warn => "warn",
-            Self::Error => "error",
-        };
-        write!(f, "{s}")
-    }
-}
-
-/// TLS configuration.
+/// Storage-layer tuning parameters.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TlsConfig {
-    /// PEM certificate file path.
-    pub cert_path: PathBuf,
-    /// PEM private key file path.
-    pub key_path: PathBuf,
-}
-
-/// Storage tuning knobs.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct StorageConfig {
-    /// Path to the manifest JSON file.
-    pub manifest_path: PathBuf,
-    /// Path to the WAL binary file.
-    pub wal_path: PathBuf,
-    /// Path to the backup directory.
-    pub backup_dir: PathBuf,
-    /// Maximum memtable size in bytes before an SSTable flush is triggered.
-    pub max_memtable_bytes: u64,
-    /// Maximum number of SSTables before compaction is triggered.
-    pub max_sstables: usize,
+    pub data_dir: String,
+    pub wal_path: String,
+    pub manifest_path: String,
+    pub backup_dir: String,
+    pub log_dir: String,
+    pub max_open_files: u32,
+    pub write_buffer_mb: u32,
+    pub compaction_workers: u32,
 }
 
 impl Default for StorageConfig {
     fn default() -> Self {
         Self {
-            manifest_path: PathBuf::from("manifest.json"),
-            wal_path: PathBuf::from("wal.bin"),
-            backup_dir: PathBuf::from("backups"),
-            max_memtable_bytes: 64 * 1024 * 1024, // 64 MiB
-            max_sstables: 8,
+            data_dir: "./data".into(),
+            wal_path: "./data/wal/wal.bin".into(),
+            manifest_path: "./data/manifest.json".into(),
+            backup_dir: "./data/backups".into(),
+            log_dir: "./logs".into(),
+            max_open_files: 512,
+            write_buffer_mb: 64,
+            compaction_workers: 2,
         }
     }
 }
 
-/// Complete server configuration.
+/// TLS configuration.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TlsConfig {
+    pub cert_path: Option<String>,
+    pub key_path: Option<String>,
+    /// When `true` TLS is skipped. Must be set explicitly; never defaulted.
+    pub insecure_skip: bool,
+}
+
+/// Full server configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ServerConfig {
-    /// Runtime mode.
-    #[serde(default)]
     pub mode: ServerMode,
-    /// HTTP/1.1 + HTTP/2 TLS listen address.
     pub http_addr: String,
-    /// QUIC / HTTP3 listen address.
     pub quic_addr: String,
-    /// PostgreSQL wire protocol listen address.
     pub pgwire_addr: String,
-    /// Plain TCP command interface address.
     pub tcp_addr: String,
-    /// JWT HMAC-SHA256 signing secret.
     pub jwt_secret: String,
-    /// Optional TLS certificate and key.  Required in production unless
-    /// `tls_insecure_skip` is set to `true`.
-    pub tls: Option<TlsConfig>,
-    /// Allow skipping TLS in production.  Must be `true` explicitly.
-    #[serde(default)]
-    pub tls_insecure_skip: bool,
-    /// Log level.
-    #[serde(default)]
-    pub log_level: LogLevel,
-    /// Storage configuration.
-    #[serde(default)]
+    pub log_level: String,
     pub storage: StorageConfig,
+    pub tls: TlsConfig,
 }
 
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             mode: ServerMode::Development,
-            http_addr: "0.0.0.0:8443".to_string(),
-            quic_addr: "0.0.0.0:4433".to_string(),
-            pgwire_addr: "0.0.0.0:5433".to_string(),
-            tcp_addr: "0.0.0.0:8080".to_string(),
-            jwt_secret: DEV_JWT_SECRET.to_string(),
-            tls: None,
-            tls_insecure_skip: false,
-            log_level: LogLevel::Info,
+            http_addr: "127.0.0.1:7070".into(),
+            quic_addr: "127.0.0.1:7443".into(),
+            pgwire_addr: "127.0.0.1:5432".into(),
+            tcp_addr: "127.0.0.1:7071".into(),
+            jwt_secret: DEV_JWT_SECRET.into(),
+            log_level: "info".into(),
             storage: StorageConfig::default(),
+            tls: TlsConfig::default(),
         }
     }
 }
 
-/// Errors produced during configuration loading or validation.
+/// Configuration error variants.
 #[derive(Debug)]
-pub struct ConfigError(pub String);
+pub enum ConfigError {
+    ProductionDevSecret,
+    JwtSecretTooShort { len: usize },
+    TlsNotConfigured,
+    TlsCertMissing { path: String },
+    TlsKeyMissing { path: String },
+    InvalidValue { key: String, value: String, reason: String },
+    ParseError(String),
+}
 
-impl std::fmt::Display for ConfigError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "OmniKV config error: {}", self.0)
+impl fmt::Display for ConfigError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ConfigError::ProductionDevSecret =>
+                write!(f, "OMNIKV_JWT_SECRET must not be the development default in production mode"),
+            ConfigError::JwtSecretTooShort { len } =>
+                write!(f, "OMNIKV_JWT_SECRET is {len} chars; production requires >= 32"),
+            ConfigError::TlsNotConfigured =>
+                write!(f, "TLS is required in production mode; set OMNIKV_TLS_CERT_PATH + OMNIKV_TLS_KEY_PATH or set OMNIKV_TLS_INSECURE_SKIP=true"),
+            ConfigError::TlsCertMissing { path } =>
+                write!(f, "TLS cert file not found: {path}"),
+            ConfigError::TlsKeyMissing { path } =>
+                write!(f, "TLS key file not found: {path}"),
+            ConfigError::InvalidValue { key, value, reason } =>
+                write!(f, "invalid value for {key}={value}: {reason}"),
+            ConfigError::ParseError(msg) =>
+                write!(f, "config parse error: {msg}"),
+        }
     }
 }
 
 impl std::error::Error for ConfigError {}
 
 impl ServerConfig {
-    /// Load configuration for **development**.
-    ///
-    /// Attempts to read `omnikv.toml` from the current directory, falls back
-    /// to built-in defaults, then applies env-var overrides.  Does **not**
-    /// validate production constraints.
+    /// Load dev configuration. Always succeeds. Never validates secrets.
     pub fn load_dev() -> Self {
         let mut cfg = Self::from_file_or_default("omnikv.toml");
         cfg.apply_env();
-        cfg.mode = ServerMode::Development;
+        // Honour OMNIKV_MODE if set; otherwise default to Development.
+        if cfg.mode != ServerMode::Production {
+            cfg.mode = ServerMode::Development;
+        }
         cfg
     }
 
-    /// Load configuration for **production**.
+    /// Load production configuration.
     ///
-    /// Same as `load_dev` but additionally calls `validate_production`, which
-    /// returns an error if any production constraint is violated.
+    /// Applies env overrides, then enforces all production constraints.
+    /// Returns `Err` with a clear message if any constraint is violated.
     pub fn load_production() -> Result<Self, ConfigError> {
         let mut cfg = Self::from_file_or_default("omnikv.toml");
         cfg.apply_env();
@@ -198,143 +186,79 @@ impl ServerConfig {
         Ok(cfg)
     }
 
-    /// Load from a specific TOML file path.
-    pub fn load_from_file(path: &std::path::Path) -> Result<Self, ConfigError> {
-        let raw = std::fs::read_to_string(path)
-            .map_err(|e| ConfigError(format!("cannot read {}: {e}", path.display())))?;
-        toml::from_str(&raw)
-            .map_err(|e| ConfigError(format!("invalid TOML in {}: {e}", path.display())))
-    }
-
-    /// Parse from a TOML string (useful in tests).
-    pub fn from_toml_str(s: &str) -> Result<Self, ConfigError> {
-        toml::from_str(s).map_err(|e| ConfigError(format!("invalid TOML: {e}")))
-    }
-
-    /// Validate all production constraints.  Returns the first violation.
+    /// Validate production constraints. Call after `apply_env`.
     pub fn validate_production(&self) -> Result<(), ConfigError> {
-        // Reject the development JWT secret.
         if self.jwt_secret == DEV_JWT_SECRET {
-            return Err(ConfigError(
-                "OMNIKV_JWT_SECRET must be changed from the development default before \
-                 running in production. Set it to a secret of at least 32 characters."
-                    .to_string(),
-            ));
+            return Err(ConfigError::ProductionDevSecret);
         }
-        // Require a sufficiently long secret.
         if self.jwt_secret.len() < 32 {
-            return Err(ConfigError(format!(
-                "OMNIKV_JWT_SECRET must be at least 32 characters (got {})",
-                self.jwt_secret.len()
-            )));
+            return Err(ConfigError::JwtSecretTooShort { len: self.jwt_secret.len() });
         }
-        // Require TLS unless explicitly skipped.
-        if !self.tls_insecure_skip {
-            match &self.tls {
-                None => {
-                    return Err(ConfigError(
-                        "TLS is required in production. Set OMNIKV_TLS_CERT_PATH and \
-                         OMNIKV_TLS_KEY_PATH, or set OMNIKV_TLS_INSECURE_SKIP=true \
-                         to opt out (not recommended)."
-                            .to_string(),
-                    ));
-                }
-                Some(tls) => {
-                    if !tls.cert_path.exists() {
-                        return Err(ConfigError(format!(
-                            "TLS cert file not found: {}",
-                            tls.cert_path.display()
-                        )));
+        if !self.tls.insecure_skip {
+            match (&self.tls.cert_path, &self.tls.key_path) {
+                (None, _) | (_, None) => return Err(ConfigError::TlsNotConfigured),
+                (Some(cert), Some(key)) => {
+                    if !std::path::Path::new(cert).exists() {
+                        return Err(ConfigError::TlsCertMissing { path: cert.clone() });
                     }
-                    if !tls.key_path.exists() {
-                        return Err(ConfigError(format!(
-                            "TLS key file not found: {}",
-                            tls.key_path.display()
-                        )));
+                    if !std::path::Path::new(key).exists() {
+                        return Err(ConfigError::TlsKeyMissing { path: key.clone() });
                     }
                 }
             }
+        } else {
+            eprintln!("WARNING: TLS is disabled via OMNIKV_TLS_INSECURE_SKIP=true. This is not recommended for production.");
         }
         Ok(())
     }
 
-    // ── Private helpers ──────────────────────────────────────────────────────
-
-    fn from_file_or_default(path: &str) -> Self {
-        match std::fs::read_to_string(path) {
-            Ok(raw) => toml::from_str(&raw).unwrap_or_default(),
-            Err(_) => Self::default(),
-        }
-    }
-
     /// Apply environment-variable overrides.
-    ///
-    /// | Variable | Field |
-    /// |---|---|
-    /// | `OMNIKV_MODE` | `mode` |
-    /// | `OMNIKV_HTTP_ADDR` | `http_addr` |
-    /// | `OMNIKV_QUIC_ADDR` | `quic_addr` |
-    /// | `OMNIKV_PGWIRE_ADDR` | `pgwire_addr` |
-    /// | `OMNIKV_TCP_ADDR` | `tcp_addr` |
-    /// | `OMNIKV_JWT_SECRET` | `jwt_secret` |
-    /// | `OMNIKV_TLS_CERT_PATH` | `tls.cert_path` |
-    /// | `OMNIKV_TLS_KEY_PATH` | `tls.key_path` |
-    /// | `OMNIKV_TLS_INSECURE_SKIP` | `tls_insecure_skip` |
-    /// | `OMNIKV_LOG_LEVEL` | `log_level` |
-    /// | `OMNIKV_MANIFEST_PATH` | `storage.manifest_path` |
-    /// | `OMNIKV_WAL_PATH` | `storage.wal_path` |
-    /// | `OMNIKV_BACKUP_DIR` | `storage.backup_dir` |
     pub fn apply_env(&mut self) {
         if let Ok(v) = std::env::var("OMNIKV_MODE") {
             if let Ok(m) = v.parse::<ServerMode>() {
                 self.mode = m;
             }
         }
-        if let Ok(v) = std::env::var("OMNIKV_HTTP_ADDR") {
-            self.http_addr = v;
+        if let Ok(v) = std::env::var("OMNIKV_HTTP_ADDR") { self.http_addr = v; }
+        if let Ok(v) = std::env::var("OMNIKV_QUIC_ADDR") { self.quic_addr = v; }
+        if let Ok(v) = std::env::var("OMNIKV_PGWIRE_ADDR") { self.pgwire_addr = v; }
+        if let Ok(v) = std::env::var("OMNIKV_TCP_ADDR") { self.tcp_addr = v; }
+        if let Ok(v) = std::env::var("OMNIKV_JWT_SECRET") { self.jwt_secret = v; }
+        if let Ok(v) = std::env::var("OMNIKV_LOG_LEVEL") { self.log_level = v; }
+        if let Ok(v) = std::env::var("OMNIKV_DATA_DIR") { self.storage.data_dir = v; }
+        if let Ok(v) = std::env::var("OMNIKV_WAL_PATH") { self.storage.wal_path = v; }
+        if let Ok(v) = std::env::var("OMNIKV_MANIFEST_PATH") { self.storage.manifest_path = v; }
+        if let Ok(v) = std::env::var("OMNIKV_BACKUP_DIR") { self.storage.backup_dir = v; }
+        if let Ok(v) = std::env::var("OMNIKV_LOG_DIR") { self.storage.log_dir = v; }
+        if let Ok(v) = std::env::var("OMNIKV_MAX_OPEN_FILES") {
+            if let Ok(n) = v.parse() { self.storage.max_open_files = n; }
         }
-        if let Ok(v) = std::env::var("OMNIKV_QUIC_ADDR") {
-            self.quic_addr = v;
+        if let Ok(v) = std::env::var("OMNIKV_WRITE_BUFFER_MB") {
+            if let Ok(n) = v.parse() { self.storage.write_buffer_mb = n; }
         }
-        if let Ok(v) = std::env::var("OMNIKV_PGWIRE_ADDR") {
-            self.pgwire_addr = v;
+        if let Ok(v) = std::env::var("OMNIKV_COMPACTION_WORKERS") {
+            if let Ok(n) = v.parse() { self.storage.compaction_workers = n; }
         }
-        if let Ok(v) = std::env::var("OMNIKV_TCP_ADDR") {
-            self.tcp_addr = v;
-        }
-        if let Ok(v) = std::env::var("OMNIKV_JWT_SECRET") {
-            self.jwt_secret = v;
-        }
+        if let Ok(v) = std::env::var("OMNIKV_TLS_CERT_PATH") { self.tls.cert_path = Some(v); }
+        if let Ok(v) = std::env::var("OMNIKV_TLS_KEY_PATH") { self.tls.key_path = Some(v); }
         if let Ok(v) = std::env::var("OMNIKV_TLS_INSECURE_SKIP") {
-            self.tls_insecure_skip = matches!(v.to_lowercase().as_str(), "true" | "1" | "yes");
+            self.tls.insecure_skip = v.to_lowercase() == "true";
         }
-        // TLS cert + key — both must be set to activate TLS via env.
-        let cert = std::env::var("OMNIKV_TLS_CERT_PATH").ok();
-        let key = std::env::var("OMNIKV_TLS_KEY_PATH").ok();
-        if let (Some(cert), Some(key)) = (cert, key) {
-            self.tls = Some(TlsConfig {
-                cert_path: PathBuf::from(cert),
-                key_path: PathBuf::from(key),
-            });
-        }
-        if let Ok(v) = std::env::var("OMNIKV_LOG_LEVEL") {
-            self.log_level = match v.to_lowercase().as_str() {
-                "trace" => LogLevel::Trace,
-                "debug" => LogLevel::Debug,
-                "info" => LogLevel::Info,
-                "warn" | "warning" => LogLevel::Warn,
-                "error" => LogLevel::Error,
-                _ => self.log_level.clone(),
-            };
-        }
-        if let Ok(v) = std::env::var("OMNIKV_MANIFEST_PATH") {
-            self.storage.manifest_path = PathBuf::from(v);
-        }
-        if let Ok(v) = std::env::var("OMNIKV_WAL_PATH") {
-            self.storage.wal_path = PathBuf::from(v);
-        }
-        if let Ok(v) = std::env::var("OMNIKV_BACKUP_DIR") {
-            self.storage.backup_dir = PathBuf::from(v);
+    }
+
+    /// Load from a TOML file, falling back to defaults.
+    ///
+    /// If the file exists but is malformed, logs the error and uses defaults.
+    fn from_file_or_default(path: &str) -> Self {
+        match std::fs::read_to_string(path) {
+            Ok(raw) => match toml::from_str::<Self>(&raw) {
+                Ok(cfg) => cfg,
+                Err(e) => {
+                    eprintln!("WARNING: failed to parse {path}: {e} — using defaults");
+                    Self::default()
+                }
+            },
+            Err(_) => Self::default(),
         }
     }
 }
