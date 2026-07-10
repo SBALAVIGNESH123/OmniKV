@@ -5,22 +5,17 @@
 //! lock errors, serialization traces, or Rust Debug output.
 
 use axum::body::Body;
-use axum::http::{Request, StatusCode};
+use axum::http::Request;
 use tower::ServiceExt;
 
 async fn test_app() -> axum::Router {
-    use crate::api::{AppState, build_router};
-    use std::sync::Arc;
+    use omni_engine::api::{AppState, build_router};
     use tempfile::tempdir;
 
     let dir = tempdir().unwrap();
     let manifest = dir.path().join("manifest.json");
     let wal = dir.path().join("wal.bin");
-    let db = crate::OmniKV::open(
-        &manifest.to_string_lossy(),
-        &wal.to_string_lossy(),
-    )
-    .unwrap();
+    let db = omni_engine::OmniKV::open(&manifest.to_string_lossy(), &wal.to_string_lossy()).unwrap();
     let state = AppState {
         db,
         jwt_secret: "0123456789abcdef0123456789abcdef".to_string(),
@@ -143,14 +138,14 @@ mod tests {
     #[tokio::test]
     async fn sanitize_storage_err_returns_stable_codes() {
         // Unit test the sanitizer directly
-        use crate::OmniError;
+        use omni_engine::OmniError;
         let cases = [
             (OmniError::NotFound, "NOT_FOUND"),
             (OmniError::BatchTooLarge(100), "BATCH_TOO_LARGE"),
             (OmniError::IoError("test".to_string()), "STORAGE_ERROR"),
         ];
         for (err, expected_code) in cases {
-            let result = crate::api::sanitize_storage_err(&err);
+            let result = omni_engine::api::sanitize_storage_err(&err);
             assert_eq!(
                 result, expected_code,
                 "Expected stable code '{}' for error {:?}",
