@@ -252,6 +252,7 @@ fn create_encrypted_backup_internal(
 ) -> Result<String, String> {
     let temp_path = format!("{output_path}.tmp");
     create_backup_internal(db, manifest_path, wal_path, &temp_path)?;
+    let _cleanup = TempFileCleanup::new(temp_path.clone());
 
     let mut data = Vec::new();
     File::open(&temp_path)
@@ -264,9 +265,23 @@ fn create_encrypted_backup_internal(
         .and_then(|mut f| f.write_all(&encrypted))
         .map_err(|e| format!("Write encrypted backup: {e}"))?;
 
-    let _ = std::fs::remove_file(&temp_path);
-
     Ok(output_path.to_string())
+}
+
+struct TempFileCleanup {
+    path: String,
+}
+
+impl TempFileCleanup {
+    fn new(path: String) -> Self {
+        Self { path }
+    }
+}
+
+impl Drop for TempFileCleanup {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
 }
 
 /// Restore a database from an encrypted backup.

@@ -207,6 +207,12 @@ fn build_index_value_prefix(index_id: IndexId, encoded_values: &[Vec<u8>]) -> St
     key
 }
 
+fn build_exact_index_value_prefix(index_id: IndexId, encoded_values: &[Vec<u8>]) -> String {
+    let mut key = build_index_value_prefix(index_id, encoded_values);
+    key.push('\x00');
+    key
+}
+
 /// Hex encoding for binary index values — preserves lexicographic sort order.
 fn hex_encode(data: &[u8]) -> String {
     data.iter().map(|b| format!("{:02x}", b)).collect()
@@ -361,7 +367,7 @@ impl IndexManager {
 
             // Unique constraint check
             if idx_def.unique {
-                let prefix = build_index_value_prefix(idx_def.id, &encoded_values);
+                let prefix = build_exact_index_value_prefix(idx_def.id, &encoded_values);
                 let end = format!("{}\x7f", prefix);
                 let seq = self.db.get_seq();
                 if let Ok(existing) = self.db.scan_iter(&prefix, &end, seq) {
@@ -461,7 +467,7 @@ impl IndexManager {
             .map(|(v, (_, ft))| encode_index_value(v, ft))
             .collect();
 
-        let prefix = build_index_value_prefix(idx_def.id, &encoded);
+        let prefix = build_exact_index_value_prefix(idx_def.id, &encoded);
         let end = format!("{}\x7f", prefix);
         let seq = self.db.get_seq();
 

@@ -269,6 +269,49 @@ fn test_group_commit_stats() {
 // ─── WAL Recovery ───────────────────────────────────────────
 
 #[test]
+fn test_group_commit_late_joiner_waits_for_next_epoch() {
+    use std::sync::Arc;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let gc = Arc::new(GroupCommitEngine::new(50));
+    let first = gc.join_group();
+    assert!(first.is_leader);
+
+    let (tx, rx) = mpsc::channel();
+    let gc_late = Arc::clone(&gc);
+    let handle = std::thread::spawn(move || {
+        let late = gc_late.join_group();
+        let was_leader = late.is_leader;
+        if was_leader {
+            late.mark_synced();
+        }
+        tx.send(was_leader).expect("send late joiner result");
+    });
+
+    std::thread::sleep(Duration::from_millis(25));
+    assert!(
+        rx.try_recv().is_err(),
+        "late joiner must not be released by the in-flight sync"
+    );
+
+    first.mark_synced();
+
+    let late_was_leader = rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("late joiner should complete next epoch");
+    assert!(
+        late_was_leader,
+        "late joiner should lead the next safe sync epoch"
+    );
+    handle.join().expect("late joiner thread");
+
+    let (epoch, pending) = gc.stats();
+    assert_eq!(epoch, 2);
+    assert_eq!(pending, 0);
+}
+
+#[test]
 fn test_wal_crash_recovery() {
     let dir = tempfile::tempdir().unwrap();
     let m = dir.path().join("manifest.json");

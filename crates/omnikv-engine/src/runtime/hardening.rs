@@ -11,7 +11,7 @@
 //! 3. **Connection Pool Config** — reqwest client tuning for Raft RPC.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -38,8 +38,7 @@ pub struct GroupCommitEngine {
     state: Mutex<GroupState>,
     /// Condition variable for waiting followers.
     cond: Condvar,
-    /// Monotonic epoch counter — increments on each completed sync.
-    epoch: AtomicU64,
+    // Monotonic epoch bookkeeping lives in GroupState::next_epoch.
 }
 
 struct GroupState {
@@ -47,6 +46,8 @@ struct GroupState {
     pending_count: usize,
     /// The epoch that was last committed.
     committed_epoch: u64,
+    /// The next sync epoch to assign to a leader.
+    next_epoch: u64,
     /// Whether a sync is currently in progress.
     sync_in_progress: bool,
 }
@@ -58,10 +59,10 @@ impl GroupCommitEngine {
             state: Mutex::new(GroupState {
                 pending_count: 0,
                 committed_epoch: 0,
+                next_epoch: 1,
                 sync_in_progress: false,
             }),
             cond: Condvar::new(),
-            epoch: AtomicU64::new(1),
         }
     }
 
@@ -75,13 +76,13 @@ impl GroupCommitEngine {
     /// Natural batching occurs because followers accumulate during the
     /// ~2ms fsync window.
     pub fn join_group(&self) -> GroupCommitGuard<'_> {
-        let my_epoch = self.epoch.load(Ordering::SeqCst);
-
         let mut state = self.state.lock().expect("group state");
         state.pending_count += 1;
 
         if !state.sync_in_progress {
             // No sync running → I'm the leader. Start syncing immediately.
+            let sync_epoch = state.next_epoch;
+            state.next_epoch += 1;
             state.sync_in_progress = true;
             drop(state);
 
@@ -89,29 +90,33 @@ impl GroupCommitEngine {
             GroupCommitGuard {
                 engine: self,
                 is_leader: true,
+                sync_epoch,
             }
         } else {
             // A sync is already in progress → wait as follower.
             // The leader will wake us when done.
-            while state.committed_epoch < my_epoch {
+            loop {
                 state = self.cond.wait(state).expect("condvar wait");
-            }
-            state.pending_count -= 1;
-            drop(state);
+                if !state.sync_in_progress {
+                    let sync_epoch = state.next_epoch;
+                    state.next_epoch += 1;
+                    state.sync_in_progress = true;
+                    drop(state);
 
-            GroupCommitGuard {
-                engine: self,
-                is_leader: false,
+                    return GroupCommitGuard {
+                        engine: self,
+                        is_leader: true,
+                        sync_epoch,
+                    };
+                }
             }
         }
     }
 
     /// Called by the leader after performing the actual fsync.
-    fn complete_sync(&self) {
-        let new_epoch = self.epoch.fetch_add(1, Ordering::SeqCst);
-
+    fn complete_sync(&self, sync_epoch: u64) {
         let mut state = self.state.lock().expect("group state");
-        state.committed_epoch = new_epoch;
+        state.committed_epoch = state.committed_epoch.max(sync_epoch);
         state.sync_in_progress = false;
         state.pending_count -= 1;
         drop(state);
@@ -134,13 +139,14 @@ pub struct GroupCommitGuard<'a> {
     engine: &'a GroupCommitEngine,
     /// If true, this writer must perform the fsync.
     pub is_leader: bool,
+    sync_epoch: u64,
 }
 
 impl GroupCommitGuard<'_> {
     /// Call after performing fsync (leader only). Wakes all followers.
     pub fn mark_synced(self) {
         if self.is_leader {
-            self.engine.complete_sync();
+            self.engine.complete_sync(self.sync_epoch);
         }
     }
 }

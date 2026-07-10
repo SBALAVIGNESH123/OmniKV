@@ -21,27 +21,27 @@ lazy_static! {
         "omnikv_active_transactions",
         "Number of currently active transactions"
     )
-    .unwrap();
+    .expect("OmniKV metric registration failed at startup: duplicate or invalid metric name");
     pub static ref COMPACTIONS_TOTAL: IntCounter = register_int_counter!(
         "omnikv_compactions_total",
         "Total number of compaction runs"
     )
-    .unwrap();
+    .expect("OmniKV metric registration failed at startup: duplicate or invalid metric name");
     pub static ref WRITE_LATENCY: Histogram = register_histogram!(HistogramOpts::new(
         "omnikv_write_latency_seconds",
         "Write operation latency"
     ))
-    .unwrap();
+    .expect("OmniKV metric registration failed at startup: duplicate or invalid metric name");
     pub static ref READ_LATENCY: Histogram = register_histogram!(HistogramOpts::new(
         "omnikv_read_latency_seconds",
         "Read operation latency"
     ))
-    .unwrap();
+    .expect("OmniKV metric registration failed at startup: duplicate or invalid metric name");
     pub static ref MEMTABLE_SIZE: IntGauge = register_int_gauge!(
         "omnikv_memtable_size_bytes",
         "Current memtable size in bytes"
     )
-    .unwrap();
+    .expect("OmniKV metric registration failed at startup: duplicate or invalid metric name");
     pub static ref SSTABLE_COUNT: IntGauge =
         register_int_gauge!("omnikv_sstable_count", "Total number of SSTables (L0 + L1)").expect(
             "OmniKV metric registration failed at startup: duplicate or invalid metric name"
@@ -50,7 +50,7 @@ lazy_static! {
         "omnikv_db_sequence",
         "Current database write sequence number"
     )
-    .unwrap();
+    .expect("OmniKV metric registration failed at startup: duplicate or invalid metric name");
     pub static ref UPTIME_SECONDS: IntGauge =
         register_int_gauge!("omnikv_uptime_seconds", "Server uptime in seconds").expect(
             "OmniKV metric registration failed at startup: duplicate or invalid metric name"

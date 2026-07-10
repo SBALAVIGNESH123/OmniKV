@@ -70,26 +70,76 @@ pub fn encrypt(data: &[u8], passphrase: &str) -> Result<Vec<u8>, String> {
 /// v0 format: [12-byte nonce | ciphertext]
 /// v1 format: [0x01 | 12-byte nonce | ciphertext]
 pub fn decrypt(data: &[u8], passphrase: &str) -> Result<Vec<u8>, String> {
-    if data.len() < 13 {
-        return Err("Data too short for AES-GCM".to_string());
-    }
-
-    // Detect format version
-    let (key_bytes, nonce_start) = if data[0] == ENCRYPTION_VERSION {
-        // v1: Argon2id
-        (derive_key(passphrase), 1)
+    let v1_error = if data.first() == Some(&ENCRYPTION_VERSION) {
+        match decrypt_v1(data, passphrase) {
+            Ok(plaintext) => return Ok(plaintext),
+            Err(err) => Some(err),
+        }
     } else {
-        // v0: Legacy SHA-256 (backward compatibility)
-        (derive_key_legacy(passphrase), 0)
+        None
     };
 
-    let key = Key::<Aes256Gcm>::from_slice(&key_bytes);
+    match decrypt_v0(data, passphrase) {
+        Ok(plaintext) => Ok(plaintext),
+        Err(v0_error) => Err(match v1_error {
+            Some(v1_error) => format!("Decryption failed for v1 ({v1_error}) and v0 ({v0_error})"),
+            None => v0_error,
+        }),
+    }
+}
+
+fn decrypt_v1(data: &[u8], passphrase: &str) -> Result<Vec<u8>, String> {
+    if data.len() < 13 {
+        return Err("Data too short for AES-GCM v1".to_string());
+    }
+
+    let key_bytes = derive_key(passphrase);
+    decrypt_with_key(&key_bytes, &data[1..13], &data[13..])
+}
+
+fn decrypt_v0(data: &[u8], passphrase: &str) -> Result<Vec<u8>, String> {
+    if data.len() < 12 {
+        return Err("Data too short for AES-GCM v0".to_string());
+    }
+
+    let key_bytes = derive_key_legacy(passphrase);
+    decrypt_with_key(&key_bytes, &data[..12], &data[12..])
+}
+
+fn decrypt_with_key(
+    key_bytes: &[u8; 32],
+    nonce_bytes: &[u8],
+    ciphertext: &[u8],
+) -> Result<Vec<u8>, String> {
+    let key = Key::<Aes256Gcm>::from_slice(key_bytes);
     let cipher = Aes256Gcm::new(key);
 
-    let nonce = Nonce::from_slice(&data[nonce_start..nonce_start + 12]);
-    let ciphertext = &data[nonce_start + 12..];
+    let nonce = Nonce::from_slice(nonce_bytes);
 
     cipher
         .decrypt(nonce, ciphertext)
         .map_err(|e| format!("Decryption failed: {}", e))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decrypts_legacy_v0_when_nonce_starts_with_version_byte() {
+        let passphrase = "correct horse battery staple";
+        let plaintext = b"legacy backup payload";
+        let key_bytes = derive_key_legacy(passphrase);
+        let key = Key::<Aes256Gcm>::from_slice(&key_bytes);
+        let cipher = Aes256Gcm::new(key);
+        let nonce_bytes = [ENCRYPTION_VERSION, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+        let nonce = Nonce::from_slice(&nonce_bytes);
+        let ciphertext = cipher.encrypt(nonce, plaintext.as_ref()).unwrap();
+
+        let mut legacy_payload = nonce_bytes.to_vec();
+        legacy_payload.extend_from_slice(&ciphertext);
+
+        let decrypted = decrypt(&legacy_payload, passphrase).unwrap();
+        assert_eq!(decrypted, plaintext);
+    }
 }

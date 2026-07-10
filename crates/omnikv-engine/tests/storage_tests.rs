@@ -545,6 +545,35 @@ fn test_index_create_and_lookup() {
 }
 
 #[test]
+fn test_index_exact_lookup_does_not_match_longer_prefix() {
+    let (db, _dir) = create_test_db();
+    let im = IndexManager::new(db.clone());
+
+    im.create_index(
+        "users_email_exact_idx",
+        "users",
+        vec![("email".to_string(), IndexFieldType::String)],
+        true,
+    )
+    .unwrap();
+
+    for (pk, email) in [("user1", "ab"), ("user2", "abc")] {
+        let doc = serde_json::json!({"email": email});
+        let mut batch = WriteBatch::new();
+        batch
+            .set(&format!("users:{pk}"), serde_json::to_string(&doc).unwrap())
+            .unwrap();
+        im.index_document("users", pk, &doc, &mut batch).unwrap();
+        db.commit_batch(&batch).unwrap();
+    }
+
+    let results = im
+        .lookup("users_email_exact_idx", &[serde_json::json!("ab")])
+        .unwrap();
+    assert_eq!(results, vec!["user1".to_string()]);
+}
+
+#[test]
 fn test_index_range_scan_integers() {
     let (db, _dir) = create_test_db();
     let im = IndexManager::new(db.clone());
