@@ -221,6 +221,7 @@ fn handle_authenticated_request(db: &Arc<OmniKV>, buf: &[u8], jwt_secret: &str) 
     // Verify HMAC-SHA256 signature
     let signing_input = format!("{}.{}", parts[0], parts[1]);
     use hmac::{Hmac, Mac};
+use hmac::KeyInit;
     use sha2::Sha256;
     let mut mac = match Hmac::<Sha256>::new_from_slice(jwt_secret.as_bytes()) {
         Ok(m) => m,
