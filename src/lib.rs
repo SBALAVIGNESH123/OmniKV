@@ -742,6 +742,7 @@ impl OmniKV {
             Ok(m) => m,
             Err(_) => {
                 let m = Manifest {
+                    format_version: MANIFEST_FORMAT_VERSION,
                     heap_path: format!("{}_heap.bin", manifest_path),
                     base_path: format!("{}_base.bin", manifest_path),
                     sstables: vec![],
