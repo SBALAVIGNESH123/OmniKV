@@ -4,6 +4,7 @@
 #![allow(unused_mut)]
 #![allow(mismatched_lifetime_syntaxes)]
 
+use crate::{metrics_prometheus, wal};
 use arc_swap::ArcSwap;
 use crossbeam_skiplist::SkipMap;
 use memmap2::{Mmap, MmapOptions};
@@ -36,34 +37,6 @@ impl Hasher for FnvHasher {
         }
     }
 }
-pub mod backup;
-pub mod catalog;
-pub mod chaos;
-pub mod config;
-pub mod crypto;
-pub mod dist_txn;
-pub mod generator;
-pub mod hardening;
-pub mod metrics_prometheus;
-pub mod ops;
-pub mod optimizer;
-pub mod pgwire;
-pub mod plan_exec;
-pub mod prepared;
-pub mod query;
-pub mod raft_impl;
-pub mod raft_init;
-pub mod raft_network;
-pub mod raft_routes;
-pub mod raft_storage;
-pub mod schema;
-pub mod secondary_index;
-pub mod sql;
-pub mod sql_exec;
-pub mod transaction;
-pub mod volcano;
-pub mod wal;
-
 #[derive(Debug, Clone)]
 pub enum OmniError {
     IoError(String),
@@ -175,19 +148,47 @@ impl OmniRecord {
         if buf.len() < 42 {
             return None;
         }
-        let key_len = u16::from_le_bytes(buf[8..10].try_into().unwrap()) as usize;
+        let key_len = u16::from_le_bytes(
+            buf[8..10]
+                .try_into()
+                .expect("record header length was prevalidated"),
+        ) as usize;
         if buf.len() < 42 + key_len {
             return None;
         }
 
-        let seq = u64::from_le_bytes(buf[0..8].try_into().unwrap());
+        let seq = u64::from_le_bytes(
+            buf[0..8]
+                .try_into()
+                .expect("record sequence length was prevalidated"),
+        );
         let key = buf[10..10 + key_len].to_vec();
         let off = 10 + key_len;
-        let offset = u64::from_le_bytes(buf[off..off + 8].try_into().unwrap());
-        let length = u64::from_le_bytes(buf[off + 8..off + 16].try_into().unwrap());
-        let payload_crc32 = u32::from_le_bytes(buf[off + 16..off + 20].try_into().unwrap());
-        let expiry = u64::from_le_bytes(buf[off + 20..off + 28].try_into().unwrap());
-        let crc32 = u32::from_le_bytes(buf[off + 28..off + 32].try_into().unwrap());
+        let offset = u64::from_le_bytes(
+            buf[off..off + 8]
+                .try_into()
+                .expect("record offset length was prevalidated"),
+        );
+        let length = u64::from_le_bytes(
+            buf[off + 8..off + 16]
+                .try_into()
+                .expect("record value length field was prevalidated"),
+        );
+        let payload_crc32 = u32::from_le_bytes(
+            buf[off + 16..off + 20]
+                .try_into()
+                .expect("record payload checksum length was prevalidated"),
+        );
+        let expiry = u64::from_le_bytes(
+            buf[off + 20..off + 28]
+                .try_into()
+                .expect("record expiry length was prevalidated"),
+        );
+        let crc32 = u32::from_le_bytes(
+            buf[off + 28..off + 32]
+                .try_into()
+                .expect("record checksum length was prevalidated"),
+        );
         let rec = Self {
             seq,
             key,
@@ -415,12 +416,20 @@ impl Metrics {
     pub fn new() -> Self {
         Self {
             read_latencies: Mutex::new(
-                hdrhistogram::Histogram::<u64>::new_with_bounds(1, 10_000_000, 3)
-                    .unwrap_or_else(|_| hdrhistogram::Histogram::new(3).unwrap()),
+                hdrhistogram::Histogram::<u64>::new_with_bounds(1, 10_000_000, 3).unwrap_or_else(
+                    |_| {
+                        hdrhistogram::Histogram::new(3)
+                            .expect("default histogram precision must be valid")
+                    },
+                ),
             ),
             commit_latencies: Mutex::new(
-                hdrhistogram::Histogram::<u64>::new_with_bounds(1, 10_000_000, 3)
-                    .unwrap_or_else(|_| hdrhistogram::Histogram::new(3).unwrap()),
+                hdrhistogram::Histogram::<u64>::new_with_bounds(1, 10_000_000, 3).unwrap_or_else(
+                    |_| {
+                        hdrhistogram::Histogram::new(3)
+                            .expect("default histogram precision must be valid")
+                    },
+                ),
             ),
         }
     }
@@ -446,7 +455,7 @@ impl<'a> SSTableReader<'a> {
         let index_offset = u64::from_le_bytes(
             self.data[self.data.len() - 16..self.data.len() - 8]
                 .try_into()
-                .unwrap(),
+                .expect("SSTable trailer offset length was prevalidated"),
         ) as usize;
         if index_offset >= self.data.len() {
             return Some(0);
@@ -456,7 +465,11 @@ impl<'a> SSTableReader<'a> {
         if index_data.len() < 8 {
             return Some(0);
         }
-        let num_entries = u64::from_le_bytes(index_data[0..8].try_into().unwrap()) as usize;
+        let num_entries = u64::from_le_bytes(
+            index_data[0..8]
+                .try_into()
+                .expect("SSTable index header length was prevalidated"),
+        ) as usize;
 
         let mut entries = Vec::with_capacity(num_entries);
         let mut curr = 8;
@@ -464,16 +477,22 @@ impl<'a> SSTableReader<'a> {
             if curr + 2 > index_data.len() {
                 break;
             }
-            let key_len =
-                u16::from_le_bytes(index_data[curr..curr + 2].try_into().unwrap()) as usize;
+            let key_len = u16::from_le_bytes(
+                index_data[curr..curr + 2]
+                    .try_into()
+                    .expect("SSTable index key length was prevalidated"),
+            ) as usize;
             curr += 2;
             if curr + key_len + 8 > index_data.len() {
                 break;
             }
             let key = &index_data[curr..curr + key_len];
             curr += key_len;
-            let offset =
-                u64::from_le_bytes(index_data[curr..curr + 8].try_into().unwrap()) as usize;
+            let offset = u64::from_le_bytes(
+                index_data[curr..curr + 8]
+                    .try_into()
+                    .expect("SSTable index block offset was prevalidated"),
+            ) as usize;
             curr += 8;
             entries.push((key, offset));
         }
@@ -496,7 +515,7 @@ impl<'a> SSTableReader<'a> {
                 let index_offset = u64::from_le_bytes(
                     self.data[self.data.len() - 16..self.data.len() - 8]
                         .try_into()
-                        .unwrap(),
+                        .expect("SSTable trailer offset length was prevalidated"),
                 ) as usize;
                 if offset >= index_offset {
                     break;
@@ -543,7 +562,7 @@ impl<'a> Iterator for SSTableIterator<'a> {
             let index_offset = u64::from_le_bytes(
                 self.data[self.data.len() - 16..self.data.len() - 8]
                     .try_into()
-                    .unwrap(),
+                    .expect("SSTable trailer offset length was prevalidated"),
             ) as usize;
             if self.offset >= index_offset {
                 return None;
@@ -589,7 +608,13 @@ impl<'a> SSTableWriter<'a> {
         self.offset += bytes.len();
 
         if self.current_block_start_key.is_some()
-            && self.offset as u64 - self.index.last().unwrap().1 >= self.block_size as u64
+            && self.offset as u64
+                - self
+                    .index
+                    .last()
+                    .expect("current block marker implies at least one index entry")
+                    .1
+                >= self.block_size as u64
         {
             self.current_block_start_key = None;
         }
@@ -1860,7 +1885,7 @@ impl OmniKV {
             for rec in reader.iter_from(b"") {
                 if rec.is_valid() {
                     let existing = merged.get(&rec.key);
-                    if existing.is_none() || existing.unwrap().0 < rec.seq {
+                    if existing.is_none_or(|existing| existing.0 < rec.seq) {
                         merged.insert(
                             rec.key.clone(),
                             (
@@ -1984,7 +2009,7 @@ impl OmniKV {
         for rec in reader.iter_from(b"") {
             if rec.is_valid() {
                 let existing = merged.get(&rec.key);
-                if existing.is_none() || existing.unwrap().0 < rec.seq {
+                if existing.is_none_or(|existing| existing.0 < rec.seq) {
                     merged.insert(
                         rec.key,
                         (
@@ -2010,7 +2035,7 @@ impl OmniKV {
             for rec in reader.iter_from(b"") {
                 if rec.is_valid() {
                     let existing = merged.get(&rec.key);
-                    if existing.is_none() || existing.unwrap().0 < rec.seq {
+                    if existing.is_none_or(|existing| existing.0 < rec.seq) {
                         merged.insert(
                             rec.key,
                             (

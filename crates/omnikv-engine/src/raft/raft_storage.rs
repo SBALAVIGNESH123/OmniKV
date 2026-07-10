@@ -72,8 +72,11 @@ impl OmniRaftStorage {
     }
 
     fn save_meta(&self, meta: &RaftStateMeta, batch: &mut WriteBatch) {
-        let json = serde_json::to_string(meta).unwrap();
-        batch.set(RAFT_META_KEY, json).unwrap();
+        let json = serde_json::to_string(meta)
+            .expect("RaftStateMeta serialization should not fail for supported fields");
+        batch
+            .set(RAFT_META_KEY, json)
+            .expect("internal Raft metadata key must be valid");
     }
 
     // ═══════════════════════════════════════════════════════════════════════

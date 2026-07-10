@@ -1,6 +1,6 @@
 //! Storage format versioning tests — issue #14.
 //!
-//! Run with: `cargo test --test storage_format_versioning -- --test-threads=1`
+//! Run with: `cargo test -p omnikv-engine --test storage_format_versioning -- --test-threads=1`
 
 use std::fs;
 

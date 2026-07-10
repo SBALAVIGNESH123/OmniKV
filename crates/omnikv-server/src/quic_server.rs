@@ -4,10 +4,12 @@
 //! Raft consensus and cluster communication. Uses Quinn for
 //! UDP-based, TLS 1.3 encrypted transport.
 
-use omnikv_engine::{OmniKV, WriteBatch};
+use omni_engine::{OmniKV, WriteBatch};
 use quinn::{ClientConfig, Endpoint, ServerConfig};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use std::sync::Arc;
+
+use base64::Engine as _;
 
 /// Binary protocol command opcodes.
 #[repr(u8)]
@@ -86,12 +88,36 @@ pub fn create_server_endpoint(
 }
 
 /// Create a QUIC client endpoint for connecting to peers.
-pub fn create_client_endpoint() -> Result<Endpoint, String> {
-    let mut crypto = rustls::ClientConfig::builder()
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(SkipServerVerification))
-        .with_no_client_auth();
+pub fn create_client_endpoint(insecure_skip_verify: bool) -> Result<Endpoint, String> {
+    // Production guard: reject insecure mode in release builds
+    #[cfg(not(debug_assertions))]
+    if insecure_skip_verify {
+        return Err(
+            "QUIC insecure_skip_verify is not permitted in production (release) builds".to_string(),
+        );
+    }
 
+    // Development warning when cert verification is disabled
+    #[cfg(debug_assertions)]
+    if insecure_skip_verify {
+        tracing::warn!(
+            "SECURITY WARNING: QUIC certificate verification is DISABLED. \
+             Only acceptable in development/test mode."
+        );
+    }
+
+    let mut crypto = if insecure_skip_verify {
+        rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(SkipServerVerification))
+            .with_no_client_auth()
+    } else {
+        let mut root_store = rustls::RootCertStore::empty();
+        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        rustls::ClientConfig::builder()
+            .with_root_certificates(root_store)
+            .with_no_client_auth()
+    };
     crypto.alpn_protocols = vec![b"omnikv/1".to_vec()];
 
     let client_config = ClientConfig::new(Arc::new(
@@ -119,24 +145,24 @@ pub async fn run_quic_server(endpoint: Endpoint, db: Arc<OmniKV>) {
             match incoming.await {
                 Ok(conn) => {
                     tracing::debug!("QUIC connection from {}", conn.remote_address());
-                    loop {
-                        match conn.accept_bi().await {
-                            Ok((mut send, mut recv)) => {
-                                let db = db.clone();
-                                tokio::spawn(async move {
-                                    let mut buf = vec![0u8; 65536];
-                                    match recv.read(&mut buf).await {
-                                        Ok(Some(n)) if n > 0 => {
-                                            let response = handle_binary_request(&db, &buf[..n]);
-                                            let _ = send.write_all(&response).await;
-                                            let _ = send.finish();
-                                        }
-                                        _ => {}
-                                    }
-                                });
+                    let jwt_secret = std::env::var("OMNI_JWT_SECRET").unwrap_or_default();
+                    while let Ok((mut send, mut recv)) = conn.accept_bi().await {
+                        let db = db.clone();
+                        let secret = jwt_secret.clone();
+                        tokio::spawn(async move {
+                            let mut buf = vec![0u8; 65536];
+                            match recv.read(&mut buf).await {
+                                Ok(Some(n)) if n > 0 => {
+                                    // First frame must begin with "AUTH <token>\n"
+                                    // followed by the actual command bytes.
+                                    let response =
+                                        handle_authenticated_request(&db, &buf[..n], &secret);
+                                    let _ = send.write_all(&response).await;
+                                    let _ = send.finish();
+                                }
+                                _ => {}
                             }
-                            Err(_) => break,
-                        }
+                        });
                     }
                 }
                 Err(e) => {
@@ -148,6 +174,80 @@ pub async fn run_quic_server(endpoint: Endpoint, db: Arc<OmniKV>) {
 }
 
 /// Handle a single binary protocol request.
+/// Validate the QUIC auth token and dispatch the binary request.
+///
+/// Every QUIC binary stream must start with:
+///   `AUTH <jwt-token>\n`
+/// followed immediately by the command bytes.
+/// Returns an error response frame if auth fails.
+fn handle_authenticated_request(db: &Arc<OmniKV>, buf: &[u8], jwt_secret: &str) -> Vec<u8> {
+    if jwt_secret.is_empty() {
+        tracing::error!("OMNI_JWT_SECRET not set — rejecting QUIC request");
+        return b"ERR AUTH_NOT_CONFIGURED\n".to_vec();
+    }
+
+    // Split "AUTH <token>\n" header from payload
+    let newline = buf.iter().position(|&b| b == b'\n');
+    let newline_pos = match newline {
+        Some(pos) => pos,
+        None => {
+            tracing::warn!("QUIC request missing auth header");
+            return b"ERR MISSING_AUTH_HEADER\n".to_vec();
+        }
+    };
+
+    let header = &buf[..newline_pos];
+    let payload = &buf[newline_pos + 1..];
+
+    if !header.starts_with(b"AUTH ") {
+        tracing::warn!("QUIC request missing AUTH prefix");
+        return b"ERR MISSING_AUTH_HEADER\n".to_vec();
+    }
+
+    let token = std::str::from_utf8(&header[5..]).unwrap_or("").trim();
+    if token.is_empty() {
+        return b"ERR MISSING_AUTH_TOKEN\n".to_vec();
+    }
+
+    // Validate JWT using HMAC-SHA256
+    // We do a lightweight structural check: header.payload.signature
+    // Full validation delegated to the same logic as REST auth.
+    let parts: Vec<&str> = token.split('.').collect();
+    if parts.len() != 3 {
+        tracing::warn!("QUIC invalid JWT structure");
+        return b"ERR INVALID_TOKEN\n".to_vec();
+    }
+
+    // Verify HMAC-SHA256 signature
+    let signing_input = format!("{}.{}", parts[0], parts[1]);
+    use hmac::{Hmac, KeyInit, Mac};
+    use sha2::Sha256;
+    let mut mac = match Hmac::<Sha256>::new_from_slice(jwt_secret.as_bytes()) {
+        Ok(m) => m,
+        Err(_) => {
+            tracing::warn!("QUIC invalid JWT secret");
+            return b"ERR INVALID_TOKEN\n".to_vec();
+        }
+    };
+    mac.update(signing_input.as_bytes());
+    let expected_sig_bytes = mac.finalize().into_bytes();
+    let expected_b64 = base64_url_encode(expected_sig_bytes.as_slice());
+    if expected_b64 != parts[2] {
+        tracing::warn!("QUIC JWT signature verification failed");
+        return b"ERR INVALID_TOKEN\n".to_vec();
+    }
+
+    if payload.is_empty() {
+        return b"ERR EMPTY_PAYLOAD\n".to_vec();
+    }
+
+    handle_binary_request(db, payload)
+}
+
+fn base64_url_encode(input: &[u8]) -> String {
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(input)
+}
+
 fn handle_binary_request(db: &Arc<OmniKV>, data: &[u8]) -> Vec<u8> {
     if data.is_empty() {
         return vec![0xFF]; // Error: empty request

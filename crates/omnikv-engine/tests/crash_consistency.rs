@@ -6,7 +6,7 @@
 //!   3. Simulates a crash (drop the engine, optionally corrupt on-disk files)
 //!   4. Reopens the engine and asserts recovery semantics
 //!
-//! Run with: `cargo test --test crash_consistency -- --test-threads=1`
+//! Run with: `cargo test -p omnikv-engine --test crash_consistency -- --test-threads=1`
 
 use std::fs;
 use std::io::Write;

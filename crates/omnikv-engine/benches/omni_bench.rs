@@ -4,10 +4,10 @@
 //! Outputs: ops/sec, latency percentiles (p50/p95/p99), thread scaling.
 //!
 //! Usage:
-//!   cargo run --bin omni_bench --release
-//!   cargo run --bin omni_bench --release -- --soak 600   # 10-min soak
+//!   cargo bench -p omnikv-engine --bench omni_bench
+//!   cargo bench -p omnikv-engine --bench omni_bench -- --soak 600   # 10-min soak
 
-use omnikv_engine::{OmniKV, WriteBatch};
+use omni_engine::{OmniKV, WriteBatch};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -298,7 +298,7 @@ fn bench_mixed_workload(db: &Arc<OmniKV>, ops: u64) {
 }
 
 fn bench_transaction_overhead(db: &Arc<OmniKV>, count: u64) {
-    use omnikv_engine::transaction::TransactionManager;
+    use omni_engine::transaction::TransactionManager;
     let tm = TransactionManager::new(db.clone());
     let mut lat = LatencyTracker::new();
     let total_start = Instant::now();

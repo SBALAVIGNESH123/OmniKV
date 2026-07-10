@@ -30,11 +30,11 @@ The primary goal is correctness and durability. The project includes crash-recov
 ```bash
 git clone https://github.com/SBALAVIGNESH123/OmniKV.git
 cd OmniKV
-cargo build --release
+cargo build --workspace --release
 export OMNIKV_JWT_SECRET="$(openssl rand -hex 32)"
 export OMNIKV_BOOTSTRAP_ADMIN_KEY="$(openssl rand -hex 32)"
 export OMNIKV_TLS_INSECURE_SKIP=true # local quick start only
-cargo run --release
+cargo run -p omnikv-server --release
 ```
 
 Connect using standard `psql`:
@@ -90,7 +90,7 @@ db.unregister_snapshot(snap);
 OmniKV has a broad test suite covering storage durability, SQL features, concurrent stress, operations, and Raft cluster behavior.
 
 ```bash
-cargo test --all-targets
+cargo test --workspace --all-targets
 ```
 
 On Windows/MSVC, full debug test linking can require significant free disk space because large PDB/debug artifacts are generated. If you hit linker errors such as `LNK1140` or `os error 112`, free disk space or run smaller test groups from `CONTRIBUTING.md`.
@@ -98,6 +98,16 @@ On Windows/MSVC, full debug test linking can require significant free disk space
 ## Operations docs
 
 - [Backup and restore](docs/backup_restore.md)
+
+## Workspace layout
+
+OmniKV is organized as a Cargo workspace:
+
+- `crates/omnikv-engine` — embeddable library crate, exposed to Rust code as `omni_engine`.
+- `crates/omnikv-server` — executable server crate for REST, QUIC, TCP, and PgWire.
+- `omni-client` — Rust client package.
+
+The engine source is grouped by domain under `storage/`, `query/`, `raft/`, and `runtime/`. The benchmark driver lives under `crates/omnikv-engine/benches/` instead of the library source root.
 
 ## Known limitations
 

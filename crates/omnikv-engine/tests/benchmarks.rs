@@ -1,7 +1,7 @@
 //! OmniKV Benchmark Suite
 //!
 //! Comparative benchmarks against industry databases.
-//! Run with: `cargo bench` or `cargo test --test benchmarks --release`
+//! Run with: `cargo bench -p omnikv-engine` or `cargo test -p omnikv-engine --test benchmarks --release`
 //!
 //! Measures:
 //! - Sequential write throughput (ops/sec)

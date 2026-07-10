@@ -8,11 +8,11 @@ use std::path::Path;
 
 /// Source files that must not contain bare `.unwrap()` without justification.
 const PRODUCTION_FILES: &[&str] = &[
-    "src/raft_storage.rs",
-    "src/catalog.rs",
-    "src/transaction.rs",
-    "src/lib.rs",
-    "src/raft_network.rs",
+    "src/raft/raft_storage.rs",
+    "src/query/catalog.rs",
+    "src/storage/transaction.rs",
+    "src/storage/core.rs",
+    "src/raft/raft_network.rs",
 ];
 
 /// Patterns that are allowed (preceded by a SAFETY comment or in an approved form).
@@ -120,7 +120,7 @@ fn lock_acquires_have_expect_messages() {
 #[test]
 fn panic_policy_doc_exists() {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    let doc_path = Path::new(manifest_dir).join("docs/PANIC_POLICY.md");
+    let doc_path = Path::new(manifest_dir).join("../../docs/PANIC_POLICY.md");
     assert!(
         doc_path.exists(),
         "docs/PANIC_POLICY.md must exist — see issue #46"

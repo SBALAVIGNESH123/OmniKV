@@ -12,7 +12,7 @@ use axum::Json;
 use axum::extract::State;
 use axum::response::IntoResponse;
 
-use crate::raft_impl::{OmniRaft, TypeConfig};
+use omni_engine::raft_impl::{OmniRaft, TypeConfig};
 use openraft::raft::{
     AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
     VoteRequest, VoteResponse,

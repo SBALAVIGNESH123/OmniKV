@@ -21,7 +21,7 @@ crash-consistency test suite.
 
 ## Failure Injection Harness
 
-The harness lives in `src/failpoints.rs`. It uses a process-global registry
+The harness lives in `crates/omnikv-engine/src/runtime/failpoints.rs`. It uses a process-global registry
 gated by the `failpoints` Cargo feature. When the feature is disabled (the default
 for release builds), all injection points compile away to no-ops. If you build
 with `--features failpoints`, the hooks are compiled in regardless of profile.
@@ -29,19 +29,17 @@ with `--features failpoints`, the hooks are compiled in regardless of profile.
 ### Usage
 
 ```rust
-use omnikv::failpoints::{arm, disarm_all, FailureMode};
+use omni_engine::failpoints::FailRegistry;
 
 // Arm a point to panic on the 3rd call:
-arm("wal::sync", FailureMode::OnNthCall {
-    n: 3,
-    mode: Box::new(FailureMode::Panic),
-});
+let registry = FailRegistry::new();
+registry.arm("wal::sync");
 
 // Run the code under test
 // ...
 
 // Always clean up
-disarm_all();
+registry.reset();
 ```
 
 ### Adding a Failure Point to Production Code
@@ -61,15 +59,15 @@ pub fn sync(&mut self) -> io::Result<()> {
 
 ```bash
 # All crash-consistency tests (single-threaded for determinism):
-cargo test --test crash_consistency -- --test-threads=1 --nocapture
+cargo test -p omnikv-engine --test crash_consistency -- --test-threads=1 --nocapture
 
 # With failure-injection feature enabled:
-cargo test --test crash_consistency --features failpoints -- --test-threads=1 --nocapture
+cargo test -p omnikv-engine --test crash_consistency --features failpoints -- --test-threads=1 --nocapture
 
 # Full storage suite:
-cargo test --test durability_evidence -- --test-threads=1 --nocapture
-cargo test --test backup_restore -- --test-threads=1 --nocapture
-cargo test --test crash_consistency -- --test-threads=1 --nocapture
+cargo test -p omnikv-engine --test durability_evidence -- --test-threads=1 --nocapture
+cargo test -p omnikv-engine --test backup_restore -- --test-threads=1 --nocapture
+cargo test -p omnikv-engine --test crash_consistency -- --test-threads=1 --nocapture
 ```
 
 ## Test Inventory
@@ -89,7 +87,7 @@ cargo test --test crash_consistency -- --test-threads=1 --nocapture
 
 ## Acceptance Criteria (Issue #10)
 
-- [x] Failure-injection harness exists and is documented (`src/failpoints.rs`)
+- [x] Failure-injection harness exists and is documented (`crates/omnikv-engine/src/runtime/failpoints.rs`)
 - [x] WAL tail corruption recovery is tested
 - [x] Manifest corruption/truncation behaviour is tested
 - [x] SSTable corruption detection is tested
