@@ -1,0 +1,5 @@
+edition = "2021"
+imports_granularity = "Preserve"
+group_imports = "Preserve"
+max_width = 100
+tab_spaces = 4
