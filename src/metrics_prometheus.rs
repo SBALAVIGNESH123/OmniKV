@@ -40,6 +40,10 @@ lazy_static! {
     .unwrap();
     pub static ref SSTABLE_COUNT: IntGauge =
         register_int_gauge!("omnikv_sstable_count", "Total number of SSTables (L0 + L1)").unwrap();
+    pub static ref DB_SEQUENCE: IntGauge =
+        register_int_gauge!("omnikv_db_sequence", "Current database write sequence number").unwrap();
+    pub static ref UPTIME_SECONDS: IntGauge =
+        register_int_gauge!("omnikv_uptime_seconds", "Server uptime in seconds").unwrap();
     pub static ref COMMIT_RATE: IntCounter =
         register_int_counter!("omnikv_commits_total", "Total number of committed batches").unwrap();
 }
@@ -53,4 +57,11 @@ pub fn render_metrics() -> String {
         .encode(&metric_families, &mut buffer)
         .unwrap_or_default();
     String::from_utf8(buffer).unwrap_or_default()
+}
+
+/// Update DB-level gauges. Call this periodically or per-request.
+pub fn record_db_stats(seq: u64, sstable_count: usize, uptime_secs: u64) {
+    DB_SEQUENCE.set(seq as i64);
+    SSTABLE_COUNT.set(sstable_count as i64);
+    UPTIME_SECONDS.set(uptime_secs as i64);
 }
