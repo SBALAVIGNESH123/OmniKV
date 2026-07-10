@@ -17,7 +17,7 @@ use axum::{
     middleware,
     response::{IntoResponse, Response},
 };
-use omni_engine::{OmniKV, WriteBatch};
+use omni_engine::{OmniError, OmniKV, WriteBatch};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tower_http::cors::CorsLayer;
@@ -135,18 +135,16 @@ impl RequiredRole {
     }
 }
 
-/// Build the Axum router with all API routes.
-
 /// Map internal storage errors to stable, sanitized client-facing error codes.
 /// Internal error details are never exposed to clients — they are logged server-side.
-fn sanitize_storage_err(e: &crate::OmniError) -> String {
+fn sanitize_storage_err(e: &OmniError) -> String {
     // Log full error server-side for operators
     tracing::error!(error = ?e, "internal storage error");
     // Return stable, opaque code to client
     match e {
-        crate::OmniError::NotFound => "NOT_FOUND".to_string(),
-        crate::OmniError::BatchTooLarge(_) => "BATCH_TOO_LARGE".to_string(),
-        crate::OmniError::UnsupportedVersion { .. } => "UNSUPPORTED_VERSION".to_string(),
+        OmniError::NotFound => "NOT_FOUND".to_string(),
+        OmniError::BatchTooLarge(_) => "BATCH_TOO_LARGE".to_string(),
+        OmniError::UnsupportedVersion { .. } => "UNSUPPORTED_VERSION".to_string(),
         _ => "STORAGE_ERROR".to_string(),
     }
 }
