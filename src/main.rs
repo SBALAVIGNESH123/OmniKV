@@ -68,7 +68,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let wal_path = cfg.storage.wal_path.clone();
 
     // Open the database using configured paths.
-    let db = OmniKV::open(manifest_path.clone(), wal_path.clone())?;
+    let db = OmniKV::open(&manifest_path, &wal_path)?;
     tracing::info!(
         seq = db.get_seq(),
         sstables = db.sstable_count(),
