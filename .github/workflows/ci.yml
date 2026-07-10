@@ -36,11 +36,11 @@ jobs:
           target
         key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
     - name: Build library
-      run: cargo build --lib
+      run: cargo build -p omnikv-engine --lib
     - name: Build binary
-      run: cargo build --release
+      run: cargo build -p omnikv-server --release
     - name: Build all targets
-      run: cargo build --all-targets
+      run: cargo build --workspace --all-targets
 
   test-storage:
     name: Storage Tests
@@ -59,15 +59,15 @@ jobs:
           target
         key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
     - name: Storage tests (76 tests)
-      run: cargo test --test storage_tests -- --test-threads=1
+      run: cargo test -p omnikv-engine --test storage_tests -- --test-threads=1
     - name: Storage correctness (14 tests)
-      run: cargo test --test storage_correctness -- --test-threads=1
+      run: cargo test -p omnikv-engine --test storage_correctness -- --test-threads=1
     - name: Storage engine (19 tests)
-      run: cargo test --test storage_engine -- --test-threads=1
+      run: cargo test -p omnikv-engine --test storage_engine -- --test-threads=1
     - name: Backup/restore contract
-      run: cargo test --test backup_restore -- --test-threads=1
+      run: cargo test -p omnikv-engine --test backup_restore -- --test-threads=1
     - name: Storage perf (21 tests)
-      run: cargo test --test storage_perf -- --test-threads=1 --nocapture
+      run: cargo test -p omnikv-engine --test storage_perf -- --test-threads=1 --nocapture
 
   test-transactions:
     name: Transaction & Concurrency Tests
@@ -86,11 +86,11 @@ jobs:
           target
         key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
     - name: SSI anomaly demos (4 tests)
-      run: cargo test --test anomaly_demos -- --test-threads=1
+      run: cargo test -p omnikv-engine --test anomaly_demos -- --test-threads=1
     - name: Concurrent stress tests (6 tests)
-      run: cargo test --test concurrent_stress -- --test-threads=1 --nocapture
+      run: cargo test -p omnikv-engine --test concurrent_stress -- --test-threads=1 --nocapture
     - name: Operations (25 tests)
-      run: cargo test --test operations -- --test-threads=1
+      run: cargo test -p omnikv-engine --test operations -- --test-threads=1
 
   test-sql:
     name: SQL & Ops Tests
@@ -109,11 +109,11 @@ jobs:
           target
         key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
     - name: SQL layer (18 tests)
-      run: cargo test --test sql_layer -- --test-threads=1
+      run: cargo test -p omnikv-engine --test sql_layer -- --test-threads=1
     - name: SQL v3 feature coverage
-      run: cargo test --test sql_v3_features -- --test-threads=1
+      run: cargo test -p omnikv-engine --test sql_v3_features -- --test-threads=1
     - name: Ops maturity (24 tests)
-      run: cargo test --test ops_maturity -- --test-threads=1 --nocapture
+      run: cargo test -p omnikv-engine --test ops_maturity -- --test-threads=1 --nocapture
 
   test-raft:
     name: Raft Consensus Tests
@@ -132,7 +132,7 @@ jobs:
           target
         key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
     - name: Raft cluster (58 tests)
-      run: cargo test --test raft_cluster -- --test-threads=1
+      run: cargo test -p omnikv-engine --test raft_cluster -- --test-threads=1
 
   clippy:
     name: Clippy Lint (All Targets)
@@ -144,7 +144,7 @@ jobs:
     - uses: dtolnay/rust-toolchain@stable
       with:
         components: clippy
-    - run: cargo clippy --all-targets -- -D warnings
+    - run: cargo clippy --workspace --all-targets -- -D warnings
 
   benchmark-smoke:
     name: Benchmark Smoke
@@ -163,7 +163,7 @@ jobs:
           target
         key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
     - name: Benchmark suite smoke test
-      run: cargo test --test benchmarks --release -- --test-threads=1 --nocapture
+      run: cargo test -p omnikv-engine --test benchmarks --release -- --test-threads=1 --nocapture
 
   fmt:
     name: Format Check

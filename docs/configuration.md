@@ -9,7 +9,7 @@ applies environment-variable overrides. Two modes are supported:
 ## Quick start — development
 
 ```bash
-cargo run --bin omnikv-server
+cargo run -p omnikv-server
 # Uses all defaults: 127.0.0.1:7070, dev JWT secret, no TLS required
 ```
 
@@ -24,7 +24,7 @@ export OMNIKV_TLS_CERT_PATH=/etc/omnikv/tls/cert.pem
 export OMNIKV_TLS_KEY_PATH=/etc/omnikv/tls/key.pem
 export OMNIKV_DATA_DIR=/var/lib/omnikv/data
 export OMNIKV_BACKUP_DIR=/var/lib/omnikv/backups
-cargo run --bin omnikv-server
+cargo run -p omnikv-server
 ```
 
 ---

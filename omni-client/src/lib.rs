@@ -154,7 +154,12 @@ impl OmniClient {
     }
 
     /// SET with optional TTL.
-    pub async fn set_with_ttl(&self, key: &str, value: &str, ttl: Option<u64>) -> Result<u64, OmniClientError> {
+    pub async fn set_with_ttl(
+        &self,
+        key: &str,
+        value: &str,
+        ttl: Option<u64>,
+    ) -> Result<u64, OmniClientError> {
         let url = format!("{}/kv", self.base_url);
         let body = SetRequest {
             key: key.to_string(),
@@ -186,7 +191,12 @@ impl OmniClient {
     }
 
     /// SCAN a key range.
-    pub async fn scan(&self, start: &str, end: &str, limit: Option<usize>) -> Result<Vec<KvPair>, OmniClientError> {
+    pub async fn scan(
+        &self,
+        start: &str,
+        end: &str,
+        limit: Option<usize>,
+    ) -> Result<Vec<KvPair>, OmniClientError> {
         let mut url = format!("{}/scan?start={}&end={}", self.base_url, start, end);
         if let Some(l) = limit {
             url.push_str(&format!("&limit={}", l));
@@ -218,7 +228,8 @@ impl OmniClient {
         let url = format!("{}/health", self.base_url);
         let resp = self.client.get(&url).send().await?;
         let body: ApiResponse<HealthStatus> = resp.json().await?;
-        body.data.ok_or_else(|| OmniClientError::Api("No health data".into()))
+        body.data
+            .ok_or_else(|| OmniClientError::Api("No health data".into()))
     }
 
     /// Fetch Prometheus metrics as raw text.

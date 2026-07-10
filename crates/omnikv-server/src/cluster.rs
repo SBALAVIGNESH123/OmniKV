@@ -3,7 +3,7 @@
 //! Manages the distributed cluster topology and coordinates
 //! write forwarding between leader and follower nodes.
 
-use omnikv_engine::WriteBatch;
+use omni_engine::WriteBatch;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tokio::sync::{mpsc, oneshot};
 
