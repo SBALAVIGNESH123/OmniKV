@@ -32,7 +32,7 @@ rustls = { version = "0.23.40", features = ["ring"] }
 quinn = "0.11.9"
 moka = { version = "0.12", features = ["sync"] }
 toml = "0.8"
-jsonwebtoken = { version = "10.4.0", default-features = false, features = ["hmac", "sha2"] }
+jsonwebtoken = { version = "10.4.0", default-features = false, features = ["aws_lc_rs"] }
 tar = "0.4.45"
 flate2 = "1.1.9"
 aes-gcm = "0.10.3"
@@ -55,3 +55,4 @@ path = "src/bench.rs"
 
 [dev-dependencies]
 tempfile = "3.15"
+tower = { version = "0.5", features = ["util"] }

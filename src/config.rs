@@ -3,6 +3,7 @@ use std::{fmt, path::Path};
 use serde::{Deserialize, Serialize};
 
 pub const DEV_JWT_SECRET: &str = "dev-secret-do-not-use-in-production";
+pub const DEV_BOOTSTRAP_ADMIN_KEY: &str = "dev-bootstrap-admin-key-do-not-use-in-production";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
@@ -70,6 +71,8 @@ pub struct ServerConfig {
     pub tcp_addr: String,
     #[serde(default = "default_jwt_secret")]
     pub jwt_secret: String,
+    #[serde(default = "default_bootstrap_admin_key")]
+    pub bootstrap_admin_key: String,
     #[serde(default)]
     pub tls_cert_path: Option<String>,
     #[serde(default)]
@@ -102,6 +105,10 @@ fn default_jwt_secret() -> String {
     DEV_JWT_SECRET.into()
 }
 
+fn default_bootstrap_admin_key() -> String {
+    DEV_BOOTSTRAP_ADMIN_KEY.into()
+}
+
 fn default_log_level() -> String {
     "info".into()
 }
@@ -115,6 +122,7 @@ impl Default for ServerConfig {
             pgwire_addr: default_pgwire_addr(),
             tcp_addr: default_tcp_addr(),
             jwt_secret: default_jwt_secret(),
+            bootstrap_admin_key: default_bootstrap_admin_key(),
             tls_cert_path: None,
             tls_key_path: None,
             tls_insecure_skip: false,
@@ -171,6 +179,13 @@ impl ServerConfig {
         }
         if let Ok(v) = std::env::var("OMNIKV_JWT_SECRET") {
             self.jwt_secret = v;
+        } else if let Ok(v) = std::env::var("OMNI_JWT_SECRET") {
+            self.jwt_secret = v;
+        }
+        if let Ok(v) = std::env::var("OMNIKV_BOOTSTRAP_ADMIN_KEY") {
+            self.bootstrap_admin_key = v;
+        } else if let Ok(v) = std::env::var("OMNI_BOOTSTRAP_ADMIN_KEY") {
+            self.bootstrap_admin_key = v;
         }
         if let Ok(v) = std::env::var("OMNIKV_TLS_CERT_PATH") {
             self.tls_cert_path = Some(v);
@@ -204,6 +219,21 @@ impl ServerConfig {
         if self.jwt_secret.len() < 32 {
             return Err(ConfigError(
                 "JWT secret must be at least 32 characters in production".into(),
+            ));
+        }
+        if self.bootstrap_admin_key == DEV_BOOTSTRAP_ADMIN_KEY {
+            return Err(ConfigError(
+                "production mode requires a non-default bootstrap admin key".into(),
+            ));
+        }
+        if self.bootstrap_admin_key.len() < 32 {
+            return Err(ConfigError(
+                "bootstrap admin key must be at least 32 characters in production".into(),
+            ));
+        }
+        if self.bootstrap_admin_key == self.jwt_secret {
+            return Err(ConfigError(
+                "bootstrap admin key must be different from the JWT secret".into(),
             ));
         }
         if !self.tls_insecure_skip {
