@@ -27,6 +27,7 @@ tower_governor = "0.4.2"
 reqwest = { version = "0.13.3", features = ["json"] }
 lz4_flex = "0.13.0"
 axum-server = { version = "0.8.0", features = ["tls-rustls"] }
+webpki-roots = "0.26"
 rcgen = "0.14.7"
 rustls = { version = "0.23.40", features = ["ring"] }
 quinn = "0.11.9"
