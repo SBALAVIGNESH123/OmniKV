@@ -84,18 +84,23 @@ pub struct ServerConfig {
 fn default_http_addr() -> String {
     "127.0.0.1:7070".into()
 }
+
 fn default_quic_addr() -> String {
     "127.0.0.1:7071".into()
 }
+
 fn default_pgwire_addr() -> String {
     "127.0.0.1:5432".into()
 }
+
 fn default_tcp_addr() -> String {
     "127.0.0.1:7072".into()
 }
+
 fn default_jwt_secret() -> String {
     DEV_JWT_SECRET.into()
 }
+
 fn default_log_level() -> String {
     "info".into()
 }
