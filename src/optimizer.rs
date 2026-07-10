@@ -8,6 +8,7 @@
 //! - Pruning unnecessary columns early
 //!
 //! The optimizer produces a `QueryPlan` tree that the executor walks.
+
 #![allow(dead_code)]
 
 use crate::catalog::Catalog;
