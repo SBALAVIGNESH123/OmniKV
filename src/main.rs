@@ -16,8 +16,9 @@ mod auth;
 mod cluster;
 mod quic_server;
 
-use omni_engine::{config::ServerConfig, OmniKV};
 use std::sync::Arc;
+
+use omni_engine::{config::ServerConfig, OmniKV};
 
 fn print_banner(cfg: &ServerConfig) {
     println!();
