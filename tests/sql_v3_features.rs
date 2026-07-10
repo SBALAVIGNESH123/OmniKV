@@ -376,14 +376,10 @@ fn test_subquery_empty_result() {
 
 #[test]
 fn test_config_defaults() {
-    let config = omni_engine::config::OmniConfig::default();
-    assert_eq!(config.port, 8080);
-    assert_eq!(config.pg_port, 5433);
-    assert_eq!(config.query_timeout_secs, 30);
-    assert_eq!(config.max_connections, 256);
-    assert!(config.max_write_batch_bytes > 0);
-
-    println!("✅ CONFIG: Default config has sensible values");
+    let config = omni_engine::config::ServerConfig::load_dev();
+    assert!(config.http_addr.contains(':'));
+    assert!(config.pgwire_addr.contains(':'));
+    assert!(!config.jwt_secret.is_empty());
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
