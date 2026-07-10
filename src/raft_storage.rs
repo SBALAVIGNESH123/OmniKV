@@ -116,7 +116,9 @@ impl OmniRaftStorage {
 
     /// Record the given index as the last applied log index.
     pub fn mark_applied(&self, index: u64) -> Result<(), crate::OmniError> {
-        let mut meta = self.meta.lock().expect("RaftStorage meta lock poisoned: fatal invariant");
+        let mut meta = self.meta
+            .lock()
+            .expect("RaftStorage meta lock poisoned: fatal invariant");
         // For the test helper, the exact leader_id is not critical — only the index matters.
         let leader_id = meta
             .last_applied
@@ -131,7 +133,9 @@ impl OmniRaftStorage {
 
     /// Returns the index of the last applied log entry, or 0 if none.
     pub fn last_applied_index(&self) -> u64 {
-        let meta = self.meta.lock().expect("RaftStorage meta lock poisoned: fatal invariant");
+        let meta = self.meta
+            .lock()
+            .expect("RaftStorage meta lock poisoned: fatal invariant");
         meta.last_applied.map(|id| id.index).unwrap_or(0)
     }
 
@@ -199,7 +203,9 @@ impl RaftSnapshotBuilder<TypeConfig> for OmniRaftStorage {
     async fn build_snapshot(&mut self) -> Result<Snapshot<TypeConfig>, StorageError<u64>> {
         let mut entries = Vec::new();
         let (snap_meta, max_seq) = {
-            let m = self.meta.lock().expect("RaftStorage meta lock poisoned: fatal invariant");
+            let m = self.meta
+                .lock()
+                .expect("RaftStorage meta lock poisoned: fatal invariant");
             if m.last_applied.is_none() {
                 return Err(StorageError::IO {
                     source: StorageIOError::new(
@@ -209,11 +215,16 @@ impl RaftSnapshotBuilder<TypeConfig> for OmniRaftStorage {
                     ),
                 });
             }
-            let la = m.last_applied.ok_or_else(|| StorageError::read(
-                openraft::StorageIOError::read_state_machine(
-                    &std::io::Error::new(std::io::ErrorKind::Other, "last_applied is None during snapshot"),
-                ),
-            ))?;
+            let la = m.last_applied.ok_or_else(|| {
+                StorageError::from_io_error(
+                    openraft::ErrorSubject::StateMachine,
+                    openraft::ErrorVerb::Read,
+                    std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        "last_applied is None during snapshot",
+                    ),
+                )
+            })?;
             let meta = SnapshotMeta {
                 last_log_id: m.last_applied,
                 last_membership: m.membership.clone(),
@@ -256,16 +267,16 @@ impl RaftSnapshotBuilder<TypeConfig> for OmniRaftStorage {
 
 fn storage_write_err(e: impl std::fmt::Display) -> openraft::StorageError<u64> {
     openraft::StorageError::from_io_error(
-        openraft::error::ErrorSubject::Store,
-        openraft::error::ErrorVerb::Write,
+        openraft::ErrorSubject::Store,
+        openraft::ErrorVerb::Write,
         std::io::Error::new(std::io::ErrorKind::Other, e.to_string()),
     )
 }
 
 fn storage_read_err(e: impl std::fmt::Display) -> openraft::StorageError<u64> {
     openraft::StorageError::from_io_error(
-        openraft::error::ErrorSubject::Store,
-        openraft::error::ErrorVerb::Read,
+        openraft::ErrorSubject::Store,
+        openraft::ErrorVerb::Read,
         std::io::Error::new(std::io::ErrorKind::Other, e.to_string()),
     )
 }
@@ -277,7 +288,9 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
     async fn save_vote(&mut self, vote: &Vote<u64>) -> Result<(), StorageError<u64>> {
         let mut batch = WriteBatch::new();
         {
-            let mut meta = self.meta.lock().expect("RaftStorage meta lock poisoned: fatal invariant");
+            let mut meta = self.meta
+                .lock()
+                .expect("RaftStorage meta lock poisoned: fatal invariant");
             meta.vote = Some(*vote);
             self.save_meta(&meta, &mut batch);
         }
@@ -292,12 +305,16 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
     }
 
     async fn read_vote(&mut self) -> Result<Option<Vote<u64>>, StorageError<u64>> {
-        let meta = self.meta.lock().expect("RaftStorage meta lock poisoned: fatal invariant");
+        let meta = self.meta
+            .lock()
+            .expect("RaftStorage meta lock poisoned: fatal invariant");
         Ok(meta.vote)
     }
 
     async fn get_log_state(&mut self) -> Result<LogState<TypeConfig>, StorageError<u64>> {
-        let meta = self.meta.lock().expect("RaftStorage meta lock poisoned: fatal invariant");
+        let meta = self.meta
+            .lock()
+            .expect("RaftStorage meta lock poisoned: fatal invariant");
         Ok(LogState {
             last_purged_log_id: meta.last_purged_log_id,
             last_log_id: meta.last_log_id,
@@ -322,7 +339,9 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
         }
 
         if last_log_id.is_some() {
-            let mut meta = self.meta.lock().expect("RaftStorage meta lock poisoned: fatal invariant");
+            let mut meta = self.meta
+                .lock()
+                .expect("RaftStorage meta lock poisoned: fatal invariant");
             meta.last_log_id = last_log_id;
             self.save_meta(&meta, &mut batch);
         }
@@ -354,7 +373,9 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
         }
 
         {
-            let mut meta = self.meta.lock().expect("RaftStorage meta lock poisoned: fatal invariant");
+            let mut meta = self.meta
+                .lock()
+                .expect("RaftStorage meta lock poisoned: fatal invariant");
             if idx > log_id.index {
                 // Determine new last_log_id (log_id.index - 1)
                 if log_id.index == 1 {
@@ -385,7 +406,9 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
         let mut batch = WriteBatch::new();
 
         let start_idx = {
-            let meta = self.meta.lock().expect("RaftStorage meta lock poisoned: fatal invariant");
+            let meta = self.meta
+                .lock()
+                .expect("RaftStorage meta lock poisoned: fatal invariant");
             meta.last_purged_log_id.map(|id| id.index + 1).unwrap_or(1)
         };
 
@@ -395,7 +418,9 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
         }
 
         {
-            let mut meta = self.meta.lock().expect("RaftStorage meta lock poisoned: fatal invariant");
+            let mut meta = self.meta
+                .lock()
+                .expect("RaftStorage meta lock poisoned: fatal invariant");
             meta.last_purged_log_id = Some(log_id);
             self.save_meta(&meta, &mut batch);
         }
@@ -413,7 +438,9 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
     async fn last_applied_state(
         &mut self,
     ) -> Result<(Option<LogId<u64>>, StoredMembership<u64, OmniNode>), StorageError<u64>> {
-        let meta = self.meta.lock().expect("RaftStorage meta lock poisoned: fatal invariant");
+        let meta = self.meta
+            .lock()
+            .expect("RaftStorage meta lock poisoned: fatal invariant");
         Ok((meta.last_applied, meta.membership.clone()))
     }
 
@@ -456,7 +483,9 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
         }
 
         if last_applied.is_some() || new_membership.is_some() {
-            let mut meta = self.meta.lock().expect("RaftStorage meta lock poisoned: fatal invariant");
+            let mut meta = self.meta
+                .lock()
+                .expect("RaftStorage meta lock poisoned: fatal invariant");
             if let Some(la) = last_applied {
                 meta.last_applied = Some(la);
             }
@@ -580,7 +609,9 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
         }
 
         // ── Atomically include Raft metadata in the snapshot build ──
-        let mut meta = self.meta.lock().expect("RaftStorage meta lock poisoned: fatal invariant");
+        let mut meta = self.meta
+            .lock()
+            .expect("RaftStorage meta lock poisoned: fatal invariant");
         meta.last_applied = snap_meta.last_log_id;
         meta.last_log_id = snap_meta.last_log_id;
         meta.membership = snap_meta.last_membership.clone();
@@ -656,8 +687,12 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
         self.db.block_cache.invalidate_all();
 
         // ── Phase G: Swap mutable write handles ──
-        *self.db.heap_file.lock().expect("heap_file lock poisoned: fatal invariant") = recovered.heap_file;
-        *self.db.wal.lock().expect("wal lock poisoned: fatal invariant") = recovered.wal;
+        *self.db.heap_file
+            .lock()
+            .expect("heap_file lock poisoned: fatal invariant") = recovered.heap_file;
+        *self.db.wal
+            .lock()
+            .expect("wal lock poisoned: fatal invariant") = recovered.wal;
         self.db
             .heap_offset
             .store(recovered.heap_offset, Ordering::Release);
