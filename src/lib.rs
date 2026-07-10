@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 
 use arc_swap::ArcSwap;
 use crossbeam_skiplist::SkipMap;
