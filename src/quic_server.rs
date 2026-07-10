@@ -219,16 +219,16 @@ fn handle_authenticated_request(db: &Arc<OmniKV>, buf: &[u8], jwt_secret: &str) 
     }
 
     // Verify HMAC-SHA256 signature
-    use std::fmt::Write as FmtWrite;
     let signing_input = format!("{}.{}", parts[0], parts[1]);
     use hmac::{Hmac, Mac};
     use sha2::Sha256;
-    let mut mac = Hmac::<Sha256>::new_from_slice(jwt_secret.as_bytes())
-        .map_err(|_| {
+    let mut mac = match Hmac::<Sha256>::new_from_slice(jwt_secret.as_bytes()) {
+        Ok(m) => m,
+        Err(_) => {
             tracing::warn!("QUIC invalid JWT secret");
-            b"ERR INVALID_TOKEN\n".to_vec()
-        })
-        .unwrap_or_else(|_| Default::default());
+            return b"ERR INVALID_TOKEN\n".to_vec();
+        }
+    };
     mac.update(signing_input.as_bytes());
     let expected_sig_bytes = mac.finalize().into_bytes();
     let expected_b64 = base64_url_encode(expected_sig_bytes.as_slice());
@@ -245,7 +245,6 @@ fn handle_authenticated_request(db: &Arc<OmniKV>, buf: &[u8], jwt_secret: &str) 
 }
 
 fn base64_url_encode(input: &[u8]) -> String {
-    use std::fmt::Write as FmtWrite;
     let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(input);
     b64
 }
