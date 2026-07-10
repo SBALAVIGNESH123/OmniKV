@@ -143,7 +143,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         _ = http_handle => tracing::error!("HTTP server exited"),
         _ = quic_handle => tracing::error!("QUIC server exited"),
         _ = tcp_handle => tracing::error!("TCP server exited"),
-    }
+    },
 
     Ok(())
 }
@@ -177,7 +177,7 @@ async fn run_tcp_server(
                 let request = request.trim();
                 if request.is_empty() {
                     continue;
-                }
+                },
 
                 let mut parts = request.splitn(3, char::is_whitespace);
                 let cmd = parts.next().unwrap_or("");
@@ -194,7 +194,7 @@ async fn run_tcp_server(
                         } else {
                             "ERROR: Missing key\n".to_string()
                         }
-                    }
+                    },
                     "SET" => {
                         if let (Some(key), Some(value)) = (parts.next(), parts.next()) {
                             let mut batch = WriteBatch::new();
@@ -208,7 +208,7 @@ async fn run_tcp_server(
                         } else {
                             "ERROR: SET <key> <value>\n".to_string()
                         }
-                    }
+                    },
                     "DELETE" => {
                         if let Some(key) = parts.next() {
                             let mut batch = WriteBatch::new();
@@ -222,7 +222,7 @@ async fn run_tcp_server(
                         } else {
                             "ERROR: Missing key\n".to_string()
                         }
-                    }
+                    },
                     "SCAN" => {
                         let start = parts.next().unwrap_or("");
                         let end = parts.next().unwrap_or("\x7F");
@@ -232,16 +232,16 @@ async fn run_tcp_server(
                                 let mut out = format!("{} results:\n", results.len());
                                 for (k, v) in results.iter().take(50) {
                                     out.push_str(&format!("  {k} = {v}\n"));
-                                }
+                                },
                                 out
-                            }
+                            },
                             Err(e) => format!("ERROR: {e:?}\n"),
                         }
-                    }
+                    },
                     "QUIT" | "EXIT" => {
                         let _ = socket.write_all(b"Goodbye.\n").await;
                         return;
-                    }
+                    },
                     _ => "ERROR: Unknown command (GET, SET, DELETE, SCAN, QUIT)\n".to_string(),
                 };
 
