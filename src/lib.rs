@@ -357,7 +357,7 @@ fn default_manifest_format_version() -> u32 {
     MANIFEST_FORMAT_VERSION
 }
 
-#[derive(serde::Serialize, serde::Deserialize, Clone)]
+#[derive(Debug, serde::Serialize, serde::Deserialize, Clone)]
 pub struct Manifest {
     pub heap_path: String,
     pub base_path: String,
