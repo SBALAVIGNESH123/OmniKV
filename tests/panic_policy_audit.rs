@@ -17,8 +17,13 @@ const PRODUCTION_FILES: &[&str] = &[
 
 /// Patterns that are allowed (preceded by a SAFETY comment or in an approved form).
 fn is_allowed_unwrap(line: &str, prev_line: &str) -> bool {
-    // unwrap_or / unwrap_or_default / unwrap_or_else are fine
-    if line.contains(".unwrap_or") {
+    // Strip unwrap_or* variants first, then check for bare .unwrap()
+    let stripped = line
+        .replace(".unwrap_or_else", "")
+        .replace(".unwrap_or_default", "")
+        .replace(".unwrap_or", "");
+    // unwrap_or / unwrap_or_default / unwrap_or_else are fine (when no bare unwrap remains)
+    if !stripped.contains(".unwrap()") && line.contains(".unwrap_or") {
         return true;
     }
     // Lines preceded by a SAFETY comment
@@ -77,8 +82,15 @@ fn lock_acquires_have_expect_messages() {
 
     for rel_path in PRODUCTION_FILES {
         let full_path = Path::new(manifest_dir).join(rel_path);
-        let Ok(content) = fs::read_to_string(&full_path) else {
-            continue;
+        let content = match fs::read_to_string(&full_path) {
+            Ok(c) => c,
+            Err(_) => {
+                violations.push(format!(
+                    "{}: file missing or unreadable — cannot audit lock acquires",
+                    rel_path
+                ));
+                continue;
+            }
         };
 
         for (i, line) in content.lines().enumerate() {
