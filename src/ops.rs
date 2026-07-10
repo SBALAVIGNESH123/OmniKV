@@ -47,6 +47,7 @@ pub struct OmniConfig {
 
     // ── Auth ──
     pub jwt_secret: String,
+    pub bootstrap_admin_key: String,
 
     // ── Logging ──
     pub log_level: String,
@@ -92,7 +93,8 @@ impl Default for OmniConfig {
             connection_pool_size: 32,
             pool_idle_timeout: Duration::from_secs(90),
 
-            jwt_secret: "omnikv-dev-secret-change-in-prod".into(),
+            jwt_secret: String::new(),
+            bootstrap_admin_key: String::new(),
 
             log_level: "info,omni_engine=debug".into(),
             log_format: LogFormat::Json,
@@ -143,6 +145,9 @@ impl OmniConfig {
         if let Ok(v) = std::env::var("OMNI_JWT_SECRET") {
             cfg.jwt_secret = v;
         }
+        if let Ok(v) = std::env::var("OMNI_BOOTSTRAP_ADMIN_KEY") {
+            cfg.bootstrap_admin_key = v;
+        }
         if let Ok(v) = std::env::var("OMNI_LOG_LEVEL") {
             cfg.log_level = v;
         }
@@ -176,8 +181,17 @@ impl OmniConfig {
     pub fn validate(&self) -> Result<(), Vec<String>> {
         let mut errors = Vec::new();
 
-        if self.jwt_secret == "omnikv-dev-secret-change-in-prod" {
-            // Warn but don't fail — it's the dev default
+        if !is_strong_runtime_secret(&self.jwt_secret) {
+            errors.push(
+                "OMNI_JWT_SECRET must be set to a non-default secret with at least 32 characters"
+                    .into(),
+            );
+        }
+        if !is_strong_runtime_secret(&self.bootstrap_admin_key) {
+            errors.push(
+                "OMNI_BOOTSTRAP_ADMIN_KEY must be set to a non-default secret with at least 32 characters"
+                    .into(),
+            );
         }
         if self.memtable_flush_threshold == 0 {
             errors.push("memtable_flush_threshold must be > 0".into());
@@ -212,6 +226,13 @@ impl OmniConfig {
             self.txn_timeout
         )
     }
+}
+
+fn is_strong_runtime_secret(value: &str) -> bool {
+    let value = value.trim();
+    value.len() >= 32
+        && value != "omnikv-dev-secret-change-in-prod"
+        && value != "change-me-in-production"
 }
 
 /// Diagnostic snapshot of current database state.

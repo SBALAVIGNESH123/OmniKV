@@ -1,7 +1,9 @@
 #![allow(clippy::field_reassign_with_default)]
 use std::sync::Mutex;
 
-use omni_engine::config::{ConfigError, DEV_JWT_SECRET, ServerConfig, ServerMode};
+use omni_engine::config::{
+    ConfigError, DEV_BOOTSTRAP_ADMIN_KEY, DEV_JWT_SECRET, ServerConfig, ServerMode,
+};
 
 static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
@@ -16,6 +18,34 @@ fn with_env<F: FnOnce()>(vars: &[(&str, &str)], f: F) {
     }
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
     for (k, prev) in &saved {
+        match prev {
+            Some(v) => unsafe { std::env::set_var(k, v) },
+            None => unsafe { std::env::remove_var(k) },
+        }
+    }
+    if let Err(e) = result {
+        std::panic::resume_unwind(e);
+    }
+}
+
+fn with_env_removed<F: FnOnce()>(vars: &[(&str, &str)], removed: &[&str], f: F) {
+    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let saved_set: Vec<(&str, Option<String>)> = vars
+        .iter()
+        .map(|(k, _)| (*k, std::env::var(k).ok()))
+        .collect();
+    let saved_removed: Vec<(&str, Option<String>)> = removed
+        .iter()
+        .map(|k| (*k, std::env::var(k).ok()))
+        .collect();
+    for (k, v) in vars {
+        unsafe { std::env::set_var(k, v) };
+    }
+    for k in removed {
+        unsafe { std::env::remove_var(k) };
+    }
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+    for (k, prev) in saved_set.iter().chain(saved_removed.iter()) {
         match prev {
             Some(v) => unsafe { std::env::set_var(k, v) },
             None => unsafe { std::env::remove_var(k) },
@@ -57,6 +87,12 @@ fn test_defaults_jwt_secret() {
 }
 
 #[test]
+fn test_defaults_bootstrap_admin_key() {
+    let cfg = ServerConfig::default();
+    assert_eq!(cfg.bootstrap_admin_key, DEV_BOOTSTRAP_ADMIN_KEY);
+}
+
+#[test]
 fn test_defaults_mode_is_development() {
     let cfg = ServerConfig::default();
     assert_eq!(cfg.mode, ServerMode::Development);
@@ -87,6 +123,41 @@ fn test_env_override_jwt_secret() {
             let mut cfg = ServerConfig::default();
             cfg.apply_env();
             assert_eq!(cfg.jwt_secret, "my-test-secret-value-here-x");
+        },
+    );
+}
+
+#[test]
+fn test_env_override_bootstrap_admin_key() {
+    with_env(
+        &[(
+            "OMNIKV_BOOTSTRAP_ADMIN_KEY",
+            "bootstrap-admin-key-value-123456",
+        )],
+        || {
+            let mut cfg = ServerConfig::default();
+            cfg.apply_env();
+            assert_eq!(cfg.bootstrap_admin_key, "bootstrap-admin-key-value-123456");
+        },
+    );
+}
+
+#[test]
+fn test_env_legacy_omni_secret_aliases() {
+    with_env_removed(
+        &[
+            ("OMNI_JWT_SECRET", "legacy-jwt-secret-value-12345678"),
+            (
+                "OMNI_BOOTSTRAP_ADMIN_KEY",
+                "legacy-bootstrap-key-value-12345",
+            ),
+        ],
+        &["OMNIKV_JWT_SECRET", "OMNIKV_BOOTSTRAP_ADMIN_KEY"],
+        || {
+            let mut cfg = ServerConfig::default();
+            cfg.apply_env();
+            assert_eq!(cfg.jwt_secret, "legacy-jwt-secret-value-12345678");
+            assert_eq!(cfg.bootstrap_admin_key, "legacy-bootstrap-key-value-12345");
         },
     );
 }
@@ -156,10 +227,43 @@ fn test_prod_rejects_short_secret() {
 }
 
 #[test]
+fn test_prod_rejects_default_bootstrap_admin_key() {
+    let mut cfg = ServerConfig::default();
+    cfg.mode = ServerMode::Production;
+    cfg.jwt_secret = "a-very-long-secret-value-here-ok".into();
+    cfg.tls_insecure_skip = true;
+    let err = cfg.validate_production().unwrap_err();
+    assert!(err.0.contains("bootstrap admin key"), "got: {err}");
+}
+
+#[test]
+fn test_prod_rejects_short_bootstrap_admin_key() {
+    let mut cfg = ServerConfig::default();
+    cfg.mode = ServerMode::Production;
+    cfg.jwt_secret = "a-very-long-secret-value-here-ok".into();
+    cfg.bootstrap_admin_key = "short".into();
+    cfg.tls_insecure_skip = true;
+    let err = cfg.validate_production().unwrap_err();
+    assert!(err.0.contains("32 characters"), "got: {err}");
+}
+
+#[test]
+fn test_prod_rejects_matching_jwt_and_bootstrap_admin_key() {
+    let mut cfg = ServerConfig::default();
+    cfg.mode = ServerMode::Production;
+    cfg.jwt_secret = "shared-secret-value-long-enough-123".into();
+    cfg.bootstrap_admin_key = cfg.jwt_secret.clone();
+    cfg.tls_insecure_skip = true;
+    let err = cfg.validate_production().unwrap_err();
+    assert!(err.0.contains("different"), "got: {err}");
+}
+
+#[test]
 fn test_prod_rejects_missing_tls() {
     let mut cfg = ServerConfig::default();
     cfg.mode = ServerMode::Production;
     cfg.jwt_secret = "a-very-long-secret-value-here-ok".into();
+    cfg.bootstrap_admin_key = "bootstrap-admin-key-value-here-ok".into();
     cfg.tls_insecure_skip = false;
     let err = cfg.validate_production().unwrap_err();
     assert!(err.0.contains("TLS"), "got: {err}");
@@ -170,6 +274,7 @@ fn test_prod_accepts_insecure_skip() {
     let mut cfg = ServerConfig::default();
     cfg.mode = ServerMode::Production;
     cfg.jwt_secret = "a-very-long-secret-value-here-ok".into();
+    cfg.bootstrap_admin_key = "bootstrap-admin-key-value-here-ok".into();
     cfg.tls_insecure_skip = true;
     assert!(cfg.validate_production().is_ok());
 }
@@ -179,6 +284,7 @@ fn test_prod_rejects_missing_cert_file() {
     let mut cfg = ServerConfig::default();
     cfg.mode = ServerMode::Production;
     cfg.jwt_secret = "a-very-long-secret-value-here-ok".into();
+    cfg.bootstrap_admin_key = "bootstrap-admin-key-value-here-ok".into();
     cfg.tls_cert_path = Some("/nonexistent/cert.pem".into());
     cfg.tls_key_path = Some("/nonexistent/key.pem".into());
     let err = cfg.validate_production().unwrap_err();

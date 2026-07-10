@@ -1,30 +1,25 @@
-# OmniKV example configuration.
+# OmniKV example server configuration.
 #
-# This file is safe to commit and ship in containers: it does not contain
-# secrets. Set OMNI_JWT_SECRET separately through your orchestrator, secret
-# manager, or local environment.
+# This file is safe to commit and ship in containers: it intentionally does
+# not contain runtime secrets. Set OMNIKV_JWT_SECRET and
+# OMNIKV_BOOTSTRAP_ADMIN_KEY through your orchestrator, secret manager, or
+# local environment.
 
-# Storage
-data_dir = "/data"
+mode = "production"
+http_addr = "0.0.0.0:8443"
+quic_addr = "0.0.0.0:4433"
+pgwire_addr = "0.0.0.0:5433"
+tcp_addr = "0.0.0.0:8080"
+log_level = "info,omni_engine=debug"
 
-# Networking
-port = 8080
-pg_port = 5433
-max_connections = 256
+# Local demos use generated self-signed certificates. For a real deployment,
+# provide tls_cert_path and tls_key_path instead of setting this to true.
+tls_insecure_skip = true
 
-# Query limits
-query_timeout_secs = 30
-slow_query_threshold_ms = 100
-max_query_result_rows = 1000000
-
-# Storage engine
-compaction_interval_ms = 500
-memtable_flush_threshold = 4194304
-gc_interval_compactions = 5
-max_write_batch_bytes = 67108864
-
-# Security
-enable_encryption = false
-
-# Logging
-log_level = "info"
+[storage]
+manifest_path = "/data/manifest.json"
+wal_path = "/data/wal.bin"
+backup_dir = "/data/backups"
+max_open_files = 512
+write_buffer_mb = 64
+compaction_workers = 2

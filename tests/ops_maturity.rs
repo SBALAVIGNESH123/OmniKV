@@ -30,8 +30,11 @@ fn test_config_defaults() {
     assert_eq!(cfg.http_addr, "0.0.0.0:8443");
     assert_eq!(cfg.pgwire_addr, "0.0.0.0:5433");
     assert_eq!(cfg.log_format, LogFormat::Json);
-    assert!(cfg.validate().is_ok());
-    println!("✅ OPS: Config defaults are sane and valid");
+    assert!(
+        cfg.validate().is_err(),
+        "production validation must fail without explicit runtime secrets"
+    );
+    println!("✅ OPS: Config defaults are sane and fail closed without secrets");
 }
 
 #[test]
@@ -41,6 +44,11 @@ fn test_config_from_env() {
         std::env::set_var("OMNI_MEMTABLE_FLUSH", "5000");
         std::env::set_var("OMNI_LOG_FORMAT", "pretty");
         std::env::set_var("OMNI_RATE_LIMIT", "500");
+        std::env::set_var("OMNI_JWT_SECRET", "0123456789abcdef0123456789abcdef");
+        std::env::set_var(
+            "OMNI_BOOTSTRAP_ADMIN_KEY",
+            "bootstrap-admin-key-0123456789abcdef",
+        );
     }
 
     let cfg = OmniConfig::from_env();
@@ -54,6 +62,8 @@ fn test_config_from_env() {
         std::env::remove_var("OMNI_MEMTABLE_FLUSH");
         std::env::remove_var("OMNI_LOG_FORMAT");
         std::env::remove_var("OMNI_RATE_LIMIT");
+        std::env::remove_var("OMNI_JWT_SECRET");
+        std::env::remove_var("OMNI_BOOTSTRAP_ADMIN_KEY");
     }
     println!("✅ OPS: Config loads from env vars correctly");
 }

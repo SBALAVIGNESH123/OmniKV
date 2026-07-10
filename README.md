@@ -31,6 +31,9 @@ The primary goal is correctness and durability. The project includes crash-recov
 git clone https://github.com/SBALAVIGNESH123/OmniKV.git
 cd OmniKV
 cargo build --release
+export OMNIKV_JWT_SECRET="$(openssl rand -hex 32)"
+export OMNIKV_BOOTSTRAP_ADMIN_KEY="$(openssl rand -hex 32)"
+export OMNIKV_TLS_INSECURE_SKIP=true # local quick start only
 cargo run --release
 ```
 
@@ -44,10 +47,27 @@ psql -h localhost -p 5433
 
 ```bash
 docker build -t omnikv:local .
-docker run --rm -p 8443:8443 -p 5433:5433 -e OMNI_JWT_SECRET="$(openssl rand -hex 32)" omnikv:local
+docker run --rm -p 8443:8443 -p 5433:5433 \
+  -e OMNIKV_HTTP_ADDR="0.0.0.0:8443" \
+  -e OMNIKV_PGWIRE_ADDR="0.0.0.0:5433" \
+  -e OMNIKV_TLS_INSECURE_SKIP=true \
+  -e OMNIKV_JWT_SECRET="$(openssl rand -hex 32)" \
+  -e OMNIKV_BOOTSTRAP_ADMIN_KEY="$(openssl rand -hex 32)" \
+  omnikv:local
 ```
 
-The container runs as a non-root user and ships with `omni.toml.example` copied to `/etc/omni/omni.toml`. Set secrets such as `OMNI_JWT_SECRET` through your runtime, secret manager, or local environment.
+The container runs as a non-root user and ships with `omni.toml.example` copied to `/etc/omni/omni.toml`. Set secrets such as `OMNIKV_JWT_SECRET` and `OMNIKV_BOOTSTRAP_ADMIN_KEY` through your runtime, secret manager, or local environment. The older `OMNI_JWT_SECRET` and `OMNI_BOOTSTRAP_ADMIN_KEY` aliases are still accepted for compatibility.
+
+For the local Docker Compose demo, make the TLS posture explicit:
+
+```bash
+export OMNIKV_JWT_SECRET="$(openssl rand -hex 32)"
+export OMNIKV_BOOTSTRAP_ADMIN_KEY="$(openssl rand -hex 32)"
+export OMNIKV_TLS_INSECURE_SKIP=true # local demo/self-signed certificates only
+docker compose up --build
+```
+
+Compose validates that the variables are present. OmniKV validates at startup that the secrets are strong, at least 32 characters, and not reused.
 
 ## Embedded library example
 

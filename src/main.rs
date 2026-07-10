@@ -62,9 +62,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .json()
         .init();
 
-    // Load configuration (development mode; switch to ServerConfig::load_production()
-    // before any production deployment).
-    let cfg = ServerConfig::load_dev();
+    // The standalone server is a network-facing binary, so it starts in
+    // production-validation mode. Tests and embedders can still use
+    // ServerConfig::load_dev() explicitly.
+    let cfg = ServerConfig::load_production()?;
     print_banner(&cfg);
     tracing::info!(
         mode = ?cfg.mode,
@@ -85,11 +86,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "Database opened"
     );
 
-    let jwt_secret = cfg.jwt_secret.clone();
-
     let app_state = api::AppState {
         db: db.clone(),
-        jwt_secret,
+        jwt_secret: cfg.jwt_secret.clone(),
+        bootstrap_admin_key: cfg.bootstrap_admin_key.clone(),
         manifest_path,
         wal_path,
     };

@@ -1,4 +1,15 @@
-version: '3.8'
+x-omnikv-common-env: &omnikv-common-env
+  OMNIKV_HTTP_ADDR: "0.0.0.0:8443"
+  OMNIKV_QUIC_ADDR: "0.0.0.0:4433"
+  OMNIKV_PGWIRE_ADDR: "0.0.0.0:5433"
+  OMNIKV_TCP_ADDR: "0.0.0.0:8080"
+  OMNIKV_BACKUP_DIR: "/data/backups"
+  # Set true only for local demos with generated self-signed certificates.
+  # Production deployments should provide trusted TLS material in omnikv.toml.
+  OMNIKV_TLS_INSECURE_SKIP: "${OMNIKV_TLS_INSECURE_SKIP:?set OMNIKV_TLS_INSECURE_SKIP=false for production, or true only for a local demo}"
+  # Compose validates presence only; OmniKV validates minimum length and uniqueness at startup.
+  OMNIKV_JWT_SECRET: "${OMNIKV_JWT_SECRET:?set OMNIKV_JWT_SECRET to a strong 32+ character value}"
+  OMNIKV_BOOTSTRAP_ADMIN_KEY: "${OMNIKV_BOOTSTRAP_ADMIN_KEY:?set OMNIKV_BOOTSTRAP_ADMIN_KEY to a different strong 32+ character value}"
 
 services:
   omni-node-1:
@@ -12,9 +23,11 @@ services:
     volumes:
       - omni-data-1:/data
     environment:
+      <<: *omnikv-common-env
       OMNI_NODE_ID: "1"
       OMNI_PEERS: "omni-node-2:4433,omni-node-3:4433"
-      OMNI_JWT_SECRET: "change-me-in-production"
+      OMNIKV_MANIFEST_PATH: "/data/manifest.json"
+      OMNIKV_WAL_PATH: "/data/wal.bin"
       RUST_LOG: "info,omni_engine=debug"
     networks:
       - omni-cluster
@@ -30,9 +43,11 @@ services:
     volumes:
       - omni-data-2:/data
     environment:
+      <<: *omnikv-common-env
       OMNI_NODE_ID: "2"
       OMNI_PEERS: "omni-node-1:4433,omni-node-3:4433"
-      OMNI_JWT_SECRET: "change-me-in-production"
+      OMNIKV_MANIFEST_PATH: "/data/manifest.json"
+      OMNIKV_WAL_PATH: "/data/wal.bin"
       RUST_LOG: "info,omni_engine=debug"
     networks:
       - omni-cluster
@@ -48,9 +63,11 @@ services:
     volumes:
       - omni-data-3:/data
     environment:
+      <<: *omnikv-common-env
       OMNI_NODE_ID: "3"
       OMNI_PEERS: "omni-node-1:4433,omni-node-2:4433"
-      OMNI_JWT_SECRET: "change-me-in-production"
+      OMNIKV_MANIFEST_PATH: "/data/manifest.json"
+      OMNIKV_WAL_PATH: "/data/wal.bin"
       RUST_LOG: "info,omni_engine=debug"
     networks:
       - omni-cluster

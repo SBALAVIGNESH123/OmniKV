@@ -10,10 +10,12 @@
 
 use axum::{
     Json, Router,
+    body::Body,
+    extract::Request,
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode, header},
     middleware,
-    response::IntoResponse,
+    response::{IntoResponse, Response},
 };
 use omni_engine::{OmniKV, WriteBatch};
 use serde::{Deserialize, Serialize};
@@ -25,6 +27,7 @@ use tower_http::cors::CorsLayer;
 pub struct AppState {
     pub db: Arc<OmniKV>,
     pub jwt_secret: String,
+    pub bootstrap_admin_key: String,
     pub manifest_path: String,
     pub wal_path: String,
 }
@@ -103,30 +106,107 @@ pub struct MetricsOutput {
     pub text: String,
 }
 
+#[derive(Clone, Copy)]
+enum RequiredRole {
+    Read,
+    Write,
+    Admin,
+}
+
+impl RequiredRole {
+    fn allows(self, role: &str) -> bool {
+        match self {
+            Self::Read => matches!(role, "read" | "write" | "admin"),
+            Self::Write => matches!(role, "write" | "admin"),
+            Self::Admin => role == "admin",
+        }
+    }
+}
+
 /// Build the Axum router with all API routes.
 pub fn build_router(state: AppState) -> Router {
-    Router::new()
-        // Health
-        .route("/health", axum::routing::get(health_handler))
-        // CRUD
+    let read_routes = Router::new()
         .route("/kv/{key}", axum::routing::get(get_handler))
+        .route("/scan", axum::routing::get(scan_handler))
+        .route_layer(middleware::from_fn_with_state(state.clone(), require_read));
+
+    let write_routes = Router::new()
         .route("/kv", axum::routing::post(set_handler))
         .route("/kv/{key}", axum::routing::delete(delete_handler))
-        // Batch
         .route("/batch", axum::routing::post(batch_handler))
-        // Scan
-        .route("/scan", axum::routing::get(scan_handler))
-        // Metrics
+        .route_layer(middleware::from_fn_with_state(state.clone(), require_write));
+
+    let admin_routes = Router::new()
         .route("/metrics", axum::routing::get(metrics_handler))
-        // Backup
         .route("/admin/backup", axum::routing::post(backup_handler))
-        // Auth
-        .route("/auth/token", axum::routing::post(token_handler))
-        // Compaction
         .route("/admin/compact", axum::routing::post(compact_handler))
-        // Layer
+        .route_layer(middleware::from_fn_with_state(state.clone(), require_admin));
+
+    Router::new()
+        .route("/health", axum::routing::get(health_handler))
+        .route("/auth/token", axum::routing::post(token_handler))
+        .merge(read_routes)
+        .merge(write_routes)
+        .merge(admin_routes)
         .layer(CorsLayer::permissive())
         .with_state(state)
+}
+
+async fn require_read(
+    State(state): State<AppState>,
+    req: Request<Body>,
+    next: middleware::Next,
+) -> Result<Response, Response> {
+    require_role(state, req, next, RequiredRole::Read).await
+}
+
+async fn require_write(
+    State(state): State<AppState>,
+    req: Request<Body>,
+    next: middleware::Next,
+) -> Result<Response, Response> {
+    require_role(state, req, next, RequiredRole::Write).await
+}
+
+async fn require_admin(
+    State(state): State<AppState>,
+    req: Request<Body>,
+    next: middleware::Next,
+) -> Result<Response, Response> {
+    require_role(state, req, next, RequiredRole::Admin).await
+}
+
+async fn require_role(
+    state: AppState,
+    req: Request<Body>,
+    next: middleware::Next,
+    required: RequiredRole,
+) -> Result<Response, Response> {
+    let Some(header_value) = req.headers().get(header::AUTHORIZATION) else {
+        return Err(auth_error(StatusCode::UNAUTHORIZED, "missing bearer token"));
+    };
+    let Ok(header_value) = header_value.to_str() else {
+        return Err(auth_error(
+            StatusCode::UNAUTHORIZED,
+            "invalid authorization header",
+        ));
+    };
+    let Some(token) = crate::auth::extract_bearer(header_value) else {
+        return Err(auth_error(
+            StatusCode::UNAUTHORIZED,
+            "authorization header must use Bearer token",
+        ));
+    };
+
+    match crate::auth::verify_token(token, &state.jwt_secret) {
+        Ok(claims) if required.allows(&claims.role) => Ok(next.run(req).await),
+        Ok(_) => Err(auth_error(StatusCode::FORBIDDEN, "insufficient role")),
+        Err(_) => Err(auth_error(StatusCode::UNAUTHORIZED, "invalid bearer token")),
+    }
+}
+
+fn auth_error(status: StatusCode, message: &str) -> Response {
+    (status, ApiResponse::<()>::err(message)).into_response()
 }
 
 // ─── Handlers ───────────────────────────────────────────
@@ -323,14 +403,150 @@ pub struct TokenRequest {
 
 async fn token_handler(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(req): Json<TokenRequest>,
 ) -> impl IntoResponse {
+    let Some(header_value) = headers.get("x-omni-admin-key") else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            ApiResponse::<String>::err("missing bootstrap admin key"),
+        );
+    };
+    let Ok(provided_key) = header_value.to_str() else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            ApiResponse::<String>::err("invalid bootstrap admin key"),
+        );
+    };
+    if !crate::auth::validate_api_key(provided_key, &state.bootstrap_admin_key) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            ApiResponse::<String>::err("invalid bootstrap admin key"),
+        );
+    }
+
     let role = req.role.as_deref().unwrap_or("read");
+    if !matches!(role, "read" | "write" | "admin") {
+        return (
+            StatusCode::BAD_REQUEST,
+            ApiResponse::<String>::err("role must be read, write, or admin"),
+        );
+    }
+
     match crate::auth::generate_token(&req.username, role, &state.jwt_secret, 86400) {
         Ok(token) => (StatusCode::OK, ApiResponse::ok(token)),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             ApiResponse::<String>::err(&e),
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{Method, Request};
+    use serde_json::json;
+    use tower::ServiceExt;
+
+    fn test_router() -> (Router, tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let manifest = dir.path().join("manifest.json");
+        let wal = dir.path().join("wal.bin");
+        let db = OmniKV::open(
+            manifest.to_str().expect("manifest path"),
+            wal.to_str().expect("wal path"),
+        )
+        .expect("open db");
+        let jwt_secret = "0123456789abcdef0123456789abcdef".to_string();
+        let bootstrap_admin_key = "bootstrap-admin-key-0123456789abcdef".to_string();
+        let router = build_router(AppState {
+            db,
+            jwt_secret: jwt_secret.clone(),
+            bootstrap_admin_key,
+            manifest_path: manifest.to_string_lossy().to_string(),
+            wal_path: wal.to_string_lossy().to_string(),
+        });
+        (router, dir, jwt_secret)
+    }
+
+    #[tokio::test]
+    async fn unauthenticated_write_is_rejected() {
+        let (router, _dir, _secret) = test_router();
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/kv")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(json!({"key":"a","value":"b"}).to_string()))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn read_token_cannot_write() {
+        let (router, _dir, secret) = test_router();
+        let token = crate::auth::generate_token("reader", "read", &secret, 60).expect("read token");
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/kv")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(json!({"key":"a","value":"b"}).to_string()))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn write_token_can_write() {
+        let (router, _dir, secret) = test_router();
+        let token =
+            crate::auth::generate_token("writer", "write", &secret, 60).expect("write token");
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/kv")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(json!({"key":"a","value":"b"}).to_string()))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn token_endpoint_requires_bootstrap_key() {
+        let (router, _dir, _secret) = test_router();
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/auth/token")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({"username":"admin","role":"admin"}).to_string(),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 }
