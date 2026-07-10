@@ -136,6 +136,27 @@ impl RequiredRole {
 }
 
 /// Build the Axum router with all API routes.
+
+/// Map internal storage errors to stable, sanitized client-facing error codes.
+/// Internal error details are never exposed to clients — they are logged server-side.
+fn sanitize_storage_err(e: &crate::OmniError) -> String {
+    // Log full error server-side for operators
+    tracing::error!(error = ?e, "internal storage error");
+    // Return stable, opaque code to client
+    match e {
+        crate::OmniError::NotFound => "NOT_FOUND".to_string(),
+        crate::OmniError::BatchTooLarge(_) => "BATCH_TOO_LARGE".to_string(),
+        crate::OmniError::UnsupportedVersion { .. } => "UNSUPPORTED_VERSION".to_string(),
+        _ => "STORAGE_ERROR".to_string(),
+    }
+}
+
+/// Map a generic std::error::Error to a sanitized client-facing message.
+fn sanitize_err(e: &impl std::fmt::Debug) -> String {
+    tracing::error!(error = ?e, "internal error");
+    "INTERNAL_ERROR".to_string()
+}
+
 pub fn build_router(state: AppState) -> Router {
     let read_routes = Router::new()
         .route("/kv/{key}", axum::routing::get(get_handler))
@@ -267,7 +288,7 @@ async fn get_handler(State(state): State<AppState>, Path(key): Path<String>) -> 
         Ok(None) => (StatusCode::NOT_FOUND, ApiResponse::err("Key not found")),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            ApiResponse::err(&format!("{:?}", e)),
+            ApiResponse::err(&sanitize_storage_err(&e)),
         ),
     }
 }
@@ -281,13 +302,13 @@ async fn set_handler(
         if let Err(e) = batch.set_with_ttl(&req.key, req.value, ttl) {
             return (
                 StatusCode::BAD_REQUEST,
-                ApiResponse::<WriteResult>::err(&format!("{:?}", e)),
+                ApiResponse::<WriteResult>::err(&sanitize_storage_err(&e)),
             );
         }
     } else if let Err(e) = batch.set(&req.key, req.value) {
         return (
             StatusCode::BAD_REQUEST,
-            ApiResponse::<WriteResult>::err(&format!("{:?}", e)),
+            ApiResponse::<WriteResult>::err(&sanitize_storage_err(&e)),
         );
     }
 
@@ -295,7 +316,7 @@ async fn set_handler(
         Ok(seq) => (StatusCode::CREATED, ApiResponse::ok(WriteResult { seq })),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            ApiResponse::<WriteResult>::err(&format!("{:?}", e)),
+            ApiResponse::<WriteResult>::err(&sanitize_storage_err(&e)),
         ),
     }
 }
@@ -310,12 +331,12 @@ async fn delete_handler(
             Ok(seq) => (StatusCode::OK, ApiResponse::ok(WriteResult { seq })),
             Err(e) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                ApiResponse::<WriteResult>::err(&format!("{:?}", e)),
+                ApiResponse::<WriteResult>::err(&sanitize_storage_err(&e)),
             ),
         },
         Err(e) => (
             StatusCode::BAD_REQUEST,
-            ApiResponse::<WriteResult>::err(&format!("{:?}", e)),
+            ApiResponse::<WriteResult>::err(&sanitize_storage_err(&e)),
         ),
     }
 }
@@ -348,7 +369,7 @@ async fn batch_handler(
         Ok(seq) => (StatusCode::OK, ApiResponse::ok(WriteResult { seq })),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            ApiResponse::<WriteResult>::err(&format!("{:?}", e)),
+            ApiResponse::<WriteResult>::err(&sanitize_storage_err(&e)),
         ),
     }
 }
@@ -373,7 +394,7 @@ async fn scan_handler(
         }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            ApiResponse::<Vec<KeyValue>>::err(&format!("{:?}", e)),
+            ApiResponse::<Vec<KeyValue>>::err(&sanitize_storage_err(&e)),
         ),
     }
 }
@@ -419,7 +440,7 @@ async fn compact_handler(State(state): State<AppState>) -> impl IntoResponse {
         ),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            ApiResponse::<String>::err(&format!("{:?}", e)),
+            ApiResponse::<String>::err(&sanitize_storage_err(&e)),
         ),
     }
 }
