@@ -16,20 +16,24 @@ mod auth;
 mod cluster;
 mod quic_server;
 
-use omni_engine::OmniKV;
+use omni_engine::{config::ServerConfig, OmniKV};
 use std::sync::Arc;
-
-use omni_engine::config::ServerConfig;
 
 fn print_banner(cfg: &ServerConfig) {
     println!();
     println!("  ╔════════════════════════════════════════════════════╗");
-    println!("  ║        ⚡ OmniKV v{}                       ║", env!("CARGO_PKG_VERSION"));
+    println!(
+        "  ║        ⚡ OmniKV v{}                       ║",
+        env!("CARGO_PKG_VERSION")
+    );
     println!("  ║  Embeddable · Distributed · Transactional KV      ║");
     println!("  ╠════════════════════════════════════════════════════╣");
     println!("  ║  HTTP/1.1 + HTTP/2 (TLS)  → {}           ║", cfg.http_addr);
     println!("  ║  QUIC/HTTP3 (binary)      → {}           ║", cfg.quic_addr);
-    println!("  ║  PostgreSQL Wire Protocol → {}           ║", cfg.pgwire_addr);
+    println!(
+        "  ║  PostgreSQL Wire Protocol → {}           ║",
+        cfg.pgwire_addr
+    );
     println!("  ║  TCP Command Interface    → {}           ║", cfg.tcp_addr);
     println!("  ╠════════════════════════════════════════════════════╣");
     println!("  ║  Built from scratch in Rust. Every byte is ours.  ║");
