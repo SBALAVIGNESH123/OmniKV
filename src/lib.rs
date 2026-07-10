@@ -1,7 +1,5 @@
-#![allow(unused_imports)]
-#![allow(unused_variables)]
-#![allow(unused_mut)]
-#![allow(mismatched_lifetime_syntaxes)]
+#![allow(dead_code)]
+
 
 
 use arc_swap::ArcSwap;
