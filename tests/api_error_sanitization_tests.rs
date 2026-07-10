@@ -15,7 +15,8 @@ async fn test_app() -> axum::Router {
     let dir = tempdir().unwrap();
     let manifest = dir.path().join("manifest.json");
     let wal = dir.path().join("wal.bin");
-    let db = omni_engine::OmniKV::open(&manifest.to_string_lossy(), &wal.to_string_lossy()).unwrap();
+    let db =
+        omni_engine::OmniKV::open(&manifest.to_string_lossy(), &wal.to_string_lossy()).unwrap();
     let state = AppState {
         db,
         jwt_secret: "0123456789abcdef0123456789abcdef".to_string(),
