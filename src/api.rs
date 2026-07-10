@@ -94,6 +94,18 @@ pub struct HealthStatus {
     pub sstable_count: usize,
 }
 
+#[derive(Serialize)]
+pub struct ReadyStatus {
+    pub ready: bool,
+    pub checks: ReadyChecks,
+}
+
+#[derive(Serialize)]
+pub struct ReadyChecks {
+    pub storage: bool,
+    pub sequence_advancing: bool,
+}
+
 #[derive(Deserialize)]
 pub struct ScanQuery {
     pub start: Option<String>,
@@ -144,6 +156,7 @@ pub fn build_router(state: AppState) -> Router {
 
     Router::new()
         .route("/health", axum::routing::get(health_handler))
+        .route("/ready", axum::routing::get(ready_handler))
         .route("/auth/token", axum::routing::post(token_handler))
         .merge(read_routes)
         .merge(write_routes)
@@ -226,6 +239,24 @@ async fn health_handler(State(state): State<AppState>) -> impl IntoResponse {
     })
 }
 
+async fn ready_handler(State(state): State<AppState>) -> impl IntoResponse {
+    let seq = state.db.get_seq();
+    let storage_ok = state.db.sstable_count() < 10_000;
+    let ready = storage_ok;
+    let status = ReadyStatus {
+        ready,
+        checks: ReadyChecks {
+            storage: storage_ok,
+            sequence_advancing: seq > 0,
+        },
+    };
+    if ready {
+        (StatusCode::OK, ApiResponse::ok(status))
+    } else {
+        (StatusCode::SERVICE_UNAVAILABLE, ApiResponse::ok(status))
+    }
+}
+
 async fn get_handler(State(state): State<AppState>, Path(key): Path<String>) -> impl IntoResponse {
     let seq = state.db.get_seq();
     match state.db.find(&key, seq) {
@@ -253,13 +284,11 @@ async fn set_handler(
                 ApiResponse::<WriteResult>::err(&format!("{:?}", e)),
             );
         }
-    } else {
-        if let Err(e) = batch.set(&req.key, req.value) {
-            return (
-                StatusCode::BAD_REQUEST,
-                ApiResponse::<WriteResult>::err(&format!("{:?}", e)),
-            );
-        }
+    } else if let Err(e) = batch.set(&req.key, req.value) {
+        return (
+            StatusCode::BAD_REQUEST,
+            ApiResponse::<WriteResult>::err(&format!("{:?}", e)),
+        );
     }
 
     match state.db.commit_batch(&batch) {
