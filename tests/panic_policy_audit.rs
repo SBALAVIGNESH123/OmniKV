@@ -82,7 +82,9 @@ fn lock_acquires_have_expect_messages() {
         };
 
         for (i, line) in content.lines().enumerate() {
-            if (line.contains(".lock().unwrap()") || line.contains(".read().unwrap()") || line.contains(".write().unwrap()"))
+            if (line.contains(".lock().unwrap()")
+                || line.contains(".read().unwrap()")
+                || line.contains(".write().unwrap()"))
                 && !line.contains(".unwrap_or")
             {
                 violations.push(format!(
