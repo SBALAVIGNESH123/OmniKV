@@ -23,10 +23,7 @@ fn pgwire_password_required_in_production() {
     let mode = std::env::var("OMNIKV_MODE").unwrap_or_default();
     if mode == "production" {
         let pw = std::env::var("OMNIKV_PGWIRE_PASSWORD").unwrap_or_default();
-        assert!(
-            !pw.is_empty(),
-            "OMNIKV_PGWIRE_PASSWORD must be set in production"
-        );
+        assert!(!pw.is_empty(), "OMNIKV_PGWIRE_PASSWORD must be set in production");
         assert!(pw.len() >= 16, "OMNIKV_PGWIRE_PASSWORD must be >= 16 chars");
     }
 }
@@ -36,10 +33,7 @@ fn quic_jwt_secret_required_in_production() {
     let mode = std::env::var("OMNIKV_MODE").unwrap_or_default();
     if mode == "production" {
         let secret = std::env::var("OMNIKV_JWT_SECRET").unwrap_or_default();
-        assert!(
-            !secret.is_empty(),
-            "OMNIKV_JWT_SECRET must be set in production"
-        );
+        assert!(!secret.is_empty(), "OMNIKV_JWT_SECRET must be set in production");
         assert!(
             secret != "omnikv-dev-secret-do-not-use-in-production",
             "must not use dev JWT secret in production"
