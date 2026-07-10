@@ -246,8 +246,7 @@ use hmac::KeyInit;
 }
 
 fn base64_url_encode(input: &[u8]) -> String {
-    let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(input);
-    b64
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(input)
 }
 
 fn handle_binary_request(db: &Arc<OmniKV>, data: &[u8]) -> Vec<u8> {
