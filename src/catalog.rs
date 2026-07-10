@@ -105,7 +105,10 @@ impl Catalog {
             .db
             .scan(CATALOG_PREFIX, &format!("{}\x7F", CATALOG_PREFIX), seq)
         {
-            let mut cache = self.cache.write().expect("catalog cache RwLock poisoned: fatal invariant");
+            let mut cache = self
+                .cache
+                .write()
+                .expect("catalog cache RwLock poisoned: fatal invariant");
             for (_key, value) in results {
                 if let Ok(table) = serde_json::from_str::<TableDef>(&value) {
                     cache.insert(table.name.to_lowercase(), table);
