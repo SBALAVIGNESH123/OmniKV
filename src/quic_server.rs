@@ -103,10 +103,7 @@ pub fn create_client_endpoint(insecure_skip_verify: bool) -> Result<Endpoint, St
         return Err(
             "QUIC insecure_skip_verify is not permitted in production (release) builds".to_string(),
         );
-        rustls::ClientConfig::builder()
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(SkipServerVerification))
-            .with_no_client_auth()
+
     } else {
         let mut root_store = rustls::RootCertStore::empty();
         root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
