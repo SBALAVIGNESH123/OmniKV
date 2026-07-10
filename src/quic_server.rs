@@ -86,11 +86,34 @@ pub fn create_server_endpoint(
 }
 
 /// Create a QUIC client endpoint for connecting to peers.
-pub fn create_client_endpoint() -> Result<Endpoint, String> {
-    let mut crypto = rustls::ClientConfig::builder()
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(SkipServerVerification))
-        .with_no_client_auth();
+pub fn create_client_endpoint(insecure_skip_verify: bool) -> Result<Endpoint, String> {
+    let mut crypto = if insecure_skip_verify {
+        #[cfg(debug_assertions)]
+        tracing::warn!(
+            "SECURITY WARNING: QUIC certificate verification is DISABLED. \
+             This is only acceptable in development/test mode. \
+             Never use insecure_skip_verify=true in production."
+        );
+        #[cfg(not(debug_assertions))]
+        tracing::error!(
+            "SECURITY ERROR: QUIC certificate verification bypass requested in RELEASE build. \
+             Refusing to disable cert verification in production."
+        );
+        #[cfg(not(debug_assertions))]
+        return Err(
+            "QUIC insecure_skip_verify is not permitted in production (release) builds".to_string(),
+        );
+        rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(SkipServerVerification))
+            .with_no_client_auth()
+    } else {
+        let mut root_store = rustls::RootCertStore::empty();
+        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        rustls::ClientConfig::builder()
+            .with_root_certificates(root_store)
+            .with_no_client_auth()
+    };
 
     crypto.alpn_protocols = vec![b"omnikv/1".to_vec()];
 
