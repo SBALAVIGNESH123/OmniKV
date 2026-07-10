@@ -111,7 +111,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let quic_addr_str = cfg.quic_addr.clone();
     let pgwire_addr_str = cfg.pgwire_addr.clone();
     let tcp_addr_str = cfg.tcp_addr.clone();
-    // Use http_addr_str (not cfg.http_addr) to avoid redundant clone warning.
     let http_addr: std::net::SocketAddr = http_addr_str.parse()?;
 
     let http_handle = tokio::spawn(async move {
@@ -126,7 +125,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ─── 2. QUIC/HTTP3 Binary Protocol ─────────────────────────
     let (quic_certs, quic_key) = quic_server::generate_self_signed_cert()?;
-    let quic_endpoint = quic_server::create_server_endpoint(quic_addr_str, quic_certs, quic_key)?;
+    let quic_endpoint = quic_server::create_server_endpoint(&quic_addr_str, quic_certs, quic_key)?;
     let quic_db = db.clone();
     let quic_handle = tokio::spawn(async move {
         quic_server::run_quic_server(quic_endpoint, quic_db).await;
@@ -137,7 +136,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _pgwire_handle = std::thread::spawn(move || {
         // Log before moving pgwire_addr_str into PgWireServer::new.
         tracing::info!("PostgreSQL wire protocol starting on {pgwire_addr_str}");
-        let server = omni_engine::pgwire::PgWireServer::new(pgwire_db, pgwire_addr_str);
+        let server = omni_engine::pgwire::PgWireServer::new(pgwire_db, &pgwire_addr_str);
         if let Err(e) = server.start() {
             tracing::error!("PgWire server error: {e}");
         }

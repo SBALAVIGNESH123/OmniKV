@@ -152,10 +152,10 @@ impl ServerConfig {
     }
 
     pub fn apply_env(&mut self) {
-        if let Ok(v) = std::env::var("OMNIKV_MODE") {
-            if let Ok(m) = v.parse() {
-                self.mode = m;
-            }
+        if let Ok(v) = std::env::var("OMNIKV_MODE")
+            && let Ok(m) = v.parse()
+        {
+            self.mode = m;
         }
         if let Ok(v) = std::env::var("OMNIKV_HTTP_ADDR") {
             self.http_addr = v;
