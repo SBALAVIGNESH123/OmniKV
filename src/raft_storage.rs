@@ -472,7 +472,9 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
                                 continue;
                             }
                             let key = parts[1].to_string();
-                            batch.set(&key, parts[2].to_string()).map_err(|e| storage_write_err(&e))?;
+                            batch
+                                .set(&key, parts[2].to_string())
+                                .map_err(|e| storage_write_err(&e))?;
                             res.push("OK".to_string());
                         } else {
                             res.push("ERR".to_string());
