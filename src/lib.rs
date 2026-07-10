@@ -365,7 +365,8 @@ pub struct Manifest {
 impl Manifest {
     pub fn load(path: &str) -> Result<Self, OmniError> {
         let content = std::fs::read_to_string(path)?;
-        let m: Self = serde_json::from_str(&content).map_err(|e| OmniError::IoError(e.to_string()))?;
+        let m: Self = serde_json::from_str(&content)
+            .map_err(|e| OmniError::IoError(e.to_string()))?;
         if m.format_version > MANIFEST_FORMAT_VERSION {
             return Err(OmniError::UnsupportedVersion {
                 found: m.format_version,
