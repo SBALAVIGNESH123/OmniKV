@@ -98,10 +98,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .await?;
 
     // Clone addr strings before async move closures
-    let http_addr_str  = cfg.http_addr.clone();
-    let quic_addr_str  = cfg.quic_addr.clone();
+    let http_addr_str = cfg.http_addr.clone();
+    let quic_addr_str = cfg.quic_addr.clone();
     let pgwire_addr_str = cfg.pgwire_addr.clone();
-    let tcp_addr_str   = cfg.tcp_addr.clone();
+    let tcp_addr_str = cfg.tcp_addr.clone();
     let http_addr: std::net::SocketAddr = cfg.http_addr.parse()?;
     let http_handle = tokio::spawn(async move {
         tracing::info!("HTTP/1.1 + HTTP/2 server starting on {}", http_addr_str);
@@ -123,7 +123,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ─── 3. PostgreSQL Wire Protocol ───────────────────────────
     let pgwire_db = db.clone();
-    let pgwire_handle = std::thread::spawn(move || {
+    let _pgwire_handle = std::thread::spawn(move || {
         let server = omni_engine::pgwire::PgWireServer::new(pgwire_db, &pgwire_addr_str);
         tracing::info!("PostgreSQL wire protocol starting on {}", pgwire_addr_str);
         if let Err(e) = server.start() {
