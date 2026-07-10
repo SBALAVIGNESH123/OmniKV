@@ -91,7 +91,6 @@ pub struct HealthStatus {
     pub sstable_count: usize,
 }
 
-
 #[derive(Serialize)]
 pub struct ReadyStatus {
     pub ready: bool,
@@ -159,7 +158,6 @@ async fn health_handler(State(state): State<AppState>) -> impl IntoResponse {
         sstable_count: state.db.sstable_count(),
     })
 }
-
 
 async fn ready_handler(State(state): State<AppState>) -> impl IntoResponse {
     let seq = state.db.get_seq();
