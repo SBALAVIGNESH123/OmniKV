@@ -16,8 +16,7 @@ fn omnikv_missing_key_returns_none_not_some() {
     let dir = tempdir().unwrap();
     let manifest = dir.path().join("manifest.json");
     let wal = dir.path().join("wal.bin");
-    let db =
-        OmniKV::open(&manifest.to_string_lossy(), &wal.to_string_lossy()).unwrap();
+    let db = OmniKV::open(&manifest.to_string_lossy(), &wal.to_string_lossy()).unwrap();
     let result = db.find_latest_internal("nonexistent_key_xyz");
     match result {
         Ok(None) => {} // correct — key does not exist
