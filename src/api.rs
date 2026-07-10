@@ -91,6 +91,18 @@ pub struct HealthStatus {
     pub sstable_count: usize,
 }
 
+#[derive(Serialize)]
+pub struct ReadyStatus {
+    pub ready: bool,
+    pub checks: ReadyChecks,
+}
+
+#[derive(Serialize)]
+pub struct ReadyChecks {
+    pub storage: bool,
+    pub sequence_advancing: bool,
+}
+
 #[derive(Deserialize)]
 pub struct ScanQuery {
     pub start: Option<String>,
@@ -108,6 +120,7 @@ pub fn build_router(state: AppState) -> Router {
     Router::new()
         // Health
         .route("/health", axum::routing::get(health_handler))
+        .route("/ready", axum::routing::get(ready_handler))
         // CRUD
         .route("/kv/{key}", axum::routing::get(get_handler))
         .route("/kv", axum::routing::post(set_handler))
@@ -144,6 +157,24 @@ async fn health_handler(State(state): State<AppState>) -> impl IntoResponse {
         uptime_secs: uptime,
         sstable_count: state.db.sstable_count(),
     })
+}
+
+async fn ready_handler(State(state): State<AppState>) -> impl IntoResponse {
+    let seq = state.db.get_seq();
+    let storage_ok = state.db.sstable_count() < 10_000;
+    let ready = storage_ok;
+    let status = ReadyStatus {
+        ready,
+        checks: ReadyChecks {
+            storage: storage_ok,
+            sequence_advancing: seq > 0,
+        },
+    };
+    if ready {
+        (StatusCode::OK, ApiResponse::ok(status))
+    } else {
+        (StatusCode::SERVICE_UNAVAILABLE, ApiResponse::ok(status))
+    }
 }
 
 async fn get_handler(State(state): State<AppState>, Path(key): Path<String>) -> impl IntoResponse {
