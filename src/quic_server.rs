@@ -221,12 +221,17 @@ fn handle_authenticated_request(db: &Arc<OmniKV>, buf: &[u8], jwt_secret: &str) 
     // Verify HMAC-SHA256 signature
     use std::fmt::Write as FmtWrite;
     let signing_input = format!("{}.{}", parts[0], parts[1]);
-    let key = ring::hmac::Key::new(
-        ring::hmac::HMAC_SHA256,
-        jwt_secret.as_bytes(),
-    );
-    let expected_sig = ring::hmac::sign(&key, signing_input.as_bytes());
-    let expected_b64 = base64_url_encode(expected_sig.as_ref());
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+    let mut mac = Hmac::<Sha256>::new_from_slice(jwt_secret.as_bytes())
+        .map_err(|_| {
+            tracing::warn!("QUIC invalid JWT secret");
+            b"ERR INVALID_TOKEN\n".to_vec()
+        })
+        .unwrap_or_else(|_| Default::default());
+    mac.update(signing_input.as_bytes());
+    let expected_sig_bytes = mac.finalize().into_bytes();
+    let expected_b64 = base64_url_encode(expected_sig_bytes.as_slice());
     if expected_b64 != parts[2] {
         tracing::warn!("QUIC JWT signature verification failed");
         return b"ERR INVALID_TOKEN\n".to_vec();
