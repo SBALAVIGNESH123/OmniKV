@@ -87,22 +87,29 @@ pub fn create_server_endpoint(
 
 /// Create a QUIC client endpoint for connecting to peers.
 pub fn create_client_endpoint(insecure_skip_verify: bool) -> Result<Endpoint, String> {
-    let mut crypto = if insecure_skip_verify {
-        #[cfg(debug_assertions)]
+    // Production guard: reject insecure mode in release builds
+    #[cfg(not(debug_assertions))]
+    if insecure_skip_verify {
+        return Err(
+            "QUIC insecure_skip_verify is not permitted in production (release) builds"
+                .to_string(),
+        );
+    }
+
+    // Development warning when cert verification is disabled
+    #[cfg(debug_assertions)]
+    if insecure_skip_verify {
         tracing::warn!(
             "SECURITY WARNING: QUIC certificate verification is DISABLED. \
-             This is only acceptable in development/test mode. \
-             Never use insecure_skip_verify=true in production."
+             Only acceptable in development/test mode."
         );
-        #[cfg(not(debug_assertions))]
-        tracing::error!(
-            "SECURITY ERROR: QUIC certificate verification bypass requested in RELEASE build. \
-             Refusing to disable cert verification in production."
-        );
-        #[cfg(not(debug_assertions))]
-        return Err(
-            "QUIC insecure_skip_verify is not permitted in production (release) builds".to_string(),
-        );
+    }
+
+    let mut crypto = if insecure_skip_verify {
+        rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(SkipServerVerification))
+            .with_no_client_auth()
     } else {
         let mut root_store = rustls::RootCertStore::empty();
         root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
@@ -110,7 +117,6 @@ pub fn create_client_endpoint(insecure_skip_verify: bool) -> Result<Endpoint, St
             .with_root_certificates(root_store)
             .with_no_client_auth()
     };
-
     crypto.alpn_protocols = vec![b"omnikv/1".to_vec()];
 
     let client_config = ClientConfig::new(Arc::new(
