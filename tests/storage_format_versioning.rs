@@ -4,7 +4,7 @@
 
 use std::fs;
 
-use omni_engine::{Manifest, OmniError, MANIFEST_FORMAT_VERSION};
+use omni_engine::{MANIFEST_FORMAT_VERSION, Manifest, OmniError};
 use tempfile::TempDir;
 
 fn test_manifest(dir: &TempDir) -> Manifest {
@@ -61,7 +61,7 @@ fn test_future_manifest_version_rejected() {
     let m = test_manifest(&dir);
     m.save(&path).expect("save");
     let raw = fs::read_to_string(&path).unwrap();
-    let patched = raw.replace(""format_version":1", ""format_version":2");
+    let patched = raw.replace("\"format_version\":1", "\"format_version\":2");
     fs::write(&path, patched).unwrap();
     let result = Manifest::load(&path);
     assert!(result.is_err(), "future version must be rejected");
@@ -113,7 +113,8 @@ fn test_golden_v1_fixture_accepted() {
     let dir = TempDir::new().unwrap();
     let path = manifest_path(&dir);
     // Golden v1 fixture — changing this is a breaking-change signal.
-    let golden = r#"{"heap_path":"h","base_path":"/v","sstables":["s.sst"],"max_seq":1,"format_version":1}"#;
+    let golden =
+        r#"{"heap_path":"h","base_path":"/v","sstables":["s.sst"],"max_seq":1,"format_version":1}"#;
     fs::write(&path, golden).unwrap();
     let m = Manifest::load(&path).expect("golden v1 fixture must load");
     assert_eq!(m.format_version, 1);
