@@ -253,6 +253,23 @@ impl RaftSnapshotBuilder<TypeConfig> for OmniRaftStorage {
     }
 }
 
+
+fn storage_write_err(e: impl std::fmt::Display) -> openraft::StorageError<u64> {
+    openraft::StorageError::from_io_error(
+        openraft::error::ErrorSubject::Store,
+        openraft::error::ErrorVerb::Write,
+        std::io::Error::new(std::io::ErrorKind::Other, e.to_string()),
+    )
+}
+
+fn storage_read_err(e: impl std::fmt::Display) -> openraft::StorageError<u64> {
+    openraft::StorageError::from_io_error(
+        openraft::error::ErrorSubject::Store,
+        openraft::error::ErrorVerb::Read,
+        std::io::Error::new(std::io::ErrorKind::Other, e.to_string()),
+    )
+}
+
 impl RaftStorage<TypeConfig> for OmniRaftStorage {
     type LogReader = Self;
     type SnapshotBuilder = Self;
@@ -299,8 +316,8 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
         let mut last_log_id = None;
         for entry in entries {
             let key = format!("{}{:020}", RAFT_LOG_PREFIX, entry.log_id.index);
-            let val = serde_json::to_string(&entry).map_err(|e| StorageError::write(&std::io::Error::new(std::io::ErrorKind::Other, e.to_string())))?;
-            batch.set(&key, val).map_err(|e| StorageError::write(&std::io::Error::new(std::io::ErrorKind::Other, e.to_string())))?;
+            let val = serde_json::to_string(&entry).map_err(|e| storage_write_err(&e))?;
+            batch.set(&key, val).map_err(|e| storage_write_err(&e))?;
             last_log_id = Some(entry.log_id);
         }
 
@@ -329,7 +346,7 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
         loop {
             let key = format!("{}{:020}", RAFT_LOG_PREFIX, idx);
             if let Ok(Some(_)) = self.db.find_latest_internal(&key) {
-                batch.delete(&key).map_err(|e| StorageError::write(&std::io::Error::new(std::io::ErrorKind::Other, e.to_string())))?;
+                batch.delete(&key).map_err(|e| storage_write_err(&e))?;
                 idx += 1;
             } else {
                 break;
@@ -374,7 +391,7 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
 
         for idx in start_idx..=log_id.index {
             let key = format!("{}{:020}", RAFT_LOG_PREFIX, idx);
-            batch.delete(&key).map_err(|e| StorageError::write(&std::io::Error::new(std::io::ErrorKind::Other, e.to_string())))?;
+            batch.delete(&key).map_err(|e| storage_write_err(&e))?;
         }
 
         {
@@ -421,7 +438,7 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
                                 continue;
                             }
                             let key = parts[1].to_string();
-                            batch.set(&key, parts[2].to_string()).map_err(|e| StorageError::write(&std::io::Error::new(std::io::ErrorKind::Other, e.to_string())))?;
+                            batch.set(&key, parts[2].to_string()).map_err(|e| storage_write_err(&e))?;
                             res.push("OK".to_string());
                         } else {
                             res.push("ERR".to_string());
@@ -568,7 +585,7 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
         meta.last_log_id = snap_meta.last_log_id;
         meta.membership = snap_meta.last_membership.clone();
         meta.last_purged_log_id = snap_meta.last_log_id;
-        let json = serde_json::to_string(&*meta).map_err(|e| StorageError::write(&std::io::Error::new(std::io::ErrorKind::Other, e.to_string())))?;
+        let json = serde_json::to_string(&*meta).map_err(|e| storage_write_err(&e))?;
         batch
             .set(RAFT_META_KEY, json)
             .map_err(|e| io_err(&format!("meta set: {}", e)))?;
