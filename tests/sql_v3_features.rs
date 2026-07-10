@@ -376,7 +376,7 @@ fn test_subquery_empty_result() {
 
 #[test]
 fn test_config_defaults() {
-    let config = omni_engine::config::OmniConfig::default();
+    let config = omni_engine::config::ServerConfig::default();
     assert_eq!(config.port, 8080);
     assert_eq!(config.pg_port, 5433);
     assert_eq!(config.query_timeout_secs, 30);
