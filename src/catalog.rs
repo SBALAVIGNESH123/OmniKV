@@ -139,11 +139,8 @@ impl Catalog {
             .map_err(|e| format!("{:?}", e))?;
 
         let mut cache = self
-
             .cache
-
             .write()
-
             .expect("catalog cache RwLock poisoned: fatal invariant");
         cache.insert(name_lower, table);
         Ok(())
@@ -186,11 +183,8 @@ impl Catalog {
             .map_err(|e| format!("{:?}", e))?;
 
         let mut cache = self
-
             .cache
-
             .write()
-
             .expect("catalog cache RwLock poisoned: fatal invariant");
         cache.remove(&name_lower);
         Ok(())
