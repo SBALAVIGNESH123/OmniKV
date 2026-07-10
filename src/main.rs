@@ -6,10 +6,6 @@
 //! 3. PostgreSQL wire protocol v3 (PgWire)
 //! 4. Prometheus metrics on /metrics
 
-#![allow(dead_code)]
-#![allow(unused_imports)]
-#![allow(unused_variables)]
-#![allow(unused_mut)]
 
 mod api;
 mod auth;
