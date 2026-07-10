@@ -377,10 +377,9 @@ fn test_subquery_empty_result() {
 #[test]
 fn test_config_defaults() {
     let config = omni_engine::config::ServerConfig::load_dev();
-    assert!(config.http_addr.contains(':'), "http_addr must be host:port");
-    assert!(config.pgwire_addr.contains(':'), "pgwire_addr must be host:port");
-    assert!(!config.jwt_secret.is_empty(), "jwt_secret must not be empty");
-    println!("\u2705 CONFIG: Default config has sensible values");
+    assert!(config.http_addr.contains(':'));
+    assert!(config.pgwire_addr.contains(':'));
+    assert!(!config.jwt_secret.is_empty());
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
