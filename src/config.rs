@@ -241,3 +241,31 @@ impl ServerConfig {
         }
     }
 }
+
+/// Query-engine configuration used by the SQL layer and integration tests.
+/// For full server deployment configuration use [`ServerConfig`].
+#[derive(Debug, Clone)]
+pub struct OmniConfig {
+    /// HTTP REST API port.
+    pub port: u16,
+    /// PostgreSQL wire-protocol port.
+    pub pg_port: u16,
+    /// Maximum seconds a query may run before being cancelled.
+    pub query_timeout_secs: u64,
+    /// Maximum number of concurrent client connections.
+    pub max_connections: usize,
+    /// Maximum bytes allowed in a single write batch.
+    pub max_write_batch_bytes: usize,
+}
+
+impl Default for OmniConfig {
+    fn default() -> Self {
+        Self {
+            port: 8080,
+            pg_port: 5433,
+            query_timeout_secs: 30,
+            max_connections: 256,
+            max_write_batch_bytes: 64 * 1024 * 1024, // 64 MiB
+        }
+    }
+}
