@@ -18,18 +18,33 @@ mod quic_server;
 
 use std::sync::Arc;
 
-use omni_engine::{config::ServerConfig, OmniKV};
+use omni_engine::{OmniKV, config::ServerConfig};
 
 fn print_banner(cfg: &ServerConfig) {
     println!();
     println!("  ╔════════════════════════════════════════════════════╗");
-    println!("  ║        ⚡ OmniKV v{}                       ║", env!("CARGO_PKG_VERSION"));
+    println!(
+        "  ║        ⚡ OmniKV v{}                       ║",
+        env!("CARGO_PKG_VERSION")
+    );
     println!("  ║  Embeddable · Distributed · Transactional KV      ║");
     println!("  ╠════════════════════════════════════════════════════╣");
-    println!("  ║  HTTP/1.1 + HTTP/2 (TLS)  → {}           ║", cfg.http_addr);
-    println!("  ║  QUIC/HTTP3 (binary)      → {}           ║", cfg.quic_addr);
-    println!("  ║  PostgreSQL Wire Protocol → {}           ║", cfg.pgwire_addr);
-    println!("  ║  TCP Command Interface    → {}           ║", cfg.tcp_addr);
+    println!(
+        "  ║  HTTP/1.1 + HTTP/2 (TLS)  → {}           ║",
+        cfg.http_addr
+    );
+    println!(
+        "  ║  QUIC/HTTP3 (binary)      → {}           ║",
+        cfg.quic_addr
+    );
+    println!(
+        "  ║  PostgreSQL Wire Protocol → {}           ║",
+        cfg.pgwire_addr
+    );
+    println!(
+        "  ║  TCP Command Interface    → {}           ║",
+        cfg.tcp_addr
+    );
     println!("  ╠════════════════════════════════════════════════════╣");
     println!("  ║  Built from scratch in Rust. Every byte is ours.  ║");
     println!("  ╚════════════════════════════════════════════════════╝");
@@ -111,8 +126,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ─── 2. QUIC/HTTP3 Binary Protocol ─────────────────────────
     let (quic_certs, quic_key) = quic_server::generate_self_signed_cert()?;
-    let quic_endpoint =
-        quic_server::create_server_endpoint(quic_addr_str, quic_certs, quic_key)?;
+    let quic_endpoint = quic_server::create_server_endpoint(quic_addr_str, quic_certs, quic_key)?;
     let quic_db = db.clone();
     let quic_handle = tokio::spawn(async move {
         quic_server::run_quic_server(quic_endpoint, quic_db).await;
@@ -144,16 +158,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         _ = http_handle => tracing::error!("HTTP server exited"),
         _ = quic_handle => tracing::error!("QUIC server exited"),
         _ = tcp_handle => tracing::error!("TCP server exited"),
-    },
+    }
 
     Ok(())
 }
 
 /// Simple TCP command interface for telnet/debugging.
-async fn run_tcp_server(
-    db: Arc<OmniKV>,
-    addr: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_tcp_server(db: Arc<OmniKV>, addr: &str) -> Result<(), Box<dyn std::error::Error>> {
     use omni_engine::WriteBatch;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -178,7 +189,7 @@ async fn run_tcp_server(
                 let request = request.trim();
                 if request.is_empty() {
                     continue;
-                },
+                }
 
                 let mut parts = request.splitn(3, char::is_whitespace);
                 let cmd = parts.next().unwrap_or("");
@@ -195,7 +206,7 @@ async fn run_tcp_server(
                         } else {
                             "ERROR: Missing key\n".to_string()
                         }
-                    },
+                    }
                     "SET" => {
                         if let (Some(key), Some(value)) = (parts.next(), parts.next()) {
                             let mut batch = WriteBatch::new();
@@ -209,7 +220,7 @@ async fn run_tcp_server(
                         } else {
                             "ERROR: SET <key> <value>\n".to_string()
                         }
-                    },
+                    }
                     "DELETE" => {
                         if let Some(key) = parts.next() {
                             let mut batch = WriteBatch::new();
@@ -223,7 +234,7 @@ async fn run_tcp_server(
                         } else {
                             "ERROR: Missing key\n".to_string()
                         }
-                    },
+                    }
                     "SCAN" => {
                         let start = parts.next().unwrap_or("");
                         let end = parts.next().unwrap_or("\x7F");
@@ -233,16 +244,16 @@ async fn run_tcp_server(
                                 let mut out = format!("{} results:\n", results.len());
                                 for (k, v) in results.iter().take(50) {
                                     out.push_str(&format!("  {k} = {v}\n"));
-                                },
+                                }
                                 out
-                            },
+                            }
                             Err(e) => format!("ERROR: {e:?}\n"),
                         }
-                    },
+                    }
                     "QUIT" | "EXIT" => {
                         let _ = socket.write_all(b"Goodbye.\n").await;
                         return;
-                    },
+                    }
                     _ => "ERROR: Unknown command (GET, SET, DELETE, SCAN, QUIT)\n".to_string(),
                 };
 
