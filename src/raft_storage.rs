@@ -537,6 +537,7 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
         let tmp_base_path = tmp_dir.join("data_base.bin").to_string_lossy().to_string();
 
         let tmp_manifest = crate::Manifest {
+            format_version: crate::MANIFEST_FORMAT_VERSION,
             heap_path: tmp_heap_path.clone(),
             base_path: tmp_base_path.clone(),
             sstables: vec![],
