@@ -142,7 +142,7 @@ fn sanitize_storage_err(e: &OmniError) -> String {
     tracing::error!(error = ?e, "internal storage error");
     // Return stable, opaque code to client
     match e {
-        OmniError::NotFound => "NOT_FOUND".to_string(),
+        OmniError::KeyNotFound => "NOT_FOUND".to_string(),
         OmniError::BatchTooLarge(_) => "BATCH_TOO_LARGE".to_string(),
         OmniError::UnsupportedVersion { .. } => "UNSUPPORTED_VERSION".to_string(),
         _ => "STORAGE_ERROR".to_string(),
