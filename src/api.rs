@@ -144,6 +144,7 @@ fn sanitize_storage_err(e: &OmniError) -> String {
     match e {
         OmniError::KeyNotFound => "NOT_FOUND".to_string(),
         OmniError::BatchTooLarge(_) => "BATCH_TOO_LARGE".to_string(),
+        OmniError::ValueTooLarge(_) => "VALUE_TOO_LARGE".to_string(),
         OmniError::UnsupportedVersion { .. } => "UNSUPPORTED_VERSION".to_string(),
         _ => "STORAGE_ERROR".to_string(),
     }
@@ -153,6 +154,15 @@ fn sanitize_storage_err(e: &OmniError) -> String {
 fn sanitize_err(e: &impl std::fmt::Debug) -> String {
     tracing::error!(error = ?e, "internal error");
     "INTERNAL_ERROR".to_string()
+}
+
+/// Derive correct HTTP status code from OmniError variant.
+fn http_status_for_storage_err(e: &OmniError) -> StatusCode {
+    match e {
+        OmniError::KeyNotFound => StatusCode::NOT_FOUND,
+        OmniError::BatchTooLarge(_) | OmniError::ValueTooLarge(_) => StatusCode::BAD_REQUEST,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    }
 }
 
 pub fn build_router(state: AppState) -> Router {
@@ -299,13 +309,13 @@ async fn set_handler(
     if let Some(ttl) = req.expiry {
         if let Err(e) = batch.set_with_ttl(&req.key, req.value, ttl) {
             return (
-                StatusCode::BAD_REQUEST,
+                http_status_for_storage_err(&e),
                 ApiResponse::<WriteResult>::err(&sanitize_storage_err(&e)),
             );
         }
     } else if let Err(e) = batch.set(&req.key, req.value) {
         return (
-            StatusCode::BAD_REQUEST,
+            http_status_for_storage_err(&e),
             ApiResponse::<WriteResult>::err(&sanitize_storage_err(&e)),
         );
     }
@@ -313,7 +323,7 @@ async fn set_handler(
     match state.db.commit_batch(&batch) {
         Ok(seq) => (StatusCode::CREATED, ApiResponse::ok(WriteResult { seq })),
         Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
+            http_status_for_storage_err(&e),
             ApiResponse::<WriteResult>::err(&sanitize_storage_err(&e)),
         ),
     }
@@ -328,12 +338,12 @@ async fn delete_handler(
         Ok(_) => match state.db.commit_batch(&batch) {
             Ok(seq) => (StatusCode::OK, ApiResponse::ok(WriteResult { seq })),
             Err(e) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
+                http_status_for_storage_err(&e),
                 ApiResponse::<WriteResult>::err(&sanitize_storage_err(&e)),
             ),
         },
         Err(e) => (
-            StatusCode::BAD_REQUEST,
+            http_status_for_storage_err(&e),
             ApiResponse::<WriteResult>::err(&sanitize_storage_err(&e)),
         ),
     }
@@ -366,7 +376,7 @@ async fn batch_handler(
     match state.db.commit_batch(&batch) {
         Ok(seq) => (StatusCode::OK, ApiResponse::ok(WriteResult { seq })),
         Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
+            http_status_for_storage_err(&e),
             ApiResponse::<WriteResult>::err(&sanitize_storage_err(&e)),
         ),
     }
@@ -437,7 +447,7 @@ async fn compact_handler(State(state): State<AppState>) -> impl IntoResponse {
             ApiResponse::ok("Compaction complete".to_string()),
         ),
         Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
+            http_status_for_storage_err(&e),
             ApiResponse::<String>::err(&sanitize_storage_err(&e)),
         ),
     }
