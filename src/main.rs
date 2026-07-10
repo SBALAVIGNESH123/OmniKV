@@ -30,13 +30,22 @@ fn print_banner(cfg: &ServerConfig) {
     );
     println!("  ║  Embeddable · Distributed · Transactional KV      ║");
     println!("  ╠════════════════════════════════════════════════════╣");
-    println!("  ║  HTTP/1.1 + HTTP/2 (TLS)  → {}           ║", &cfg.http_addr);
-    println!("  ║  QUIC/HTTP3 (binary)      → {}           ║", &cfg.quic_addr);
+    println!(
+        "  ║  HTTP/1.1 + HTTP/2 (TLS)  → {}           ║",
+        cfg.http_addr
+    );
+    println!(
+        "  ║  QUIC/HTTP3 (binary)      → {}           ║",
+        cfg.quic_addr
+    );
     println!(
         "  ║  PostgreSQL Wire Protocol → {}           ║",
-        &cfg.pgwire_addr
+        cfg.pgwire_addr
     );
-    println!("  ║  TCP Command Interface    → {}           ║", &cfg.tcp_addr);
+    println!(
+        "  ║  TCP Command Interface    → {}           ║",
+        cfg.tcp_addr
+    );
     println!("  ╠════════════════════════════════════════════════════╣");
     println!("  ║  Built from scratch in Rust. Every byte is ours.  ║");
     println!("  ╚════════════════════════════════════════════════════╝");
@@ -66,10 +75,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // Open the database using configured paths.
-    let db = OmniKV::open(
-        &cfg.storage.manifest_path,
-        &cfg.storage.wal_path,
-    )?;
+    let db = OmniKV::open(&cfg.storage.manifest_path, &cfg.storage.wal_path)?;
     tracing::info!(
         seq = db.get_seq(),
         sstables = db.sstable_count(),
@@ -97,12 +103,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )
     .await?;
 
-    // Clone addr strings before async move closures
+    // Clone addr strings before async move closures consume cfg
     let http_addr_str = cfg.http_addr.clone();
     let quic_addr_str = cfg.quic_addr.clone();
     let pgwire_addr_str = cfg.pgwire_addr.clone();
     let tcp_addr_str = cfg.tcp_addr.clone();
     let http_addr: std::net::SocketAddr = cfg.http_addr.parse()?;
+
     let http_handle = tokio::spawn(async move {
         tracing::info!("HTTP/1.1 + HTTP/2 server starting on {}", http_addr_str);
         if let Err(e) = axum_server::bind_rustls(http_addr, tls_config)
@@ -115,7 +122,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ─── 2. QUIC/HTTP3 Binary Protocol ─────────────────────────
     let (quic_certs, quic_key) = quic_server::generate_self_signed_cert()?;
-    let quic_endpoint = quic_server::create_server_endpoint(&quic_addr_str, quic_certs, quic_key)?;
+    let quic_endpoint =
+        quic_server::create_server_endpoint(&quic_addr_str, quic_certs, quic_key)?;
     let quic_db = db.clone();
     let quic_handle = tokio::spawn(async move {
         quic_server::run_quic_server(quic_endpoint, quic_db).await;
@@ -125,7 +133,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let pgwire_db = db.clone();
     let _pgwire_handle = std::thread::spawn(move || {
         let server = omni_engine::pgwire::PgWireServer::new(pgwire_db, &pgwire_addr_str);
-        tracing::info!("PostgreSQL wire protocol starting on {}", pgwire_addr_str);
+        tracing::info!(
+            "PostgreSQL wire protocol starting on {}",
+            pgwire_addr_str
+        );
         if let Err(e) = server.start() {
             tracing::error!("PgWire server error: {}", e);
         }
@@ -141,7 +152,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tracing::info!("All servers started. OmniKV is ready.");
 
-    // Wait for any server to exit (they shouldn't)
+    // Wait for any server to exit (they should not)
     tokio::select! {
         _ = http_handle => tracing::error!("HTTP server exited"),
         _ = quic_handle => tracing::error!("QUIC server exited"),
@@ -152,7 +163,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// Simple TCP command interface for telnet/debugging.
-async fn run_tcp_server(db: Arc<OmniKV>, addr: &str) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_tcp_server(
+    db: Arc<OmniKV>,
+    addr: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
     use omni_engine::WriteBatch;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
