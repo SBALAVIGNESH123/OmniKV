@@ -1,6 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::fmt;
-use std::path::Path;
+use std::{fmt, path::Path};
 
 pub const DEV_JWT_SECRET: &str = "dev-secret-do-not-use-in-production";
 
