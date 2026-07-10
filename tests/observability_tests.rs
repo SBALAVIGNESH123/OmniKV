@@ -24,8 +24,6 @@ fn test_metrics_counters_are_accessible() {
     use omni_engine::metrics_prometheus::{READS_TOTAL, WRITES_TOTAL};
     let r = READS_TOTAL.get();
     let w = WRITES_TOTAL.get();
-    assert!(r >= 0);
-    assert!(w >= 0);
 }
 
 #[test]
