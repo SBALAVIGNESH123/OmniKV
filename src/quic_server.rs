@@ -145,8 +145,7 @@ pub async fn run_quic_server(endpoint: Endpoint, db: Arc<OmniKV>) {
             match incoming.await {
                 Ok(conn) => {
                     tracing::debug!("QUIC connection from {}", conn.remote_address());
-                    let jwt_secret = std::env::var("OMNI_JWT_SECRET")
-                        .unwrap_or_default();
+                    let jwt_secret = std::env::var("OMNI_JWT_SECRET").unwrap_or_default();
                     while let Ok((mut send, mut recv)) = conn.accept_bi().await {
                         let db = db.clone();
                         let secret = jwt_secret.clone();
