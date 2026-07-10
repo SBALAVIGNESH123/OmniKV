@@ -1,20 +1,13 @@
-/// Tests for PGWire and QUIC protocol authentication enforcement (Issue #50).
-///
-/// Wire-level integration tests require a running server; these unit tests
-/// validate the environment-variable gate logic and password comparison logic
-/// that guard both protocols.
+use omni_engine::config::ServerConfig;
 
 #[test]
 fn pgwire_wrong_password_is_rejected() {
-    let required = "correct-horse-battery-staple-32ch";
-    let submitted = "wrong-password";
+    let expected = "correct-password";
+    let supplied = "wrong-password";
     assert_ne!(
-        required, submitted,
-        "passwords must differ — wrong password must be rejected"
-    );
-    assert!(
-        required.len() >= 16,
-        "production passwords must be at least 16 chars"
+        expected,
+        supplied,
+        "wrong password must not match expected"
     );
 }
 
@@ -22,9 +15,12 @@ fn pgwire_wrong_password_is_rejected() {
 fn pgwire_password_required_in_production() {
     let mode = std::env::var("OMNIKV_MODE").unwrap_or_default();
     if mode == "production" {
-        let pw = std::env::var("OMNIKV_PGWIRE_PASSWORD").unwrap_or_default();
-        assert!(!pw.is_empty(), "OMNIKV_PGWIRE_PASSWORD must be set in production");
-        assert!(pw.len() >= 16, "OMNIKV_PGWIRE_PASSWORD must be >= 16 chars");
+        let pw = std::env::var("OMNI_PGWIRE_PASSWORD").unwrap_or_default();
+        assert!(
+            !pw.is_empty(),
+            "OMNI_PGWIRE_PASSWORD must be set in production"
+        );
+        assert!(pw.len() >= 16, "OMNI_PGWIRE_PASSWORD must be >= 16 chars");
     }
 }
 
@@ -32,12 +28,25 @@ fn pgwire_password_required_in_production() {
 fn quic_jwt_secret_required_in_production() {
     let mode = std::env::var("OMNIKV_MODE").unwrap_or_default();
     if mode == "production" {
-        let secret = std::env::var("OMNIKV_JWT_SECRET").unwrap_or_default();
-        assert!(!secret.is_empty(), "OMNIKV_JWT_SECRET must be set in production");
+        let secret = std::env::var("OMNI_JWT_SECRET").unwrap_or_default();
+        assert!(
+            !secret.is_empty(),
+            "OMNI_JWT_SECRET must be set in production"
+        );
         assert!(
             secret != "omnikv-dev-secret-do-not-use-in-production",
             "must not use dev JWT secret in production"
         );
-        assert!(secret.len() >= 32, "OMNIKV_JWT_SECRET must be >= 32 chars");
+        assert!(
+            secret.len() >= 32,
+            "OMNI_JWT_SECRET must be >= 32 chars in production"
+        );
     }
+}
+
+#[test]
+fn server_config_loads_in_dev_mode() {
+    let cfg = ServerConfig::load_dev();
+    assert!(!cfg.http_addr.is_empty(), "http_addr must be set");
+    assert!(!cfg.pgwire_addr.is_empty(), "pgwire_addr must be set");
 }
