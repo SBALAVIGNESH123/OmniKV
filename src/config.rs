@@ -140,7 +140,7 @@ impl ServerConfig {
         cfg.apply_env();
         cfg.mode = ServerMode::Development;
         cfg
-    }
+    },
 
     pub fn load_production() -> Result<Self, ConfigError> {
         let mut cfg = Self::from_file_or_default("omnikv.toml");
@@ -148,73 +148,73 @@ impl ServerConfig {
         cfg.mode = ServerMode::Production;
         cfg.validate_production()?;
         Ok(cfg)
-    }
+    },
 
     pub fn apply_env(&mut self) {
         if let Ok(v) = std::env::var("OMNIKV_MODE") {
             if let Ok(m) = v.parse() {
                 self.mode = m;
             }
-        }
+        },
         if let Ok(v) = std::env::var("OMNIKV_HTTP_ADDR") {
             self.http_addr = v;
-        }
+        },
         if let Ok(v) = std::env::var("OMNIKV_QUIC_ADDR") {
             self.quic_addr = v;
-        }
+        },
         if let Ok(v) = std::env::var("OMNIKV_PGWIRE_ADDR") {
             self.pgwire_addr = v;
-        }
+        },
         if let Ok(v) = std::env::var("OMNIKV_TCP_ADDR") {
             self.tcp_addr = v;
-        }
+        },
         if let Ok(v) = std::env::var("OMNIKV_JWT_SECRET") {
             self.jwt_secret = v;
-        }
+        },
         if let Ok(v) = std::env::var("OMNIKV_TLS_CERT_PATH") {
             self.tls_cert_path = Some(v);
-        }
+        },
         if let Ok(v) = std::env::var("OMNIKV_TLS_KEY_PATH") {
             self.tls_key_path = Some(v);
-        }
+        },
         if let Ok(v) = std::env::var("OMNIKV_TLS_INSECURE_SKIP") {
             self.tls_insecure_skip = v.to_lowercase() == "true";
-        }
+        },
         if let Ok(v) = std::env::var("OMNIKV_LOG_LEVEL") {
             self.log_level = v;
-        }
+        },
         if let Ok(v) = std::env::var("OMNIKV_MANIFEST_PATH") {
             self.storage.manifest_path = v;
-        }
+        },
         if let Ok(v) = std::env::var("OMNIKV_WAL_PATH") {
             self.storage.wal_path = v;
-        }
+        },
         if let Ok(v) = std::env::var("OMNIKV_BACKUP_DIR") {
             self.storage.backup_dir = v;
         }
-    }
+    },
 
     pub fn validate_production(&self) -> Result<(), ConfigError> {
         if self.jwt_secret == DEV_JWT_SECRET {
             return Err(ConfigError(
                 "production mode requires a non-default JWT secret".into(),
             ));
-        }
+        },
         if self.jwt_secret.len() < 32 {
             return Err(ConfigError(
                 "JWT secret must be at least 32 characters in production".into(),
             ));
-        }
+        },
         if !self.tls_insecure_skip {
             match (&self.tls_cert_path, &self.tls_key_path) {
                 (Some(cert), Some(key)) => {
                     if !Path::new(cert).exists() {
                         return Err(ConfigError(format!("TLS cert not found: {cert}")));
-                    }
+                    },
                     if !Path::new(key).exists() {
                         return Err(ConfigError(format!("TLS key not found: {key}")));
                     }
-                }
+                },
                 _ => {
                     return Err(ConfigError(
                         "production mode requires TLS cert+key or OMNIKV_TLS_INSECURE_SKIP=true"
@@ -224,9 +224,9 @@ impl ServerConfig {
             }
         } else {
             eprintln!("WARNING: TLS verification is disabled (OMNIKV_TLS_INSECURE_SKIP=true)");
-        }
+        },
         Ok(())
-    }
+    },
 
     fn from_file_or_default(path: &str) -> Self {
         match std::fs::read_to_string(path) {
