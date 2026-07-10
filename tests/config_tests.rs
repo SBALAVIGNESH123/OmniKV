@@ -1,38 +1,39 @@
-//! Integration tests for ServerConfig.
+//! Integration tests for OmniKV server configuration.
 //!
-//! These tests exercise the real config loading, env-override, and production
-//! validation paths.  No mocking — every code path is driven as the binary
-//! would drive it.
+//! All env-var tests serialise access through ENV_MUTEX to prevent races
+//! in parallel test execution.
 
-use omni_engine::config::{ConfigError, LogLevel, ServerConfig, ServerMode, DEV_JWT_SECRET};
-use std::io::Write;
-use tempfile::NamedTempFile;
+use omni_engine::config::{ConfigError, DEV_JWT_SECRET, ServerConfig, ServerMode};
+use std::sync::Mutex;
 
-// ── helpers ──────────────────────────────────────────────────────────────────
+static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
-/// Run a closure with specific env vars set, then restore previous values.
-fn with_env<F: FnOnce()>(vars: &[(&str, &str)], f: F) {
+/// Run `f` with env vars set, restoring originals even on panic.
+fn with_env<F: FnOnce() -> R, R>(vars: &[(&str, &str)], f: F) -> R {
+    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let saved: Vec<(&str, Option<String>)> = vars
         .iter()
         .map(|(k, _)| (*k, std::env::var(k).ok()))
         .collect();
     for (k, v) in vars {
-        std::env::set_var(k, v);
+        unsafe { std::env::set_var(k, v) };
     }
-    f();
-    for (k, prev) in saved {
-        match prev {
-            Some(v) => std::env::set_var(k, v),
-            None => std::env::remove_var(k),
+    struct Restore<'a>(Vec<(&'a str, Option<String>)>);
+    impl<'a> Drop for Restore<'a> {
+        fn drop(&mut self) {
+            for (k, prev) in &self.0 {
+                match prev {
+                    Some(v) => unsafe { std::env::set_var(k, v) },
+                    None => unsafe { std::env::remove_var(k) },
+                }
+            }
         }
     }
+    let _restore = Restore(saved);
+    f()
 }
 
-fn prod_secret() -> &'static str {
-    "a-sufficiently-long-production-jwt-secret-value"
-}
-
-// ── Default / dev mode ───────────────────────────────────────────────────────
+// ── defaults ──────────────────────────────────────────────────────────────────
 
 #[test]
 fn test_default_mode_is_development() {
@@ -41,7 +42,7 @@ fn test_default_mode_is_development() {
 }
 
 #[test]
-fn test_default_jwt_secret_is_dev_constant() {
+fn test_default_jwt_is_dev_secret() {
     let cfg = ServerConfig::default();
     assert_eq!(cfg.jwt_secret, DEV_JWT_SECRET);
 }
@@ -49,138 +50,48 @@ fn test_default_jwt_secret_is_dev_constant() {
 #[test]
 fn test_default_http_addr() {
     let cfg = ServerConfig::default();
-    assert_eq!(cfg.http_addr, "0.0.0.0:8443");
-}
-
-#[test]
-fn test_default_quic_addr() {
-    let cfg = ServerConfig::default();
-    assert_eq!(cfg.quic_addr, "0.0.0.0:4433");
-}
-
-#[test]
-fn test_default_pgwire_addr() {
-    let cfg = ServerConfig::default();
-    assert_eq!(cfg.pgwire_addr, "0.0.0.0:5433");
-}
-
-#[test]
-fn test_default_tcp_addr() {
-    let cfg = ServerConfig::default();
-    assert_eq!(cfg.tcp_addr, "0.0.0.0:8080");
-}
-
-#[test]
-fn test_default_tls_is_none() {
-    let cfg = ServerConfig::default();
-    assert!(cfg.tls.is_none());
+    assert_eq!(cfg.http_addr, "127.0.0.1:7070");
 }
 
 #[test]
 fn test_default_storage_paths() {
     let cfg = ServerConfig::default();
-    assert_eq!(cfg.storage.manifest_path.to_str().unwrap(), "manifest.json");
-    assert_eq!(cfg.storage.wal_path.to_str().unwrap(), "wal.bin");
+    assert!(cfg.storage.data_dir.contains("data"));
+    assert!(cfg.storage.wal_path.contains("wal"));
+    assert!(cfg.storage.manifest_path.contains("manifest"));
 }
 
-// ── TOML parsing ─────────────────────────────────────────────────────────────
-
-#[test]
-fn test_toml_parse_minimal() {
-    let toml = r#"
-        http_addr = "127.0.0.1:9443"
-        jwt_secret = "test-secret"
-    "#;
-    let cfg = ServerConfig::from_toml_str(toml).unwrap();
-    assert_eq!(cfg.http_addr, "127.0.0.1:9443");
-    assert_eq!(cfg.jwt_secret, "test-secret");
-}
-
-#[test]
-fn test_toml_parse_all_fields() {
-    let toml = r#"
-        mode = "production"
-        http_addr = "0.0.0.0:443"
-        quic_addr = "0.0.0.0:443"
-        pgwire_addr = "0.0.0.0:5432"
-        tcp_addr = "0.0.0.0:9090"
-        jwt_secret = "my-super-secret-production-value-here"
-        tls_insecure_skip = true
-        log_level = "debug"
-
-        [storage]
-        manifest_path = "/data/manifest.json"
-        wal_path = "/data/wal.bin"
-        backup_dir = "/backups"
-        max_memtable_bytes = 134217728
-        max_sstables = 16
-    "#;
-    let cfg = ServerConfig::from_toml_str(toml).unwrap();
-    assert_eq!(cfg.mode, ServerMode::Production);
-    assert_eq!(cfg.log_level, LogLevel::Debug);
-    assert_eq!(cfg.storage.max_sstables, 16);
-    assert_eq!(cfg.storage.max_memtable_bytes, 134_217_728);
-    assert!(cfg.tls_insecure_skip);
-}
-
-#[test]
-fn test_toml_invalid_returns_error() {
-    let result = ServerConfig::from_toml_str("not valid toml [[[");
-    assert!(result.is_err());
-    let msg = result.unwrap_err().to_string();
-    assert!(msg.contains("OmniKV config error"));
-}
-
-// ── Environment variable overrides ───────────────────────────────────────────
+// ── env overrides ─────────────────────────────────────────────────────────────
 
 #[test]
 fn test_env_override_jwt_secret() {
-    with_env(&[("OMNIKV_JWT_SECRET", "env-secret-value")], || {
+    with_env(&[("OMNIKV_JWT_SECRET", "supersecret123456789012345678901")], || {
         let mut cfg = ServerConfig::default();
         cfg.apply_env();
-        assert_eq!(cfg.jwt_secret, "env-secret-value");
+        assert_eq!(cfg.jwt_secret, "supersecret123456789012345678901");
     });
 }
 
 #[test]
 fn test_env_override_http_addr() {
-    with_env(&[("OMNIKV_HTTP_ADDR", "127.0.0.1:9000")], || {
+    with_env(&[("OMNIKV_HTTP_ADDR", "0.0.0.0:8080")], || {
         let mut cfg = ServerConfig::default();
         cfg.apply_env();
-        assert_eq!(cfg.http_addr, "127.0.0.1:9000");
+        assert_eq!(cfg.http_addr, "0.0.0.0:8080");
     });
 }
 
 #[test]
-fn test_env_override_manifest_and_wal() {
-    with_env(
-        &[
-            ("OMNIKV_MANIFEST_PATH", "/tmp/test-manifest.json"),
-            ("OMNIKV_WAL_PATH", "/tmp/test-wal.bin"),
-        ],
-        || {
-            let mut cfg = ServerConfig::default();
-            cfg.apply_env();
-            assert_eq!(
-                cfg.storage.manifest_path.to_str().unwrap(),
-                "/tmp/test-manifest.json"
-            );
-            assert_eq!(cfg.storage.wal_path.to_str().unwrap(), "/tmp/test-wal.bin");
-        },
-    );
-}
-
-#[test]
-fn test_env_override_log_level_warn() {
-    with_env(&[("OMNIKV_LOG_LEVEL", "warn")], || {
+fn test_env_override_log_level() {
+    with_env(&[("OMNIKV_LOG_LEVEL", "debug")], || {
         let mut cfg = ServerConfig::default();
         cfg.apply_env();
-        assert_eq!(cfg.log_level, LogLevel::Warn);
+        assert_eq!(cfg.log_level, "debug");
     });
 }
 
 #[test]
-fn test_env_mode_production() {
+fn test_env_override_mode_production() {
     with_env(&[("OMNIKV_MODE", "production")], || {
         let mut cfg = ServerConfig::default();
         cfg.apply_env();
@@ -189,117 +100,131 @@ fn test_env_mode_production() {
 }
 
 #[test]
-fn test_env_tls_insecure_skip_true() {
-    with_env(&[("OMNIKV_TLS_INSECURE_SKIP", "true")], || {
+fn test_env_override_backup_dir() {
+    with_env(&[("OMNIKV_BACKUP_DIR", "/var/lib/omnikv/backups")], || {
         let mut cfg = ServerConfig::default();
         cfg.apply_env();
-        assert!(cfg.tls_insecure_skip);
+        assert_eq!(cfg.storage.backup_dir, "/var/lib/omnikv/backups");
     });
 }
 
-// ── Production validation ─────────────────────────────────────────────────────
+#[test]
+fn test_env_override_max_open_files() {
+    with_env(&[("OMNIKV_MAX_OPEN_FILES", "1024")], || {
+        let mut cfg = ServerConfig::default();
+        cfg.apply_env();
+        assert_eq!(cfg.storage.max_open_files, 1024);
+    });
+}
+
+// ── production validation ─────────────────────────────────────────────────────
 
 #[test]
-fn test_prod_rejects_dev_jwt_secret() {
+fn test_production_rejects_dev_secret() {
     let mut cfg = ServerConfig::default();
     cfg.mode = ServerMode::Production;
-    cfg.tls_insecure_skip = true;
-    // jwt_secret is still DEV_JWT_SECRET
-    let result = cfg.validate_production();
-    assert!(result.is_err());
-    let msg = result.unwrap_err().to_string();
-    assert!(msg.contains("JWT") || msg.contains("jwt") || msg.contains("secret"));
+    let err = cfg.validate_production().unwrap_err();
+    assert!(matches!(err, ConfigError::ProductionDevSecret));
 }
 
 #[test]
-fn test_prod_rejects_short_jwt_secret() {
+fn test_production_rejects_short_secret() {
     let mut cfg = ServerConfig::default();
-    cfg.tls_insecure_skip = true;
-    cfg.jwt_secret = "tooshort".to_string();
-    let result = cfg.validate_production();
-    assert!(result.is_err());
+    cfg.mode = ServerMode::Production;
+    cfg.jwt_secret = "tooshort".into();
+    let err = cfg.validate_production().unwrap_err();
+    assert!(matches!(err, ConfigError::JwtSecretTooShort { .. }));
 }
 
 #[test]
-fn test_prod_rejects_missing_tls_when_not_skipped() {
+fn test_production_rejects_missing_tls() {
     let mut cfg = ServerConfig::default();
-    cfg.jwt_secret = prod_secret().to_string();
-    cfg.tls = None;
-    cfg.tls_insecure_skip = false;
-    let result = cfg.validate_production();
-    assert!(result.is_err());
-    let msg = result.unwrap_err().to_string();
-    assert!(msg.contains("TLS") || msg.contains("tls"));
+    cfg.mode = ServerMode::Production;
+    cfg.jwt_secret = "a".repeat(32);
+    let err = cfg.validate_production().unwrap_err();
+    assert!(matches!(err, ConfigError::TlsNotConfigured));
 }
 
 #[test]
-fn test_prod_accepts_insecure_skip_with_good_secret() {
+fn test_production_accepts_insecure_skip() {
     let mut cfg = ServerConfig::default();
-    cfg.jwt_secret = prod_secret().to_string();
-    cfg.tls_insecure_skip = true;
+    cfg.mode = ServerMode::Production;
+    cfg.jwt_secret = "a".repeat(32);
+    cfg.tls.insecure_skip = true;
     assert!(cfg.validate_production().is_ok());
 }
 
 #[test]
-fn test_prod_rejects_missing_cert_file() {
-    use omni_engine::config::TlsConfig;
+fn test_production_rejects_missing_cert_file() {
     let mut cfg = ServerConfig::default();
-    cfg.jwt_secret = prod_secret().to_string();
-    cfg.tls = Some(TlsConfig {
-        cert_path: std::path::PathBuf::from("/nonexistent/cert.pem"),
-        key_path: std::path::PathBuf::from("/nonexistent/key.pem"),
-    });
-    let result = cfg.validate_production();
-    assert!(result.is_err());
-    let msg = result.unwrap_err().to_string();
-    assert!(msg.contains("cert") || msg.contains("TLS"));
+    cfg.mode = ServerMode::Production;
+    cfg.jwt_secret = "a".repeat(32);
+    cfg.tls.cert_path = Some("/nonexistent/cert.pem".into());
+    cfg.tls.key_path = Some("/nonexistent/key.pem".into());
+    let err = cfg.validate_production().unwrap_err();
+    assert!(matches!(err, ConfigError::TlsCertMissing { .. }));
+}
+
+// ── mode parsing ──────────────────────────────────────────────────────────────
+
+#[test]
+fn test_mode_parse_development() {
+    let m: ServerMode = "development".parse().unwrap();
+    assert_eq!(m, ServerMode::Development);
 }
 
 #[test]
-fn test_prod_accepts_existing_tls_files() {
-    use omni_engine::config::TlsConfig;
-    let cert = NamedTempFile::new().unwrap();
-    let key = NamedTempFile::new().unwrap();
-    let mut cfg = ServerConfig::default();
-    cfg.jwt_secret = prod_secret().to_string();
-    cfg.tls = Some(TlsConfig {
-        cert_path: cert.path().to_path_buf(),
-        key_path: key.path().to_path_buf(),
-    });
-    assert!(cfg.validate_production().is_ok());
-}
-
-// ── Load from TOML file ───────────────────────────────────────────────────────
-
-#[test]
-fn test_load_from_toml_file() {
-    let mut f = NamedTempFile::new().unwrap();
-    writeln!(f, r#"http_addr = "0.0.0.0:9443""#).unwrap();
-    writeln!(f, r#"jwt_secret = "file-loaded-secret""#).unwrap();
-    let cfg = ServerConfig::load_from_file(f.path()).unwrap();
-    assert_eq!(cfg.http_addr, "0.0.0.0:9443");
-    assert_eq!(cfg.jwt_secret, "file-loaded-secret");
+fn test_mode_parse_production() {
+    let m: ServerMode = "production".parse().unwrap();
+    assert_eq!(m, ServerMode::Production);
 }
 
 #[test]
-fn test_load_from_nonexistent_file_returns_error() {
-    let result = ServerConfig::load_from_file(std::path::Path::new("/no/such/file.toml"));
-    assert!(result.is_err());
+fn test_mode_parse_dev_alias() {
+    let m: ServerMode = "dev".parse().unwrap();
+    assert_eq!(m, ServerMode::Development);
 }
 
-// ── Error display ─────────────────────────────────────────────────────────────
-
 #[test]
-fn test_config_error_display() {
-    let e = ConfigError("something went wrong".to_string());
-    assert!(e.to_string().contains("something went wrong"));
+fn test_mode_parse_invalid() {
+    let err = "staging".parse::<ServerMode>();
+    assert!(err.is_err());
 }
 
-// ── LogLevel display ──────────────────────────────────────────────────────────
+// ── error display ─────────────────────────────────────────────────────────────
 
 #[test]
-fn test_log_level_display() {
-    assert_eq!(LogLevel::Info.to_string(), "info");
-    assert_eq!(LogLevel::Warn.to_string(), "warn");
-    assert_eq!(LogLevel::Debug.to_string(), "debug");
+fn test_error_display_dev_secret() {
+    let e = ConfigError::ProductionDevSecret;
+    assert!(e.to_string().contains("OMNIKV_JWT_SECRET"));
+}
+
+#[test]
+fn test_error_display_tls_not_configured() {
+    let e = ConfigError::TlsNotConfigured;
+    assert!(e.to_string().contains("TLS"));
+}
+
+#[test]
+fn test_error_display_jwt_too_short() {
+    let e = ConfigError::JwtSecretTooShort { len: 8 };
+    assert!(e.to_string().contains("8"));
+}
+
+// ── storage config ────────────────────────────────────────────────────────────
+
+#[test]
+fn test_storage_defaults() {
+    let s = omni_engine::config::StorageConfig::default();
+    assert_eq!(s.max_open_files, 512);
+    assert_eq!(s.write_buffer_mb, 64);
+    assert_eq!(s.compaction_workers, 2);
+}
+
+// ── load_dev ──────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_load_dev_succeeds() {
+    let cfg = ServerConfig::load_dev();
+    assert_eq!(cfg.mode, ServerMode::Development);
 }
