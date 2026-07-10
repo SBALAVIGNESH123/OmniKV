@@ -22,10 +22,7 @@ use std::sync::Arc;
 fn print_banner(cfg: &ServerConfig) {
     println!();
     println!("  ╔════════════════════════════════════════════════════╗");
-    println!(
-        "  ║        ⚡ OmniKV v{}                       ║",
-        env!("CARGO_PKG_VERSION")
-    );
+    println!("  ║        ⚡ OmniKV v{}                       ║", env!("CARGO_PKG_VERSION"));
     println!("  ║  Embeddable · Distributed · Transactional KV      ║");
     println!("  ╠════════════════════════════════════════════════════╣");
     println!("  ║  HTTP/1.1 + HTTP/2 (TLS)  → {}           ║", cfg.http_addr);
