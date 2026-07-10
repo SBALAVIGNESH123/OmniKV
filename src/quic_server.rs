@@ -91,8 +91,7 @@ pub fn create_client_endpoint(insecure_skip_verify: bool) -> Result<Endpoint, St
     #[cfg(not(debug_assertions))]
     if insecure_skip_verify {
         return Err(
-            "QUIC insecure_skip_verify is not permitted in production (release) builds"
-                .to_string(),
+            "QUIC insecure_skip_verify is not permitted in production (release) builds".to_string(),
         );
     }
 
