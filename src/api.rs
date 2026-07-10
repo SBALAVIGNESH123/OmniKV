@@ -137,15 +137,7 @@ impl RequiredRole {
 
 /// Build the Axum router with all API routes.
 pub fn build_router(state: AppState) -> Router {
-<<<<<<< HEAD
     let read_routes = Router::new()
-=======
-    Router::new()
-        // Health
-        .route("/health", axum::routing::get(health_handler))
-        .route("/ready", axum::routing::get(ready_handler))
-        // CRUD
->>>>>>> origin/master
         .route("/kv/{key}", axum::routing::get(get_handler))
         .route("/scan", axum::routing::get(scan_handler))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_read));
