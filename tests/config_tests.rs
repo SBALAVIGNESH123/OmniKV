@@ -1,5 +1,6 @@
-use omni_engine::config::{ConfigError, ServerConfig, ServerMode, DEV_JWT_SECRET};
 use std::sync::Mutex;
+
+use omni_engine::config::{ConfigError, ServerConfig, ServerMode, DEV_JWT_SECRET};
 
 static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
