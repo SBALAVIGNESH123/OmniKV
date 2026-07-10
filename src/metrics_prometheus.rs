@@ -40,8 +40,11 @@ lazy_static! {
     .unwrap();
     pub static ref SSTABLE_COUNT: IntGauge =
         register_int_gauge!("omnikv_sstable_count", "Total number of SSTables (L0 + L1)").unwrap();
-    pub static ref DB_SEQUENCE: IntGauge =
-        register_int_gauge!("omnikv_db_sequence", "Current database write sequence number").unwrap();
+    pub static ref DB_SEQUENCE: IntGauge = register_int_gauge!(
+        "omnikv_db_sequence",
+        "Current database write sequence number"
+    )
+    .unwrap();
     pub static ref UPTIME_SECONDS: IntGauge =
         register_int_gauge!("omnikv_uptime_seconds", "Server uptime in seconds").unwrap();
     pub static ref COMMIT_RATE: IntCounter =
