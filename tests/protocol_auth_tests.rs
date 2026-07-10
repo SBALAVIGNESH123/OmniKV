@@ -4,11 +4,7 @@ use omni_engine::config::ServerConfig;
 fn pgwire_wrong_password_is_rejected() {
     let expected = "correct-password";
     let supplied = "wrong-password";
-    assert_ne!(
-        expected,
-        supplied,
-        "wrong password must not match expected"
-    );
+    assert_ne!(expected, supplied, "wrong password must not match expected");
 }
 
 #[test]
