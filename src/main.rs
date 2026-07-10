@@ -24,28 +24,13 @@ use omni_engine::config::ServerConfig;
 fn print_banner(cfg: &ServerConfig) {
     println!();
     println!("  ╔════════════════════════════════════════════════════╗");
-    println!(
-        "  ║        ⚡ OmniKV v{}                       ║",
-        env!("CARGO_PKG_VERSION")
-    );
+    println!("  ║        ⚡ OmniKV v{}                       ║", env!("CARGO_PKG_VERSION"));
     println!("  ║  Embeddable · Distributed · Transactional KV      ║");
     println!("  ╠════════════════════════════════════════════════════╣");
-    println!(
-        "  ║  HTTP/1.1 + HTTP/2 (TLS)  → {}           ║",
-        cfg.http_addr
-    );
-    println!(
-        "  ║  QUIC/HTTP3 (binary)      → {}           ║",
-        cfg.quic_addr
-    );
-    println!(
-        "  ║  PostgreSQL Wire Protocol → {}           ║",
-        cfg.pgwire_addr
-    );
-    println!(
-        "  ║  TCP Command Interface    → {}           ║",
-        cfg.tcp_addr
-    );
+    println!("  ║  HTTP/1.1 + HTTP/2 (TLS)  → {}           ║", cfg.http_addr);
+    println!("  ║  QUIC/HTTP3 (binary)      → {}           ║", cfg.quic_addr);
+    println!("  ║  PostgreSQL Wire Protocol → {}           ║", cfg.pgwire_addr);
+    println!("  ║  TCP Command Interface    → {}           ║", cfg.tcp_addr);
     println!("  ╠════════════════════════════════════════════════════╣");
     println!("  ║  Built from scratch in Rust. Every byte is ours.  ║");
     println!("  ╚════════════════════════════════════════════════════╝");
@@ -111,12 +96,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let http_addr: std::net::SocketAddr = cfg.http_addr.parse()?;
 
     let http_handle = tokio::spawn(async move {
-        tracing::info!("HTTP/1.1 + HTTP/2 server starting on {}", http_addr_str);
+        tracing::info!("HTTP/1.1 + HTTP/2 server starting on {http_addr_str}");
         if let Err(e) = axum_server::bind_rustls(http_addr, tls_config)
             .serve(router.into_make_service())
             .await
         {
-            tracing::error!("HTTP server error: {}", e);
+            tracing::error!("HTTP server error: {e}");
         }
     });
 
@@ -133,12 +118,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let pgwire_db = db.clone();
     let _pgwire_handle = std::thread::spawn(move || {
         let server = omni_engine::pgwire::PgWireServer::new(pgwire_db, &pgwire_addr_str);
-        tracing::info!(
-            "PostgreSQL wire protocol starting on {}",
-            pgwire_addr_str
-        );
+        tracing::info!("PostgreSQL wire protocol starting on {pgwire_addr_str}");
         if let Err(e) = server.start() {
-            tracing::error!("PgWire server error: {}", e);
+            tracing::error!("PgWire server error: {e}");
         }
     });
 
@@ -146,7 +128,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let tcp_db = db.clone();
     let tcp_handle = tokio::spawn(async move {
         if let Err(e) = run_tcp_server(tcp_db, &tcp_addr_str).await {
-            tracing::error!("TCP server error: {}", e);
+            tracing::error!("TCP server error: {e}");
         }
     });
 
@@ -171,7 +153,7 @@ async fn run_tcp_server(
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    tracing::info!("TCP command interface on {}", addr);
+    tracing::info!("TCP command interface on {addr}");
 
     loop {
         let (mut socket, _addr) = listener.accept().await?;
@@ -201,9 +183,9 @@ async fn run_tcp_server(
                         if let Some(key) = parts.next() {
                             let seq = db.get_seq();
                             match db.find(key, seq) {
-                                Ok(Some(val)) => format!("OK: {}\n", val),
+                                Ok(Some(val)) => format!("OK: {val}\n"),
                                 Ok(None) => "NOT_FOUND\n".to_string(),
-                                Err(e) => format!("ERROR: {:?}\n", e),
+                                Err(e) => format!("ERROR: {e:?}\n"),
                             }
                         } else {
                             "ERROR: Missing key\n".to_string()
@@ -214,10 +196,10 @@ async fn run_tcp_server(
                             let mut batch = WriteBatch::new();
                             match batch.set(key, value.to_string()) {
                                 Ok(_) => match db.commit_batch(&batch) {
-                                    Ok(seq) => format!("OK: seq={}\n", seq),
-                                    Err(e) => format!("ERROR: {:?}\n", e),
+                                    Ok(seq) => format!("OK: seq={seq}\n"),
+                                    Err(e) => format!("ERROR: {e:?}\n"),
                                 },
-                                Err(e) => format!("ERROR: {:?}\n", e),
+                                Err(e) => format!("ERROR: {e:?}\n"),
                             }
                         } else {
                             "ERROR: SET <key> <value>\n".to_string()
@@ -228,10 +210,10 @@ async fn run_tcp_server(
                             let mut batch = WriteBatch::new();
                             match batch.delete(key) {
                                 Ok(_) => match db.commit_batch(&batch) {
-                                    Ok(seq) => format!("DELETED: seq={}\n", seq),
-                                    Err(e) => format!("ERROR: {:?}\n", e),
+                                    Ok(seq) => format!("DELETED: seq={seq}\n"),
+                                    Err(e) => format!("ERROR: {e:?}\n"),
                                 },
-                                Err(e) => format!("ERROR: {:?}\n", e),
+                                Err(e) => format!("ERROR: {e:?}\n"),
                             }
                         } else {
                             "ERROR: Missing key\n".to_string()
@@ -245,11 +227,11 @@ async fn run_tcp_server(
                             Ok(results) => {
                                 let mut out = format!("{} results:\n", results.len());
                                 for (k, v) in results.iter().take(50) {
-                                    out.push_str(&format!("  {} = {}\n", k, v));
+                                    out.push_str(&format!("  {k} = {v}\n"));
                                 }
                                 out
                             }
-                            Err(e) => format!("ERROR: {:?}\n", e),
+                            Err(e) => format!("ERROR: {e:?}\n"),
                         }
                     }
                     "QUIT" | "EXIT" => {
