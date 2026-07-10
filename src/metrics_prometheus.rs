@@ -10,9 +10,13 @@ use prometheus::{
 
 lazy_static! {
     pub static ref WRITES_TOTAL: IntCounter =
-        register_int_counter!("omnikv_writes_total", "Total number of write operations").unwrap();
+        register_int_counter!("omnikv_writes_total", "Total number of write operations").expect(
+            "OmniKV metric registration failed at startup: duplicate or invalid metric name"
+        );
     pub static ref READS_TOTAL: IntCounter =
-        register_int_counter!("omnikv_reads_total", "Total number of read operations").unwrap();
+        register_int_counter!("omnikv_reads_total", "Total number of read operations").expect(
+            "OmniKV metric registration failed at startup: duplicate or invalid metric name"
+        );
     pub static ref ACTIVE_TRANSACTIONS: IntGauge = register_int_gauge!(
         "omnikv_active_transactions",
         "Number of currently active transactions"
@@ -39,16 +43,22 @@ lazy_static! {
     )
     .unwrap();
     pub static ref SSTABLE_COUNT: IntGauge =
-        register_int_gauge!("omnikv_sstable_count", "Total number of SSTables (L0 + L1)").unwrap();
+        register_int_gauge!("omnikv_sstable_count", "Total number of SSTables (L0 + L1)").expect(
+            "OmniKV metric registration failed at startup: duplicate or invalid metric name"
+        );
     pub static ref DB_SEQUENCE: IntGauge = register_int_gauge!(
         "omnikv_db_sequence",
         "Current database write sequence number"
     )
     .unwrap();
     pub static ref UPTIME_SECONDS: IntGauge =
-        register_int_gauge!("omnikv_uptime_seconds", "Server uptime in seconds").unwrap();
+        register_int_gauge!("omnikv_uptime_seconds", "Server uptime in seconds").expect(
+            "OmniKV metric registration failed at startup: duplicate or invalid metric name"
+        );
     pub static ref COMMIT_RATE: IntCounter =
-        register_int_counter!("omnikv_commits_total", "Total number of committed batches").unwrap();
+        register_int_counter!("omnikv_commits_total", "Total number of committed batches").expect(
+            "OmniKV metric registration failed at startup: duplicate or invalid metric name"
+        );
 }
 
 /// Render all metrics in Prometheus text format.
