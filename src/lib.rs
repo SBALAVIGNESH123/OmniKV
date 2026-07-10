@@ -214,15 +214,7 @@ impl BloomFilter {
 
     pub fn load(path: &str) -> Result<Self, OmniError> {
         let content = std::fs::read_to_string(path)?;
-        let m: Self =
-            serde_json::from_str(&content).map_err(|e| OmniError::IoError(e.to_string()))?;
-        if m.format_version > MANIFEST_FORMAT_VERSION {
-            return Err(OmniError::UnsupportedVersion {
-                found: m.format_version,
-                supported: MANIFEST_FORMAT_VERSION,
-            });
-        }
-        Ok(m)
+        serde_json::from_str(&content).map_err(|e| OmniError::IoError(e.to_string()))
     }
 
     pub fn new(expected_elements: usize) -> Self {
@@ -349,8 +341,7 @@ impl WriteBatch {
     }
 }
 
-/// Current on-disk manifest format version. Increment when the layout changes
-/// in a backward-incompatible way. Old binaries will refuse to open newer files.
+/// Current on-disk manifest format version. Increment for incompatible changes.
 pub const MANIFEST_FORMAT_VERSION: u32 = 1;
 
 fn default_manifest_format_version() -> u32 {
@@ -366,8 +357,7 @@ pub struct Manifest {
     pub l1_sstables: Vec<String>,
     #[serde(default)]
     pub max_seq: u64,
-    /// Format version written into every manifest file.
-    /// Missing in manifests created before versioning was added — treated as v1.
+    /// Format version. Missing in old manifests → treated as v1.
     #[serde(default = "default_manifest_format_version")]
     pub format_version: u32,
 }
@@ -375,11 +365,18 @@ pub struct Manifest {
 impl Manifest {
     pub fn load(path: &str) -> Result<Self, OmniError> {
         let content = std::fs::read_to_string(path)?;
-        serde_json::from_str(&content).map_err(|e| OmniError::IoError(e.to_string()))
+        let m: Self =
+            serde_json::from_str(&content).map_err(|e| OmniError::IoError(e.to_string()))?;
+        if m.format_version > MANIFEST_FORMAT_VERSION {
+            return Err(OmniError::UnsupportedVersion {
+                found: m.format_version,
+                supported: MANIFEST_FORMAT_VERSION,
+            });
+        }
+        Ok(m)
     }
     pub fn save(&self, path: &str) -> Result<(), OmniError> {
-        // Always persist the current format version so readers can detect
-        // future incompatible changes.
+        // Always write current format version.
         let mut to_save = self.clone();
         to_save.format_version = MANIFEST_FORMAT_VERSION;
         let content = serde_json::to_string(&to_save)
