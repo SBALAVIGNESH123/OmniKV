@@ -83,7 +83,13 @@ pub enum OmniError {
 
 impl std::fmt::Display for OmniError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{:?}", self)
+        match self {
+            OmniError::UnsupportedVersion { found, supported } => write!(
+                f,
+                "unsupported manifest version {found}: this build supports up to {supported}"
+            ),
+            other => write!(f, "{other:?}"),
+        }
     }
 }
 
