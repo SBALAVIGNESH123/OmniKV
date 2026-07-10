@@ -73,6 +73,9 @@ pub enum OmniError {
     HashCollision,
     LockPoisoned(String),
     WriteStall,
+    /// The on-disk format version is newer than this binary understands.
+    /// The `found` version was read; `supported` is the maximum this build accepts.
+    UnsupportedVersion { found: u32, supported: u32 },
 }
 
 impl std::fmt::Display for OmniError {
@@ -211,7 +214,15 @@ impl BloomFilter {
 
     pub fn load(path: &str) -> Result<Self, OmniError> {
         let content = std::fs::read_to_string(path)?;
-        serde_json::from_str(&content).map_err(|e| OmniError::IoError(e.to_string()))
+        let m: Self =
+            serde_json::from_str(&content).map_err(|e| OmniError::IoError(e.to_string()))?;
+        if m.format_version > MANIFEST_FORMAT_VERSION {
+            return Err(OmniError::UnsupportedVersion {
+                found: m.format_version,
+                supported: MANIFEST_FORMAT_VERSION,
+            });
+        }
+        Ok(m)
     }
 
     pub fn new(expected_elements: usize) -> Self {
@@ -338,6 +349,14 @@ impl WriteBatch {
     }
 }
 
+/// Current on-disk manifest format version. Increment when the layout changes
+/// in a backward-incompatible way. Old binaries will refuse to open newer files.
+pub const MANIFEST_FORMAT_VERSION: u32 = 1;
+
+fn default_manifest_format_version() -> u32 {
+    MANIFEST_FORMAT_VERSION
+}
+
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
 pub struct Manifest {
     pub heap_path: String,
@@ -347,6 +366,10 @@ pub struct Manifest {
     pub l1_sstables: Vec<String>,
     #[serde(default)]
     pub max_seq: u64,
+    /// Format version written into every manifest file.
+    /// Missing in manifests created before versioning was added — treated as v1.
+    #[serde(default = "default_manifest_format_version")]
+    pub format_version: u32,
 }
 
 impl Manifest {
@@ -355,7 +378,11 @@ impl Manifest {
         serde_json::from_str(&content).map_err(|e| OmniError::IoError(e.to_string()))
     }
     pub fn save(&self, path: &str) -> Result<(), OmniError> {
-        let content = serde_json::to_string(self)
+        // Always persist the current format version so readers can detect
+        // future incompatible changes.
+        let mut to_save = self.clone();
+        to_save.format_version = MANIFEST_FORMAT_VERSION;
+        let content = serde_json::to_string(&to_save)
             .map_err(|e| OmniError::IoError(format!("Manifest serialize: {}", e)))?;
         let tmp_path = format!("{}.tmp", path);
         std::fs::write(&tmp_path, content)?;
