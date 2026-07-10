@@ -49,7 +49,11 @@ fn test_clean_shutdown_no_data_loss() {
     let got = db2
         .find_latest_internal("k1")
         .expect("find after clean shutdown");
-    assert_eq!(got.as_deref(), Some("v1"), "value must survive clean shutdown");
+    assert_eq!(
+        got.as_deref(),
+        Some("v1"),
+        "value must survive clean shutdown"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -72,8 +76,7 @@ fn test_wal_tail_corruption_committed_data_survives() {
     f.sync_all().expect("sync corruption");
     drop(f);
 
-    let db2 = OmniKV::open(&manifest, &wal)
-        .expect("engine must open despite WAL tail corruption");
+    let db2 = OmniKV::open(&manifest, &wal).expect("engine must open despite WAL tail corruption");
     let got = db2
         .find_latest_internal("k2")
         .expect("find after WAL tail corruption");
@@ -151,7 +154,10 @@ fn test_uncommitted_write_not_visible_after_crash() {
     let got = db2
         .find_latest_internal("k5_uncommitted")
         .expect("find uncommitted key");
-    assert!(got.is_none(), "uncommitted write must not be visible after crash");
+    assert!(
+        got.is_none(),
+        "uncommitted write must not be visible after crash"
+    );
 
     let committed = db2
         .find_latest_internal("k5_committed")
