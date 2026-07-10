@@ -6,7 +6,6 @@
 //! 3. PostgreSQL wire protocol v3 (PgWire)
 //! 4. Prometheus metrics on /metrics
 
-
 mod api;
 mod auth;
 mod cluster;
