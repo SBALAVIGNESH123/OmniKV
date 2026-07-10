@@ -1,6 +1,8 @@
 #![allow(dead_code)]
-
-
+#![allow(unused_imports)]
+#![allow(unused_variables)]
+#![allow(unused_mut)]
+#![allow(mismatched_lifetime_syntaxes)]
 
 use arc_swap::ArcSwap;
 use crossbeam_skiplist::SkipMap;
