@@ -22,7 +22,6 @@
 //! SeqScanIter::next()  ← reads one row at a time from storage
 //! ```
 
-#![allow(dead_code)]
 
 use crate::OmniKV;
 use crate::catalog::{Catalog, TableDef};
