@@ -2,7 +2,7 @@
 //!
 //! Executes queries using the optimizer's physical plan tree instead of
 //! the old hardcoded scan-filter-sort pipeline.
-
+#![allow(dead_code)]
 
 use crate::OmniKV;
 use crate::catalog::{Catalog, TableDef};
