@@ -16,17 +16,18 @@ fn test_manifest_format_version_constant() {
 fn test_legacy_manifest_no_version_field_loads_as_v1() {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("manifest.json").to_string_lossy().to_string();
+    // Old-style manifest: no format_version field at all
     let legacy = r#"{"heap_path":"heap.bin","base_path":"/tmp","sstables":[],"max_seq":0}"#;
     fs::write(&path, legacy).unwrap();
     let m = Manifest::load(&path).expect("legacy manifest must load");
-    assert_eq!(m.format_version, 1);
+    assert_eq!(m.format_version, 1, "missing field must default to v1");
 }
 
 #[test]
 fn test_manifest_v1_explicit_loads() {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("manifest.json").to_string_lossy().to_string();
-    let v1 = r#"{"heap_path":"heap.bin","base_path":"/tmp","sstables":["sst_001.sst"],"l1_sstables":[],"max_seq":42,"format_version":1}"#;
+    let v1 = r#"{"heap_path":"h","base_path":"/t","sstables":["s.sst"],"max_seq":42,"format_version":1}"#;
     fs::write(&path, v1).unwrap();
     let m = Manifest::load(&path).expect("v1 manifest must load");
     assert_eq!(m.format_version, 1);
@@ -37,7 +38,8 @@ fn test_manifest_v1_explicit_loads() {
 fn test_future_manifest_version_rejected() {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("manifest.json").to_string_lossy().to_string();
-    let future = r#"{"heap_path":"heap.bin","base_path":"/tmp","sstables":[],"max_seq":0,"format_version":2}"#;
+    let future =
+        r#"{"heap_path":"h","base_path":"/t","sstables":[],"max_seq":0,"format_version":2}"#;
     fs::write(&path, future).unwrap();
     let result = Manifest::load(&path);
     assert!(result.is_err(), "manifest with future version must be rejected");
@@ -60,12 +62,12 @@ fn test_saved_manifest_includes_format_version() {
         sstables: vec![],
         l1_sstables: vec![],
         max_seq: 0,
-        format_version: 0,
+        format_version: 0, // intentionally wrong — save() must override
     };
     m.save(&path).expect("save must succeed");
     let raw = fs::read_to_string(&path).expect("read saved manifest");
     assert!(
-        raw.contains("\"format_version\":1"),
+        raw.contains(""format_version":1"),
         "saved manifest must contain format_version:1, got: {raw}"
     );
 }
@@ -94,8 +96,9 @@ fn test_manifest_round_trip() {
 fn test_golden_v1_fixture_accepted() {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("manifest.json").to_string_lossy().to_string();
-    let golden: &[u8] = br#"{"heap_path":"heap.bin","base_path":"/var/lib/omnikv","sstables":["level0/sst_000001.sst"],"l1_sstables":[],"max_seq":1,"format_version":1}"#;
-    fs::write(&path, golden).unwrap();
+    // Golden v1 fixture — changing this test is a breaking-change signal.
+    let golden = r#"{"heap_path":"h","base_path":"/v","sstables":["l0/s.sst"],"max_seq":1,"format_version":1}"#;
+    fs::write(&path, golden.as_bytes()).unwrap();
     let m = Manifest::load(&path).expect("golden v1 fixture must load");
     assert_eq!(m.format_version, 1);
     assert_eq!(m.max_seq, 1);
@@ -106,7 +109,7 @@ fn test_corrupt_manifest_returns_err() {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("manifest.json").to_string_lossy().to_string();
     fs::write(&path, b"{corrupt{{").unwrap();
-    assert!(Manifest::load(&path).is_err());
+    assert!(Manifest::load(&path).is_err(), "corrupt manifest must return Err");
 }
 
 #[test]
@@ -114,5 +117,5 @@ fn test_empty_manifest_returns_err() {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("manifest.json").to_string_lossy().to_string();
     fs::write(&path, b"").unwrap();
-    assert!(Manifest::load(&path).is_err());
+    assert!(Manifest::load(&path).is_err(), "empty manifest must return Err");
 }
