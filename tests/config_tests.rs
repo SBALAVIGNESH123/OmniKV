@@ -10,13 +10,13 @@ fn with_env<F: FnOnce()>(vars: &[(&str, &str)], f: F) {
         .map(|(k, _)| (*k, std::env::var(k).ok()))
         .collect();
     for (k, v) in vars {
-        unsafe { std::env::set_var(k, v) };
+        std::env::set_var(k, v);
     }
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
     for (k, prev) in &saved {
         match prev {
-            Some(v) => unsafe { std::env::set_var(k, v) },
-            None => unsafe { std::env::remove_var(k) },
+            Some(v) => std::env::set_var(k, v),
+            None => std::env::remove_var(k),
         }
     }
     if let Err(e) = result {
