@@ -105,7 +105,7 @@ impl Catalog {
             .db
             .scan(CATALOG_PREFIX, &format!("{}\x7F", CATALOG_PREFIX), seq)
         {
-            let mut cache = self.cache.write().unwrap();
+            let mut cache = self.cache.write().expect("catalog cache RwLock poisoned: fatal invariant");
             for (_key, value) in results {
                 if let Ok(table) = serde_json::from_str::<TableDef>(&value) {
                     cache.insert(table.name.to_lowercase(), table);
@@ -117,7 +117,7 @@ impl Catalog {
     pub fn create_table(&self, table: TableDef) -> Result<(), String> {
         let name_lower = table.name.to_lowercase();
         {
-            let cache = self.cache.read().unwrap();
+            let cache = self.cache.read().expect("catalog cache RwLock poisoned: fatal invariant");
             if cache.contains_key(&name_lower) {
                 return Err(format!("Table '{}' already exists", table.name));
             }
@@ -132,7 +132,7 @@ impl Catalog {
             .commit_batch(&batch)
             .map_err(|e| format!("{:?}", e))?;
 
-        let mut cache = self.cache.write().unwrap();
+        let mut cache = self.cache.write().expect("catalog cache RwLock poisoned: fatal invariant");
         cache.insert(name_lower, table);
         Ok(())
     }
@@ -140,7 +140,7 @@ impl Catalog {
     pub fn drop_table(&self, name: &str) -> Result<(), String> {
         let name_lower = name.to_lowercase();
         let table = {
-            let cache = self.cache.read().unwrap();
+            let cache = self.cache.read().expect("catalog cache RwLock poisoned: fatal invariant");
             cache
                 .get(&name_lower)
                 .cloned()
@@ -170,18 +170,18 @@ impl Catalog {
             .commit_batch(&batch)
             .map_err(|e| format!("{:?}", e))?;
 
-        let mut cache = self.cache.write().unwrap();
+        let mut cache = self.cache.write().expect("catalog cache RwLock poisoned: fatal invariant");
         cache.remove(&name_lower);
         Ok(())
     }
 
     pub fn get_table(&self, name: &str) -> Option<TableDef> {
-        let cache = self.cache.read().unwrap();
+        let cache = self.cache.read().expect("catalog cache RwLock poisoned: fatal invariant");
         cache.get(&name.to_lowercase()).cloned()
     }
 
     pub fn list_tables(&self) -> Vec<String> {
-        let cache = self.cache.read().unwrap();
+        let cache = self.cache.read().expect("catalog cache RwLock poisoned: fatal invariant");
         cache.keys().cloned().collect()
     }
 }
