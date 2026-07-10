@@ -16,17 +16,11 @@ mod auth;
 mod cluster;
 mod quic_server;
 
-use omni_engine::OmniKV;
 use std::sync::Arc;
 
-const MANIFEST_PATH: &str = "manifest.json";
-const WAL_PATH: &str = "wal.bin";
-const HTTP_ADDR: &str = "0.0.0.0:8443";
-const QUIC_ADDR: &str = "0.0.0.0:4433";
-const PGWIRE_ADDR: &str = "0.0.0.0:5433";
-const TCP_ADDR: &str = "0.0.0.0:8080";
+use omni_engine::{OmniKV, config::ServerConfig};
 
-fn print_banner() {
+fn print_banner(cfg: &ServerConfig) {
     println!();
     println!("  ╔════════════════════════════════════════════════════╗");
     println!(
@@ -35,13 +29,22 @@ fn print_banner() {
     );
     println!("  ║  Embeddable · Distributed · Transactional KV      ║");
     println!("  ╠════════════════════════════════════════════════════╣");
-    println!("  ║  HTTP/1.1 + HTTP/2 (TLS)  → {}           ║", HTTP_ADDR);
-    println!("  ║  QUIC/HTTP3 (binary)      → {}           ║", QUIC_ADDR);
+    println!(
+        "  ║  HTTP/1.1 + HTTP/2 (TLS)  → {}           ║",
+        cfg.http_addr
+    );
+    println!(
+        "  ║  QUIC/HTTP3 (binary)      → {}           ║",
+        cfg.quic_addr
+    );
     println!(
         "  ║  PostgreSQL Wire Protocol → {}           ║",
-        PGWIRE_ADDR
+        cfg.pgwire_addr
     );
-    println!("  ║  TCP Command Interface    → {}           ║", TCP_ADDR);
+    println!(
+        "  ║  TCP Command Interface    → {}           ║",
+        cfg.tcp_addr
+    );
     println!("  ╠════════════════════════════════════════════════════╣");
     println!("  ║  Built from scratch in Rust. Every byte is ours.  ║");
     println!("  ╚════════════════════════════════════════════════════╝");
@@ -59,27 +62,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .json()
         .init();
 
-    print_banner();
+    // Load configuration (development mode; switch to ServerConfig::load_production()
+    // before any production deployment).
+    let cfg = ServerConfig::load_dev();
+    print_banner(&cfg);
+    tracing::info!(
+        mode = ?cfg.mode,
+        http_addr = %cfg.http_addr,
+        manifest = %cfg.storage.manifest_path,
+        "Configuration loaded"
+    );
 
-    // Open the database
-    let db = OmniKV::open(MANIFEST_PATH, WAL_PATH)?;
+    // Clone paths before opening so they remain available for AppState.
+    let manifest_path = cfg.storage.manifest_path.clone();
+    let wal_path = cfg.storage.wal_path.clone();
+
+    // Open the database using configured paths.
+    let db = OmniKV::open(&manifest_path, &wal_path)?;
     tracing::info!(
         seq = db.get_seq(),
         sstables = db.sstable_count(),
         "Database opened"
     );
 
-    // ─── 1. HTTP/1.1 + HTTP/2 REST API (TLS with ALPN) ────────
-    let jwt_secret = std::env::var("OMNI_JWT_SECRET").unwrap_or_else(|_| {
-        tracing::warn!("OMNI_JWT_SECRET is not set; using a development-only JWT secret");
-        "omnikv-dev-secret-change-in-prod".to_string()
-    });
+    let jwt_secret = cfg.jwt_secret.clone();
 
     let app_state = api::AppState {
         db: db.clone(),
         jwt_secret,
-        manifest_path: MANIFEST_PATH.to_string(),
-        wal_path: WAL_PATH.to_string(),
+        manifest_path,
+        wal_path,
     };
 
     let router = api::build_router(app_state);
@@ -94,20 +106,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )
     .await?;
 
-    let http_addr: std::net::SocketAddr = HTTP_ADDR.parse()?;
+    // Clone addr strings before async move closures consume cfg.
+    let http_addr_str = cfg.http_addr.clone();
+    let quic_addr_str = cfg.quic_addr.clone();
+    let pgwire_addr_str = cfg.pgwire_addr.clone();
+    let tcp_addr_str = cfg.tcp_addr.clone();
+    let http_addr: std::net::SocketAddr = http_addr_str.parse()?;
+
     let http_handle = tokio::spawn(async move {
-        tracing::info!("HTTP/1.1 + HTTP/2 server starting on {}", HTTP_ADDR);
+        tracing::info!("HTTP/1.1 + HTTP/2 server starting on {http_addr_str}");
         if let Err(e) = axum_server::bind_rustls(http_addr, tls_config)
             .serve(router.into_make_service())
             .await
         {
-            tracing::error!("HTTP server error: {}", e);
+            tracing::error!("HTTP server error: {e}");
         }
     });
 
     // ─── 2. QUIC/HTTP3 Binary Protocol ─────────────────────────
     let (quic_certs, quic_key) = quic_server::generate_self_signed_cert()?;
-    let quic_endpoint = quic_server::create_server_endpoint(QUIC_ADDR, quic_certs, quic_key)?;
+    let quic_endpoint = quic_server::create_server_endpoint(&quic_addr_str, quic_certs, quic_key)?;
     let quic_db = db.clone();
     let quic_handle = tokio::spawn(async move {
         quic_server::run_quic_server(quic_endpoint, quic_db).await;
@@ -115,25 +133,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ─── 3. PostgreSQL Wire Protocol ───────────────────────────
     let pgwire_db = db.clone();
-    let pgwire_handle = std::thread::spawn(move || {
-        let server = omni_engine::pgwire::PgWireServer::new(pgwire_db, PGWIRE_ADDR);
-        tracing::info!("PostgreSQL wire protocol starting on {}", PGWIRE_ADDR);
+    let _pgwire_handle = std::thread::spawn(move || {
+        // Log before moving pgwire_addr_str into PgWireServer::new.
+        tracing::info!("PostgreSQL wire protocol starting on {pgwire_addr_str}");
+        let server = omni_engine::pgwire::PgWireServer::new(pgwire_db, &pgwire_addr_str);
         if let Err(e) = server.start() {
-            tracing::error!("PgWire server error: {}", e);
+            tracing::error!("PgWire server error: {e}");
         }
     });
 
     // ─── 4. TCP Command Interface (for telnet/debug) ──────────
     let tcp_db = db.clone();
     let tcp_handle = tokio::spawn(async move {
-        if let Err(e) = run_tcp_server(tcp_db, TCP_ADDR).await {
-            tracing::error!("TCP server error: {}", e);
+        if let Err(e) = run_tcp_server(tcp_db, &tcp_addr_str).await {
+            tracing::error!("TCP server error: {e}");
         }
     });
 
     tracing::info!("All servers started. OmniKV is ready.");
 
-    // Wait for any server to exit (they shouldn't)
+    // Wait for any server to exit (they should not)
     tokio::select! {
         _ = http_handle => tracing::error!("HTTP server exited"),
         _ = quic_handle => tracing::error!("QUIC server exited"),
@@ -149,7 +168,7 @@ async fn run_tcp_server(db: Arc<OmniKV>, addr: &str) -> Result<(), Box<dyn std::
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    tracing::info!("TCP command interface on {}", addr);
+    tracing::info!("TCP command interface on {addr}");
 
     loop {
         let (mut socket, _addr) = listener.accept().await?;
@@ -179,9 +198,9 @@ async fn run_tcp_server(db: Arc<OmniKV>, addr: &str) -> Result<(), Box<dyn std::
                         if let Some(key) = parts.next() {
                             let seq = db.get_seq();
                             match db.find(key, seq) {
-                                Ok(Some(val)) => format!("OK: {}\n", val),
+                                Ok(Some(val)) => format!("OK: {val}\n"),
                                 Ok(None) => "NOT_FOUND\n".to_string(),
-                                Err(e) => format!("ERROR: {:?}\n", e),
+                                Err(e) => format!("ERROR: {e:?}\n"),
                             }
                         } else {
                             "ERROR: Missing key\n".to_string()
@@ -192,10 +211,10 @@ async fn run_tcp_server(db: Arc<OmniKV>, addr: &str) -> Result<(), Box<dyn std::
                             let mut batch = WriteBatch::new();
                             match batch.set(key, value.to_string()) {
                                 Ok(_) => match db.commit_batch(&batch) {
-                                    Ok(seq) => format!("OK: seq={}\n", seq),
-                                    Err(e) => format!("ERROR: {:?}\n", e),
+                                    Ok(seq) => format!("OK: seq={seq}\n"),
+                                    Err(e) => format!("ERROR: {e:?}\n"),
                                 },
-                                Err(e) => format!("ERROR: {:?}\n", e),
+                                Err(e) => format!("ERROR: {e:?}\n"),
                             }
                         } else {
                             "ERROR: SET <key> <value>\n".to_string()
@@ -206,10 +225,10 @@ async fn run_tcp_server(db: Arc<OmniKV>, addr: &str) -> Result<(), Box<dyn std::
                             let mut batch = WriteBatch::new();
                             match batch.delete(key) {
                                 Ok(_) => match db.commit_batch(&batch) {
-                                    Ok(seq) => format!("DELETED: seq={}\n", seq),
-                                    Err(e) => format!("ERROR: {:?}\n", e),
+                                    Ok(seq) => format!("DELETED: seq={seq}\n"),
+                                    Err(e) => format!("ERROR: {e:?}\n"),
                                 },
-                                Err(e) => format!("ERROR: {:?}\n", e),
+                                Err(e) => format!("ERROR: {e:?}\n"),
                             }
                         } else {
                             "ERROR: Missing key\n".to_string()
@@ -223,11 +242,11 @@ async fn run_tcp_server(db: Arc<OmniKV>, addr: &str) -> Result<(), Box<dyn std::
                             Ok(results) => {
                                 let mut out = format!("{} results:\n", results.len());
                                 for (k, v) in results.iter().take(50) {
-                                    out.push_str(&format!("  {} = {}\n", k, v));
+                                    out.push_str(&format!("  {k} = {v}\n"));
                                 }
                                 out
                             }
-                            Err(e) => format!("ERROR: {:?}\n", e),
+                            Err(e) => format!("ERROR: {e:?}\n"),
                         }
                     }
                     "QUIT" | "EXIT" => {

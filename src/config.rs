@@ -1,224 +1,272 @@
-//! OmniKV Configuration
-//!
-//! TOML-based configuration with sensible defaults for all settings.
+use std::{fmt, path::Path};
 
-use std::path::Path;
+use serde::{Deserialize, Serialize};
 
-/// OmniKV server configuration with production-ready defaults.
+pub const DEV_JWT_SECRET: &str = "dev-secret-do-not-use-in-production";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ServerMode {
+    #[default]
+    Development,
+    Production,
+}
+
+impl fmt::Display for ServerMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ServerMode::Development => write!(f, "development"),
+            ServerMode::Production => write!(f, "production"),
+        }
+    }
+}
+
+impl std::str::FromStr for ServerMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "production" | "prod" => Ok(ServerMode::Production),
+            "development" | "dev" => Ok(ServerMode::Development),
+            other => Err(format!("unknown mode: {other}")),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StorageConfig {
+    pub manifest_path: String,
+    pub wal_path: String,
+    pub backup_dir: String,
+    pub max_open_files: u32,
+    pub write_buffer_mb: u32,
+    pub compaction_workers: u32,
+}
+
+impl Default for StorageConfig {
+    fn default() -> Self {
+        Self {
+            manifest_path: "manifest.json".into(),
+            wal_path: "wal.bin".into(),
+            backup_dir: "./data/backups".into(),
+            max_open_files: 512,
+            write_buffer_mb: 64,
+            compaction_workers: 2,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServerConfig {
+    #[serde(default)]
+    pub mode: ServerMode,
+    #[serde(default = "default_http_addr")]
+    pub http_addr: String,
+    #[serde(default = "default_quic_addr")]
+    pub quic_addr: String,
+    #[serde(default = "default_pgwire_addr")]
+    pub pgwire_addr: String,
+    #[serde(default = "default_tcp_addr")]
+    pub tcp_addr: String,
+    #[serde(default = "default_jwt_secret")]
+    pub jwt_secret: String,
+    #[serde(default)]
+    pub tls_cert_path: Option<String>,
+    #[serde(default)]
+    pub tls_key_path: Option<String>,
+    #[serde(default)]
+    pub tls_insecure_skip: bool,
+    #[serde(default = "default_log_level")]
+    pub log_level: String,
+    #[serde(default)]
+    pub storage: StorageConfig,
+}
+
+fn default_http_addr() -> String {
+    "127.0.0.1:7070".into()
+}
+
+fn default_quic_addr() -> String {
+    "127.0.0.1:7071".into()
+}
+
+fn default_pgwire_addr() -> String {
+    "127.0.0.1:5432".into()
+}
+
+fn default_tcp_addr() -> String {
+    "127.0.0.1:7072".into()
+}
+
+fn default_jwt_secret() -> String {
+    DEV_JWT_SECRET.into()
+}
+
+fn default_log_level() -> String {
+    "info".into()
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            mode: ServerMode::default(),
+            http_addr: default_http_addr(),
+            quic_addr: default_quic_addr(),
+            pgwire_addr: default_pgwire_addr(),
+            tcp_addr: default_tcp_addr(),
+            jwt_secret: default_jwt_secret(),
+            tls_cert_path: None,
+            tls_key_path: None,
+            tls_insecure_skip: false,
+            log_level: default_log_level(),
+            storage: StorageConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct ConfigError(pub String);
+
+impl fmt::Display for ConfigError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "config error: {}", self.0)
+    }
+}
+
+impl std::error::Error for ConfigError {}
+
+impl ServerConfig {
+    pub fn load_dev() -> Self {
+        let mut cfg = Self::from_file_or_default("omnikv.toml");
+        cfg.apply_env();
+        cfg.mode = ServerMode::Development;
+        cfg
+    }
+
+    pub fn load_production() -> Result<Self, ConfigError> {
+        let mut cfg = Self::from_file_or_default("omnikv.toml");
+        cfg.apply_env();
+        cfg.mode = ServerMode::Production;
+        cfg.validate_production()?;
+        Ok(cfg)
+    }
+
+    pub fn apply_env(&mut self) {
+        if let Ok(v) = std::env::var("OMNIKV_MODE")
+            && let Ok(m) = v.parse()
+        {
+            self.mode = m;
+        }
+        if let Ok(v) = std::env::var("OMNIKV_HTTP_ADDR") {
+            self.http_addr = v;
+        }
+        if let Ok(v) = std::env::var("OMNIKV_QUIC_ADDR") {
+            self.quic_addr = v;
+        }
+        if let Ok(v) = std::env::var("OMNIKV_PGWIRE_ADDR") {
+            self.pgwire_addr = v;
+        }
+        if let Ok(v) = std::env::var("OMNIKV_TCP_ADDR") {
+            self.tcp_addr = v;
+        }
+        if let Ok(v) = std::env::var("OMNIKV_JWT_SECRET") {
+            self.jwt_secret = v;
+        }
+        if let Ok(v) = std::env::var("OMNIKV_TLS_CERT_PATH") {
+            self.tls_cert_path = Some(v);
+        }
+        if let Ok(v) = std::env::var("OMNIKV_TLS_KEY_PATH") {
+            self.tls_key_path = Some(v);
+        }
+        if let Ok(v) = std::env::var("OMNIKV_TLS_INSECURE_SKIP") {
+            self.tls_insecure_skip = v.to_lowercase() == "true";
+        }
+        if let Ok(v) = std::env::var("OMNIKV_LOG_LEVEL") {
+            self.log_level = v;
+        }
+        if let Ok(v) = std::env::var("OMNIKV_MANIFEST_PATH") {
+            self.storage.manifest_path = v;
+        }
+        if let Ok(v) = std::env::var("OMNIKV_WAL_PATH") {
+            self.storage.wal_path = v;
+        }
+        if let Ok(v) = std::env::var("OMNIKV_BACKUP_DIR") {
+            self.storage.backup_dir = v;
+        }
+    }
+
+    pub fn validate_production(&self) -> Result<(), ConfigError> {
+        if self.jwt_secret == DEV_JWT_SECRET {
+            return Err(ConfigError(
+                "production mode requires a non-default JWT secret".into(),
+            ));
+        }
+        if self.jwt_secret.len() < 32 {
+            return Err(ConfigError(
+                "JWT secret must be at least 32 characters in production".into(),
+            ));
+        }
+        if !self.tls_insecure_skip {
+            match (&self.tls_cert_path, &self.tls_key_path) {
+                (Some(cert), Some(key)) => {
+                    if !Path::new(cert).exists() {
+                        return Err(ConfigError(format!("TLS cert not found: {cert}")));
+                    }
+                    if !Path::new(key).exists() {
+                        return Err(ConfigError(format!("TLS key not found: {key}")));
+                    }
+                }
+                _ => {
+                    return Err(ConfigError(
+                        "production mode requires TLS cert+key or OMNIKV_TLS_INSECURE_SKIP=true"
+                            .into(),
+                    ));
+                }
+            }
+        } else {
+            eprintln!("WARNING: TLS verification is disabled (OMNIKV_TLS_INSECURE_SKIP=true)");
+        }
+        Ok(())
+    }
+
+    fn from_file_or_default(path: &str) -> Self {
+        match std::fs::read_to_string(path) {
+            Ok(raw) => match toml::from_str(&raw) {
+                Ok(cfg) => cfg,
+                Err(e) => {
+                    eprintln!("WARNING: failed to parse {path}: {e} -- using defaults");
+                    Self::default()
+                }
+            },
+            Err(_) => Self::default(),
+        }
+    }
+}
+
+/// Query-engine configuration used by the SQL layer and integration tests.
+/// For full server deployment configuration use [`ServerConfig`].
 #[derive(Debug, Clone)]
 pub struct OmniConfig {
-    /// Directory for data files (manifest, WAL, SSTables)
-    pub data_dir: String,
-    /// REST API port
+    /// HTTP REST API port.
     pub port: u16,
-    /// PostgreSQL wire protocol port
+    /// PostgreSQL wire-protocol port.
     pub pg_port: u16,
-    /// Maximum concurrent connections
-    pub max_connections: usize,
-    /// Query timeout in seconds (0 = no timeout)
+    /// Maximum seconds a query may run before being cancelled.
     pub query_timeout_secs: u64,
-    /// Slow query log threshold in milliseconds
-    pub slow_query_threshold_ms: u64,
-    /// MVCC GC runs every N compaction cycles
-    pub gc_interval_compactions: u32,
-    /// Maximum write batch size in bytes
+    /// Maximum number of concurrent client connections.
+    pub max_connections: usize,
+    /// Maximum bytes allowed in a single write batch.
     pub max_write_batch_bytes: usize,
-    /// Maximum rows returned by a single query
-    pub max_query_result_rows: usize,
-    /// Enable encryption at rest
-    pub enable_encryption: bool,
-    /// Log level: "debug", "info", "warn", "error"
-    pub log_level: String,
-    /// Compaction check interval in milliseconds
-    pub compaction_interval_ms: u64,
-    /// Memtable flush threshold in bytes
-    pub memtable_flush_threshold: usize,
 }
 
 impl Default for OmniConfig {
     fn default() -> Self {
         Self {
-            data_dir: "./omnikv_data".into(),
             port: 8080,
             pg_port: 5433,
-            max_connections: 256,
             query_timeout_secs: 30,
-            slow_query_threshold_ms: 100,
-            gc_interval_compactions: 5,
-            max_write_batch_bytes: 64 * 1024 * 1024, // 64 MB
-            max_query_result_rows: 1_000_000,
-            enable_encryption: false,
-            log_level: "info".into(),
-            compaction_interval_ms: 500,
-            memtable_flush_threshold: 4 * 1024 * 1024, // 4 MB
+            max_connections: 256,
+            max_write_batch_bytes: 64 * 1024 * 1024, // 64 MiB
         }
-    }
-}
-
-impl OmniConfig {
-    /// Load configuration from a TOML file.
-    /// Unknown keys are silently ignored. Missing keys use defaults.
-    pub fn load_from_file(path: &str) -> Result<Self, String> {
-        let content = std::fs::read_to_string(path)
-            .map_err(|e| format!("Failed to read config file '{}': {}", path, e))?;
-        Self::parse_toml(&content)
-    }
-
-    /// Load from file if it exists, otherwise use defaults.
-    pub fn load_or_default(path: &str) -> Self {
-        if Path::new(path).exists() {
-            Self::load_from_file(path).unwrap_or_else(|e| {
-                eprintln!("[CONFIG] Warning: {}, using defaults", e);
-                Self::default()
-            })
-        } else {
-            Self::default()
-        }
-    }
-
-    /// Parse a TOML string into config. Simple key=value parser.
-    fn parse_toml(content: &str) -> Result<Self, String> {
-        let mut config = Self::default();
-
-        for line in content.lines() {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') || line.starts_with('[') {
-                continue;
-            }
-
-            if let Some((key, value)) = line.split_once('=') {
-                let key = key.trim();
-                let value = value.trim().trim_matches('"');
-
-                match key {
-                    "data_dir" => config.data_dir = value.into(),
-                    "port" => config.port = value.parse().unwrap_or(config.port),
-                    "pg_port" => config.pg_port = value.parse().unwrap_or(config.pg_port),
-                    "max_connections" => {
-                        config.max_connections = value.parse().unwrap_or(config.max_connections)
-                    }
-                    "query_timeout_secs" => {
-                        config.query_timeout_secs =
-                            value.parse().unwrap_or(config.query_timeout_secs)
-                    }
-                    "slow_query_threshold_ms" => {
-                        config.slow_query_threshold_ms =
-                            value.parse().unwrap_or(config.slow_query_threshold_ms)
-                    }
-                    "gc_interval_compactions" => {
-                        config.gc_interval_compactions =
-                            value.parse().unwrap_or(config.gc_interval_compactions)
-                    }
-                    "max_write_batch_bytes" => {
-                        config.max_write_batch_bytes =
-                            value.parse().unwrap_or(config.max_write_batch_bytes)
-                    }
-                    "max_query_result_rows" => {
-                        config.max_query_result_rows =
-                            value.parse().unwrap_or(config.max_query_result_rows)
-                    }
-                    "enable_encryption" => config.enable_encryption = value == "true",
-                    "log_level" => config.log_level = value.into(),
-                    "compaction_interval_ms" => {
-                        config.compaction_interval_ms =
-                            value.parse().unwrap_or(config.compaction_interval_ms)
-                    }
-                    "memtable_flush_threshold" => {
-                        config.memtable_flush_threshold =
-                            value.parse().unwrap_or(config.memtable_flush_threshold)
-                    }
-                    _ => {} // Ignore unknown keys
-                }
-            }
-        }
-
-        Ok(config)
-    }
-
-    /// Generate a sample configuration file content.
-    pub fn sample_config() -> String {
-        r#"# OmniKV Configuration
-# See https://github.com/SBALAVIGNESH123/OmniKV for documentation.
-
-# Storage
-data_dir = "./omnikv_data"
-
-# Networking
-port = 8080
-pg_port = 5433
-max_connections = 256
-
-# Query Limits
-query_timeout_secs = 30
-slow_query_threshold_ms = 100
-max_query_result_rows = 1000000
-
-# Storage Engine
-compaction_interval_ms = 500
-memtable_flush_threshold = 4194304
-gc_interval_compactions = 5
-max_write_batch_bytes = 67108864
-
-# Security
-enable_encryption = false
-
-# Logging
-log_level = "info"
-"#
-        .into()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_default_config() {
-        let config = OmniConfig::default();
-        assert_eq!(config.port, 8080);
-        assert_eq!(config.pg_port, 5433);
-        assert_eq!(config.query_timeout_secs, 30);
-        assert_eq!(config.max_connections, 256);
-    }
-
-    #[test]
-    fn test_parse_toml() {
-        let toml = r#"
-port = 9090
-pg_port = 5434
-data_dir = "/var/lib/omnikv"
-query_timeout_secs = 60
-enable_encryption = true
-log_level = "debug"
-"#;
-        let config = OmniConfig::parse_toml(toml).unwrap();
-        assert_eq!(config.port, 9090);
-        assert_eq!(config.pg_port, 5434);
-        assert_eq!(config.data_dir, "/var/lib/omnikv");
-        assert_eq!(config.query_timeout_secs, 60);
-        assert!(config.enable_encryption);
-        assert_eq!(config.log_level, "debug");
-    }
-
-    #[test]
-    fn test_parse_with_comments() {
-        let toml = r#"
-# This is a comment
-[server]
-port = 7070
-# Another comment
-max_connections = 512
-"#;
-        let config = OmniConfig::parse_toml(toml).unwrap();
-        assert_eq!(config.port, 7070);
-        assert_eq!(config.max_connections, 512);
-    }
-
-    #[test]
-    fn test_sample_config() {
-        let sample = OmniConfig::sample_config();
-        assert!(sample.contains("port = 8080"));
-        assert!(sample.contains("pg_port = 5433"));
     }
 }
