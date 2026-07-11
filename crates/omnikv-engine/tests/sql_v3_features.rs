@@ -2,11 +2,6 @@
 // SQL v3 Feature Tests — OFFSET, HAVING, Subqueries, UNION, RIGHT JOIN
 // ═══════════════════════════════════════════════════════════════════════════
 
-#![expect(
-    clippy::uninlined_format_args,
-    reason = "SQL feature tests use generated query data extensively; style-only formatting cleanup is tracked separately."
-)]
-
 use omni_engine::OmniKV;
 use omni_engine::sql::*;
 use omni_engine::sql_exec::*;
@@ -15,8 +10,8 @@ use std::sync::Arc;
 /// Helper: create DB + catalog + executor
 fn create_sql_env(prefix: &str) -> (Arc<OmniKV>, SqlExecutor) {
     let dir = tempfile::tempdir().unwrap();
-    let m = dir.path().join(format!("{}_m.json", prefix));
-    let w = dir.path().join(format!("{}_w.bin", prefix));
+    let m = dir.path().join(format!("{prefix}_m.json"));
+    let w = dir.path().join(format!("{prefix}_w.bin"));
     let db = OmniKV::open(m.to_str().unwrap(), w.to_str().unwrap()).unwrap();
     let catalog = Arc::new(omni_engine::catalog::Catalog::new(db.clone()));
     let exec = SqlExecutor::new(db.clone(), catalog);
@@ -25,16 +20,16 @@ fn create_sql_env(prefix: &str) -> (Arc<OmniKV>, SqlExecutor) {
 }
 
 fn exec_sql(executor: &SqlExecutor, sql: &str) -> ExecResult {
-    let stmt = parse_sql(sql).unwrap_or_else(|e| panic!("Parse error for '{}': {}", sql, e));
+    let stmt = parse_sql(sql).unwrap_or_else(|e| panic!("Parse error for '{sql}': {e}"));
     executor
         .execute(&stmt)
-        .unwrap_or_else(|e| panic!("Exec error for '{}': {}", sql, e))
+        .unwrap_or_else(|e| panic!("Exec error for '{sql}': {e}"))
 }
 
 fn exec_rows(executor: &SqlExecutor, sql: &str) -> (Vec<String>, Vec<Vec<String>>) {
     match exec_sql(executor, sql) {
         ExecResult::Rows { columns, rows } => (columns, rows),
-        _ => panic!("Expected Rows result for: {}", sql),
+        _ => panic!("Expected Rows result for: {sql}"),
     }
 }
 

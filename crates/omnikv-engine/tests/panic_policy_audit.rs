@@ -1,16 +1,7 @@
 //! Panic policy audit — CI gate for bare `.unwrap()` in production source.
 //!
 //! This test scans production `src/` files and fails if bare `.unwrap()` appears
-//! outside of approved locations.  See docs/PANIC_POLICY.md for the full policy.
-
-#![expect(
-    clippy::doc_markdown,
-    clippy::manual_assert,
-    clippy::manual_let_else,
-    clippy::single_match_else,
-    clippy::uninlined_format_args,
-    reason = "The audit test intentionally formats policy failures as grouped diagnostics; style cleanup is secondary to readable CI failure output."
-)]
+//! outside of approved locations.  See `docs/PANIC_POLICY.md` for the full policy.
 
 use std::fs;
 use std::path::Path;
@@ -76,12 +67,11 @@ fn no_bare_unwrap_in_production_sources() {
         }
     }
 
-    if !violations.is_empty() {
-        panic!(
-            "Panic policy violations found (see docs/PANIC_POLICY.md):\n\n{}",
-            violations.join("\n")
-        );
-    }
+    assert!(
+        violations.is_empty(),
+        "Panic policy violations found (see docs/PANIC_POLICY.md):\n\n{}",
+        violations.join("\n")
+    );
 }
 
 #[test]
@@ -91,15 +81,11 @@ fn lock_acquires_have_expect_messages() {
 
     for rel_path in PRODUCTION_FILES {
         let full_path = Path::new(manifest_dir).join(rel_path);
-        let content = match fs::read_to_string(&full_path) {
-            Ok(c) => c,
-            Err(_) => {
-                violations.push(format!(
-                    "{}: file missing or unreadable — cannot audit lock acquires",
-                    rel_path
-                ));
-                continue;
-            }
+        let Ok(content) = fs::read_to_string(&full_path) else {
+            violations.push(format!(
+                "{rel_path}: file missing or unreadable — cannot audit lock acquires"
+            ));
+            continue;
         };
 
         for (i, line) in content.lines().enumerate() {
@@ -118,12 +104,11 @@ fn lock_acquires_have_expect_messages() {
         }
     }
 
-    if !violations.is_empty() {
-        panic!(
-            "Lock acquire policy violations (see docs/PANIC_POLICY.md):\n\n{}",
-            violations.join("\n")
-        );
-    }
+    assert!(
+        violations.is_empty(),
+        "Lock acquire policy violations (see docs/PANIC_POLICY.md):\n\n{}",
+        violations.join("\n")
+    );
 }
 
 #[test]

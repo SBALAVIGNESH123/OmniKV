@@ -1,18 +1,9 @@
-#![expect(
-    clippy::doc_markdown,
-    clippy::explicit_iter_loop,
-    clippy::many_single_char_names,
-    clippy::match_same_arms,
-    clippy::uninlined_format_args,
-    reason = "Storage correctness scenarios use compact generated keys and explicit loops to make crash cases auditable."
-)]
-
 /// Stage 1 — Single-node storage correctness test suite.
 ///
 /// Each test simulates a specific crash or failure point and verifies:
 ///   1. No acknowledged write is lost after recovery
 ///   2. Torn WAL records are rejected and never enter memtable
-///   3. Partial batches (missing __COMMIT_MARKER__) never publish
+///   3. Partial batches (missing __`COMMIT_MARKER`__) never publish
 ///   4. Manifest swap is safe: engine recovers to consistent state
 ///   5. TTL/expiry: expired keys are never returned
 ///   6. Compaction: L0→L1→L2 always produces identical results
@@ -62,10 +53,7 @@ fn assert_get(db: &OmniKV, key: &str, expected: &str) {
     assert_eq!(
         got.as_str(),
         expected,
-        "key='{}' expected='{}' got='{}'",
-        key,
-        expected,
-        got
+        "key='{key}' expected='{expected}' got='{got}'"
     );
 }
 
@@ -76,9 +64,7 @@ fn assert_missing(db: &OmniKV, key: &str) {
     db.unregister_snapshot(snap);
     assert!(
         got.is_none(),
-        "key='{}' should be absent but got {:?}",
-        key,
-        got
+        "key='{key}' should be absent but got {got:?}"
     );
 }
 
@@ -104,13 +90,13 @@ fn test_write_survives_restart() {
 fn test_multiple_commits_survive_restart() {
     let (dir, db) = open_fresh();
     for i in 0u64..100 {
-        put(&db, &format!("key{:04}", i), &format!("val{}", i));
+        put(&db, &format!("key{i:04}"), &format!("val{i}"));
     }
     drop(db);
 
     let db2 = reopen(&dir);
     for i in 0u64..100 {
-        assert_get(&db2, &format!("key{:04}", i), &format!("val{}", i));
+        assert_get(&db2, &format!("key{i:04}"), &format!("val{i}"));
     }
 }
 
@@ -237,7 +223,7 @@ fn test_data_readable_after_compaction() {
 
     // Write enough data to trigger L0 compaction
     for i in 0u64..200 {
-        put(&db, &format!("ckey{:05}", i), &format!("cval{}", i));
+        put(&db, &format!("ckey{i:05}"), &format!("cval{i}"));
     }
 
     // Manually trigger compaction
@@ -245,14 +231,14 @@ fn test_data_readable_after_compaction() {
 
     // All keys must still be readable after compaction
     for i in 0u64..200 {
-        assert_get(&db, &format!("ckey{:05}", i), &format!("cval{}", i));
+        assert_get(&db, &format!("ckey{i:05}"), &format!("cval{i}"));
     }
 
     drop(db);
     // And after restart too
     let db2 = reopen(&dir);
     for i in 0u64..200 {
-        assert_get(&db2, &format!("ckey{:05}", i), &format!("cval{}", i));
+        assert_get(&db2, &format!("ckey{i:05}"), &format!("cval{i}"));
     }
 }
 
@@ -264,7 +250,7 @@ fn test_scan_range_correctness() {
     let (_, db) = open_fresh();
 
     for i in 0u64..20 {
-        put(&db, &format!("scan:{:03}", i), &format!("v{}", i));
+        put(&db, &format!("scan:{i:03}"), &format!("v{i}"));
     }
 
     let snap = db.snapshot();
@@ -274,8 +260,8 @@ fn test_scan_range_correctness() {
     // Should return keys scan:005 through scan:009 (end exclusive in lex order)
     assert!(!results.is_empty(), "scan should return results");
     for (k, _) in &results {
-        assert!(k.as_str() >= "scan:005", "key {} below scan start", k);
-        assert!(k.as_str() <= "scan:010", "key {} above scan end", k);
+        assert!(k.as_str() >= "scan:005", "key {k} below scan start");
+        assert!(k.as_str() <= "scan:010", "key {k} above scan end");
     }
 }
 
@@ -350,20 +336,14 @@ fn test_heap_crc_corruption_detected() {
 
     // Either the key is gone (recovery skipped corrupted record) or we get a CRC error.
     // Crucially: we must NEVER silently return corrupted data.
-    match result {
-        Ok(Some(val)) => {
-            // If it returns Ok with a value, it must match the original (not corrupted bytes)
-            assert_eq!(
-                val, "important_value",
-                "CRITICAL: Corrupted heap returned wrong data without error!"
-            );
-        }
-        Ok(None) => {
-            // Acceptable: corruption detected, key treated as absent
-        }
-        Err(_) => {
-            // Expected: CRC error surfaced to caller
-        }
+    if let Ok(Some(val)) = result {
+        // If it returns Ok with a value, it must match the original (not corrupted bytes)
+        assert_eq!(
+            val, "important_value",
+            "CRITICAL: Corrupted heap returned wrong data without error!"
+        );
+    } else {
+        // Acceptable: corruption detected and either treated as absent or surfaced as an error
     }
 }
 
@@ -374,7 +354,7 @@ fn test_heap_crc_corruption_detected() {
 fn test_recovery_is_deterministic() {
     let (dir, db) = open_fresh();
     for i in 0u64..50 {
-        put(&db, &format!("det{:03}", i), &format!("v{}", i));
+        put(&db, &format!("det{i:03}"), &format!("v{i}"));
     }
     drop(db);
 
@@ -382,7 +362,7 @@ fn test_recovery_is_deterministic() {
     for restart in 0..3 {
         let db = reopen(&dir);
         for i in 0u64..50 {
-            assert_get(&db, &format!("det{:03}", i), &format!("v{}", i));
+            assert_get(&db, &format!("det{i:03}"), &format!("v{i}"));
         }
         drop(db);
         println!("Restart {} verified OK", restart + 1);
@@ -397,32 +377,32 @@ fn test_batch_is_atomic() {
     let (dir, db) = open_fresh();
 
     // Write a batch with 5 keys atomically
-    let mut b = WriteBatch::new();
-    b.set("atom:a", "1".to_string()).unwrap();
-    b.set("atom:b", "2".to_string()).unwrap();
-    b.set("atom:c", "3".to_string()).unwrap();
-    b.set("atom:d", "4".to_string()).unwrap();
-    b.set("atom:e", "5".to_string()).unwrap();
-    db.commit_batch(&b).expect("batch commit");
+    let mut batch = WriteBatch::new();
+    batch.set("atom:a", "1".to_string()).unwrap();
+    batch.set("atom:b", "2".to_string()).unwrap();
+    batch.set("atom:c", "3".to_string()).unwrap();
+    batch.set("atom:d", "4".to_string()).unwrap();
+    batch.set("atom:e", "5".to_string()).unwrap();
+    db.commit_batch(&batch).expect("batch commit");
 
     drop(db);
     let db2 = reopen(&dir);
 
     // Either ALL keys are present, or NONE should be (atomicity)
     let snap = db2.snapshot();
-    let a = db2.find("atom:a", snap).unwrap();
+    let atom_a = db2.find("atom:a", snap).unwrap();
     let b_val = db2.find("atom:b", snap).unwrap();
-    let c = db2.find("atom:c", snap).unwrap();
-    let d = db2.find("atom:d", snap).unwrap();
-    let e = db2.find("atom:e", snap).unwrap();
+    let atom_c = db2.find("atom:c", snap).unwrap();
+    let atom_d = db2.find("atom:d", snap).unwrap();
+    let atom_e = db2.find("atom:e", snap).unwrap();
     db2.unregister_snapshot(snap);
 
     // All must be present (the commit succeeded before drop)
-    assert_eq!(a.unwrap(), "1");
+    assert_eq!(atom_a.unwrap(), "1");
     assert_eq!(b_val.unwrap(), "2");
-    assert_eq!(c.unwrap(), "3");
-    assert_eq!(d.unwrap(), "4");
-    assert_eq!(e.unwrap(), "5");
+    assert_eq!(atom_c.unwrap(), "3");
+    assert_eq!(atom_d.unwrap(), "4");
+    assert_eq!(atom_e.unwrap(), "5");
 }
 
 #[test]
@@ -459,7 +439,7 @@ fn test_concurrent_read_during_root_swap() {
     let shard2 = omni_engine::shard_idx(b"key2");
 
     let mut found_key1 = false;
-    for entry in memtable[shard1].iter() {
+    for entry in &memtable[shard1] {
         if entry.key().0 == b"key1" {
             found_key1 = true;
         }
@@ -467,7 +447,7 @@ fn test_concurrent_read_during_root_swap() {
     assert!(found_key1, "Reader should still see key1 in old memtable");
 
     let mut found_key2 = false;
-    for entry in memtable[shard2].iter() {
+    for entry in &memtable[shard2] {
         if entry.key().0 == b"key2" {
             found_key2 = true;
         }

@@ -1,8 +1,3 @@
-#![expect(
-    clippy::field_reassign_with_default,
-    clippy::redundant_closure_for_method_calls,
-    reason = "Config tests intentionally mutate defaults one field at a time to isolate validation failures."
-)]
 use std::sync::Mutex;
 
 use omni_engine::config::{
@@ -12,7 +7,9 @@ use omni_engine::config::{
 static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
 fn with_env<F: FnOnce()>(vars: &[(&str, &str)], f: F) {
-    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let _guard = ENV_MUTEX
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let saved: Vec<(&str, Option<String>)> = vars
         .iter()
         .map(|(k, _)| (*k, std::env::var(k).ok()))
@@ -33,7 +30,9 @@ fn with_env<F: FnOnce()>(vars: &[(&str, &str)], f: F) {
 }
 
 fn with_env_removed<F: FnOnce()>(vars: &[(&str, &str)], removed: &[&str], f: F) {
-    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let _guard = ENV_MUTEX
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let saved_set: Vec<(&str, Option<String>)> = vars
         .iter()
         .map(|(k, _)| (*k, std::env::var(k).ok()))
@@ -213,84 +212,101 @@ fn test_env_override_backup_dir() {
 
 #[test]
 fn test_prod_rejects_dev_secret() {
-    let mut cfg = ServerConfig::default();
-    cfg.mode = ServerMode::Production;
-    cfg.tls_insecure_skip = true;
+    let cfg = ServerConfig {
+        mode: ServerMode::Production,
+        tls_insecure_skip: true,
+        ..Default::default()
+    };
     let err = cfg.validate_production().unwrap_err();
     assert!(err.0.contains("non-default"), "got: {err}");
 }
 
 #[test]
 fn test_prod_rejects_short_secret() {
-    let mut cfg = ServerConfig::default();
-    cfg.mode = ServerMode::Production;
-    cfg.jwt_secret = "short".into();
-    cfg.tls_insecure_skip = true;
+    let cfg = ServerConfig {
+        mode: ServerMode::Production,
+        jwt_secret: "short".into(),
+        tls_insecure_skip: true,
+        ..Default::default()
+    };
     let err = cfg.validate_production().unwrap_err();
     assert!(err.0.contains("32 characters"), "got: {err}");
 }
 
 #[test]
 fn test_prod_rejects_default_bootstrap_admin_key() {
-    let mut cfg = ServerConfig::default();
-    cfg.mode = ServerMode::Production;
-    cfg.jwt_secret = "a-very-long-secret-value-here-ok".into();
-    cfg.tls_insecure_skip = true;
+    let cfg = ServerConfig {
+        mode: ServerMode::Production,
+        jwt_secret: "a-very-long-secret-value-here-ok".into(),
+        tls_insecure_skip: true,
+        ..Default::default()
+    };
     let err = cfg.validate_production().unwrap_err();
     assert!(err.0.contains("bootstrap admin key"), "got: {err}");
 }
 
 #[test]
 fn test_prod_rejects_short_bootstrap_admin_key() {
-    let mut cfg = ServerConfig::default();
-    cfg.mode = ServerMode::Production;
-    cfg.jwt_secret = "a-very-long-secret-value-here-ok".into();
-    cfg.bootstrap_admin_key = "short".into();
-    cfg.tls_insecure_skip = true;
+    let cfg = ServerConfig {
+        mode: ServerMode::Production,
+        jwt_secret: "a-very-long-secret-value-here-ok".into(),
+        bootstrap_admin_key: "short".into(),
+        tls_insecure_skip: true,
+        ..Default::default()
+    };
     let err = cfg.validate_production().unwrap_err();
     assert!(err.0.contains("32 characters"), "got: {err}");
 }
 
 #[test]
 fn test_prod_rejects_matching_jwt_and_bootstrap_admin_key() {
-    let mut cfg = ServerConfig::default();
-    cfg.mode = ServerMode::Production;
-    cfg.jwt_secret = "shared-secret-value-long-enough-123".into();
-    cfg.bootstrap_admin_key = cfg.jwt_secret.clone();
-    cfg.tls_insecure_skip = true;
+    let shared_secret = "shared-secret-value-long-enough-123";
+    let cfg = ServerConfig {
+        mode: ServerMode::Production,
+        jwt_secret: shared_secret.into(),
+        bootstrap_admin_key: shared_secret.into(),
+        tls_insecure_skip: true,
+        ..Default::default()
+    };
     let err = cfg.validate_production().unwrap_err();
     assert!(err.0.contains("different"), "got: {err}");
 }
 
 #[test]
 fn test_prod_rejects_missing_tls() {
-    let mut cfg = ServerConfig::default();
-    cfg.mode = ServerMode::Production;
-    cfg.jwt_secret = "a-very-long-secret-value-here-ok".into();
-    cfg.bootstrap_admin_key = "bootstrap-admin-key-value-here-ok".into();
-    cfg.tls_insecure_skip = false;
+    let cfg = ServerConfig {
+        mode: ServerMode::Production,
+        jwt_secret: "a-very-long-secret-value-here-ok".into(),
+        bootstrap_admin_key: "bootstrap-admin-key-value-here-ok".into(),
+        tls_insecure_skip: false,
+        ..Default::default()
+    };
     let err = cfg.validate_production().unwrap_err();
     assert!(err.0.contains("TLS"), "got: {err}");
 }
 
 #[test]
 fn test_prod_accepts_insecure_skip() {
-    let mut cfg = ServerConfig::default();
-    cfg.mode = ServerMode::Production;
-    cfg.jwt_secret = "a-very-long-secret-value-here-ok".into();
-    cfg.bootstrap_admin_key = "bootstrap-admin-key-value-here-ok".into();
-    cfg.tls_insecure_skip = true;
+    let cfg = ServerConfig {
+        mode: ServerMode::Production,
+        jwt_secret: "a-very-long-secret-value-here-ok".into(),
+        bootstrap_admin_key: "bootstrap-admin-key-value-here-ok".into(),
+        tls_insecure_skip: true,
+        ..Default::default()
+    };
     assert!(cfg.validate_production().is_ok());
 }
 
 #[test]
 fn test_prod_rejects_missing_cert_file() {
-    let mut cfg = ServerConfig::default();
-    cfg.mode = ServerMode::Production;
-    cfg.jwt_secret = "a-very-long-secret-value-here-ok".into();
-    cfg.bootstrap_admin_key = "bootstrap-admin-key-value-here-ok".into();
-    cfg.tls_cert_path = Some("/nonexistent/cert.pem".into());
-    cfg.tls_key_path = Some("/nonexistent/key.pem".into());
+    let cfg = ServerConfig {
+        mode: ServerMode::Production,
+        jwt_secret: "a-very-long-secret-value-here-ok".into(),
+        bootstrap_admin_key: "bootstrap-admin-key-value-here-ok".into(),
+        tls_cert_path: Some("/nonexistent/cert.pem".into()),
+        tls_key_path: Some("/nonexistent/key.pem".into()),
+        ..Default::default()
+    };
     let err = cfg.validate_production().unwrap_err();
     assert!(err.0.contains("cert"), "got: {err}");
 }

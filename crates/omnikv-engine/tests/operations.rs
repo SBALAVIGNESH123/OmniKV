@@ -1,10 +1,3 @@
-#![expect(
-    clippy::doc_markdown,
-    clippy::redundant_clone,
-    clippy::stable_sort_primitive,
-    clippy::uninlined_format_args,
-    reason = "Operations tests keep scenario setup readable and deterministic; strict style findings are documented separately from correctness checks."
-)]
 // ═══════════════════════════════════════════════════════════════════════════
 // Operations & Edge Case Tests — Gaps #32 through #47
 // ═══════════════════════════════════════════════════════════════════════════
@@ -12,11 +5,11 @@
 use omni_engine::transaction::TransactionManager;
 use omni_engine::{OmniKV, WriteBatch};
 
-/// Helper: create a temp OmniKV instance
+/// Helper: create a temp `OmniKV` instance
 fn create_temp_db(prefix: &str) -> (std::sync::Arc<OmniKV>, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
-    let manifest = dir.path().join(format!("{}_m.json", prefix));
-    let wal = dir.path().join(format!("{}_w.bin", prefix));
+    let manifest = dir.path().join(format!("{prefix}_m.json"));
+    let wal = dir.path().join(format!("{prefix}_w.bin"));
     let db = OmniKV::open(manifest.to_str().unwrap(), wal.to_str().unwrap()).unwrap();
     (db, dir)
 }
@@ -39,9 +32,7 @@ fn test_concurrent_writers() {
             std::thread::spawn(move || {
                 let mut batch = WriteBatch::new();
                 for i in 0..25 {
-                    batch
-                        .set(&format!("t{}_k{}", t, i), format!("v{}", i))
-                        .unwrap();
+                    batch.set(&format!("t{t}_k{i}"), format!("v{i}")).unwrap();
                 }
                 db.commit_batch(&batch).unwrap();
             })
@@ -56,7 +47,7 @@ fn test_concurrent_writers() {
     let mut count = 0;
     for t in 0..4 {
         for i in 0..25 {
-            if db.find(&format!("t{}_k{}", t, i), seq).unwrap().is_some() {
+            if db.find(&format!("t{t}_k{i}"), seq).unwrap().is_some() {
                 count += 1;
             }
         }
@@ -78,7 +69,7 @@ fn test_large_value_1mb() {
     let (db, _dir) = create_temp_db("lv");
     let val = "A".repeat(1_000_000);
     let mut batch = WriteBatch::new();
-    batch.set("large_1mb", val.clone()).unwrap();
+    batch.set("large_1mb", val).unwrap();
     db.commit_batch(&batch).unwrap();
 
     assert_eq!(
@@ -159,9 +150,7 @@ fn test_large_batch() {
     let (db, _dir) = create_temp_db("lb");
     let mut batch = WriteBatch::new();
     for i in 0..500 {
-        batch
-            .set(&format!("lb_k{:04}", i), format!("v{}", i))
-            .unwrap();
+        batch.set(&format!("lb_k{i:04}"), format!("v{i}")).unwrap();
     }
     db.commit_batch(&batch).unwrap();
 
@@ -210,7 +199,7 @@ fn test_bloom_filter_no_false_negatives() {
 
     let mut batch = WriteBatch::new();
     for i in 0..100 {
-        batch.set(&format!("bf_k{}", i), format!("v{}", i)).unwrap();
+        batch.set(&format!("bf_k{i}"), format!("v{i}")).unwrap();
     }
     db.commit_batch(&batch).unwrap();
     let _ = db.compact_sstables();
@@ -219,9 +208,8 @@ fn test_bloom_filter_no_false_negatives() {
     let seq = db.get_seq();
     for i in 0..100 {
         assert!(
-            db.find(&format!("bf_k{}", i), seq).unwrap().is_some(),
-            "Bloom filter false negative on bf_k{}",
-            i
+            db.find(&format!("bf_k{i}"), seq).unwrap().is_some(),
+            "Bloom filter false negative on bf_k{i}"
         );
     }
 
@@ -318,16 +306,14 @@ fn test_min_active_snapshot() {
 // Gap #40: WAL rotation under load
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Gap #40a: WAL rotation preserves data via SSTable
+/// Gap #40a: WAL rotation preserves data via `SSTable`
 #[test]
 fn test_wal_rotation() {
     let (db, _dir) = create_temp_db("walr");
 
     let mut batch = WriteBatch::new();
     for i in 0..50 {
-        batch
-            .set(&format!("walr_k{}", i), format!("v{}", i))
-            .unwrap();
+        batch.set(&format!("walr_k{i}"), format!("v{i}")).unwrap();
     }
     db.commit_batch(&batch).unwrap();
 
@@ -337,7 +323,7 @@ fn test_wal_rotation() {
     // Data should still be available from SSTable
     let seq = db.get_seq();
     for i in 0..50 {
-        assert!(db.find(&format!("walr_k{}", i), seq).unwrap().is_some());
+        assert!(db.find(&format!("walr_k{i}"), seq).unwrap().is_some());
     }
 
     println!("✅ OPS 40a: WAL rotated after compaction, 50 keys in SSTable");
@@ -354,7 +340,7 @@ fn test_hot_key_overwrite() {
 
     for i in 0..100 {
         let mut batch = WriteBatch::new();
-        batch.set("hot_key", format!("version_{}", i)).unwrap();
+        batch.set("hot_key", format!("version_{i}")).unwrap();
         db.commit_batch(&batch).unwrap();
     }
 
@@ -377,9 +363,7 @@ fn test_sequential_writes() {
 
     let mut batch = WriteBatch::new();
     for i in 0..200 {
-        batch
-            .set(&format!("seq_{:06}", i), format!("v{}", i))
-            .unwrap();
+        batch.set(&format!("seq_{i:06}"), format!("v{i}")).unwrap();
     }
     db.commit_batch(&batch).unwrap();
 
@@ -400,13 +384,13 @@ fn test_random_pattern_writes() {
     ];
     let mut batch = WriteBatch::new();
     for k in &keys {
-        batch.set(k, format!("{}_val", k)).unwrap();
+        batch.set(k, format!("{k}_val")).unwrap();
     }
     db.commit_batch(&batch).unwrap();
 
     let seq = db.get_seq();
     for k in &keys {
-        assert_eq!(db.find(k, seq).unwrap(), Some(format!("{}_val", k)));
+        assert_eq!(db.find(k, seq).unwrap(), Some(format!("{k}_val")));
     }
 
     println!("✅ OPS 42b: 10 random-pattern keys all correct");
@@ -423,9 +407,7 @@ fn test_read_consistency_across_compaction() {
 
     let mut batch = WriteBatch::new();
     for i in 0..50 {
-        batch
-            .set(&format!("rdc_k{:03}", i), format!("v{}", i))
-            .unwrap();
+        batch.set(&format!("rdc_k{i:03}"), format!("v{i}")).unwrap();
     }
     db.commit_batch(&batch).unwrap();
 
@@ -451,14 +433,14 @@ fn test_scan_ordering() {
 
     let mut batch = WriteBatch::new();
     for k in ["scan_c", "scan_a", "scan_b", "scan_e", "scan_d"] {
-        batch.set(k, format!("{}_val", k)).unwrap();
+        batch.set(k, format!("{k}_val")).unwrap();
     }
     db.commit_batch(&batch).unwrap();
 
     let results = db.scan("scan_", "scan_z", db.get_seq()).unwrap();
     let keys: Vec<&str> = results.iter().map(|(k, _)| k.as_str()).collect();
     let mut sorted = keys.clone();
-    sorted.sort();
+    sorted.sort_unstable();
     assert_eq!(keys, sorted);
 
     println!(
@@ -490,9 +472,7 @@ fn test_memtable_size_tracking() {
     let size_before = db.memtable_size();
     let mut batch = WriteBatch::new();
     for i in 0..50 {
-        batch
-            .set(&format!("met_k{}", i), format!("val_{}", i))
-            .unwrap();
+        batch.set(&format!("met_k{i}"), format!("val_{i}")).unwrap();
     }
     db.commit_batch(&batch).unwrap();
 
@@ -502,10 +482,7 @@ fn test_memtable_size_tracking() {
         "Memtable should grow after writes"
     );
 
-    println!(
-        "✅ OPS 45a: Memtable size {} → {} after 50 writes",
-        size_before, size_after
-    );
+    println!("✅ OPS 45a: Memtable size {size_before} → {size_after} after 50 writes");
 }
 
 /// Gap #45b: Sequence number monotonically increases
@@ -516,15 +493,10 @@ fn test_seq_monotonic() {
     let mut prev = db.get_seq();
     for i in 0..10 {
         let mut batch = WriteBatch::new();
-        batch.set(&format!("seqm_k{}", i), "v".into()).unwrap();
+        batch.set(&format!("seqm_k{i}"), "v".into()).unwrap();
         db.commit_batch(&batch).unwrap();
         let current = db.get_seq();
-        assert!(
-            current > prev,
-            "Seq should increase: {} <= {}",
-            current,
-            prev
-        );
+        assert!(current > prev, "Seq should increase: {current} <= {prev}");
         prev = current;
     }
 
@@ -546,7 +518,7 @@ fn test_multi_restart_durability() {
         let db = OmniKV::open(m.to_str().unwrap(), w.to_str().unwrap()).unwrap();
         let mut batch = WriteBatch::new();
         batch
-            .set(&format!("dur_k{}", cycle), format!("cycle_{}", cycle))
+            .set(&format!("dur_k{cycle}"), format!("cycle_{cycle}"))
             .unwrap();
         db.commit_batch(&batch).unwrap();
     }
@@ -556,8 +528,8 @@ fn test_multi_restart_durability() {
     let seq = db.get_seq();
     for cycle in 0..5 {
         assert_eq!(
-            db.find(&format!("dur_k{}", cycle), seq).unwrap(),
-            Some(format!("cycle_{}", cycle))
+            db.find(&format!("dur_k{cycle}"), seq).unwrap(),
+            Some(format!("cycle_{cycle}"))
         );
     }
 
@@ -614,7 +586,7 @@ fn test_ssi_conflict_abort() {
     batch.set("ssic_key", "initial".into()).unwrap();
     db.commit_batch(&batch).unwrap();
 
-    let tm = TransactionManager::new(db.clone());
+    let tm = TransactionManager::new(db);
 
     let mut txn1 = tm.begin();
     let mut txn2 = tm.begin();

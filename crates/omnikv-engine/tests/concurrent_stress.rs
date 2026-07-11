@@ -3,12 +3,6 @@
 //! These tests prove correctness under REAL parallel thread contention —
 //! not simulated single-threaded scenarios.
 
-#![expect(
-    clippy::or_fun_call,
-    clippy::uninlined_format_args,
-    reason = "Stress tests favor scenario clarity and repeated generated keys over style-only rewrites."
-)]
-
 use omni_engine::transaction::TransactionManager;
 use omni_engine::{OmniKV, WriteBatch};
 use std::sync::Arc;
@@ -49,7 +43,10 @@ fn test_concurrent_counter_4_threads() {
                 for _ in 0..50 {
                     loop {
                         let mut txn = tm.begin();
-                        let val = tm.get(&mut txn, "counter").unwrap().unwrap_or("0".into());
+                        let val = tm
+                            .get(&mut txn, "counter")
+                            .unwrap()
+                            .unwrap_or_else(|| "0".into());
                         let n: i64 = val.parse().unwrap();
                         tm.set(&mut txn, "counter", (n + 1).to_string()).unwrap();
                         match tm.commit(&mut txn) {
@@ -86,8 +83,7 @@ fn test_concurrent_counter_4_threads() {
     assert_eq!(m_aborted, retries, "Metrics: aborts == retries");
 
     println!(
-        "✅ STRESS 1: 4 threads × 50 = {} commits, {} retries, SSI metrics verified",
-        commits, retries
+        "✅ STRESS 1: 4 threads × 50 = {commits} commits, {retries} retries, SSI metrics verified"
     );
 }
 
@@ -106,8 +102,8 @@ fn test_concurrent_disjoint_keys_no_conflicts() {
             thread::spawn(move || {
                 for i in 0..100 {
                     let mut txn = tm.begin();
-                    let key = format!("thread{}_{}", tid, i);
-                    tm.set(&mut txn, &key, format!("val_{}", i)).unwrap();
+                    let key = format!("thread{tid}_{i}");
+                    tm.set(&mut txn, &key, format!("val_{i}")).unwrap();
                     match tm.commit(&mut txn) {
                         Ok(_) => {}
                         Err(_) => {
@@ -126,20 +122,18 @@ fn test_concurrent_disjoint_keys_no_conflicts() {
     let total_conflicts = conflicts.load(Ordering::Relaxed);
     assert_eq!(
         total_conflicts, 0,
-        "Disjoint keys should have 0 conflicts, got {}",
-        total_conflicts
+        "Disjoint keys should have 0 conflicts, got {total_conflicts}"
     );
 
     // Verify all 400 keys exist
     let seq = db.get_seq();
     for tid in 0..4 {
         for i in 0..100 {
-            let key = format!("thread{}_{}", tid, i);
+            let key = format!("thread{tid}_{i}");
             assert_eq!(
                 db.find(&key, seq).unwrap(),
-                Some(format!("val_{}", i)),
-                "Missing key {}",
-                key
+                Some(format!("val_{i}")),
+                "Missing key {key}"
             );
         }
     }
@@ -157,7 +151,7 @@ fn test_concurrent_hot_key_contention() {
     // Setup 5 hot keys
     let mut batch = WriteBatch::new();
     for i in 0..5 {
-        batch.set(&format!("hot_{}", i), "0".into()).unwrap();
+        batch.set(&format!("hot_{i}"), "0".into()).unwrap();
     }
     db.commit_batch(&batch).unwrap();
 
@@ -175,8 +169,8 @@ fn test_concurrent_hot_key_contention() {
                     // Each thread writes to 2 of the 5 hot keys
                     let k1 = format!("hot_{}", tid % 5);
                     let k2 = format!("hot_{}", (tid + 1) % 5);
-                    tm.set(&mut txn, &k1, format!("t{}_{}", tid, i)).unwrap();
-                    tm.set(&mut txn, &k2, format!("t{}_{}", tid, i)).unwrap();
+                    tm.set(&mut txn, &k1, format!("t{tid}_{i}")).unwrap();
+                    tm.set(&mut txn, &k2, format!("t{tid}_{i}")).unwrap();
                     match tm.commit(&mut txn) {
                         Ok(_) => {
                             commits.fetch_add(1, Ordering::Relaxed);
@@ -204,13 +198,12 @@ fn test_concurrent_hot_key_contention() {
     // Verify all hot keys have valid values
     let seq = db.get_seq();
     for i in 0..5 {
-        let val = db.find(&format!("hot_{}", i), seq).unwrap();
-        assert!(val.is_some(), "hot_{} should have a value", i);
+        let val = db.find(&format!("hot_{i}"), seq).unwrap();
+        assert!(val.is_some(), "hot_{i} should have a value");
     }
 
     println!(
-        "✅ STRESS 3: 8 threads × 30 ops on 5 hot keys: {} commits, {} aborts",
-        total_commits, total_aborts
+        "✅ STRESS 3: 8 threads × 30 ops on 5 hot keys: {total_commits} commits, {total_aborts} aborts"
     );
 }
 
@@ -224,7 +217,7 @@ fn test_concurrent_mixed_read_write() {
     let mut batch = WriteBatch::new();
     for i in 0..50 {
         batch
-            .set(&format!("mixed_{}", i), format!("init_{}", i))
+            .set(&format!("mixed_{i}"), format!("init_{i}"))
             .unwrap();
     }
     db.commit_batch(&batch).unwrap();
@@ -243,7 +236,7 @@ fn test_concurrent_mixed_read_write() {
             for _ in 0..100 {
                 let mut txn = tm.begin();
                 for i in 0..10 {
-                    let _ = tm.get(&mut txn, &format!("mixed_{}", i));
+                    let _ = tm.get(&mut txn, &format!("mixed_{i}"));
                 }
                 // Read-only commit should always succeed
                 let result = tm.commit(&mut txn);
@@ -262,7 +255,7 @@ fn test_concurrent_mixed_read_write() {
                 loop {
                     let mut txn = tm.begin();
                     let key = format!("mixed_{}", (tid * 10 + i) % 50);
-                    tm.set(&mut txn, &key, format!("w_{}_{}", tid, i)).unwrap();
+                    tm.set(&mut txn, &key, format!("w_{tid}_{i}")).unwrap();
                     if tm.commit(&mut txn).is_ok() {
                         writes.fetch_add(1, Ordering::Relaxed);
                         break;
@@ -282,10 +275,7 @@ fn test_concurrent_mixed_read_write() {
     assert_eq!(reads, 400, "All 400 read txns should complete");
     assert_eq!(writes, 200, "All 200 write txns should complete");
 
-    println!(
-        "✅ STRESS 4: 4 readers × 100 + 4 writers × 50 = {} reads, {} writes",
-        reads, writes
-    );
+    println!("✅ STRESS 4: 4 readers × 100 + 4 writers × 50 = {reads} reads, {writes} writes");
 }
 
 /// Stress test 5: Savepoint correctness under concurrent load.
@@ -303,8 +293,8 @@ fn test_concurrent_savepoints() {
             thread::spawn(move || {
                 for i in 0..25 {
                     let mut txn = tm.begin();
-                    let k1 = format!("sp_{}_{}_a", tid, i);
-                    let k2 = format!("sp_{}_{}_b", tid, i);
+                    let k1 = format!("sp_{tid}_{i}_a");
+                    let k2 = format!("sp_{tid}_{i}_b");
 
                     tm.set(&mut txn, &k1, "before_savepoint".into()).unwrap();
                     tm.savepoint(&mut txn, "sp1").unwrap();
@@ -341,13 +331,12 @@ fn test_concurrent_savepoints() {
     let seq = db.get_seq();
     for tid in 0..4 {
         for i in 0..25 {
-            let k1 = format!("sp_{}_{}_a", tid, i);
-            let k2 = format!("sp_{}_{}_b", tid, i);
-            assert!(db.find(&k1, seq).unwrap().is_some(), "{} should exist", k1);
+            let k1 = format!("sp_{tid}_{i}_a");
+            let k2 = format!("sp_{tid}_{i}_b");
+            assert!(db.find(&k1, seq).unwrap().is_some(), "{k1} should exist");
             assert!(
                 db.find(&k2, seq).unwrap().is_none(),
-                "{} should NOT exist",
-                k2
+                "{k2} should NOT exist"
             );
         }
     }
@@ -375,7 +364,7 @@ fn test_concurrent_metrics_accuracy() {
                         let val = tm
                             .get(&mut txn, "metrics_key")
                             .unwrap()
-                            .unwrap_or("0".into());
+                            .unwrap_or_else(|| "0".into());
                         let n: i64 = val.parse().unwrap();
                         tm.set(&mut txn, "metrics_key", (n + 1).to_string())
                             .unwrap();
@@ -408,7 +397,6 @@ fn test_concurrent_metrics_accuracy() {
     );
 
     println!(
-        "✅ STRESS 6: Metrics accurate — started={}, committed={}, aborted={}, conflicts={}",
-        started, committed, aborted, conflicts
+        "✅ STRESS 6: Metrics accurate — started={started}, committed={committed}, aborted={aborted}, conflicts={conflicts}"
     );
 }
