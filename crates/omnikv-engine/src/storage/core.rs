@@ -1570,7 +1570,7 @@ impl OmniKV {
         #[cfg(unix)]
         {
             let file = self.roots.load().heap_reader.clone();
-            file.read_exact_at(&mut buf, offset)?;
+            file.read_exact_at(buf.as_mut_slice(), offset)?;
         }
         #[cfg(windows)]
         {
