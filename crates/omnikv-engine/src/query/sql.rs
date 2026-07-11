@@ -6,7 +6,10 @@
 use crate::catalog::ColumnType;
 
 #[derive(Debug, Clone, PartialEq)]
-#[allow(clippy::large_enum_variant)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "SQL statement variants intentionally keep owned AST payloads for parser simplicity; boxing the largest variant needs a separate API-impact review."
+)]
 pub enum SqlStatement {
     CreateTable {
         name: String,

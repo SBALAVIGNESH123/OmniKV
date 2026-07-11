@@ -11,6 +11,15 @@
 //! - Transaction commit throughput (txn/sec)
 //! - Batch write throughput (ops/sec)
 
+#![expect(
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss,
+    clippy::doc_markdown,
+    clippy::missing_const_for_fn,
+    clippy::uninlined_format_args,
+    reason = "Benchmark smoke tests prioritize stable, readable measurement code; strict clippy findings are documented as benchmark debt."
+)]
+
 use omni_engine::sql::{AggFunc, CmpOp, SelectColumn, SqlValue, WhereExpr};
 use omni_engine::sql_exec::Row;
 use omni_engine::transaction::TransactionManager;

@@ -77,6 +77,28 @@ The `tests/panic_policy_audit.rs` test scans production source files and fails
 the build if bare `.unwrap()` appears outside of approved locations (tests,
 benchmarks, build scripts, `// SAFETY:` guarded sites).
 
+The workspace also enables the `clippy::all`, `clippy::pedantic`, and
+`clippy::nursery` lint groups through Cargo lint configuration. CI enforces the
+policy with:
+
+```bash
+cargo clippy --workspace --all-targets -- -D warnings
+```
+
+New lint suppressions must use `#[expect(..., reason = "...")]` instead of
+`#[allow(...)]`. `expect` is intentional: CI fails when the lint no longer
+triggers, which prevents stale suppressions from silently accumulating.
+
+Allowed clippy expectations must be narrow and justified:
+
+- Prefer fixing production-code lints directly when the change is low-risk.
+- Use crate-level expectations only for documented legacy debt that spans many
+  existing call sites.
+- Use item-level expectations for local invariants such as parser enum sizing,
+  explicit SQL clause argument lists, or test-only diagnostic formatting.
+- Do not add `#[allow(...)]` in Rust source without a follow-up issue and a
+  specific reason this cannot be expressed as `#[expect(...)]`.
+
 ## Adding a New Panic
 
 Before adding a new `unwrap()` or `expect()`:

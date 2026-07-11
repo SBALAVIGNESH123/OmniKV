@@ -3,6 +3,19 @@
 //! Production-grade Rust client for OmniKV's REST API.
 //! Supports CRUD, batch operations, scans, health checks, and metrics.
 
+#![expect(
+    clippy::doc_markdown,
+    clippy::format_push_string,
+    clippy::map_unwrap_or,
+    clippy::missing_const_for_fn,
+    clippy::missing_errors_doc,
+    clippy::missing_panics_doc,
+    clippy::must_use_candidate,
+    clippy::return_self_not_must_use,
+    clippy::uninlined_format_args,
+    reason = "The published client keeps its current API surface while strict clippy groups are introduced; these documented exceptions are staged for follow-up cleanup."
+)]
+
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;

@@ -4,7 +4,10 @@
 //! GROUP BY aggregation, and ORDER BY sorting.
 
 use crate::catalog::{Catalog, Column, ColumnType, TableDef};
-use crate::sql::*;
+use crate::sql::{
+    AggFunc, CmpOp, FromClause, JoinType, OrderByItem, SelectColumn, SetOpType, SqlColumnDef,
+    SqlStatement, SqlValue, WhereExpr, WindowFuncType,
+};
 use crate::{OmniKV, WriteBatch};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -402,7 +405,10 @@ impl SqlExecutor {
             .collect()
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The SELECT executor mirrors SQL clauses explicitly; refactoring into an execution context is planned separately to avoid query semantics churn."
+    )]
     fn exec_select(
         &self,
         columns: &[SelectColumn],
@@ -674,7 +680,10 @@ impl SqlExecutor {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Join execution keeps the parsed join shape explicit; collapsing into a context struct is a later planner cleanup."
+    )]
     fn execute_join(
         &self,
         left: &[Row],

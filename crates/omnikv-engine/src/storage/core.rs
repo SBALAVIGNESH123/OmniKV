@@ -1,8 +1,7 @@
-#![allow(dead_code)]
-#![allow(unused_imports)]
-#![allow(unused_variables)]
-#![allow(unused_mut)]
-#![allow(mismatched_lifetime_syntaxes)]
+#![expect(
+    dead_code,
+    reason = "Storage core intentionally carries staged LSM, compaction, transaction, and compatibility paths while the module is being split into smaller production components."
+)]
 
 use crate::{metrics_prometheus, wal};
 use arc_swap::ArcSwap;

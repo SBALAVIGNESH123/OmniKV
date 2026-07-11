@@ -1,3 +1,10 @@
+#![expect(
+    clippy::doc_markdown,
+    clippy::match_same_arms,
+    clippy::uninlined_format_args,
+    reason = "API sanitization tests keep explicit acceptable outcomes and readable diagnostic strings."
+)]
+
 use omni_engine::{OmniError, OmniKV};
 use tempfile::tempdir;
 

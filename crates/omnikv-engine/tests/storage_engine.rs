@@ -2,6 +2,12 @@
 // Storage Engine Integration Tests — Gaps #15 through #22
 // ═══════════════════════════════════════════════════════════════════════════
 
+#![expect(
+    clippy::doc_markdown,
+    clippy::uninlined_format_args,
+    reason = "Storage engine integration tests use generated key names and scenario labels to keep failure output clear."
+)]
+
 use omni_engine::{OmniKV, WriteBatch};
 
 /// Helper: create a temp OmniKV instance

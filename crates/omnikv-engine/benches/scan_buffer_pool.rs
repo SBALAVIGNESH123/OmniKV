@@ -8,6 +8,12 @@
 //!   cargo bench -p omnikv-engine --bench scan_buffer_pool
 //!   cargo bench -p omnikv-engine --bench scan_buffer_pool -- --rows 20000 --rounds 20
 
+#![expect(
+    clippy::cast_precision_loss,
+    clippy::doc_markdown,
+    reason = "Scan benchmark keeps CLI docs and throughput math simple for before/after comparisons."
+)]
+
 use omni_engine::{OmniKV, WriteBatch};
 use std::time::{Duration, Instant};
 use tempfile::TempDir;

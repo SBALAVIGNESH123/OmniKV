@@ -6,10 +6,25 @@
 //! 3. PostgreSQL wire protocol v3 (PgWire)
 //! 4. Prometheus metrics on /metrics
 
-#![allow(dead_code)]
-#![allow(unused_imports)]
-#![allow(unused_variables)]
-#![allow(unused_mut)]
+#![expect(
+    dead_code,
+    unused_mut,
+    reason = "The server crate includes staged cluster, Raft route, and QUIC client helpers that are built in CI before every protocol surface is enabled by the binary."
+)]
+#![expect(
+    clippy::doc_markdown,
+    clippy::format_push_string,
+    clippy::ignored_unit_patterns,
+    clippy::items_after_statements,
+    clippy::manual_let_else,
+    clippy::match_same_arms,
+    clippy::missing_const_for_fn,
+    clippy::option_if_let_else,
+    clippy::single_match_else,
+    clippy::trait_duplication_in_bounds,
+    clippy::uninlined_format_args,
+    reason = "Strict clippy lint groups are enabled. These server style findings are documented legacy debt while protocol hardening work continues."
+)]
 
 mod api;
 mod auth;

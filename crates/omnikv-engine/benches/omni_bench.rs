@@ -7,6 +7,16 @@
 //!   cargo bench -p omnikv-engine --bench omni_bench
 //!   cargo bench -p omnikv-engine --bench omni_bench -- --soak 600   # 10-min soak
 
+#![expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss,
+    clippy::doc_markdown,
+    clippy::too_many_lines,
+    clippy::uninlined_format_args,
+    reason = "Benchmark harness keeps readable numeric reporting and CLI output; strict clippy findings are tracked separately from production engine code."
+)]
+
 use omni_engine::{OmniKV, WriteBatch};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};

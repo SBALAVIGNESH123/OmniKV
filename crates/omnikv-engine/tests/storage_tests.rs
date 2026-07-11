@@ -1,6 +1,14 @@
 //! Integration tests for the OmniKV storage engine.
 //! These test the full write path, read path, compaction, TTL, MVCC, and crash recovery.
 
+#![expect(
+    clippy::doc_markdown,
+    clippy::needless_collect,
+    clippy::redundant_clone,
+    clippy::uninlined_format_args,
+    reason = "Large storage integration suite favors explicit scenario setup and readable failure output; strict style cleanup is tracked separately."
+)]
+
 use omni_engine::{OmniError, OmniKV, OmniRecord, SSTableReader, SSTableWriter, WriteBatch};
 use std::sync::Arc;
 use tempfile::TempDir;

@@ -13,10 +13,7 @@ use axum::extract::State;
 use axum::response::IntoResponse;
 
 use omni_engine::raft_impl::{OmniRaft, TypeConfig};
-use openraft::raft::{
-    AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
-    VoteRequest, VoteResponse,
-};
+use openraft::raft::{AppendEntriesRequest, InstallSnapshotRequest, VoteRequest};
 use std::sync::Arc;
 
 /// Shared state for Raft RPC routes.
