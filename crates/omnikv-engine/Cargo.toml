@@ -61,3 +61,8 @@ harness = false
 name = "volcano_dispatch"
 path = "benches/volcano_dispatch.rs"
 harness = false
+
+[[bench]]
+name = "scan_buffer_pool"
+path = "benches/scan_buffer_pool.rs"
+harness = false

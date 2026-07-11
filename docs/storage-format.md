@@ -86,6 +86,27 @@ OmniKV maps SSTable/base files read-only. The format relies on these invariants:
   reject deletion of a still-mapped file; cleanup treats that as a safe deferred
   deletion rather than a correctness failure.
 
+### Scan Iterator Ownership and Buffer Reuse
+
+SSTable range iterators own a lightweight handle to their backing table data.
+Production table reads keep an `Arc<Mmap>` handle; tests and byte-slice callers
+copy into `Arc<[u8]>`. This keeps iterator state independent from temporary
+reader objects and prevents references into mapped pages from escaping their
+owning storage handle.
+
+`scan_iter` still performs candidate collection and newest-version
+deduplication before lazy heap reads, but the heap-read scratch buffer is now
+borrowed from a small per-database pool. A range scan reuses one `Vec<u8>`
+across all yielded values, then returns it to the pool when the iterator is
+dropped. This removes repeated per-row heap-read buffer allocation from the
+scan hot path while preserving the existing lazy I/O behavior.
+
+The `scan_buffer_pool` benchmark can be used to compare future scan changes:
+
+```bash
+cargo bench -p omnikv-engine --bench scan_buffer_pool -- --rows 20000 --rounds 20
+```
+
 ---
 
 ## Checksums
