@@ -92,12 +92,61 @@ fn test_existing_mmap_reader_survives_compaction_root_swap() {
     assert_eq!(db.sstable_count(), 0);
     assert_eq!(db.l1_sstable_count(), 1);
 
-    let held_reader = SSTableReader::new(&held_l0_mmap);
+    let held_reader = SSTableReader::from_mmap(held_l0_mmap);
     let rec = held_reader
         .find(b"held-map-007", db.get_seq())
         .expect("held mmap should remain readable after root swap");
     let uncompressed_flag = 1_u64 << 63;
     assert_eq!(rec.1 & !uncompressed_flag, "value-007".len() as u64);
+}
+
+#[test]
+fn test_sstable_iterator_owns_backing_data() {
+    let mut iter = {
+        let record = OmniRecord::new(1, b"owned-key".to_vec(), 0, 5, 99, 0);
+        let encoded = record.encode();
+        let reader = SSTableReader::new(&encoded);
+        reader.iter_from(b"owned")
+    };
+
+    let rec = iter
+        .next()
+        .expect("iterator should keep table bytes alive after reader drops");
+    assert_eq!(rec.key, b"owned-key".to_vec());
+    assert!(iter.next().is_none());
+}
+
+#[test]
+fn test_scan_iter_reuses_pooled_heap_buffer() {
+    let (db, _dir) = create_test_db();
+
+    for i in 0..16 {
+        let mut batch = WriteBatch::new();
+        batch
+            .set(&format!("scan_pool_{i:03}"), format!("value-{i:03}"))
+            .unwrap();
+        db.commit_batch(&batch).unwrap();
+    }
+
+    assert_eq!(db.scan_buffer_pool_available(), 0);
+
+    let first: Vec<_> = db
+        .scan_iter("scan_pool_000", "scan_pool_999", db.get_seq())
+        .unwrap()
+        .collect();
+    assert_eq!(first.len(), 16);
+    assert_eq!(db.scan_buffer_pool_available(), 1);
+
+    let second: Vec<_> = db
+        .scan_iter("scan_pool_000", "scan_pool_999", db.get_seq())
+        .unwrap()
+        .collect();
+    assert_eq!(second.len(), 16);
+    assert_eq!(
+        db.scan_buffer_pool_available(),
+        1,
+        "second scan should reuse and return the same pooled buffer"
+    );
 }
 
 #[test]

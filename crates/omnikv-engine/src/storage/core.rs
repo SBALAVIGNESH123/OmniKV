@@ -513,33 +513,164 @@ impl Metrics {
     }
 }
 
-pub struct SSTableReader<'a> {
-    data: &'a [u8],
+const SCAN_BUFFER_INITIAL_CAPACITY: usize = 8 * 1024;
+const SCAN_BUFFER_POOL_MAX_BUFFERS: usize = 64;
+
+#[derive(Default)]
+struct ScanBufferPool {
+    buffers: Mutex<Vec<Vec<u8>>>,
 }
-impl<'a> SSTableReader<'a> {
-    pub fn new(data: &'a [u8]) -> Self {
-        Self { data }
+
+impl ScanBufferPool {
+    fn acquire(self: &Arc<Self>) -> PooledScanBuffer {
+        let buffer = self
+            .buffers
+            .lock()
+            .ok()
+            .and_then(|mut buffers| buffers.pop())
+            .unwrap_or_else(|| Vec::with_capacity(SCAN_BUFFER_INITIAL_CAPACITY));
+
+        PooledScanBuffer {
+            pool: self.clone(),
+            buffer: Some(buffer),
+        }
+    }
+
+    fn available(&self) -> usize {
+        self.buffers
+            .lock()
+            .map(|buffers| buffers.len())
+            .unwrap_or_default()
+    }
+
+    fn release(&self, mut buffer: Vec<u8>) {
+        buffer.clear();
+        if let Ok(mut buffers) = self.buffers.lock()
+            && buffers.len() < SCAN_BUFFER_POOL_MAX_BUFFERS
+        {
+            buffers.push(buffer);
+        }
+    }
+}
+
+struct PooledScanBuffer {
+    pool: Arc<ScanBufferPool>,
+    buffer: Option<Vec<u8>>,
+}
+
+impl PooledScanBuffer {
+    fn as_mut_vec(&mut self) -> &mut Vec<u8> {
+        self.buffer
+            .as_mut()
+            .expect("pooled scan buffer is present until drop")
+    }
+}
+
+impl Drop for PooledScanBuffer {
+    fn drop(&mut self) {
+        if let Some(buffer) = self.buffer.take() {
+            self.pool.release(buffer);
+        }
+    }
+}
+
+struct ScanCandidate {
+    key: Vec<u8>,
+    seq: u64,
+    offset: u64,
+    length: u64,
+    crc: u32,
+    expiry: u64,
+}
+
+pub struct ScanIterator<'a> {
+    db: &'a OmniKV,
+    candidates: std::vec::IntoIter<ScanCandidate>,
+    now: u64,
+    read_buffer: PooledScanBuffer,
+}
+
+impl Iterator for ScanIterator<'_> {
+    type Item = (String, String);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        for candidate in self.candidates.by_ref() {
+            if candidate.length == 0 || (candidate.expiry > 0 && candidate.expiry <= self.now) {
+                continue;
+            }
+            let key = key_to_string(&candidate.key);
+            let value = self
+                .db
+                .read_from_heap_into(
+                    candidate.offset,
+                    candidate.length,
+                    candidate.crc,
+                    self.read_buffer.as_mut_vec(),
+                )
+                .ok()?;
+            return Some((key, value));
+        }
+        None
+    }
+}
+
+#[derive(Clone)]
+enum SSTableData {
+    Mmap(Arc<Mmap>),
+    Bytes(Arc<[u8]>),
+}
+
+impl SSTableData {
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::Mmap(mmap) => mmap,
+            Self::Bytes(bytes) => bytes,
+        }
+    }
+}
+
+pub struct SSTableReader {
+    data: SSTableData,
+}
+
+impl SSTableReader {
+    /// Creates a reader from arbitrary bytes.
+    ///
+    /// This copies into an owned `Arc<[u8]>` so iterators derived from this
+    /// reader can outlive the source byte slice. Production mmap paths should
+    /// use `from_mmap` to avoid copying table files.
+    pub fn new(data: &[u8]) -> Self {
+        Self {
+            data: SSTableData::Bytes(Arc::<[u8]>::from(data)),
+        }
+    }
+
+    pub fn from_mmap(mmap: Arc<Mmap>) -> Self {
+        Self {
+            data: SSTableData::Mmap(mmap),
+        }
     }
 
     fn get_block_for_key(&self, target: &[u8]) -> Option<usize> {
-        if self.data.len() < 16 {
+        let data = self.data.as_slice();
+        if data.len() < 16 {
             return Some(0);
         }
-        let magic = &self.data[self.data.len() - 8..];
+        let magic = &data[data.len() - 8..];
         if magic != b"OMNIV2**" {
             return Some(0);
         }
 
         let index_offset = u64::from_le_bytes(
-            self.data[self.data.len() - 16..self.data.len() - 8]
+            data[data.len() - 16..data.len() - 8]
                 .try_into()
                 .expect("SSTable trailer offset length was prevalidated"),
         ) as usize;
-        if index_offset >= self.data.len() {
+        if index_offset >= data.len() {
             return Some(0);
         }
 
-        let index_data = &self.data[index_offset..self.data.len() - 16];
+        let index_data = &data[index_offset..data.len() - 16];
         if index_data.len() < 8 {
             return Some(0);
         }
@@ -584,14 +715,15 @@ impl<'a> SSTableReader<'a> {
     }
 
     pub fn find(&self, target_key: &[u8], read_seq: u64) -> Option<(u64, u64, u32, u64)> {
+        let data = self.data.as_slice();
         let mut offset = self.get_block_for_key(target_key).unwrap_or(0);
         let mut best = None;
         let mut best_seq = 0;
 
-        while offset < self.data.len() {
-            if self.data.len() >= 16 && &self.data[self.data.len() - 8..] == b"OMNIV2**" {
+        while offset < data.len() {
+            if data.len() >= 16 && &data[data.len() - 8..] == b"OMNIV2**" {
                 let index_offset = u64::from_le_bytes(
-                    self.data[self.data.len() - 16..self.data.len() - 8]
+                    data[data.len() - 16..data.len() - 8]
                         .try_into()
                         .expect("SSTable trailer offset length was prevalidated"),
                 ) as usize;
@@ -600,7 +732,7 @@ impl<'a> SSTableReader<'a> {
                 }
             }
 
-            if let Some((rec, len)) = OmniRecord::decode(&self.data[offset..]) {
+            if let Some((rec, len)) = OmniRecord::decode(&data[offset..]) {
                 offset += len;
                 if rec.key.as_slice() > target_key {
                     break;
@@ -620,25 +752,28 @@ impl<'a> SSTableReader<'a> {
         best
     }
 
-    pub fn iter_from(&self, start_key: &[u8]) -> SSTableIterator<'a> {
+    pub fn iter_from(&self, start_key: &[u8]) -> SSTableIterator {
         let offset = self.get_block_for_key(start_key).unwrap_or(0);
         SSTableIterator {
-            data: self.data,
+            data: self.data.clone(),
             offset,
         }
     }
 }
 
-pub struct SSTableIterator<'a> {
-    data: &'a [u8],
+pub struct SSTableIterator {
+    data: SSTableData,
     offset: usize,
 }
-impl<'a> Iterator for SSTableIterator<'a> {
+
+impl Iterator for SSTableIterator {
     type Item = OmniRecord;
+
     fn next(&mut self) -> Option<Self::Item> {
-        if self.data.len() >= 16 && &self.data[self.data.len() - 8..] == b"OMNIV2**" {
+        let data = self.data.as_slice();
+        if data.len() >= 16 && &data[data.len() - 8..] == b"OMNIV2**" {
             let index_offset = u64::from_le_bytes(
-                self.data[self.data.len() - 16..self.data.len() - 8]
+                data[data.len() - 16..data.len() - 8]
                     .try_into()
                     .expect("SSTable trailer offset length was prevalidated"),
             ) as usize;
@@ -646,7 +781,7 @@ impl<'a> Iterator for SSTableIterator<'a> {
                 return None;
             }
         }
-        if let Some((rec, len)) = OmniRecord::decode(&self.data[self.offset..]) {
+        if let Some((rec, len)) = OmniRecord::decode(&data[self.offset..]) {
             self.offset += len;
             Some(rec)
         } else {
@@ -763,6 +898,7 @@ pub struct OmniKV {
     pub metrics: Arc<Metrics>,
     pub(crate) active_snapshots: Mutex<std::collections::BTreeMap<u64, usize>>,
     pub(crate) block_cache: moka::sync::Cache<u64, String>,
+    scan_buffer_pool: Arc<ScanBufferPool>,
 
     // ── Group commit engine ──
     // Batches concurrent fsyncs: N writers → 1 fsync instead of N fsyncs.
@@ -809,6 +945,7 @@ impl OmniKV {
             metrics: Arc::new(Metrics::new()),
             active_snapshots: Mutex::new(std::collections::BTreeMap::new()),
             block_cache: moka::sync::Cache::builder().max_capacity(100_000).build(),
+            scan_buffer_pool: Arc::new(ScanBufferPool::default()),
             // Group commit: wait up to 200µs for more writers to join each batch.
             // On SSDs, this batches 5-50 concurrent writes into a single fsync.
             group_commit: crate::hardening::GroupCommitEngine::new(200),
@@ -884,9 +1021,9 @@ impl OmniKV {
         // second engine instance can truncate or mutate the file while mapped.
         // Internal compaction never edits a mapped file in place; it writes a
         // new file, syncs it, maps it, and atomically publishes a new root.
-        let base_mmap = unsafe { MmapOptions::new().map(&base_file)? };
+        let base_mmap = Arc::new(unsafe { MmapOptions::new().map(&base_file)? });
 
-        let reader = SSTableReader::new(&base_mmap);
+        let reader = SSTableReader::from_mmap(base_mmap.clone());
         let base_bloom_path = manifest.base_path.replace(".bin", ".bloom");
         let base_bloom = match BloomFilter::load(&base_bloom_path) {
             Ok(b) => b,
@@ -914,7 +1051,8 @@ impl OmniKV {
                 // prevents concurrent OmniKV processes from mutating them.
                 && let Ok(mmap) = unsafe { MmapOptions::new().map(&file) }
             {
-                let reader = SSTableReader::new(&mmap);
+                let mmap = Arc::new(mmap);
+                let reader = SSTableReader::from_mmap(mmap.clone());
                 let bloom_path = sst_path.replace(".sst", ".bloom");
                 let bloom = match BloomFilter::load(&bloom_path) {
                     Ok(b) => b,
@@ -935,7 +1073,7 @@ impl OmniKV {
                         b
                     }
                 };
-                loaded_sstables.push((Arc::new(mmap), Arc::new(bloom), sst_path.clone()));
+                loaded_sstables.push((mmap, Arc::new(bloom), sst_path.clone()));
             }
         }
 
@@ -947,7 +1085,8 @@ impl OmniKV {
                 // never by in-place mutation while mapped.
                 && let Ok(mmap) = unsafe { MmapOptions::new().map(&file) }
             {
-                let reader = SSTableReader::new(&mmap);
+                let mmap = Arc::new(mmap);
+                let reader = SSTableReader::from_mmap(mmap.clone());
                 let bloom_path = sst_path.replace(".sst", ".bloom");
                 let bloom = match BloomFilter::load(&bloom_path) {
                     Ok(b) => b,
@@ -968,7 +1107,7 @@ impl OmniKV {
                         b
                     }
                 };
-                loaded_l1_sstables.push((Arc::new(mmap), Arc::new(bloom), sst_path.clone()));
+                loaded_l1_sstables.push((mmap, Arc::new(bloom), sst_path.clone()));
             }
         }
 
@@ -1000,7 +1139,7 @@ impl OmniKV {
         let wal = wal::WriteAheadLog::new(wal_path)?;
 
         Ok(RecoveredStorage {
-            base_mmap: Arc::new(base_mmap),
+            base_mmap,
             base_bloom: Arc::new(base_bloom),
             sstables: Arc::new(loaded_sstables),
             l1_sstables: Arc::new(loaded_l1_sstables),
@@ -1098,6 +1237,10 @@ impl OmniKV {
 
     pub fn total_records(&self) -> usize {
         self.memtable_size() // + other counts if needed
+    }
+
+    pub fn scan_buffer_pool_available(&self) -> usize {
+        self.scan_buffer_pool.available()
     }
 
     pub fn flush_memtable_to_disk(&self, _id: u64) -> Result<(), OmniError> {
@@ -1399,6 +1542,17 @@ impl OmniKV {
         length_with_flag: u64,
         expected_crc32: u32,
     ) -> Result<String, OmniError> {
+        let mut buf = Vec::new();
+        self.read_from_heap_into(offset, length_with_flag, expected_crc32, &mut buf)
+    }
+
+    fn read_from_heap_into(
+        &self,
+        offset: u64,
+        length_with_flag: u64,
+        expected_crc32: u32,
+        buf: &mut Vec<u8>,
+    ) -> Result<String, OmniError> {
         if let Some(cached) = self.block_cache.get(&offset) {
             return Ok(cached);
         }
@@ -1406,7 +1560,8 @@ impl OmniKV {
         let is_uncompressed = (length_with_flag & UNCOMPRESSED_FLAG) != 0;
         let length = length_with_flag & !UNCOMPRESSED_FLAG;
 
-        let mut buf = vec![0u8; length as usize];
+        buf.clear();
+        buf.resize(length as usize, 0);
 
         // On Windows, use the writer handle (heap_file) for reads to guarantee
         // visibility of recently written data. Windows doesn't guarantee
@@ -1436,15 +1591,15 @@ impl OmniKV {
         }
 
         let mut hasher = crc32fast::Hasher::new();
-        hasher.update(&buf);
+        hasher.update(buf.as_slice());
         if hasher.finalize() != expected_crc32 {
             return Err(OmniError::IoError("Payload CRC32 mismatch!".into()));
         }
 
         let result = if is_uncompressed {
-            Ok(String::from_utf8_lossy(&buf).to_string())
+            Ok(String::from_utf8_lossy(buf.as_slice()).to_string())
         } else {
-            let decompressed = lz4_flex::decompress_size_prepended(&buf)
+            let decompressed = lz4_flex::decompress_size_prepended(buf.as_slice())
                 .map_err(|e| OmniError::IoError(format!("LZ4 Error: {:?}", e)))?;
             Ok(String::from_utf8_lossy(&decompressed).to_string())
         };
@@ -1532,7 +1687,7 @@ impl OmniKV {
             let mut h = FnvHasher::default();
             target_key.hash(&mut h);
             if bloom.might_contain(h.finish()) {
-                let reader = SSTableReader::new(mmap);
+                let reader = SSTableReader::from_mmap(mmap.clone());
                 if let Some(ptr) = reader.find(&target_key, read_seq) {
                     pointer = Some(ptr);
                     break;
@@ -1546,7 +1701,7 @@ impl OmniKV {
                 let mut h = FnvHasher::default();
                 target_key.hash(&mut h);
                 if bloom.might_contain(h.finish()) {
-                    let reader = SSTableReader::new(mmap);
+                    let reader = SSTableReader::from_mmap(mmap.clone());
                     if let Some(ptr) = reader.find(&target_key, read_seq) {
                         pointer = Some(ptr);
                         break;
@@ -1561,7 +1716,7 @@ impl OmniKV {
             target_key.hash(&mut h);
             if base_bloom.might_contain(h.finish()) {
                 let base_mmap = self.roots.load().base_mmap.clone();
-                let reader = SSTableReader::new(&base_mmap);
+                let reader = SSTableReader::from_mmap(base_mmap);
                 pointer = reader.find(&target_key, read_seq);
             }
         }
@@ -1606,9 +1761,8 @@ impl OmniKV {
             .as_secs();
 
         // Phase 1: Collect candidate records from all levels into a single Vec.
-        // Each entry: (key, seq, offset, length, crc, expiry)
         // We use a Vec instead of BTreeMap to avoid per-insert O(log N) overhead.
-        let mut candidates: Vec<(Vec<u8>, u64, u64, u64, u32, u64)> = Vec::new();
+        let mut candidates: Vec<ScanCandidate> = Vec::new();
 
         // Memtable (highest priority â€” newest data)
         let active_mem = self.roots.load().memtable.clone();
@@ -1620,14 +1774,14 @@ impl OmniKV {
                 }
                 let seq = entry.key().1.0;
                 if seq <= read_seq {
-                    candidates.push((
+                    candidates.push(ScanCandidate {
                         key,
                         seq,
-                        entry.value().0,
-                        entry.value().1,
-                        entry.value().2,
-                        entry.value().3,
-                    ));
+                        offset: entry.value().0,
+                        length: entry.value().1,
+                        crc: entry.value().2,
+                        expiry: entry.value().3,
+                    });
                 }
             }
         }
@@ -1643,14 +1797,14 @@ impl OmniKV {
                     }
                     let seq = entry.key().1.0;
                     if seq <= read_seq {
-                        candidates.push((
+                        candidates.push(ScanCandidate {
                             key,
                             seq,
-                            entry.value().0,
-                            entry.value().1,
-                            entry.value().2,
-                            entry.value().3,
-                        ));
+                            offset: entry.value().0,
+                            length: entry.value().1,
+                            crc: entry.value().2,
+                            expiry: entry.value().3,
+                        });
                     }
                 }
             }
@@ -1659,20 +1813,20 @@ impl OmniKV {
         // L0 SSTables (newest first)
         let sstables = self.roots.load().sstables.clone();
         for (mmap, _, _) in sstables.iter().rev() {
-            let reader = SSTableReader::new(mmap);
+            let reader = SSTableReader::from_mmap(mmap.clone());
             for rec in reader.iter_from(&start_key) {
                 if rec.key > end_key {
                     break;
                 }
                 if rec.is_valid() && rec.seq <= read_seq {
-                    candidates.push((
-                        rec.key,
-                        rec.seq,
-                        rec.offset,
-                        rec.length,
-                        rec.payload_crc32,
-                        rec.expiry,
-                    ));
+                    candidates.push(ScanCandidate {
+                        key: rec.key,
+                        seq: rec.seq,
+                        offset: rec.offset,
+                        length: rec.length,
+                        crc: rec.payload_crc32,
+                        expiry: rec.expiry,
+                    });
                 }
             }
         }
@@ -1680,62 +1834,57 @@ impl OmniKV {
         // L1 SSTables
         let l1_sstables = self.roots.load().l1_sstables.clone();
         for (mmap, _, _) in &**l1_sstables {
-            let reader = SSTableReader::new(mmap);
+            let reader = SSTableReader::from_mmap(mmap.clone());
             for rec in reader.iter_from(&start_key) {
                 if rec.key > end_key {
                     break;
                 }
                 if rec.is_valid() && rec.seq <= read_seq {
-                    candidates.push((
-                        rec.key,
-                        rec.seq,
-                        rec.offset,
-                        rec.length,
-                        rec.payload_crc32,
-                        rec.expiry,
-                    ));
+                    candidates.push(ScanCandidate {
+                        key: rec.key,
+                        seq: rec.seq,
+                        offset: rec.offset,
+                        length: rec.length,
+                        crc: rec.payload_crc32,
+                        expiry: rec.expiry,
+                    });
                 }
             }
         }
 
         // Base file (oldest data, lowest priority)
         let base_mmap = self.roots.load().base_mmap.clone();
-        let reader = SSTableReader::new(&base_mmap);
+        let reader = SSTableReader::from_mmap(base_mmap);
         for rec in reader.iter_from(&start_key) {
             if rec.key > end_key {
                 break;
             }
             if rec.is_valid() && rec.seq <= read_seq {
-                candidates.push((
-                    rec.key,
-                    rec.seq,
-                    rec.offset,
-                    rec.length,
-                    rec.payload_crc32,
-                    rec.expiry,
-                ));
+                candidates.push(ScanCandidate {
+                    key: rec.key,
+                    seq: rec.seq,
+                    offset: rec.offset,
+                    length: rec.length,
+                    crc: rec.payload_crc32,
+                    expiry: rec.expiry,
+                });
             }
         }
 
         // Phase 2: Sort by (key ASC, seq DESC) â€” this groups duplicates together
         // with the newest version first, enabling O(N) deduplication in one pass.
-        candidates.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
+        candidates.sort_unstable_by(|a, b| a.key.cmp(&b.key).then(b.seq.cmp(&a.seq)));
 
         // Phase 3: Deduplicate â€” keep only the first (newest) entry per key.
-        candidates.dedup_by(|a, b| a.0 == b.0);
+        candidates.dedup_by(|a, b| a.key == b.key);
 
         // Phase 4: Lazy heap I/O â€” only read values when the iterator is consumed.
-        Ok(candidates
-            .into_iter()
-            .filter_map(move |(k, _seq, offset, length, crc, expiry)| {
-                if length == 0 || (expiry > 0 && expiry <= now) {
-                    return None;
-                }
-                let k_str = key_to_string(&k);
-                self.read_from_heap(offset, length, crc)
-                    .ok()
-                    .map(|val| (k_str, val))
-            }))
+        Ok(ScanIterator {
+            db: self,
+            candidates: candidates.into_iter(),
+            now,
+            read_buffer: self.scan_buffer_pool.acquire(),
+        })
     }
 
     /// Returns the sequence number of the latest version of a key visible at `read_seq`.
@@ -1769,13 +1918,13 @@ impl OmniKV {
         }
 
         // Helper: search SSTables via iter_from (returns OmniRecord with .seq)
-        let search_sstable = |mmap: &Mmap, bloom: &BloomFilter| -> Option<u64> {
+        let search_sstable = |mmap: &Arc<Mmap>, bloom: &BloomFilter| -> Option<u64> {
             let mut h = FnvHasher::default();
             target_key.hash(&mut h);
             if !bloom.might_contain(h.finish()) {
                 return None;
             }
-            let reader = SSTableReader::new(mmap);
+            let reader = SSTableReader::from_mmap(mmap.clone());
             let mut best_seq = 0u64;
             for rec in reader.iter_from(&target_key) {
                 if rec.key > target_key {
@@ -1819,7 +1968,7 @@ impl OmniKV {
         }
         {
             let base_mmap = self.roots.load().base_mmap.clone();
-            let reader = SSTableReader::new(&base_mmap);
+            let reader = SSTableReader::from_mmap(base_mmap);
             let mut best_seq = 0u64;
             for rec in reader.iter_from(&target_key) {
                 if rec.key > target_key {
@@ -1980,7 +2129,7 @@ impl OmniKV {
         let mut merged: BTreeMap<Vec<u8>, (u64, u64, u64, u32, u64)> = BTreeMap::new();
 
         for (mmap, _, _) in &**sstables {
-            let reader = SSTableReader::new(mmap);
+            let reader = SSTableReader::from_mmap(mmap.clone());
             for rec in reader.iter_from(b"") {
                 if rec.is_valid() {
                     let existing = merged.get(&rec.key);
@@ -2107,7 +2256,7 @@ impl OmniKV {
         let mut merged: BTreeMap<Vec<u8>, (u64, u64, u64, u32, u64)> = BTreeMap::new();
 
         let base_mmap = self.roots.load().base_mmap.clone();
-        let reader = SSTableReader::new(&base_mmap);
+        let reader = SSTableReader::from_mmap(base_mmap);
         for rec in reader.iter_from(b"") {
             if rec.is_valid() {
                 let existing = merged.get(&rec.key);
@@ -2133,7 +2282,7 @@ impl OmniKV {
         let num_l1_merged = l1_sstables_snap.len();
 
         for (mmap, _, _) in &**l1_sstables_snap {
-            let reader = SSTableReader::new(mmap);
+            let reader = SSTableReader::from_mmap(mmap.clone());
             for rec in reader.iter_from(b"") {
                 if rec.is_valid() {
                     let existing = merged.get(&rec.key);
@@ -2268,7 +2417,7 @@ impl OmniKV {
             };
 
         let base_mmap = self.roots.load().base_mmap.clone();
-        let reader = SSTableReader::new(&base_mmap);
+        let reader = SSTableReader::from_mmap(base_mmap);
         for rec in reader.iter_from(b"") {
             if rec.is_valid() {
                 add_to_merged(
@@ -2284,7 +2433,7 @@ impl OmniKV {
 
         let sstables = self.roots.load().sstables.clone();
         for (mmap, _, _) in &**sstables {
-            let reader = SSTableReader::new(mmap);
+            let reader = SSTableReader::from_mmap(mmap.clone());
             for rec in reader.iter_from(b"") {
                 if rec.is_valid() {
                     add_to_merged(
@@ -2301,7 +2450,7 @@ impl OmniKV {
 
         let l1_sstables = self.roots.load().l1_sstables.clone();
         for (mmap, _, _) in &**l1_sstables {
-            let reader = SSTableReader::new(mmap);
+            let reader = SSTableReader::from_mmap(mmap.clone());
             for rec in reader.iter_from(b"") {
                 if rec.is_valid() {
                     add_to_merged(
