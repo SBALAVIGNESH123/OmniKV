@@ -40,6 +40,28 @@ a guarded `.unwrap()` is acceptable.  A `// SAFETY:` comment is required.
 **Examples:**
 - `.duration_since(UNIX_EPOCH).unwrap_or_default()` — clock is always ≥ epoch
 
+### 4. Unsafe / mmap Safety Comments
+
+Every `unsafe` block in production storage code must carry a nearby
+`// SAFETY:` comment that states the invariant making it sound. For mmap usage,
+the comment must explain why the mapped file cannot be concurrently truncated or
+mutated while the mapping is alive.
+
+Current storage mmap invariants:
+
+- `OmniKV::open()` acquires an exclusive database-directory `LOCK` file before
+  manifest recovery, WAL replay, heap opening, or SSTable mmap creation.
+- A second live `OmniKV` instance for the same database directory returns
+  `OmniError::DatabaseAlreadyOpen`.
+- SSTable/base files are immutable after they are mapped. Compaction writes a new
+  file, fsyncs it, creates a read-only mmap, and publishes it with an atomic root
+  swap.
+- Old mmap handles are reference-counted through `Arc<Mmap>`. Cleanup may remove
+  old pathnames later, but reader-owned mappings stay alive until the last reader
+  drops them.
+- The database lock is stored as the final `OmniKV` field so mapped files and
+  file handles are dropped before the lock file is unlocked and closed.
+
 ## Not Allowed
 
 | Pattern | Required replacement |
@@ -64,3 +86,15 @@ Before adding a new `unwrap()` or `expect()`:
 3. If **fatal invariant** — use `.expect("clear reason why this cannot be recovered")`.
 4. If **startup-only** — use `.expect("startup: <what failed and why it is fatal>")`.
 5. Update this document if a new category is needed.
+
+## Adding a New mmap or Unsafe Storage Path
+
+Before adding a new mmap or unsafe storage path:
+
+1. Acquire or prove the relevant database-directory lock is already held.
+2. Ensure the mapped file is immutable for the full lifetime of the mapping.
+3. Do not write through mmap. OmniKV writes with normal file I/O, fsyncs, then
+   maps read-only.
+4. Keep old mapped files alive through `Arc<Mmap>` until readers finish.
+5. Add a regression test for truncation/corruption behavior and any root-swap or
+   compaction lifetime behavior the change touches.

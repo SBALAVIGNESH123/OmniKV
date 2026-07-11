@@ -9,7 +9,7 @@ use arc_swap::ArcSwap;
 use crossbeam_skiplist::SkipMap;
 use memmap2::{Mmap, MmapOptions};
 use std::cmp::Reverse;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::hash::{Hash, Hasher};
 use std::io::{BufWriter, Read, Write};
@@ -17,8 +17,9 @@ use std::io::{BufWriter, Read, Write};
 use std::os::unix::fs::FileExt;
 #[cfg(windows)]
 use std::os::windows::fs::FileExt;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 pub struct FnvHasher(u64);
 impl Default for FnvHasher {
@@ -40,6 +41,9 @@ impl Hasher for FnvHasher {
 #[derive(Debug, Clone)]
 pub enum OmniError {
     IoError(String),
+    DatabaseAlreadyOpen {
+        lock_path: String,
+    },
     BatchTooLarge(usize),
     ValueTooLarge(usize),
     KeyNotFound,
@@ -57,6 +61,9 @@ pub enum OmniError {
 impl std::fmt::Display for OmniError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            OmniError::DatabaseAlreadyOpen { lock_path } => {
+                write!(f, "database is already open: lock file {lock_path}")
+            }
             OmniError::UnsupportedVersion { found, supported } => write!(
                 f,
                 "unsupported manifest version {found}: this build supports up to {supported}"
@@ -64,6 +71,77 @@ impl std::fmt::Display for OmniError {
             other => write!(f, "{other:?}"),
         }
     }
+}
+
+static PROCESS_DB_LOCKS: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+
+fn process_db_locks() -> &'static Mutex<HashSet<PathBuf>> {
+    PROCESS_DB_LOCKS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn database_lock_path(manifest_path: &str) -> Result<PathBuf, OmniError> {
+    let manifest_path = Path::new(manifest_path);
+    let dir = manifest_path.parent().filter(|p| !p.as_os_str().is_empty());
+    let dir = dir.unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(dir)?;
+    Ok(std::fs::canonicalize(dir)?.join("LOCK"))
+}
+
+struct DatabaseLock {
+    file: File,
+    path: PathBuf,
+}
+
+impl DatabaseLock {
+    fn acquire(manifest_path: &str) -> Result<Self, OmniError> {
+        let path = database_lock_path(manifest_path)?;
+        {
+            let mut locks = process_db_locks()
+                .lock()
+                .map_err(|_| OmniError::LockPoisoned("process database lock registry".into()))?;
+            if locks.contains(&path) {
+                return Err(OmniError::DatabaseAlreadyOpen {
+                    lock_path: path.display().to_string(),
+                });
+            }
+            locks.insert(path.clone());
+        }
+
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .map_err(|err| {
+                let _ = release_process_db_lock(&path);
+                OmniError::IoError(format!("open database lock {}: {err}", path.display()))
+            })?;
+
+        if let Err(_err) = fs2::FileExt::try_lock_exclusive(&file) {
+            let _ = release_process_db_lock(&path);
+            return Err(OmniError::DatabaseAlreadyOpen {
+                lock_path: path.display().to_string(),
+            });
+        }
+
+        Ok(Self { file, path })
+    }
+}
+
+impl Drop for DatabaseLock {
+    fn drop(&mut self) {
+        let _ = fs2::FileExt::unlock(&self.file);
+        let _ = release_process_db_lock(&self.path);
+    }
+}
+
+fn release_process_db_lock(path: &Path) -> Result<(), OmniError> {
+    let mut locks = process_db_locks()
+        .lock()
+        .map_err(|_| OmniError::LockPoisoned("process database lock registry".into()))?;
+    locks.remove(path);
+    Ok(())
 }
 
 impl std::error::Error for OmniError {}
@@ -695,12 +773,18 @@ pub struct OmniKV {
     // Shared (read) lock: commit_batch, compaction, flush.
     // Exclusive (write) lock: snapshot install only — freezes all writers/compactors.
     pub(crate) transition_guard: RwLock<()>,
+
+    // Must be declared last: Rust drops struct fields in declaration order, so
+    // all mmap-bearing roots and files are released before the database LOCK
+    // file is unlocked and closed.
+    db_lock: DatabaseLock,
 }
 
 impl OmniKV {
     /// Opens an OmniKV database from the given manifest and WAL paths.
     /// Recovers state from WAL and initializes the storage engine.
     pub fn open(manifest_path: &str, wal_path: &str) -> Result<Arc<Self>, OmniError> {
+        let db_lock = DatabaseLock::acquire(manifest_path)?;
         let recovered = Self::recover_storage_roots(manifest_path, wal_path)?;
 
         let initial_roots = StorageRoots {
@@ -729,6 +813,7 @@ impl OmniKV {
             // On SSDs, this batches 5-50 concurrent writes into a single fsync.
             group_commit: crate::hardening::GroupCommitEngine::new(200),
             transition_guard: RwLock::new(()),
+            db_lock,
         }))
     }
 
@@ -794,6 +879,11 @@ impl OmniKV {
         if base_file.metadata()?.len() == 0 {
             base_file.set_len(4096)?; // dummy length to allow mmap
         }
+        // SAFETY: The base SSTable file is mapped read-only after it is created
+        // or opened. OmniKV holds the database LOCK before this point, so no
+        // second engine instance can truncate or mutate the file while mapped.
+        // Internal compaction never edits a mapped file in place; it writes a
+        // new file, syncs it, maps it, and atomically publishes a new root.
         let base_mmap = unsafe { MmapOptions::new().map(&base_file)? };
 
         let reader = SSTableReader::new(&base_mmap);
@@ -819,6 +909,9 @@ impl OmniKV {
         let mut loaded_sstables = Vec::new();
         for sst_path in &manifest.sstables {
             if let Ok(file) = OpenOptions::new().read(true).open(sst_path)
+                // SAFETY: Recovered L0 SSTables are opened read-only and are
+                // immutable once published in the manifest. The database LOCK
+                // prevents concurrent OmniKV processes from mutating them.
                 && let Ok(mmap) = unsafe { MmapOptions::new().map(&file) }
             {
                 let reader = SSTableReader::new(&mmap);
@@ -849,6 +942,9 @@ impl OmniKV {
         let mut loaded_l1_sstables = Vec::new();
         for sst_path in &manifest.l1_sstables {
             if let Ok(file) = OpenOptions::new().read(true).open(sst_path)
+                // SAFETY: Recovered L1 SSTables are immutable read-only table
+                // files. They are replaced by publishing new root snapshots,
+                // never by in-place mutation while mapped.
                 && let Ok(mmap) = unsafe { MmapOptions::new().map(&file) }
             {
                 let reader = SSTableReader::new(&mmap);
@@ -1828,6 +1924,9 @@ impl OmniKV {
 
         file.sync_all()?;
 
+        // SAFETY: The new L0 SSTable is fully written, flushed, and fsynced
+        // before this read-only mapping is created. After publication, OmniKV
+        // treats the table as immutable and replaces it only by root swap.
         let mmap = unsafe { MmapOptions::new().map(&file)? };
 
         let mut manifest = self.roots.load().manifest.clone().as_ref().clone();
@@ -1963,6 +2062,9 @@ impl OmniKV {
         writer.finish()?;
         file.sync_all()?;
 
+        // SAFETY: The new L1 SSTable is fully materialized and synced before
+        // mapping. Compaction installs the mapping via an atomic root swap and
+        // does not mutate the file afterward.
         let mmap = unsafe { MmapOptions::new().map(&file)? };
 
         let mut manifest = self.roots.load().manifest.clone().as_ref().clone();
@@ -2089,6 +2191,9 @@ impl OmniKV {
         writer.finish()?;
         file.sync_all()?;
 
+        // SAFETY: The replacement base SSTable is complete and fsynced before
+        // mapping. Existing readers retain Arc-owned mappings for old files,
+        // while new readers see this immutable mapping after the root swap.
         let new_base_mmap = unsafe { MmapOptions::new().map(&file)? };
 
         // Critical Section: Swap ALL topology in a SINGLE atomic update.
@@ -2306,6 +2411,9 @@ impl OmniKV {
 
         drop(new_heap_writer);
 
+        // SAFETY: Garbage collection writes a brand-new compacted base file,
+        // fsyncs it, maps it read-only, and then publishes it atomically. Old
+        // mmap handles remain Arc-owned until all readers release them.
         let new_base_mmap = unsafe { MmapOptions::new().map(&new_base_file)? };
 
         let new_heap_reader = OpenOptions::new().read(true).open(&new_heap_path)?;
