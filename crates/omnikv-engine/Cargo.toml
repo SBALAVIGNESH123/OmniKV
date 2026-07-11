@@ -56,3 +56,8 @@ tempfile = "3.15"
 name = "omni_bench"
 path = "benches/omni_bench.rs"
 harness = false
+
+[[bench]]
+name = "volcano_dispatch"
+path = "benches/volcano_dispatch.rs"
+harness = false
