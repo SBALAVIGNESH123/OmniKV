@@ -2,25 +2,14 @@
 //!
 //! Proves: log replication, leader election, crash recovery across 3 nodes.
 
-#![expect(
-    clippy::doc_markdown,
-    clippy::redundant_clone,
-    clippy::similar_names,
-    clippy::single_match_else,
-    clippy::too_many_lines,
-    clippy::uninlined_format_args,
-    clippy::used_underscore_binding,
-    reason = "Large Raft integration suite favors explicit node names, generated keys, and readable distributed-failure diagnostics."
-)]
-
 use omni_engine::OmniKV;
 use omni_engine::raft_storage::OmniRaftStorage;
 use std::sync::Arc;
 
 fn create_node(name: &str) -> (Arc<OmniKV>, OmniRaftStorage, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
-    let manifest = dir.path().join(format!("{}_manifest.json", name));
-    let wal = dir.path().join(format!("{}_wal.bin", name));
+    let manifest = dir.path().join(format!("{name}_manifest.json"));
+    let wal = dir.path().join(format!("{name}_wal.bin"));
     let db = OmniKV::open(manifest.to_str().unwrap(), wal.to_str().unwrap()).unwrap();
     let storage = OmniRaftStorage::new(db.clone());
     (db, storage, dir)
@@ -31,7 +20,7 @@ fn replicate_log(leader: &OmniRaftStorage, followers: &[&OmniRaftStorage], start
     for idx in start..end {
         let entry = leader
             .read_log(idx)
-            .unwrap_or_else(|| panic!("Leader missing log {}", idx));
+            .unwrap_or_else(|| panic!("Leader missing log {idx}"));
         for f in followers {
             f.append_log(idx, &entry).expect("Follower append failed");
         }
@@ -47,7 +36,7 @@ fn test_3_node_log_replication() {
     // Node1 is leader — append 10 log entries
     for i in 1..=10 {
         node1
-            .append_log(i, &format!("SET key{} value{}", i, i))
+            .append_log(i, &format!("SET key{i} value{i}"))
             .unwrap();
     }
 
@@ -59,8 +48,8 @@ fn test_3_node_log_replication() {
         let e1 = node1.read_log(i).unwrap();
         let e2 = node2.read_log(i).unwrap();
         let e3 = node3.read_log(i).unwrap();
-        assert_eq!(e1, e2, "Node1 vs Node2 mismatch at index {}", i);
-        assert_eq!(e2, e3, "Node2 vs Node3 mismatch at index {}", i);
+        assert_eq!(e1, e2, "Node1 vs Node2 mismatch at index {i}");
+        assert_eq!(e2, e3, "Node2 vs Node3 mismatch at index {i}");
     }
 
     println!("✅ 3-NODE LOG REPLICATION: All 10 entries identical across 3 nodes");
@@ -104,32 +93,27 @@ fn test_state_machine_apply() {
         assert_eq!(
             db.find("user:1", seq).unwrap(),
             Some("Alice".into()),
-            "{} missing user:1",
-            name
+            "{name} missing user:1"
         );
         assert_eq!(
             db.find("user:2", seq).unwrap(),
             Some("Bob".into()),
-            "{} missing user:2",
-            name
+            "{name} missing user:2"
         );
         assert_eq!(
             db.find("user:3", seq).unwrap(),
             Some("Charlie".into()),
-            "{} missing user:3",
-            name
+            "{name} missing user:3"
         );
         assert_eq!(
             db.find("balance:1", seq).unwrap(),
             Some("1000".into()),
-            "{} missing balance:1",
-            name
+            "{name} missing balance:1"
         );
         assert_eq!(
             db.find("balance:2", seq).unwrap(),
             Some("2500".into()),
-            "{} missing balance:2",
-            name
+            "{name} missing balance:2"
         );
     }
 
@@ -154,9 +138,7 @@ fn test_leader_election_simulation() {
 
     // Leader writes entries 1-5
     for i in 1..=5 {
-        node1
-            .append_log(i, &format!("SET key{} val{}", i, i))
-            .unwrap();
+        node1.append_log(i, &format!("SET key{i} val{i}")).unwrap();
     }
     replicate_log(&node1, &[&node2, &node3], 1, 6);
 
@@ -167,7 +149,7 @@ fn test_leader_election_simulation() {
     // New leader (node2) writes entries 6-8
     for i in 6..=8 {
         node2
-            .append_log(i, &format!("SET newkey{} newval{}", i, i))
+            .append_log(i, &format!("SET newkey{i} newval{i}"))
             .unwrap();
     }
 
@@ -176,8 +158,8 @@ fn test_leader_election_simulation() {
 
     // Verify node2 and node3 have all 8 entries
     for i in 1..=8 {
-        assert!(node2.read_log(i).is_some(), "Node2 missing log {}", i);
-        assert!(node3.read_log(i).is_some(), "Node3 missing log {}", i);
+        assert!(node2.read_log(i).is_some(), "Node2 missing log {i}");
+        assert!(node3.read_log(i).is_some(), "Node3 missing log {i}");
     }
 
     // Verify node2's vote is term 2
@@ -193,8 +175,8 @@ fn test_leader_election_simulation() {
         let e1 = node1.read_log(i).unwrap();
         let e2 = node2.read_log(i).unwrap();
         let e3 = node3.read_log(i).unwrap();
-        assert_eq!(e1, e2, "Mismatch at {}", i);
-        assert_eq!(e2, e3, "Mismatch at {}", i);
+        assert_eq!(e1, e2, "Mismatch at {i}");
+        assert_eq!(e2, e3, "Mismatch at {i}");
     }
 
     println!("✅ LEADER ELECTION: Node1 crashed, Node2 elected, Node1 recovered and caught up");
@@ -206,7 +188,7 @@ fn test_log_compaction() {
 
     // Write 20 entries
     for i in 1..=20 {
-        node.append_log(i, &format!("SET k{} v{}", i, i)).unwrap();
+        node.append_log(i, &format!("SET k{i} v{i}")).unwrap();
     }
 
     // Apply first 10
@@ -221,12 +203,12 @@ fn test_log_compaction() {
 
     // Entries 1-10 should be gone
     for i in 1..=10 {
-        assert!(node.read_log(i).is_none(), "Log {} should be compacted", i);
+        assert!(node.read_log(i).is_none(), "Log {i} should be compacted");
     }
 
     // Entries 11-20 should still exist
     for i in 11..=20 {
-        assert!(node.read_log(i).is_some(), "Log {} should exist", i);
+        assert!(node.read_log(i).is_some(), "Log {i} should exist");
     }
 
     assert_eq!(node.last_applied_index(), 10);
@@ -242,11 +224,11 @@ fn test_crash_recovery_persistence() {
     // Phase 1: Write data and "crash"
     {
         let db = OmniKV::open(manifest.to_str().unwrap(), wal.to_str().unwrap()).unwrap();
-        let storage = OmniRaftStorage::new(db.clone());
+        let storage = OmniRaftStorage::new(db);
 
         for i in 1..=5 {
             storage
-                .append_log(i, &format!("SET persist{} data{}", i, i))
+                .append_log(i, &format!("SET persist{i} data{i}"))
                 .unwrap();
             let entry = storage.read_log(i).unwrap();
             storage.apply_write(&entry).unwrap();
@@ -276,8 +258,8 @@ fn test_crash_recovery_persistence() {
         // Data persisted
         let seq = db.get_seq();
         for i in 1..=5 {
-            let val = db.find(&format!("persist{}", i), seq).unwrap();
-            assert_eq!(val, Some(format!("data{}", i)), "Data {} not persisted", i);
+            let val = db.find(&format!("persist{i}"), seq).unwrap();
+            assert_eq!(val, Some(format!("data{i}")), "Data {i} not persisted");
         }
     }
 
@@ -298,7 +280,7 @@ fn test_leader_election_under_load() {
     node1.save_vote(r#"{"term":1,"voted_for":1}"#).unwrap();
     for i in 1..=50 {
         node1
-            .append_log(i, &format!("SET load_key{} load_val{}", i, i))
+            .append_log(i, &format!("SET load_key{i} load_val{i}"))
             .unwrap();
     }
 
@@ -322,7 +304,7 @@ fn test_leader_election_under_load() {
     // New leader writes 20 more entries (indices 31-50, overwriting node1's)
     for i in 31..=50 {
         node2
-            .append_log(i, &format!("SET new_key{} new_val{}", i, i))
+            .append_log(i, &format!("SET new_key{i} new_val{i}"))
             .unwrap();
     }
     replicate_log(&node2, &[&node3], 31, 51);
@@ -342,20 +324,16 @@ fn test_leader_election_under_load() {
         // First 30 from old leader
         for i in 1..=30 {
             assert!(
-                db.find(&format!("load_key{}", i), seq).unwrap().is_some(),
-                "{} missing load_key{}",
-                name,
-                i
+                db.find(&format!("load_key{i}"), seq).unwrap().is_some(),
+                "{name} missing load_key{i}"
             );
         }
         // Last 20 from new leader
         for i in 31..=50 {
             assert_eq!(
-                db.find(&format!("new_key{}", i), seq).unwrap(),
-                Some(format!("new_val{}", i)),
-                "{} missing new_key{}",
-                name,
-                i
+                db.find(&format!("new_key{i}"), seq).unwrap(),
+                Some(format!("new_val{i}")),
+                "{name} missing new_key{i}"
             );
         }
     }
@@ -378,11 +356,11 @@ fn test_log_consistency_after_crash() {
     // Phase 1: Write 20 entries, apply 10, crash
     {
         let db = OmniKV::open(manifest.to_str().unwrap(), wal.to_str().unwrap()).unwrap();
-        let storage = OmniRaftStorage::new(db.clone());
+        let storage = OmniRaftStorage::new(db);
 
         for i in 1..=20 {
             storage
-                .append_log(i, &format!("SET crash_k{} crash_v{}", i, i))
+                .append_log(i, &format!("SET crash_k{i} crash_v{i}"))
                 .unwrap();
         }
         for i in 1..=10u64 {
@@ -408,13 +386,13 @@ fn test_log_consistency_after_crash() {
         // Verify all 20 log entries survived
         for i in 1..=20 {
             let entry = storage.read_log(i);
-            assert!(entry.is_some(), "Log entry {} lost after crash", i);
+            assert!(entry.is_some(), "Log entry {i} lost after crash");
         }
 
         // Continue writing from index 21
         for i in 21..=30 {
             storage
-                .append_log(i, &format!("SET post_crash{} val{}", i, i))
+                .append_log(i, &format!("SET post_crash{i} val{i}"))
                 .unwrap();
         }
 
@@ -431,14 +409,14 @@ fn test_log_consistency_after_crash() {
         let seq = db.get_seq();
         for i in 1..=20 {
             assert_eq!(
-                db.find(&format!("crash_k{}", i), seq).unwrap(),
-                Some(format!("crash_v{}", i))
+                db.find(&format!("crash_k{i}"), seq).unwrap(),
+                Some(format!("crash_v{i}"))
             );
         }
         for i in 21..=30 {
             assert_eq!(
-                db.find(&format!("post_crash{}", i), seq).unwrap(),
-                Some(format!("val{}", i))
+                db.find(&format!("post_crash{i}"), seq).unwrap(),
+                Some(format!("val{i}"))
             );
         }
     }
@@ -453,12 +431,12 @@ fn test_log_consistency_after_crash() {
 fn test_snapshot_and_compaction() {
     let (db1, node1, _d1) = create_node("snap_leader");
     let (_db2, node2, _d2) = create_node("snap_follower");
-    let (_db3, node3, _d3) = create_node("snap_late_joiner");
+    let (db3, node3, _d3) = create_node("snap_late_joiner");
 
     // Leader writes 100 entries
     for i in 1..=100 {
         node1
-            .append_log(i, &format!("SET snap_k{} snap_v{}", i, i))
+            .append_log(i, &format!("SET snap_k{i} snap_v{i}"))
             .unwrap();
     }
 
@@ -479,23 +457,23 @@ fn test_snapshot_and_compaction() {
 
     // Verify compacted entries are gone
     for i in 1..=80 {
-        assert!(node1.read_log(i).is_none(), "Log {} should be compacted", i);
+        assert!(node1.read_log(i).is_none(), "Log {i} should be compacted");
     }
 
     // Verify remaining entries still exist
     for i in 81..=100 {
-        assert!(node1.read_log(i).is_some(), "Log {} should exist", i);
+        assert!(node1.read_log(i).is_some(), "Log {i} should exist");
     }
 
     // Late joiner catches up: needs snapshot (entries 1-80 data) + logs 81-100
     // Simulate snapshot transfer: copy applied data keys directly
     let seq = db1.get_seq();
     for i in 1..=80 {
-        let key = format!("snap_k{}", i);
+        let key = format!("snap_k{i}");
         if let Ok(Some(val)) = db1.find(&key, seq) {
             let mut batch = omni_engine::WriteBatch::new();
             batch.set(&key, val).unwrap();
-            _db3.commit_batch(&batch).unwrap();
+            db3.commit_batch(&batch).unwrap();
         }
     }
 
@@ -508,12 +486,11 @@ fn test_snapshot_and_compaction() {
     }
 
     // Verify late joiner has ALL 100 keys
-    let seq3 = _db3.get_seq();
+    let seq3 = db3.get_seq();
     for i in 1..=100 {
         assert!(
-            _db3.find(&format!("snap_k{}", i), seq3).unwrap().is_some(),
-            "Late joiner missing snap_k{}",
-            i
+            db3.find(&format!("snap_k{i}"), seq3).unwrap().is_some(),
+            "Late joiner missing snap_k{i}"
         );
     }
 
@@ -532,7 +509,7 @@ fn test_snapshot_and_compaction() {
 
 fn create_5_node_cluster() -> Vec<(std::sync::Arc<OmniKV>, OmniRaftStorage, tempfile::TempDir)> {
     (1..=5)
-        .map(|i| create_node(&format!("partition_node{}", i)))
+        .map(|i| create_node(&format!("partition_node{i}")))
         .collect()
 }
 
@@ -577,7 +554,7 @@ fn test_symmetric_partition_majority_progresses() {
     }
     for i in 1..=20 {
         nodes[0]
-            .append_log(i, &format!("SET partition_k{} v{}", i, i))
+            .append_log(i, &format!("SET partition_k{i} v{i}"))
             .unwrap();
     }
     replicate_to_set(nodes[0], &nodes[1..], 1, 21);
@@ -600,7 +577,7 @@ fn test_symmetric_partition_majority_progresses() {
     // Majority leader (Node3) writes entries 21-40
     for i in 21..=40 {
         nodes[2]
-            .append_log(i, &format!("SET majority_k{} maj_v{}", i, i))
+            .append_log(i, &format!("SET majority_k{i} maj_v{i}"))
             .unwrap();
     }
     // Replicate to Node4 and Node5 only (partition blocks Node1, Node2)
@@ -615,7 +592,7 @@ fn test_symmetric_partition_majority_progresses() {
     // It can append locally but cannot replicate to a majority
     for i in 21..=30 {
         nodes[0]
-            .append_log(i, &format!("SET stale_k{} stale_v{}", i, i))
+            .append_log(i, &format!("SET stale_k{i} stale_v{i}"))
             .unwrap();
     }
     // Node1 can only replicate to Node2 — that's 2/5, not a quorum
@@ -628,8 +605,8 @@ fn test_symmetric_partition_majority_progresses() {
         let seq = db.get_seq();
         for i in 21..=40 {
             assert_eq!(
-                db.find(&format!("majority_k{}", i), seq).unwrap(),
-                Some(format!("maj_v{}", i)),
+                db.find(&format!("majority_k{i}"), seq).unwrap(),
+                Some(format!("maj_v{i}")),
                 "Majority node {} missing majority_k{}",
                 n + 1,
                 i
@@ -673,7 +650,7 @@ fn test_stale_leader_superseded_after_heal() {
     }
     for i in 1..=10 {
         nodes[0]
-            .append_log(i, &format!("SET base_k{} base_v{}", i, i))
+            .append_log(i, &format!("SET base_k{i} base_v{i}"))
             .unwrap();
     }
     replicate_to_set(nodes[0], &nodes[1..], 1, 11);
@@ -685,7 +662,7 @@ fn test_stale_leader_superseded_after_heal() {
     // Minority stale leader (Node1) writes uncommitted entries 11-15
     for i in 11..=15 {
         nodes[0]
-            .append_log(i, &format!("SET stale_{} stale_v{}", i, i))
+            .append_log(i, &format!("SET stale_{i} stale_v{i}"))
             .unwrap();
     }
     replicate_to_set(nodes[0], &[nodes[1]], 11, 16);
@@ -696,7 +673,7 @@ fn test_stale_leader_superseded_after_heal() {
     nodes[4].save_vote(r#"{"term":2,"voted_for":3}"#).unwrap();
     for i in 11..=20 {
         nodes[2]
-            .append_log(i, &format!("SET legit_{} legit_v{}", i, i))
+            .append_log(i, &format!("SET legit_{i} legit_v{i}"))
             .unwrap();
     }
     replicate_to_set(nodes[2], &[nodes[3], nodes[4]], 11, 21);
@@ -726,8 +703,8 @@ fn test_stale_leader_superseded_after_heal() {
         let seq = db.get_seq();
         for i in 11..=20 {
             assert_eq!(
-                db.find(&format!("legit_{}", i), seq).unwrap(),
-                Some(format!("legit_v{}", i)),
+                db.find(&format!("legit_{i}"), seq).unwrap(),
+                Some(format!("legit_v{i}")),
                 "Node {} missing legit_{}",
                 node_idx + 1,
                 i
@@ -742,8 +719,7 @@ fn test_stale_leader_superseded_after_heal() {
             let entry = n.read_log(i).unwrap();
             assert!(
                 entry.contains("legit_"),
-                "Stale entry should be overwritten at index {}",
-                i
+                "Stale entry should be overwritten at index {i}"
             );
         }
     }
@@ -776,7 +752,7 @@ fn test_data_convergence_after_partition_heal() {
     }
     for i in 1..=50 {
         nodes[0]
-            .append_log(i, &format!("SET shared_k{} shared_v{}", i, i))
+            .append_log(i, &format!("SET shared_k{i} shared_v{i}"))
             .unwrap();
     }
     replicate_to_set(nodes[0], &nodes[1..], 1, 51);
@@ -792,7 +768,7 @@ fn test_data_convergence_after_partition_heal() {
 
     for i in 51..=100 {
         nodes[2]
-            .append_log(i, &format!("SET post_part_k{} post_v{}", i, i))
+            .append_log(i, &format!("SET post_part_k{i} post_v{i}"))
             .unwrap();
     }
     replicate_to_set(nodes[2], &[nodes[3], nodes[4]], 51, 101);
@@ -818,7 +794,7 @@ fn test_data_convergence_after_partition_heal() {
 
         // Pre-partition keys
         for i in 1..=50 {
-            let key = format!("shared_k{}", i);
+            let key = format!("shared_k{i}");
             let ref_val = reference_db.find(&key, ref_seq).unwrap();
             let node_val = db.find(&key, seq).unwrap();
             assert_eq!(
@@ -832,7 +808,7 @@ fn test_data_convergence_after_partition_heal() {
 
         // Post-partition keys
         for i in 51..=100 {
-            let key = format!("post_part_k{}", i);
+            let key = format!("post_part_k{i}");
             let ref_val = reference_db.find(&key, ref_seq).unwrap();
             let node_val = db.find(&key, seq).unwrap();
             assert_eq!(
@@ -874,7 +850,7 @@ fn test_asymmetric_partition_isolated_node() {
     }
     for i in 1..=10 {
         nodes[0]
-            .append_log(i, &format!("SET asym_k{} asym_v{}", i, i))
+            .append_log(i, &format!("SET asym_k{i} asym_v{i}"))
             .unwrap();
     }
     replicate_to_set(nodes[0], &nodes[1..], 1, 11);
@@ -887,7 +863,7 @@ fn test_asymmetric_partition_isolated_node() {
     // Leader (Node1) continues writing entries 11-30
     for i in 11..=30 {
         nodes[0]
-            .append_log(i, &format!("SET asym_k{} asym_v{}", i, i))
+            .append_log(i, &format!("SET asym_k{i} asym_v{i}"))
             .unwrap();
     }
     // Replicate to Node2, Node3, Node4 only (not Node5)
@@ -926,10 +902,9 @@ fn test_asymmetric_partition_isolated_node() {
     let seq5 = db5.get_seq();
     for i in 1..=30 {
         assert_eq!(
-            db5.find(&format!("asym_k{}", i), seq5).unwrap(),
-            Some(format!("asym_v{}", i)),
-            "Node5 missing asym_k{} after heal",
-            i
+            db5.find(&format!("asym_k{i}"), seq5).unwrap(),
+            Some(format!("asym_v{i}")),
+            "Node5 missing asym_k{i} after heal"
         );
     }
 
@@ -954,7 +929,7 @@ fn test_cascading_partitions_no_data_loss() {
     }
     for i in 1..=20 {
         nodes[0]
-            .append_log(i, &format!("SET cascade_k{} cascade_v{}", i, i))
+            .append_log(i, &format!("SET cascade_k{i} cascade_v{i}"))
             .unwrap();
     }
     replicate_to_set(nodes[0], &nodes[1..], 1, 21);
@@ -970,7 +945,7 @@ fn test_cascading_partitions_no_data_loss() {
 
     for i in 21..=40 {
         nodes[2]
-            .append_log(i, &format!("SET cascade_k{} cascade_v{}", i, i))
+            .append_log(i, &format!("SET cascade_k{i} cascade_v{i}"))
             .unwrap();
     }
     replicate_to_set(nodes[2], &[nodes[3], nodes[4]], 21, 41);
@@ -994,7 +969,7 @@ fn test_cascading_partitions_no_data_loss() {
 
     for i in 41..=60 {
         nodes[0]
-            .append_log(i, &format!("SET cascade_k{} cascade_v{}", i, i))
+            .append_log(i, &format!("SET cascade_k{i} cascade_v{i}"))
             .unwrap();
     }
     replicate_to_set(nodes[0], &[nodes[1], nodes[2]], 41, 61);
@@ -1015,8 +990,8 @@ fn test_cascading_partitions_no_data_loss() {
         let seq = db.get_seq();
         for i in 1..=60 {
             assert_eq!(
-                db.find(&format!("cascade_k{}", i), seq).unwrap(),
-                Some(format!("cascade_v{}", i)),
+                db.find(&format!("cascade_k{i}"), seq).unwrap(),
+                Some(format!("cascade_v{i}")),
                 "Node {} missing cascade_k{} after cascading partitions",
                 node_idx + 1,
                 i
@@ -1068,7 +1043,7 @@ fn test_out_of_order_log_delivery() {
     // Leader writes entries 1-20 sequentially
     for i in 1..=20 {
         leader
-            .append_log(i, &format!("SET ooo_k{} ooo_v{}", i, i))
+            .append_log(i, &format!("SET ooo_k{i} ooo_v{i}"))
             .unwrap();
     }
 
@@ -1082,7 +1057,7 @@ fn test_out_of_order_log_delivery() {
     for i in 1..=20 {
         let l = leader.read_log(i).unwrap();
         let f = follower.read_log(i).unwrap();
-        assert_eq!(l, f, "Log mismatch at index {} after reverse delivery", i);
+        assert_eq!(l, f, "Log mismatch at index {i} after reverse delivery");
     }
 
     // Apply all in correct order and verify data
@@ -1090,10 +1065,9 @@ fn test_out_of_order_log_delivery() {
     let seq = db2.get_seq();
     for i in 1..=20 {
         assert_eq!(
-            db2.find(&format!("ooo_k{}", i), seq).unwrap(),
-            Some(format!("ooo_v{}", i)),
-            "Follower missing ooo_k{} after out-of-order delivery",
-            i
+            db2.find(&format!("ooo_k{i}"), seq).unwrap(),
+            Some(format!("ooo_v{i}")),
+            "Follower missing ooo_k{i} after out-of-order delivery"
         );
     }
 
@@ -1118,7 +1092,7 @@ fn test_stale_term_message_rejected() {
 
     for i in 1..=10 {
         node1
-            .append_log(i, &format!("SET stale_k{} v{}", i, i))
+            .append_log(i, &format!("SET stale_k{i} v{i}"))
             .unwrap();
     }
     replicate_to_set(&node1, &[&node2, &node3], 1, 11);
@@ -1132,7 +1106,7 @@ fn test_stale_term_message_rejected() {
 
     for i in 11..=20 {
         node2
-            .append_log(i, &format!("SET term2_k{} term2_v{}", i, i))
+            .append_log(i, &format!("SET term2_k{i} term2_v{i}"))
             .unwrap();
     }
     replicate_to_set(&node2, &[&node3], 11, 21);
@@ -1147,8 +1121,7 @@ fn test_stale_term_message_rejected() {
     let vote = node2.read_vote().unwrap();
     assert!(
         vote.contains("\"term\":2"),
-        "Node2 should be in term 2, got: {}",
-        vote
+        "Node2 should be in term 2, got: {vote}"
     );
 
     // The stale term-1 entries should NOT overwrite term-2 entries
@@ -1157,9 +1130,7 @@ fn test_stale_term_message_rejected() {
         let entry = node2.read_log(i).unwrap();
         assert!(
             entry.contains("term2_"),
-            "Index {} should contain term2 data, got: {}",
-            i,
-            entry
+            "Index {i} should contain term2 data, got: {entry}"
         );
     }
 
@@ -1188,7 +1159,7 @@ fn test_duplicate_message_idempotent() {
     // Leader writes 15 entries
     for i in 1..=15 {
         leader
-            .append_log(i, &format!("SET dup_k{} dup_v{}", i, i))
+            .append_log(i, &format!("SET dup_k{i} dup_v{i}"))
             .unwrap();
     }
 
@@ -1210,7 +1181,7 @@ fn test_duplicate_message_idempotent() {
     for i in 1..=15 {
         let l = leader.read_log(i).unwrap();
         let f = follower.read_log(i).unwrap();
-        assert_eq!(l, f, "Duplicate delivery corrupted index {}", i);
+        assert_eq!(l, f, "Duplicate delivery corrupted index {i}");
     }
 
     // Apply and verify data integrity
@@ -1220,10 +1191,10 @@ fn test_duplicate_message_idempotent() {
     let seq1 = db1.get_seq();
     let seq2 = db2.get_seq();
     for i in 1..=15 {
-        let key = format!("dup_k{}", i);
+        let key = format!("dup_k{i}");
         let v1 = db1.find(&key, seq1).unwrap();
         let v2 = db2.find(&key, seq2).unwrap();
-        assert_eq!(v1, v2, "Data mismatch on {} after duplicate delivery", key);
+        assert_eq!(v1, v2, "Data mismatch on {key} after duplicate delivery");
     }
 
     assert_eq!(leader.last_applied_index(), 15);
@@ -1244,7 +1215,7 @@ fn test_gap_then_fill_replication() {
     // Leader writes entries 1-20
     for i in 1..=20 {
         leader
-            .append_log(i, &format!("SET gap_k{} gap_v{}", i, i))
+            .append_log(i, &format!("SET gap_k{i} gap_v{i}"))
             .unwrap();
     }
 
@@ -1262,17 +1233,16 @@ fn test_gap_then_fill_replication() {
 
     // Verify: follower has 1-5 and 11-15 but NOT 6-10
     for i in 1..=5 {
-        assert!(follower.read_log(i).is_some(), "Should have entry {}", i);
+        assert!(follower.read_log(i).is_some(), "Should have entry {i}");
     }
     for i in 6..=10 {
         assert!(
             follower.read_log(i).is_none(),
-            "Should NOT have entry {} yet",
-            i
+            "Should NOT have entry {i} yet"
         );
     }
     for i in 11..=15 {
-        assert!(follower.read_log(i).is_some(), "Should have entry {}", i);
+        assert!(follower.read_log(i).is_some(), "Should have entry {i}");
     }
 
     // Phase 3: The delayed entries 6-10 finally arrive
@@ -1291,7 +1261,7 @@ fn test_gap_then_fill_replication() {
     for i in 1..=20 {
         let l = leader.read_log(i).unwrap();
         let f = follower.read_log(i).unwrap();
-        assert_eq!(l, f, "Mismatch at index {} after gap fill", i);
+        assert_eq!(l, f, "Mismatch at index {i} after gap fill");
     }
 
     // Apply in correct order and verify
@@ -1299,10 +1269,9 @@ fn test_gap_then_fill_replication() {
     let seq = db2.get_seq();
     for i in 1..=20 {
         assert_eq!(
-            db2.find(&format!("gap_k{}", i), seq).unwrap(),
-            Some(format!("gap_v{}", i)),
-            "Follower missing gap_k{} after gap-fill",
-            i
+            db2.find(&format!("gap_k{i}"), seq).unwrap(),
+            Some(format!("gap_v{i}")),
+            "Follower missing gap_k{i} after gap-fill"
         );
     }
 
@@ -1330,7 +1299,7 @@ fn test_interleaved_multi_leader_replication() {
     // Term 1 leader writes entries 1-20
     for i in 1..=20 {
         term1_leader
-            .append_log(i, &format!("SET il_k{} term1_v{}", i, i))
+            .append_log(i, &format!("SET il_k{i} term1_v{i}"))
             .unwrap();
     }
 
@@ -1341,7 +1310,7 @@ fn test_interleaved_multi_leader_replication() {
     }
     for i in 11..=30 {
         term2_leader
-            .append_log(i, &format!("SET il_k{} term2_v{}", i, i))
+            .append_log(i, &format!("SET il_k{i} term2_v{i}"))
             .unwrap();
     }
 
@@ -1383,8 +1352,7 @@ fn test_interleaved_multi_leader_replication() {
         let actual = follower.read_log(i).unwrap();
         assert_eq!(
             expected, actual,
-            "Index {} should match term2 leader's log",
-            i
+            "Index {i} should match term2 leader's log"
         );
     }
 
@@ -1393,18 +1361,14 @@ fn test_interleaved_multi_leader_replication() {
         let entry = follower.read_log(i).unwrap();
         assert!(
             entry.contains("term1_v"),
-            "Index {} should be term1 data (shared): {}",
-            i,
-            entry
+            "Index {i} should be term1 data (shared): {entry}"
         );
     }
     for i in 11..=30 {
         let entry = follower.read_log(i).unwrap();
         assert!(
             entry.contains("term2_v"),
-            "Index {} should be term2 data (overwritten): {}",
-            i,
-            entry
+            "Index {i} should be term2 data (overwritten): {entry}"
         );
     }
 
@@ -1415,19 +1379,17 @@ fn test_interleaved_multi_leader_replication() {
     let seq = db3.get_seq();
     for i in 1..=10 {
         assert_eq!(
-            db3.find(&format!("il_k{}", i), seq).unwrap(),
-            Some(format!("term1_v{}", i)),
-            "Key il_k{} should have term1 value",
-            i
+            db3.find(&format!("il_k{i}"), seq).unwrap(),
+            Some(format!("term1_v{i}")),
+            "Key il_k{i} should have term1 value"
         );
     }
     // For keys 11-30, the state machine has the latest write (term2 overwrote term1)
     for i in 11..=30 {
         assert_eq!(
-            db3.find(&format!("il_k{}", i), seq).unwrap(),
-            Some(format!("term2_v{}", i)),
-            "Key il_k{} should have term2 value (overwritten)",
-            i
+            db3.find(&format!("il_k{i}"), seq).unwrap(),
+            Some(format!("term2_v{i}")),
+            "Key il_k{i} should have term2 value (overwritten)"
         );
     }
 
@@ -1453,7 +1415,7 @@ fn test_interleaved_multi_leader_replication() {
 
 /// Gap #7a: MVCC ordering uses logical sequence numbers, not wall clocks
 ///
-/// Two nodes start with different global_seq values (simulating clock skew).
+/// Two nodes start with different `global_seq` values (simulating clock skew).
 /// Writes are applied through Raft log (sequence-independent). Prove that
 /// reads are ordered by Raft log index, not by node-local sequence numbers.
 #[test]
@@ -1469,7 +1431,7 @@ fn test_mvcc_logical_clock_ordering() {
 
     // Both nodes process the SAME Raft log entries (replicated via Raft)
     for i in 1..=20 {
-        let cmd = format!("SET clock_k{} clock_v{}", i, i);
+        let cmd = format!("SET clock_k{i} clock_v{i}");
         node1.append_log(i, &cmd).unwrap();
         node2.append_log(i, &cmd).unwrap();
     }
@@ -1488,15 +1450,14 @@ fn test_mvcc_logical_clock_ordering() {
 
     // But ALL data reads produce the same values
     for i in 1..=20 {
-        let key = format!("clock_k{}", i);
+        let key = format!("clock_k{i}");
         let v1 = db1.find(&key, seq1).unwrap();
         let v2 = db2.find(&key, seq2).unwrap();
         assert_eq!(
             v1, v2,
-            "Data mismatch on {} despite seq skew (seq1={}, seq2={})",
-            key, seq1, seq2
+            "Data mismatch on {key} despite seq skew (seq1={seq1}, seq2={seq2})"
         );
-        assert_eq!(v1, Some(format!("clock_v{}", i)));
+        assert_eq!(v1, Some(format!("clock_v{i}")));
     }
 
     // Both applied the same number of log entries
@@ -1531,7 +1492,7 @@ fn test_term_based_election_immune_to_clock_skew() {
     }
     for i in 1..=10 {
         nodes[0]
-            .append_log(i, &format!("SET skew_k{} skew_v{}", i, i))
+            .append_log(i, &format!("SET skew_k{i} skew_v{i}"))
             .unwrap();
     }
     replicate_to_set(nodes[0], &nodes[1..], 1, 11);
@@ -1548,7 +1509,7 @@ fn test_term_based_election_immune_to_clock_skew() {
     // Node5 (the "slow clock" node) writes entries 11-20 as leader
     for i in 11..=20 {
         nodes[4]
-            .append_log(i, &format!("SET skew_k{} skew2_v{}", i, i))
+            .append_log(i, &format!("SET skew_k{i} skew2_v{i}"))
             .unwrap();
     }
     replicate_to_set(nodes[4], &[nodes[0], nodes[1], nodes[2], nodes[3]], 11, 21);
@@ -1562,7 +1523,7 @@ fn test_term_based_election_immune_to_clock_skew() {
     }
     for i in 21..=30 {
         nodes[2]
-            .append_log(i, &format!("SET skew_k{} skew3_v{}", i, i))
+            .append_log(i, &format!("SET skew_k{i} skew3_v{i}"))
             .unwrap();
     }
     replicate_to_set(nodes[2], &[nodes[0], nodes[1], nodes[3], nodes[4]], 21, 31);
@@ -1587,7 +1548,7 @@ fn test_term_based_election_immune_to_clock_skew() {
         let seq = db.get_seq();
         for k in 1..=30 {
             assert!(
-                db.find(&format!("skew_k{}", k), seq).unwrap().is_some(),
+                db.find(&format!("skew_k{k}"), seq).unwrap().is_some(),
                 "Node {} missing skew_k{}",
                 i + 1,
                 k
@@ -1615,7 +1576,7 @@ fn test_sequence_divergence_and_convergence() {
     }
     for i in 1..=10 {
         node1
-            .append_log(i, &format!("SET div_k{} div_v{}", i, i))
+            .append_log(i, &format!("SET div_k{i} div_v{i}"))
             .unwrap();
     }
     replicate_to_set(&node1, &[&node2, &node3], 1, 11);
@@ -1632,7 +1593,7 @@ fn test_sequence_divergence_and_convergence() {
     for i in 0..100 {
         let mut batch = omni_engine::WriteBatch::new();
         batch
-            .set(&format!("__local_node1_{}", i), format!("junk{}", i))
+            .set(&format!("__local_node1_{i}"), format!("junk{i}"))
             .unwrap();
         db1.commit_batch(&batch).unwrap();
     }
@@ -1650,7 +1611,7 @@ fn test_sequence_divergence_and_convergence() {
 
     for i in 11..=20 {
         node2
-            .append_log(i, &format!("SET div_k{} div_v{}", i, i))
+            .append_log(i, &format!("SET div_k{i} div_v{i}"))
             .unwrap();
     }
     replicate_to_set(&node2, &[&node1, &node3], 11, 21);
@@ -1665,12 +1626,9 @@ fn test_sequence_divergence_and_convergence() {
         let seq = db.get_seq();
         for i in 1..=20 {
             assert_eq!(
-                db.find(&format!("div_k{}", i), seq).unwrap(),
-                Some(format!("div_v{}", i)),
-                "{} missing div_k{} (seq={})",
-                name,
-                i,
-                seq
+                db.find(&format!("div_k{i}"), seq).unwrap(),
+                Some(format!("div_v{i}")),
+                "{name} missing div_k{i} (seq={seq})"
             );
         }
     }
@@ -1689,8 +1647,7 @@ fn test_sequence_divergence_and_convergence() {
     assert_eq!(node3.last_applied_index(), 20);
 
     println!(
-        "✅ CLOCK 7c: Node1 drifted +100 seqs, all 3 nodes converged on Raft data (seq1={}, seq2={})",
-        final_seq1, final_seq2
+        "✅ CLOCK 7c: Node1 drifted +100 seqs, all 3 nodes converged on Raft data (seq1={final_seq1}, seq2={final_seq2})"
     );
 }
 
@@ -1713,7 +1670,7 @@ fn test_ttl_consistency_across_replicas() {
 
     // Write non-TTL keys through Raft (immune to clock skew)
     for i in 1..=10 {
-        let cmd = format!("SET ttl_perm_{} permanent_v{}", i, i);
+        let cmd = format!("SET ttl_perm_{i} permanent_v{i}");
         node1.append_log(i, &cmd).unwrap();
     }
     replicate_to_set(&node1, &[&node2, &node3], 1, 11);
@@ -1747,14 +1704,12 @@ fn test_ttl_consistency_across_replicas() {
         assert_eq!(
             db.find("ttl_alive_key", seq).unwrap(),
             Some("alive_value".to_string()),
-            "{} should see ttl_alive_key (TTL=3600s, not expired)",
-            name
+            "{name} should see ttl_alive_key (TTL=3600s, not expired)"
         );
         assert_eq!(
             db.find("ttl_noexpiry_key", seq).unwrap(),
             Some("forever_value".to_string()),
-            "{} should see ttl_noexpiry_key (no expiry)",
-            name
+            "{name} should see ttl_noexpiry_key (no expiry)"
         );
     }
 
@@ -1763,11 +1718,9 @@ fn test_ttl_consistency_across_replicas() {
         let seq = db.get_seq();
         for i in 1..=10 {
             assert_eq!(
-                db.find(&format!("ttl_perm_{}", i), seq).unwrap(),
-                Some(format!("permanent_v{}", i)),
-                "{} missing ttl_perm_{}",
-                name,
-                i
+                db.find(&format!("ttl_perm_{i}"), seq).unwrap(),
+                Some(format!("permanent_v{i}")),
+                "{name} missing ttl_perm_{i}"
             );
         }
     }
@@ -1789,8 +1742,7 @@ fn test_ttl_consistency_across_replicas() {
         let val = db.find("ttl_short_key", seq).unwrap();
         assert!(
             val.is_some(),
-            "{} should see ttl_short_key (just written, TTL=1s)",
-            name
+            "{name} should see ttl_short_key (just written, TTL=1s)"
         );
     }
 
@@ -1803,6 +1755,10 @@ fn test_ttl_consistency_across_replicas() {
 /// Leadership passes through 5 different nodes across 5 terms.
 /// Prove that Raft log is consistent and data converges regardless.
 #[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "Raft integration scenario intentionally keeps multi-term setup, replication, and convergence assertions together."
+)]
 fn test_multi_term_progression_with_extreme_seq_skew() {
     let cluster = create_5_node_cluster();
     let nodes: Vec<&OmniRaftStorage> = cluster.iter().map(|(_, s, _)| s).collect();
@@ -1821,7 +1777,7 @@ fn test_multi_term_progression_with_extreme_seq_skew() {
     }
     for i in 1..=5 {
         nodes[0]
-            .append_log(i, &format!("SET mt_k{} t1_v{}", i, i))
+            .append_log(i, &format!("SET mt_k{i} t1_v{i}"))
             .unwrap();
     }
     replicate_to_set(nodes[0], &nodes[1..], 1, 6);
@@ -1835,7 +1791,7 @@ fn test_multi_term_progression_with_extreme_seq_skew() {
     }
     for i in 6..=10 {
         nodes[1]
-            .append_log(i, &format!("SET mt_k{} t2_v{}", i, i))
+            .append_log(i, &format!("SET mt_k{i} t2_v{i}"))
             .unwrap();
     }
     replicate_to_set(nodes[1], &[nodes[0], nodes[2], nodes[3], nodes[4]], 6, 11);
@@ -1849,7 +1805,7 @@ fn test_multi_term_progression_with_extreme_seq_skew() {
     }
     for i in 11..=15 {
         nodes[2]
-            .append_log(i, &format!("SET mt_k{} t3_v{}", i, i))
+            .append_log(i, &format!("SET mt_k{i} t3_v{i}"))
             .unwrap();
     }
     replicate_to_set(nodes[2], &[nodes[0], nodes[1], nodes[3], nodes[4]], 11, 16);
@@ -1863,7 +1819,7 @@ fn test_multi_term_progression_with_extreme_seq_skew() {
     }
     for i in 16..=20 {
         nodes[3]
-            .append_log(i, &format!("SET mt_k{} t4_v{}", i, i))
+            .append_log(i, &format!("SET mt_k{i} t4_v{i}"))
             .unwrap();
     }
     replicate_to_set(nodes[3], &[nodes[0], nodes[1], nodes[2], nodes[4]], 16, 21);
@@ -1877,7 +1833,7 @@ fn test_multi_term_progression_with_extreme_seq_skew() {
     }
     for i in 21..=25 {
         nodes[4]
-            .append_log(i, &format!("SET mt_k{} t5_v{}", i, i))
+            .append_log(i, &format!("SET mt_k{i} t5_v{i}"))
             .unwrap();
     }
     replicate_to_set(nodes[4], &[nodes[0], nodes[1], nodes[2], nodes[3]], 21, 26);
@@ -1899,8 +1855,8 @@ fn test_multi_term_progression_with_extreme_seq_skew() {
 
         for (range, term_prefix) in &expected_terms {
             for i in range.clone() {
-                let key = format!("mt_k{}", i);
-                let expected_val = format!("{}_v{}", term_prefix, i);
+                let key = format!("mt_k{i}");
+                let expected_val = format!("{term_prefix}_v{i}");
                 assert_eq!(
                     db.find(&key, seq).unwrap(),
                     Some(expected_val.clone()),
@@ -1977,7 +1933,7 @@ fn test_2pc_happy_path_commit() {
     let (db_p2, _, _d_p2) = create_node("2pc_participant2");
     let (db_p3, _, _d_p3) = create_node("2pc_participant3");
 
-    let coordinator = TwoPhaseCoordinator::new(1, db_coord.clone(), 5000);
+    let coordinator = TwoPhaseCoordinator::new(1, db_coord, 5000);
     let participant1 = TwoPhaseParticipant::new(10, db_p1.clone());
     let participant2 = TwoPhaseParticipant::new(20, db_p2.clone());
     let participant3 = TwoPhaseParticipant::new(30, db_p3.clone());
@@ -1998,8 +1954,8 @@ fn test_2pc_happy_path_commit() {
         .unwrap();
 
     // PREPARE phase
-    let participants = coordinator.prepare(txn_id).unwrap();
-    assert_eq!(participants.len(), 3);
+    let prepared_participants = coordinator.prepare(txn_id).unwrap();
+    assert_eq!(prepared_participants.len(), 3);
     assert_eq!(
         coordinator.get_state(txn_id),
         Some(DistTxnState::WaitingForVotes)
@@ -2071,7 +2027,7 @@ fn test_2pc_abort_on_single_abort_vote() {
     let (db_p1, _, _d_p1) = create_node("2pc_abort_p1");
     let (db_p2, _, _d_p2) = create_node("2pc_abort_p2");
 
-    let coordinator = TwoPhaseCoordinator::new(1, db_coord.clone(), 5000);
+    let coordinator = TwoPhaseCoordinator::new(1, db_coord, 5000);
     let participant1 = TwoPhaseParticipant::new(10, db_p1.clone());
     let participant2 = TwoPhaseParticipant::new(20, db_p2.clone());
 
@@ -2139,7 +2095,7 @@ fn test_2pc_abort_on_single_abort_vote() {
 
 /// Gap #8c: Coordinator WAL persistence — PREPARE and COMMIT records survive crash
 ///
-/// The coordinator writes PREPARE and COMMIT records to OmniKV.
+/// The coordinator writes PREPARE and COMMIT records to `OmniKV`.
 /// After a simulated crash (drop + reopen), verify the log entries
 /// are still present for recovery.
 #[test]
@@ -2154,7 +2110,7 @@ fn test_2pc_coordinator_wal_persistence() {
     {
         let db = OmniKV::open(manifest.to_str().unwrap(), wal.to_str().unwrap()).unwrap();
         let coordinator = TwoPhaseCoordinator::new(1, db.clone(), 5000);
-        let participant = TwoPhaseParticipant::new(10, db.clone());
+        let participant = TwoPhaseParticipant::new(10, db);
 
         // Run a full 2PC
         txn_id = coordinator.begin();
@@ -2239,6 +2195,10 @@ fn test_2pc_coordinator_wal_persistence() {
 /// 1. The 2PC commit is atomic across all participants
 /// 2. Each participant's data is Raft-replicated to its followers
 #[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "Cross-shard 2PC integration scenario keeps participant setup, Raft replication, and atomicity checks together."
+)]
 fn test_2pc_cross_shard_with_raft_replication() {
     // Create 3 "shards", each with a primary and a follower
     let (db_s1_primary, raft_s1_primary, _d1) = create_node("shard1_primary");
@@ -2389,7 +2349,7 @@ fn test_2pc_concurrent_independent_transactions() {
     let (db_p1, _, _d_p1) = create_node("2pc_conc_p1");
     let (db_p2, _, _d_p2) = create_node("2pc_conc_p2");
 
-    let coordinator = TwoPhaseCoordinator::new(1, db_coord.clone(), 5000);
+    let coordinator = TwoPhaseCoordinator::new(1, db_coord, 5000);
     let participant1 = TwoPhaseParticipant::new(10, db_p1.clone());
     let participant2 = TwoPhaseParticipant::new(20, db_p2.clone());
 
@@ -2535,7 +2495,7 @@ fn test_ssi_write_write_conflict() {
 #[test]
 fn test_ssi_read_write_conflict() {
     let (db, _, _d) = create_node("ssi_rw");
-    let tm = TransactionManager::new(db.clone());
+    let tm = TransactionManager::new(db);
 
     // Pre-populate
     let mut setup = tm.begin();
@@ -2595,7 +2555,7 @@ fn test_ssi_no_false_positive() {
 #[test]
 fn test_ssi_dangerous_structure_chain() {
     let (db, _, _d) = create_node("ssi_chain");
-    let tm = TransactionManager::new(db.clone());
+    let tm = TransactionManager::new(db);
 
     // Setup: create keys
     let mut setup = tm.begin();
@@ -2794,7 +2754,7 @@ fn test_multi_key_atomic_intent() {
     // Atomic multi-key write
     let mut txn = tm.begin();
     for i in 0..20 {
-        tm.set(&mut txn, &format!("mk_{}", i), format!("val_{}", i))
+        tm.set(&mut txn, &format!("mk_{i}"), format!("val_{i}"))
             .unwrap();
     }
     tm.commit(&mut txn).unwrap();
@@ -2803,22 +2763,22 @@ fn test_multi_key_atomic_intent() {
     let seq = db.get_seq();
     for i in 0..20 {
         assert_eq!(
-            db.find(&format!("mk_{}", i), seq).unwrap(),
-            Some(format!("val_{}", i))
+            db.find(&format!("mk_{i}"), seq).unwrap(),
+            Some(format!("val_{i}"))
         );
     }
 
     // Abort a second multi-key txn — none should appear
     let mut txn2 = tm.begin();
     for i in 20..40 {
-        tm.set(&mut txn2, &format!("mk_{}", i), format!("val_{}", i))
+        tm.set(&mut txn2, &format!("mk_{i}"), format!("val_{i}"))
             .unwrap();
     }
     tm.abort(&mut txn2);
 
     let seq = db.get_seq();
     for i in 20..40 {
-        assert_eq!(db.find(&format!("mk_{}", i), seq).unwrap(), None);
+        assert_eq!(db.find(&format!("mk_{i}"), seq).unwrap(), None);
     }
 
     println!("✅ INTENT 10e: 20-key atomic commit + 20-key atomic abort, all correct");
@@ -2883,9 +2843,9 @@ fn test_txn_multiple_retries() {
             let mut competitor = tm.begin();
             let mut our_txn = tm.begin();
 
-            tm.set(&mut competitor, "hot_key", format!("comp_{}", attempt))
+            tm.set(&mut competitor, "hot_key", format!("comp_{attempt}"))
                 .unwrap();
-            tm.set(&mut our_txn, "hot_key", format!("ours_{}", attempt))
+            tm.set(&mut our_txn, "hot_key", format!("ours_{attempt}"))
                 .unwrap();
 
             tm.commit(&mut competitor).unwrap();
@@ -2905,10 +2865,7 @@ fn test_txn_multiple_retries() {
     let seq = db.get_seq();
     assert_eq!(db.find("hot_key", seq).unwrap(), Some("ours_final".into()));
 
-    println!(
-        "✅ RETRY 11b: Txn succeeded after {} retries on hot key",
-        retry_count
-    );
+    println!("✅ RETRY 11b: Txn succeeded after {retry_count} retries on hot key");
 }
 
 /// Gap #11c: Retry with exponential backoff simulation
@@ -2927,28 +2884,25 @@ fn test_txn_retry_with_backoff_pattern() {
     for attempt in 0..3 {
         let mut txn = tm.begin();
         let _current = tm.get(&mut txn, "backoff_key").unwrap();
-        tm.set(&mut txn, "backoff_key", format!("attempt_{}", attempt))
+        tm.set(&mut txn, "backoff_key", format!("attempt_{attempt}"))
             .unwrap();
 
         // Simulate a competing write on first 2 attempts
         if attempt < 2 {
             let mut blocker = tm.begin();
-            tm.set(&mut blocker, "backoff_key", format!("block_{}", attempt))
+            tm.set(&mut blocker, "backoff_key", format!("block_{attempt}"))
                 .unwrap();
             tm.commit(&mut blocker).unwrap();
         }
 
-        match tm.commit(&mut txn) {
-            Ok(_) => {
-                attempts.push((attempt, true, 0));
-                break;
-            }
-            Err(_) => {
-                let backoff = base_delay_ms * (1 << attempt); // exponential
-                attempts.push((attempt, false, backoff));
-                std::thread::sleep(std::time::Duration::from_millis(backoff));
-            }
+        if tm.commit(&mut txn).is_ok() {
+            attempts.push((attempt, true, 0));
+            break;
         }
+
+        let backoff = base_delay_ms * (1 << attempt); // exponential
+        attempts.push((attempt, false, backoff));
+        std::thread::sleep(std::time::Duration::from_millis(backoff));
     }
 
     // Should have failed twice, succeeded on third
@@ -2973,12 +2927,12 @@ fn test_txn_retry_with_backoff_pattern() {
 #[test]
 fn test_read_only_txn_no_retry_needed() {
     let (db, _, _d) = create_node("retry_readonly");
-    let tm = TransactionManager::new(db.clone());
+    let tm = TransactionManager::new(db);
 
     // Populate data
     for i in 0..10 {
         let mut txn = tm.begin();
-        tm.set(&mut txn, &format!("ro_k{}", i), format!("ro_v{}", i))
+        tm.set(&mut txn, &format!("ro_k{i}"), format!("ro_v{i}"))
             .unwrap();
         tm.commit(&mut txn).unwrap();
     }
@@ -2986,8 +2940,8 @@ fn test_read_only_txn_no_retry_needed() {
     // Read-only txn while writes happen concurrently
     let mut reader = tm.begin();
     for i in 0..10 {
-        let val = tm.get(&mut reader, &format!("ro_k{}", i)).unwrap();
-        assert_eq!(val, Some(format!("ro_v{}", i)));
+        let val = tm.get(&mut reader, &format!("ro_k{i}")).unwrap();
+        assert_eq!(val, Some(format!("ro_v{i}")));
     }
 
     // Concurrent writer modifies keys
@@ -3011,7 +2965,7 @@ fn test_txn_retry_multi_key() {
     // Setup 5 keys
     let mut setup = tm.begin();
     for i in 0..5 {
-        tm.set(&mut setup, &format!("rmk_{}", i), format!("init_{}", i))
+        tm.set(&mut setup, &format!("rmk_{i}"), format!("init_{i}"))
             .unwrap();
     }
     tm.commit(&mut setup).unwrap();
@@ -3021,9 +2975,9 @@ fn test_txn_retry_multi_key() {
     let mut t2 = tm.begin();
 
     for i in 0..5 {
-        tm.set(&mut t1, &format!("rmk_{}", i), format!("t1_{}", i))
+        tm.set(&mut t1, &format!("rmk_{i}"), format!("t1_{i}"))
             .unwrap();
-        tm.set(&mut t2, &format!("rmk_{}", i), format!("t2_{}", i))
+        tm.set(&mut t2, &format!("rmk_{i}"), format!("t2_{i}"))
             .unwrap();
     }
 
@@ -3036,20 +2990,16 @@ fn test_txn_retry_multi_key() {
     // Retry: T2 gets fresh snapshot and succeeds
     let mut t2_retry = tm.begin();
     for i in 0..5 {
-        tm.set(
-            &mut t2_retry,
-            &format!("rmk_{}", i),
-            format!("t2_final_{}", i),
-        )
-        .unwrap();
+        tm.set(&mut t2_retry, &format!("rmk_{i}"), format!("t2_final_{i}"))
+            .unwrap();
     }
     tm.commit(&mut t2_retry).unwrap();
 
     let seq = db.get_seq();
     for i in 0..5 {
         assert_eq!(
-            db.find(&format!("rmk_{}", i), seq).unwrap(),
-            Some(format!("t2_final_{}", i))
+            db.find(&format!("rmk_{i}"), seq).unwrap(),
+            Some(format!("t2_final_{i}"))
         );
     }
 
@@ -3115,7 +3065,7 @@ fn test_range_scan_mvcc_snapshot() {
     let mut batch = omni_engine::WriteBatch::new();
     for i in 0..10 {
         batch
-            .set(&format!("scan_k{:02}", i), format!("v1_{}", i))
+            .set(&format!("scan_k{i:02}"), format!("v1_{i}"))
             .unwrap();
     }
     let s1 = db.commit_batch(&batch).unwrap();
@@ -3170,7 +3120,7 @@ fn test_range_scan_across_replicated_nodes() {
     // Write range data on primary via Raft
     for i in 0..20 {
         node1
-            .append_log(i + 1, &format!("SET rng_{:03} rng_val_{}", i, i))
+            .append_log(i + 1, &format!("SET rng_{i:03} rng_val_{i}"))
             .unwrap();
     }
 
@@ -3207,7 +3157,7 @@ fn test_range_scan_with_deletes() {
     let mut batch = omni_engine::WriteBatch::new();
     for i in 0..10 {
         batch
-            .set(&format!("del_k{:02}", i), format!("del_v{}", i))
+            .set(&format!("del_k{i:02}"), format!("del_v{i}"))
             .unwrap();
     }
     db.commit_batch(&batch).unwrap();
@@ -3256,8 +3206,7 @@ fn test_membership_add_node_catches_up() {
 
     // 3-node cluster writes 20 entries
     for i in 1..=20 {
-        n1.append_log(i, &format!("SET mem_k{} mem_v{}", i, i))
-            .unwrap();
+        n1.append_log(i, &format!("SET mem_k{i} mem_v{i}")).unwrap();
     }
     replicate_to_set(&n1, &[&n2, &n3], 1, 21);
     apply_range(&n1, 1, 21);
@@ -3280,10 +3229,9 @@ fn test_membership_add_node_catches_up() {
     let seq4 = db4.get_seq();
     for i in 1..=20 {
         assert_eq!(
-            db4.find(&format!("mem_k{}", i), seq4).unwrap(),
-            Some(format!("mem_v{}", i)),
-            "Node4 should have mem_k{}",
-            i
+            db4.find(&format!("mem_k{i}"), seq4).unwrap(),
+            Some(format!("mem_v{i}")),
+            "Node4 should have mem_k{i}"
         );
     }
 
@@ -3309,8 +3257,7 @@ fn test_membership_remove_node() {
 
     // Initial writes to 3-node cluster
     for i in 1..=10 {
-        n1.append_log(i, &format!("SET rem_k{} rem_v{}", i, i))
-            .unwrap();
+        n1.append_log(i, &format!("SET rem_k{i} rem_v{i}")).unwrap();
     }
     replicate_to_set(&n1, &[&n2, &n3], 1, 11);
     apply_range(&n1, 1, 11);
@@ -3320,8 +3267,7 @@ fn test_membership_remove_node() {
     // "Remove" node3 — stop replicating to it
     // Continue writing to n1, n2 only
     for i in 11..=20 {
-        n1.append_log(i, &format!("SET rem_k{} rem_v{}", i, i))
-            .unwrap();
+        n1.append_log(i, &format!("SET rem_k{i} rem_v{i}")).unwrap();
     }
     replicate_to_set(&n1, &[&n2], 11, 21); // only n2
     apply_range(&n1, 11, 21);
@@ -3350,8 +3296,7 @@ fn test_membership_scale_out_3_to_5() {
 
     // Phase 1: 3 nodes, 10 entries
     for i in 1..=10 {
-        n1.append_log(i, &format!("SET sc_k{} sc_v{}", i, i))
-            .unwrap();
+        n1.append_log(i, &format!("SET sc_k{i} sc_v{i}")).unwrap();
     }
     replicate_to_set(&n1, &[&n2, &n3], 1, 11);
     apply_range(&n1, 1, 11);
@@ -3369,8 +3314,7 @@ fn test_membership_scale_out_3_to_5() {
     apply_range(&n5, 1, 11);
 
     for i in 11..=15 {
-        n1.append_log(i, &format!("SET sc_k{} sc_v{}", i, i))
-            .unwrap();
+        n1.append_log(i, &format!("SET sc_k{i} sc_v{i}")).unwrap();
     }
     replicate_to_set(&n1, &[&n2, &n3, &n4, &n5], 11, 16);
     for node in [&n1, &n2, &n3, &n4, &n5] {
@@ -3388,11 +3332,9 @@ fn test_membership_scale_out_3_to_5() {
         let seq = db.get_seq();
         for i in 1..=15 {
             assert_eq!(
-                db.find(&format!("sc_k{}", i), seq).unwrap(),
-                Some(format!("sc_v{}", i)),
-                "{} missing sc_k{}",
-                name,
-                i
+                db.find(&format!("sc_k{i}"), seq).unwrap(),
+                Some(format!("sc_v{i}")),
+                "{name} missing sc_k{i}"
             );
         }
     }
@@ -3409,8 +3351,7 @@ fn test_membership_readd_node() {
 
     // Phase 1: All 3 nodes in sync with 10 entries
     for i in 1..=10 {
-        n1.append_log(i, &format!("SET ra_k{} ra_v{}", i, i))
-            .unwrap();
+        n1.append_log(i, &format!("SET ra_k{i} ra_v{i}")).unwrap();
     }
     replicate_to_set(&n1, &[&n2, &n3], 1, 11);
     apply_range(&n1, 1, 11);
@@ -3419,8 +3360,7 @@ fn test_membership_readd_node() {
 
     // Phase 2: Remove n3, write 10 more entries to n1, n2
     for i in 11..=20 {
-        n1.append_log(i, &format!("SET ra_k{} ra_v{}", i, i))
-            .unwrap();
+        n1.append_log(i, &format!("SET ra_k{i} ra_v{i}")).unwrap();
     }
     replicate_to_set(&n1, &[&n2], 11, 21);
     apply_range(&n1, 11, 21);
@@ -3434,10 +3374,9 @@ fn test_membership_readd_node() {
     let seq3 = db3.get_seq();
     for i in 1..=20 {
         assert_eq!(
-            db3.find(&format!("ra_k{}", i), seq3).unwrap(),
-            Some(format!("ra_v{}", i)),
-            "Re-added n3 missing ra_k{}",
-            i
+            db3.find(&format!("ra_k{i}"), seq3).unwrap(),
+            Some(format!("ra_v{i}")),
+            "Re-added n3 missing ra_k{i}"
         );
     }
 
@@ -3452,8 +3391,7 @@ fn test_membership_data_integrity() {
 
     // Phase 1: 2-node cluster, 5 entries
     for i in 1..=5 {
-        n1.append_log(i, &format!("SET ig_k{} ig_v{}", i, i))
-            .unwrap();
+        n1.append_log(i, &format!("SET ig_k{i} ig_v{i}")).unwrap();
     }
     replicate_to_set(&n1, &[&n2], 1, 6);
     apply_range(&n1, 1, 6);
@@ -3465,8 +3403,7 @@ fn test_membership_data_integrity() {
     apply_range(&n3, 1, 6);
 
     for i in 6..=10 {
-        n1.append_log(i, &format!("SET ig_k{} ig_v{}", i, i))
-            .unwrap();
+        n1.append_log(i, &format!("SET ig_k{i} ig_v{i}")).unwrap();
     }
     replicate_to_set(&n1, &[&n2, &n3], 6, 11);
     apply_range(&n1, 6, 11);
@@ -3479,8 +3416,7 @@ fn test_membership_data_integrity() {
     apply_range(&n4, 1, 11);
 
     for i in 11..=15 {
-        n1.append_log(i, &format!("SET ig_k{} ig_v{}", i, i))
-            .unwrap();
+        n1.append_log(i, &format!("SET ig_k{i} ig_v{i}")).unwrap();
     }
     replicate_to_set(&n1, &[&n3, &n4], 11, 16);
     apply_range(&n1, 11, 16);
@@ -3497,11 +3433,9 @@ fn test_membership_data_integrity() {
         let seq = db.get_seq();
         for i in 1..=expected {
             assert_eq!(
-                db.find(&format!("ig_k{}", i), seq).unwrap(),
-                Some(format!("ig_v{}", i)),
-                "{} missing ig_k{}",
-                name,
-                i
+                db.find(&format!("ig_k{i}"), seq).unwrap(),
+                Some(format!("ig_v{i}")),
+                "{name} missing ig_k{i}"
             );
         }
     }
@@ -3533,7 +3467,7 @@ fn test_rolling_restart_no_data_loss() {
         let mut batch = omni_engine::WriteBatch::new();
         for i in 0..10 {
             batch
-                .set(&format!("roll_k{}", i), format!("roll_v{}", i))
+                .set(&format!("roll_k{i}"), format!("roll_v{i}"))
                 .unwrap();
         }
         db1.commit_batch(&batch).unwrap();
@@ -3549,15 +3483,15 @@ fn test_rolling_restart_no_data_loss() {
         // Verify original data survived restart
         for i in 0..10 {
             assert_eq!(
-                db1.find(&format!("roll_k{}", i), seq).unwrap(),
-                Some(format!("roll_v{}", i)),
+                db1.find(&format!("roll_k{i}"), seq).unwrap(),
+                Some(format!("roll_v{i}")),
                 "Node1 lost data after restart"
             );
         }
         let mut batch = omni_engine::WriteBatch::new();
         for i in 10..15 {
             batch
-                .set(&format!("roll_k{}", i), format!("roll_v{}", i))
+                .set(&format!("roll_k{i}"), format!("roll_v{i}"))
                 .unwrap();
         }
         db1.commit_batch(&batch).unwrap();
@@ -3569,8 +3503,8 @@ fn test_rolling_restart_no_data_loss() {
         let seq = db2.get_seq();
         for i in 0..10 {
             assert_eq!(
-                db2.find(&format!("roll_k{}", i), seq).unwrap(),
-                Some(format!("roll_v{}", i)),
+                db2.find(&format!("roll_k{i}"), seq).unwrap(),
+                Some(format!("roll_v{i}")),
                 "Node2 lost data after restart"
             );
         }
@@ -3582,8 +3516,8 @@ fn test_rolling_restart_no_data_loss() {
         let seq = db3.get_seq();
         for i in 0..10 {
             assert_eq!(
-                db3.find(&format!("roll_k{}", i), seq).unwrap(),
-                Some(format!("roll_v{}", i)),
+                db3.find(&format!("roll_k{i}"), seq).unwrap(),
+                Some(format!("roll_v{i}")),
                 "Node3 lost data after restart"
             );
         }
@@ -3601,8 +3535,7 @@ fn test_rolling_upgrade_continuous_writes() {
 
     // Phase 1: Write entries 1-10 to all 3
     for i in 1..=10 {
-        n1.append_log(i, &format!("SET upg_k{} upg_v{}", i, i))
-            .unwrap();
+        n1.append_log(i, &format!("SET upg_k{i} upg_v{i}")).unwrap();
     }
     replicate_to_set(&n1, &[&n2, &n3], 1, 11);
     apply_range(&n1, 1, 11);
@@ -3612,8 +3545,7 @@ fn test_rolling_upgrade_continuous_writes() {
     // Phase 2: "Restart" n3 — simulate by stopping replication, then catching up
     // Leader continues writing to n1, n2
     for i in 11..=15 {
-        n1.append_log(i, &format!("SET upg_k{} upg_v{}", i, i))
-            .unwrap();
+        n1.append_log(i, &format!("SET upg_k{i} upg_v{i}")).unwrap();
     }
     replicate_to_set(&n1, &[&n2], 11, 16);
     apply_range(&n1, 11, 16);
@@ -3625,8 +3557,7 @@ fn test_rolling_upgrade_continuous_writes() {
 
     // Phase 3: "Restart" n2 — leader writes to n1, n3
     for i in 16..=20 {
-        n1.append_log(i, &format!("SET upg_k{} upg_v{}", i, i))
-            .unwrap();
+        n1.append_log(i, &format!("SET upg_k{i} upg_v{i}")).unwrap();
     }
     replicate_to_set(&n1, &[&n3], 16, 21);
     apply_range(&n1, 16, 21);
@@ -3641,11 +3572,9 @@ fn test_rolling_upgrade_continuous_writes() {
         let seq = db.get_seq();
         for i in 1..=20 {
             assert_eq!(
-                db.find(&format!("upg_k{}", i), seq).unwrap(),
-                Some(format!("upg_v{}", i)),
-                "{} missing upg_k{}",
-                name,
-                i
+                db.find(&format!("upg_k{i}"), seq).unwrap(),
+                Some(format!("upg_v{i}")),
+                "{name} missing upg_k{i}"
             );
         }
     }
@@ -3662,8 +3591,7 @@ fn test_rolling_upgrade_read_availability() {
 
     // Populate all nodes
     for i in 1..=10 {
-        n1.append_log(i, &format!("SET av_k{} av_v{}", i, i))
-            .unwrap();
+        n1.append_log(i, &format!("SET av_k{i} av_v{i}")).unwrap();
     }
     replicate_to_set(&n1, &[&n2, &n3], 1, 11);
     apply_range(&n1, 1, 11);
@@ -3674,8 +3602,8 @@ fn test_rolling_upgrade_read_availability() {
     let seq1 = db1.get_seq();
     let seq2 = db2.get_seq();
     for i in 1..=10 {
-        let v1 = db1.find(&format!("av_k{}", i), seq1).unwrap();
-        let v2 = db2.find(&format!("av_k{}", i), seq2).unwrap();
+        let v1 = db1.find(&format!("av_k{i}"), seq1).unwrap();
+        let v2 = db2.find(&format!("av_k{i}"), seq2).unwrap();
         assert!(v1.is_some(), "n1 should serve reads while n3 is down");
         assert!(v2.is_some(), "n2 should serve reads while n3 is down");
         assert_eq!(v1, v2);
@@ -3684,7 +3612,7 @@ fn test_rolling_upgrade_read_availability() {
     // Simulate n2 also "restarting" — n1 alone can still serve reads
     let seq1 = db1.get_seq();
     for i in 1..=10 {
-        let v1 = db1.find(&format!("av_k{}", i), seq1).unwrap();
+        let v1 = db1.find(&format!("av_k{i}"), seq1).unwrap();
         assert!(v1.is_some(), "n1 alone should serve reads");
     }
 
@@ -3700,7 +3628,7 @@ fn test_rolling_upgrade_generation_tags() {
 
     // Gen-1 writes (simulating "old version")
     for i in 1..=5 {
-        n1.append_log(i, &format!("SET gen1_k{} gen1_v{}", i, i))
+        n1.append_log(i, &format!("SET gen1_k{i} gen1_v{i}"))
             .unwrap();
     }
     replicate_to_set(&n1, &[&n2, &n3], 1, 6);
@@ -3710,7 +3638,7 @@ fn test_rolling_upgrade_generation_tags() {
 
     // "Upgrade" n3: gen-2 writes
     for i in 6..=10 {
-        n1.append_log(i, &format!("SET gen2_k{} gen2_v{}", i, i))
+        n1.append_log(i, &format!("SET gen2_k{i} gen2_v{i}"))
             .unwrap();
     }
     replicate_to_set(&n1, &[&n2, &n3], 6, 11);
@@ -3720,7 +3648,7 @@ fn test_rolling_upgrade_generation_tags() {
 
     // "Upgrade" n2: gen-3 writes
     for i in 11..=15 {
-        n1.append_log(i, &format!("SET gen3_k{} gen3_v{}", i, i))
+        n1.append_log(i, &format!("SET gen3_k{i} gen3_v{i}"))
             .unwrap();
     }
     replicate_to_set(&n1, &[&n2, &n3], 11, 16);
@@ -3733,23 +3661,20 @@ fn test_rolling_upgrade_generation_tags() {
         let seq = db.get_seq();
         for i in 1..=5 {
             assert!(
-                db.find(&format!("gen1_k{}", i), seq).unwrap().is_some(),
-                "{} missing gen1 data",
-                name
+                db.find(&format!("gen1_k{i}"), seq).unwrap().is_some(),
+                "{name} missing gen1 data"
             );
         }
         for i in 6..=10 {
             assert!(
-                db.find(&format!("gen2_k{}", i), seq).unwrap().is_some(),
-                "{} missing gen2 data",
-                name
+                db.find(&format!("gen2_k{i}"), seq).unwrap().is_some(),
+                "{name} missing gen2 data"
             );
         }
         for i in 11..=15 {
             assert!(
-                db.find(&format!("gen3_k{}", i), seq).unwrap().is_some(),
-                "{} missing gen3 data",
-                name
+                db.find(&format!("gen3_k{i}"), seq).unwrap().is_some(),
+                "{name} missing gen3 data"
             );
         }
     }
@@ -3776,7 +3701,7 @@ fn test_full_cluster_restart() {
         let mut batch = omni_engine::WriteBatch::new();
         for i in 0..20 {
             batch
-                .set(&format!("full_k{:02}", i), format!("full_v{}", i))
+                .set(&format!("full_k{i:02}"), format!("full_v{i}"))
                 .unwrap();
         }
         db1.commit_batch(&batch).unwrap();
@@ -3794,19 +3719,17 @@ fn test_full_cluster_restart() {
 
         // Both should have all 20 entries
         for i in 0..20 {
-            let k = format!("full_k{:02}", i);
-            let expected = format!("full_v{}", i);
+            let k = format!("full_k{i:02}");
+            let expected = format!("full_v{i}");
             assert_eq!(
                 db1.find(&k, seq1).unwrap(),
                 Some(expected.clone()),
-                "db1 missing {} after full restart",
-                k
+                "db1 missing {k} after full restart"
             );
             assert_eq!(
                 db2.find(&k, seq2).unwrap(),
                 Some(expected),
-                "db2 missing {} after full restart",
-                k
+                "db2 missing {k} after full restart"
             );
         }
 

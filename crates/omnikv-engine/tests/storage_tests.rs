@@ -1,19 +1,11 @@
-//! Integration tests for the OmniKV storage engine.
+//! Integration tests for the `OmniKV` storage engine.
 //! These test the full write path, read path, compaction, TTL, MVCC, and crash recovery.
-
-#![expect(
-    clippy::doc_markdown,
-    clippy::needless_collect,
-    clippy::redundant_clone,
-    clippy::uninlined_format_args,
-    reason = "Large storage integration suite favors explicit scenario setup and readable failure output; strict style cleanup is tracked separately."
-)]
 
 use omni_engine::{OmniError, OmniKV, OmniRecord, SSTableReader, SSTableWriter, WriteBatch};
 use std::sync::Arc;
 use tempfile::TempDir;
 
-/// Helper: creates a fresh OmniKV instance in a temp directory.
+/// Helper: creates a fresh `OmniKV` instance in a temp directory.
 fn create_test_db() -> (Arc<OmniKV>, TempDir) {
     let dir = TempDir::new().expect("tempdir");
     let manifest = dir
@@ -138,18 +130,18 @@ fn test_scan_iter_reuses_pooled_heap_buffer() {
 
     assert_eq!(db.scan_buffer_pool_available(), 0);
 
-    let first: Vec<_> = db
+    let first_count = db
         .scan_iter("scan_pool_000", "scan_pool_999", db.get_seq())
         .unwrap()
-        .collect();
-    assert_eq!(first.len(), 16);
+        .count();
+    assert_eq!(first_count, 16);
     assert_eq!(db.scan_buffer_pool_available(), 1);
 
-    let second: Vec<_> = db
+    let second_count = db
         .scan_iter("scan_pool_000", "scan_pool_999", db.get_seq())
         .unwrap()
-        .collect();
-    assert_eq!(second.len(), 16);
+        .count();
+    assert_eq!(second_count, 16);
     assert_eq!(
         db.scan_buffer_pool_available(),
         1,
@@ -268,7 +260,7 @@ fn test_scan_range() {
     for i in 0..10 {
         let mut batch = WriteBatch::new();
         batch
-            .set(&format!("scan_{:03}", i), format!("val_{}", i))
+            .set(&format!("scan_{i:03}"), format!("val_{i}"))
             .unwrap();
         db.commit_batch(&batch).unwrap();
     }
@@ -327,15 +319,15 @@ fn test_many_keys_stress() {
     for i in 0..count {
         let mut batch = WriteBatch::new();
         batch
-            .set(&format!("stress_{:06}", i), format!("payload_{}", i))
+            .set(&format!("stress_{i:06}"), format!("payload_{i}"))
             .unwrap();
         db.commit_batch(&batch).unwrap();
     }
 
     let seq = db.get_seq();
     for i in 0..count {
-        let val = db.find(&format!("stress_{:06}", i), seq).unwrap();
-        assert_eq!(val, Some(format!("payload_{}", i)));
+        let val = db.find(&format!("stress_{i:06}"), seq).unwrap();
+        assert_eq!(val, Some(format!("payload_{i}")));
     }
 }
 
@@ -347,7 +339,7 @@ fn test_compaction_l0() {
     for i in 0..100 {
         let mut batch = WriteBatch::new();
         batch
-            .set(&format!("compact_{:04}", i), format!("v{}", i))
+            .set(&format!("compact_{i:04}"), format!("v{i}"))
             .unwrap();
         db.commit_batch(&batch).unwrap();
     }
@@ -358,8 +350,8 @@ fn test_compaction_l0() {
     // Verify data is still readable after compaction
     let seq = db.get_seq();
     for i in 0..100 {
-        let val = db.find(&format!("compact_{:04}", i), seq).unwrap();
-        assert_eq!(val, Some(format!("v{}", i)));
+        let val = db.find(&format!("compact_{i:04}"), seq).unwrap();
+        assert_eq!(val, Some(format!("v{i}")));
     }
 }
 
@@ -388,7 +380,7 @@ fn test_write_stall_backpressure() {
     // This is a design validation — we don't actually create 12 SSTables,
     // just verify the error type exists and is handled.
     let err = OmniError::WriteStall;
-    assert_eq!(format!("{:?}", err), "WriteStall");
+    assert_eq!(format!("{err:?}"), "WriteStall");
 }
 
 #[test]
@@ -424,7 +416,7 @@ fn test_concurrent_writes() {
                 for i in 0..100 {
                     let mut batch = WriteBatch::new();
                     batch
-                        .set(&format!("thread{}_{:04}", t, i), format!("val_{}_{}", t, i))
+                        .set(&format!("thread{t}_{i:04}"), format!("val_{t}_{i}"))
                         .unwrap();
                     db.commit_batch(&batch).unwrap();
                 }
@@ -441,9 +433,9 @@ fn test_concurrent_writes() {
     for t in 0..4 {
         for i in 0..100 {
             let val = db
-                .find(&format!("thread{}_{:04}", t, i), seq)
-                .unwrap_or_else(|e| panic!("Read error for thread{}_{:04}: {:?}", t, i, e));
-            assert_eq!(val, Some(format!("val_{}_{}", t, i)));
+                .find(&format!("thread{t}_{i:04}"), seq)
+                .unwrap_or_else(|e| panic!("Read error for thread{t}_{i:04}: {e:?}"));
+            assert_eq!(val, Some(format!("val_{t}_{i}")));
             found += 1;
         }
     }
@@ -507,7 +499,7 @@ fn test_txn_basic_commit() {
 #[test]
 fn test_txn_read_your_own_writes() {
     let (db, _dir) = create_test_db();
-    let tm = TransactionManager::new(db.clone());
+    let tm = TransactionManager::new(db);
 
     let mut txn = tm.begin();
     tm.set(&mut txn, "ryw_key", "written_in_txn".to_string())
@@ -548,8 +540,7 @@ fn test_txn_write_write_conflict() {
     let err = result.unwrap_err().to_string();
     assert!(
         err.contains("SSI CONFLICT"),
-        "Error should mention SSI CONFLICT: {}",
-        err
+        "Error should mention SSI CONFLICT: {err}"
     );
 
     // T2's write should be the final value
@@ -749,7 +740,7 @@ fn test_index_range_scan_integers() {
     ] {
         let doc = serde_json::json!({"name": name, "age": age});
         let mut batch = WriteBatch::new();
-        let pk = format!("users:{}", name);
+        let pk = format!("users:{name}");
         batch
             .set(&pk, serde_json::to_string(&doc).unwrap())
             .unwrap();
@@ -807,7 +798,7 @@ fn test_index_unique_constraint() {
         "Should reject duplicate unique index value"
     );
     let err = result.unwrap_err().to_string();
-    assert!(err.contains("UNIQUE CONSTRAINT"), "Error: {}", err);
+    assert!(err.contains("UNIQUE CONSTRAINT"), "Error: {err}");
 }
 
 #[test]
@@ -837,7 +828,7 @@ fn test_index_composite() {
         let mut batch = WriteBatch::new();
         batch
             .set(
-                &format!("users:{}", name),
+                &format!("users:{name}"),
                 serde_json::to_string(doc).unwrap(),
             )
             .unwrap();
@@ -937,7 +928,7 @@ fn test_index_remove_document() {
 #[test]
 fn test_index_list() {
     let (db, _dir) = create_test_db();
-    let im = IndexManager::new(db.clone());
+    let im = IndexManager::new(db);
 
     im.create_index(
         "idx_a",
@@ -1009,7 +1000,7 @@ fn test_prepared_select_range() {
     for i in 0..10 {
         let mut batch = WriteBatch::new();
         batch
-            .set(&format!("row_{:03}", i), format!("data_{}", i))
+            .set(&format!("row_{i:03}"), format!("data_{i}"))
             .unwrap();
         db.commit_batch(&batch).unwrap();
     }
@@ -1036,9 +1027,7 @@ fn test_prepared_select_count() {
 
     for i in 0..5 {
         let mut batch = WriteBatch::new();
-        batch
-            .set(&format!("cnt_{:03}", i), format!("v{}", i))
-            .unwrap();
+        batch.set(&format!("cnt_{i:03}"), format!("v{i}")).unwrap();
         db.commit_batch(&batch).unwrap();
     }
 
@@ -1117,7 +1106,7 @@ fn test_named_params() {
 #[test]
 fn test_plan_cache_hits() {
     let (db, _dir) = create_test_db();
-    let qe = QueryEngine::new(db.clone(), 100);
+    let qe = QueryEngine::new(db, 100);
 
     // First prepare → cache miss
     let _stmt1 = qe
@@ -1148,7 +1137,7 @@ fn test_plan_cache_hits() {
 #[test]
 fn test_plan_cache_eviction() {
     let (db, _dir) = create_test_db();
-    let qe = QueryEngine::new(db.clone(), 2); // tiny cache: 2 entries
+    let qe = QueryEngine::new(db, 2); // tiny cache: 2 entries
 
     qe.prepare("SELECT * WHERE key = $1").unwrap();
     qe.prepare("SELECT COUNT WHERE key = $1").unwrap();
@@ -1182,9 +1171,7 @@ fn test_select_with_limit_and_order() {
 
     for i in 0..10 {
         let mut batch = WriteBatch::new();
-        batch
-            .set(&format!("ord_{:03}", i), format!("v{}", i))
-            .unwrap();
+        batch.set(&format!("ord_{i:03}"), format!("v{i}")).unwrap();
         db.commit_batch(&batch).unwrap();
     }
 
@@ -1206,20 +1193,20 @@ fn test_select_with_limit_and_order() {
 #[test]
 fn test_missing_param_error() {
     let (db, _dir) = create_test_db();
-    let qe = QueryEngine::new(db.clone(), 100);
+    let qe = QueryEngine::new(db, 100);
 
     let stmt = qe.prepare("INSERT $1 $2").unwrap();
     // Only provide 1 param instead of 2
     let result = qe.execute(&stmt, &["only_key"]);
     assert!(result.is_err());
     let err = result.unwrap_err().to_string();
-    assert!(err.contains("Missing parameter $2"), "Error: {}", err);
+    assert!(err.contains("Missing parameter $2"), "Error: {err}");
 }
 
 #[test]
 fn test_cache_clear() {
     let (db, _dir) = create_test_db();
-    let qe = QueryEngine::new(db.clone(), 100);
+    let qe = QueryEngine::new(db, 100);
 
     qe.prepare("SELECT * WHERE key = $1").unwrap();
     qe.prepare("DELETE WHERE key = $1").unwrap();
@@ -1274,10 +1261,7 @@ fn test_schema_create_index_migration() {
         let doc = serde_json::json!({"email": format!("user{}@test.com", i)});
         let mut batch = WriteBatch::new();
         batch
-            .set(
-                &format!("users:{}", i),
-                serde_json::to_string(&doc).unwrap(),
-            )
+            .set(&format!("users:{i}"), serde_json::to_string(&doc).unwrap())
             .unwrap();
         db.commit_batch(&batch).unwrap();
     }
@@ -1343,7 +1327,7 @@ fn test_schema_add_field_backfill() {
         let mut batch = WriteBatch::new();
         batch
             .set(
-                &format!("profiles:{}", i),
+                &format!("profiles:{i}"),
                 serde_json::to_string(&doc).unwrap(),
             )
             .unwrap();
@@ -1567,7 +1551,7 @@ fn test_rate_limiter_allows_burst() {
     // Should allow 5 requests immediately (burst)
     for i in 0..5 {
         let result = rl.try_acquire("user1");
-        assert!(result.is_ok(), "Request {} should succeed", i);
+        assert!(result.is_ok(), "Request {i} should succeed");
     }
 
     // 6th should be rate limited
@@ -1598,8 +1582,8 @@ fn test_rate_limiter_retry_after() {
     rl.try_acquire("user1").unwrap(); // use the one token
 
     let err = rl.try_acquire("user1").unwrap_err();
-    assert!(err > 0, "retry_after_ms should be positive: {}", err);
-    assert!(err <= 200, "retry_after should be reasonable: {}ms", err);
+    assert!(err > 0, "retry_after_ms should be positive: {err}");
+    assert!(err <= 200, "retry_after should be reasonable: {err}ms");
 }
 
 #[test]
@@ -1779,7 +1763,7 @@ fn test_chaos_run_all() {
         );
     }
 
-    assert_eq!(passed, total, "Chaos suite: {}/{} passed", passed, total);
+    assert_eq!(passed, total, "Chaos suite: {passed}/{total} passed");
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -1906,7 +1890,7 @@ fn test_2pc_participant_abort() {
     let (db, _dir) = create_test_db();
     let coord = TwoPhaseCoordinator::new(1, db.clone(), 5000);
     let p1 = TwoPhaseParticipant::new(2, db.clone());
-    let _p2 = TwoPhaseParticipant::new(3, db.clone());
+    let _p2 = TwoPhaseParticipant::new(3, db);
 
     let txn_id = coord.begin();
     coord
@@ -1943,7 +1927,7 @@ fn test_2pc_participant_abort() {
 #[test]
 fn test_2pc_coordinator_abort() {
     let (db, _dir) = create_test_db();
-    let coord = TwoPhaseCoordinator::new(1, db.clone(), 5000);
+    let coord = TwoPhaseCoordinator::new(1, db, 5000);
 
     let txn_id = coord.begin();
     coord
@@ -1960,7 +1944,7 @@ fn test_2pc_coordinator_abort() {
 fn test_2pc_timeout_detection() {
     let (db, _dir) = create_test_db();
     // Very short timeout (1ms)
-    let coord = TwoPhaseCoordinator::new(1, db.clone(), 1);
+    let coord = TwoPhaseCoordinator::new(1, db, 1);
 
     let txn_id = coord.begin();
     coord

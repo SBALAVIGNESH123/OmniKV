@@ -1,17 +1,10 @@
-#![expect(
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    clippy::doc_markdown,
-    clippy::uninlined_format_args,
-    reason = "Durability evidence tests use generated crash-case data and compact diagnostic output to keep failure scenarios auditable."
-)]
 /// Phase 3 — Durability Evidence Test Suite
 ///
-/// These tests prove OmniKV survives real failure scenarios:
+/// These tests prove `OmniKV` survives real failure scenarios:
 ///   - Crash during compaction
 ///   - 1000 crash-recovery cycles
 ///   - Manifest corruption
-///   - SSTable corruption (CRC detection)
+///   - `SSTable` corruption (CRC detection)
 ///   - WAL corruption with valid data interleaved
 ///   - Backup/restore roundtrip
 ///   - Concurrent crash during write
@@ -51,6 +44,10 @@ fn reopen(dir: &TempDir) -> Arc<OmniKV> {
     OmniKV::open(&manifest, &wal).expect("reopen")
 }
 
+fn deterministic_garbage_byte(seed: usize) -> u8 {
+    u8::try_from(seed % 256).expect("modulo 256 always fits in u8")
+}
+
 fn put(db: &OmniKV, key: &str, val: &str) {
     let mut b = WriteBatch::new();
     b.set(key, val.to_string()).unwrap();
@@ -64,10 +61,7 @@ fn assert_get(db: &OmniKV, key: &str, expected: &str) {
     assert_eq!(
         got.as_str(),
         expected,
-        "key='{}' expected='{}' got='{}'",
-        key,
-        expected,
-        got
+        "key='{key}' expected='{expected}' got='{got}'"
     );
 }
 
@@ -77,9 +71,7 @@ fn assert_missing(db: &OmniKV, key: &str) {
     db.unregister_snapshot(snap);
     assert!(
         got.is_none(),
-        "key='{}' should be absent but got {:?}",
-        key,
-        got
+        "key='{key}' should be absent but got {got:?}"
     );
 }
 
@@ -87,13 +79,12 @@ fn assert_missing(db: &OmniKV, key: &str) {
 fn verify_all_keys(db: &OmniKV, n: u64, prefix: &str) {
     let snap = db.snapshot();
     for i in 0..n {
-        let key = format!("{}:{:06}", prefix, i);
-        let expected = format!("val_{}", i);
+        let key = format!("{prefix}:{i:06}");
+        let expected = format!("val_{i}");
         let got = db.find(&key, snap).expect("find").unwrap_or_default();
         assert_eq!(
             got, expected,
-            "DURABILITY FAILURE: key='{}' expected='{}' got='{}'",
-            key, expected, got
+            "DURABILITY FAILURE: key='{key}' expected='{expected}' got='{got}'"
         );
     }
     db.unregister_snapshot(snap);
@@ -116,7 +107,7 @@ fn test_recovery_after_crash_during_compaction() {
 
     // Phase 1: Write enough data to fill the memtable and produce SSTables
     for i in 0u64..500 {
-        put(&db, &format!("cmpct:{:06}", i), &format!("val_{}", i));
+        put(&db, &format!("cmpct:{i:06}"), &format!("val_{i}"));
     }
 
     // Force a memtable flush to produce an L0 SSTable
@@ -124,7 +115,7 @@ fn test_recovery_after_crash_during_compaction() {
 
     // Write more data on top
     for i in 500u64..1000 {
-        put(&db, &format!("cmpct:{:06}", i), &format!("val_{}", i));
+        put(&db, &format!("cmpct:{i:06}"), &format!("val_{i}"));
     }
 
     // Trigger another compaction — then "crash" by dropping without clean shutdown
@@ -166,7 +157,7 @@ fn test_1000_crash_recovery_cycles() {
 
     for cycle in 0u64..num_cycles {
         // Open engine
-        let db = OmniKV::open(&manifest, &wal).unwrap_or_else(|_| panic!("open cycle {}", cycle));
+        let db = OmniKV::open(&manifest, &wal).unwrap_or_else(|_| panic!("open cycle {cycle}"));
 
         // Verify all previously written keys
         if total_keys > 0 {
@@ -176,33 +167,24 @@ fn test_1000_crash_recovery_cycles() {
             let first = db.find(&first_key, snap).expect("find first");
             assert!(
                 first.is_some(),
-                "CYCLE {}: First key '{}' lost! total_keys={}",
-                cycle,
-                first_key,
-                total_keys
+                "CYCLE {cycle}: First key '{first_key}' lost! total_keys={total_keys}"
             );
 
             let last_key = format!("crash:{:08}", total_keys - 1);
             let last = db.find(&last_key, snap).expect("find last");
             assert!(
                 last.is_some(),
-                "CYCLE {}: Last key '{}' lost! total_keys={}",
-                cycle,
-                last_key,
-                total_keys
+                "CYCLE {cycle}: Last key '{last_key}' lost! total_keys={total_keys}"
             );
 
             // Check 10 random midpoints
             for check in 0..std::cmp::min(10, total_keys) {
                 let idx = (check * total_keys) / 10;
-                let mid_key = format!("crash:{:08}", idx);
+                let mid_key = format!("crash:{idx:08}");
                 let mid = db.find(&mid_key, snap).expect("find mid");
                 assert!(
                     mid.is_some(),
-                    "CYCLE {}: Mid key '{}' lost! total_keys={}",
-                    cycle,
-                    mid_key,
-                    total_keys
+                    "CYCLE {cycle}: Mid key '{mid_key}' lost! total_keys={total_keys}"
                 );
             }
             db.unregister_snapshot(snap);
@@ -210,8 +192,8 @@ fn test_1000_crash_recovery_cycles() {
 
         // Write 5 new keys per cycle
         for j in 0u64..5 {
-            let key = format!("crash:{:08}", total_keys);
-            let val = format!("v_{}_{}", cycle, j);
+            let key = format!("crash:{total_keys:08}");
+            let val = format!("v_{cycle}_{j}");
             put(&db, &key, &val);
             total_keys += 1;
         }
@@ -229,21 +211,16 @@ fn test_1000_crash_recovery_cycles() {
     let db = OmniKV::open(&manifest, &wal).expect("final open");
     let snap = db.snapshot();
     for i in 0u64..total_keys {
-        let key = format!("crash:{:08}", i);
+        let key = format!("crash:{i:08}");
         let val = db.find(&key, snap).expect("find");
         assert!(
             val.is_some(),
-            "FINAL VERIFY: key '{}' lost after {} cycles!",
-            key,
-            num_cycles
+            "FINAL VERIFY: key '{key}' lost after {num_cycles} cycles!"
         );
     }
     db.unregister_snapshot(snap);
 
-    println!(
-        "✓ {} crash-recovery cycles passed. {} keys verified.",
-        num_cycles, total_keys
-    );
+    println!("✓ {num_cycles} crash-recovery cycles passed. {total_keys} keys verified.");
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -262,7 +239,7 @@ fn test_manifest_corruption_recovery() {
 
     // Write real data
     for i in 0u64..100 {
-        put(&db, &format!("mfst:{:06}", i), &format!("val_{}", i));
+        put(&db, &format!("mfst:{i:06}"), &format!("val_{i}"));
     }
     db.compact_sstables().expect("compact");
     drop(db);
@@ -287,7 +264,7 @@ fn test_manifest_corruption_recovery() {
         }
         Err(e) => {
             // Clear error is acceptable
-            println!("Truncated manifest: clean error: {}", e);
+            println!("Truncated manifest: clean error: {e}");
         }
     }
 
@@ -303,12 +280,14 @@ fn test_manifest_corruption_recovery() {
             drop(db);
         }
         Err(e) => {
-            println!("Zeroed manifest: clean error: {}", e);
+            println!("Zeroed manifest: clean error: {e}");
         }
     }
 
     // Test 3c: Random garbage manifest
-    let garbage: Vec<u8> = (0..original.len()).map(|i| (i * 37 + 13) as u8).collect();
+    let garbage: Vec<u8> = (0..original.len())
+        .map(|i| deterministic_garbage_byte(i * 37 + 13))
+        .collect();
     fs::write(&manifest_path, &garbage).expect("garbage manifest");
     let result = OmniKV::open(
         &manifest_path.to_string_lossy(),
@@ -320,7 +299,7 @@ fn test_manifest_corruption_recovery() {
             drop(db);
         }
         Err(e) => {
-            println!("Garbage manifest: clean error: {}", e);
+            println!("Garbage manifest: clean error: {e}");
         }
     }
 
@@ -343,7 +322,7 @@ fn test_sstable_corruption_detected_on_read() {
 
     // Write data and compact to SSTable
     for i in 0u64..50 {
-        put(&db, &format!("crc:{:06}", i), &format!("val_{}", i));
+        put(&db, &format!("crc:{i:06}"), &format!("val_{i}"));
     }
     db.compact_sstables().expect("compact");
 
@@ -384,15 +363,14 @@ fn test_sstable_corruption_detected_on_read() {
     let mut silent_wrong_data = false;
 
     for i in 0u64..50 {
-        let key = format!("crc:{:06}", i);
-        let expected = format!("val_{}", i);
+        let key = format!("crc:{i:06}");
+        let expected = format!("val_{i}");
         match db2.find(&key, snap) {
             Ok(Some(val)) => {
                 if val != expected {
                     silent_wrong_data = true;
                     eprintln!(
-                        "CRITICAL: key='{}' returned wrong data: expected='{}' got='{}'",
-                        key, expected, val
+                        "CRITICAL: key='{key}' returned wrong data: expected='{expected}' got='{val}'"
                     );
                 }
             }
@@ -432,7 +410,7 @@ fn test_wal_corruption_partial_recovery() {
 
     // Write records that will be committed to WAL
     for i in 0u64..50 {
-        put(&db, &format!("wal_ok:{:06}", i), &format!("val_{}", i));
+        put(&db, &format!("wal_ok:{i:06}"), &format!("val_{i}"));
     }
     drop(db);
 
@@ -443,7 +421,9 @@ fn test_wal_corruption_partial_recovery() {
         .open(&wal_path)
         .expect("open wal");
     // Write random garbage that looks nothing like a valid record
-    let garbage: Vec<u8> = (0..256).map(|i| (i * 7 + 3) as u8).collect();
+    let garbage: Vec<u8> = (0..256)
+        .map(|i| deterministic_garbage_byte(i * 7 + 3))
+        .collect();
     wal_file.write_all(&garbage).unwrap();
     drop(wal_file);
 
@@ -482,7 +462,7 @@ fn test_multi_stage_crash_compaction_recovery() {
     {
         let db = OmniKV::open(&manifest, &wal).expect("stage1 open");
         for i in 0u64..200 {
-            put(&db, &format!("stage:{:06}", i), &format!("val_{}", i));
+            put(&db, &format!("stage:{i:06}"), &format!("val_{i}"));
         }
         db.compact_sstables().expect("stage1 compact");
         drop(db); // crash
@@ -495,7 +475,7 @@ fn test_multi_stage_crash_compaction_recovery() {
         verify_all_keys(&db, 200, "stage");
 
         for i in 200u64..400 {
-            put(&db, &format!("stage:{:06}", i), &format!("val_{}", i));
+            put(&db, &format!("stage:{i:06}"), &format!("val_{i}"));
         }
         db.compact_sstables().expect("stage2 compact");
 
@@ -525,14 +505,14 @@ fn test_delete_survives_compaction_and_crash() {
 
     // Write 100 keys
     for i in 0u64..100 {
-        put(&db, &format!("del:{:04}", i), &format!("val_{}", i));
+        put(&db, &format!("del:{i:04}"), &format!("val_{i}"));
     }
     db.compact_sstables().expect("compact after write");
 
     // Delete even-numbered keys
     for i in (0u64..100).step_by(2) {
         let mut b = WriteBatch::new();
-        b.delete(&format!("del:{:04}", i)).unwrap();
+        b.delete(&format!("del:{i:04}")).unwrap();
         db.commit_batch(&b).expect("delete commit");
     }
 
@@ -543,11 +523,11 @@ fn test_delete_survives_compaction_and_crash() {
     // Recover and verify
     let db2 = reopen(&dir);
     for i in 0u64..100 {
-        let key = format!("del:{:04}", i);
+        let key = format!("del:{i:04}");
         if i % 2 == 0 {
             assert_missing(&db2, &key);
         } else {
-            assert_get(&db2, &key, &format!("val_{}", i));
+            assert_get(&db2, &key, &format!("val_{i}"));
         }
     }
     println!("✓ Deletes survived compaction + crash: 50 present, 50 absent");
@@ -565,13 +545,13 @@ fn test_overwrite_survives_compaction_and_crash() {
 
     // Write initial values
     for i in 0u64..100 {
-        put(&db, &format!("ow:{:04}", i), &format!("initial_{}", i));
+        put(&db, &format!("ow:{i:04}"), &format!("initial_{i}"));
     }
     db.compact_sstables().expect("compact 1");
 
     // Overwrite all keys with new values
     for i in 0u64..100 {
-        put(&db, &format!("ow:{:04}", i), &format!("updated_{}", i));
+        put(&db, &format!("ow:{i:04}"), &format!("updated_{i}"));
     }
     db.compact_sstables().expect("compact 2");
     drop(db); // crash
@@ -579,7 +559,7 @@ fn test_overwrite_survives_compaction_and_crash() {
     // Verify latest values survive
     let db2 = reopen(&dir);
     for i in 0u64..100 {
-        assert_get(&db2, &format!("ow:{:04}", i), &format!("updated_{}", i));
+        assert_get(&db2, &format!("ow:{i:04}"), &format!("updated_{i}"));
     }
     println!("✓ Overwrites survived compaction + crash: 100 keys have latest value");
 }
@@ -598,7 +578,7 @@ fn test_large_batch_atomicity_across_crash() {
     {
         let mut b = WriteBatch::new();
         for i in 0u64..500 {
-            b.set(&format!("committed:{:06}", i), format!("val_{}", i))
+            b.set(&format!("committed:{i:06}"), format!("val_{i}"))
                 .unwrap();
         }
         db.commit_batch(&b).expect("commit large batch");
@@ -626,7 +606,7 @@ fn test_gc_does_not_lose_inflight_data() {
 
     // Write initial data
     for i in 0u64..100 {
-        put(&db, &format!("gc:{:06}", i), &format!("val_{}", i));
+        put(&db, &format!("gc:{i:06}"), &format!("val_{i}"));
     }
 
     // Compact to produce SSTables
@@ -637,7 +617,7 @@ fn test_gc_does_not_lose_inflight_data() {
 
     // Write NEW data AFTER GC started (this is what the old bug lost)
     for i in 100u64..200 {
-        put(&db, &format!("gc:{:06}", i), &format!("val_{}", i));
+        put(&db, &format!("gc:{i:06}"), &format!("val_{i}"));
     }
 
     // Verify ALL data is present (both pre- and post-GC writes)
@@ -674,7 +654,7 @@ fn test_full_lsm_lifecycle_with_restarts() {
     {
         let db = OmniKV::open(&manifest, &wal).expect("phase1");
         for i in 0u64..300 {
-            put(&db, &format!("lsm:{:06}", i), &format!("val_{}", i));
+            put(&db, &format!("lsm:{i:06}"), &format!("val_{i}"));
             total_keys += 1;
         }
         db.compact_sstables().expect("L0 flush");
@@ -688,7 +668,7 @@ fn test_full_lsm_lifecycle_with_restarts() {
         verify_all_keys(&db, total_keys, "lsm");
 
         for i in total_keys..total_keys + 300 {
-            put(&db, &format!("lsm:{:06}", i), &format!("val_{}", i));
+            put(&db, &format!("lsm:{i:06}"), &format!("val_{i}"));
         }
         total_keys += 300;
 
@@ -703,7 +683,7 @@ fn test_full_lsm_lifecycle_with_restarts() {
         verify_all_keys(&db, total_keys, "lsm");
 
         for i in total_keys..total_keys + 300 {
-            put(&db, &format!("lsm:{:06}", i), &format!("val_{}", i));
+            put(&db, &format!("lsm:{i:06}"), &format!("val_{i}"));
         }
         total_keys += 300;
 
@@ -718,8 +698,7 @@ fn test_full_lsm_lifecycle_with_restarts() {
         let db = OmniKV::open(&manifest, &wal).expect("final");
         verify_all_keys(&db, total_keys, "lsm");
         println!(
-            "✓ Full LSM lifecycle: {} keys survived memtable→L0→L1→L2 with 3 crashes",
-            total_keys
+            "✓ Full LSM lifecycle: {total_keys} keys survived memtable→L0→L1→L2 with 3 crashes"
         );
     }
 }
@@ -736,7 +715,7 @@ fn test_backup_restore_roundtrip() {
 
     // Write data
     for i in 0u64..200 {
-        put(&db, &format!("backup:{:06}", i), &format!("val_{}", i));
+        put(&db, &format!("backup:{i:06}"), &format!("val_{i}"));
     }
     db.compact_sstables().expect("compact before backup");
 

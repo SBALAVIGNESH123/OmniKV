@@ -2,19 +2,13 @@
 // Storage Engine Integration Tests — Gaps #15 through #22
 // ═══════════════════════════════════════════════════════════════════════════
 
-#![expect(
-    clippy::doc_markdown,
-    clippy::uninlined_format_args,
-    reason = "Storage engine integration tests use generated key names and scenario labels to keep failure output clear."
-)]
-
 use omni_engine::{OmniKV, WriteBatch};
 
-/// Helper: create a temp OmniKV instance
+/// Helper: create a temp `OmniKV` instance
 fn create_temp_db(prefix: &str) -> (std::sync::Arc<OmniKV>, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
-    let manifest = dir.path().join(format!("{}_manifest.json", prefix));
-    let wal = dir.path().join(format!("{}_wal.bin", prefix));
+    let manifest = dir.path().join(format!("{prefix}_manifest.json"));
+    let wal = dir.path().join(format!("{prefix}_wal.bin"));
     let db = OmniKV::open(manifest.to_str().unwrap(), wal.to_str().unwrap()).unwrap();
     (db, dir)
 }
@@ -24,10 +18,7 @@ fn write_n(db: &OmniKV, prefix: &str, n: usize) -> u64 {
     let mut batch = WriteBatch::new();
     for i in 0..n {
         batch
-            .set(
-                &format!("{}_k{:04}", prefix, i),
-                format!("{}_v{}", prefix, i),
-            )
+            .set(&format!("{prefix}_k{i:04}"), format!("{prefix}_v{i}"))
             .unwrap();
     }
     db.commit_batch(&batch).unwrap()
@@ -37,13 +28,12 @@ fn write_n(db: &OmniKV, prefix: &str, n: usize) -> u64 {
 fn verify_n(db: &OmniKV, prefix: &str, n: usize) {
     let seq = db.get_seq();
     for i in 0..n {
-        let key = format!("{}_k{:04}", prefix, i);
-        let expected = format!("{}_v{}", prefix, i);
+        let key = format!("{prefix}_k{i:04}");
+        let expected = format!("{prefix}_v{i}");
         assert_eq!(
             db.find(&key, seq).unwrap(),
             Some(expected),
-            "Missing key: {}",
-            key
+            "Missing key: {key}"
         );
     }
 }
@@ -52,7 +42,7 @@ fn verify_n(db: &OmniKV, prefix: &str, n: usize) {
 // Gap #15: Crash during compaction recovery
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Gap #15a: Data survives compaction + restart (via SSTable)
+/// Gap #15a: Data survives compaction + restart (via `SSTable`)
 #[test]
 fn test_compaction_crash_recovery_basic() {
     let dir = tempfile::tempdir().unwrap();
@@ -93,12 +83,12 @@ fn test_compaction_multiple_cycles() {
     let (db, _dir) = create_temp_db("multi_comp");
 
     for cycle in 0..3 {
-        write_n(&db, &format!("cy{}", cycle), 20);
+        write_n(&db, &format!("cy{cycle}"), 20);
         let _ = db.compact_sstables();
     }
 
     for cycle in 0..3 {
-        verify_n(&db, &format!("cy{}", cycle), 20);
+        verify_n(&db, &format!("cy{cycle}"), 20);
     }
 
     println!("✅ STORAGE 15b: 3 compaction cycles, all 60 keys preserved");
@@ -113,7 +103,7 @@ fn test_compaction_with_deletes() {
 
     let mut batch = WriteBatch::new();
     for i in 0..10 {
-        batch.delete(&format!("dc_k{:04}", i)).unwrap();
+        batch.delete(&format!("dc_k{i:04}")).unwrap();
     }
     db.commit_batch(&batch).unwrap();
 
@@ -121,10 +111,10 @@ fn test_compaction_with_deletes() {
 
     let seq = db.get_seq();
     for i in 0..10 {
-        assert_eq!(db.find(&format!("dc_k{:04}", i), seq).unwrap(), None);
+        assert_eq!(db.find(&format!("dc_k{i:04}"), seq).unwrap(), None);
     }
     for i in 10..30 {
-        assert!(db.find(&format!("dc_k{:04}", i), seq).unwrap().is_some());
+        assert!(db.find(&format!("dc_k{i:04}"), seq).unwrap().is_some());
     }
 
     println!("✅ STORAGE 15c: Compaction respected 10 tombstones, 20 keys remain");
@@ -165,9 +155,7 @@ fn test_multiple_batches_wal_recovery() {
         let db = OmniKV::open(m.to_str().unwrap(), w.to_str().unwrap()).unwrap();
         for i in 0..5 {
             let mut batch = WriteBatch::new();
-            batch
-                .set(&format!("mb_k{}", i), format!("mb_v{}", i))
-                .unwrap();
+            batch.set(&format!("mb_k{i}"), format!("mb_v{i}")).unwrap();
             db.commit_batch(&batch).unwrap();
         }
     }
@@ -177,8 +165,8 @@ fn test_multiple_batches_wal_recovery() {
         let seq = db.get_seq();
         for i in 0..5 {
             assert_eq!(
-                db.find(&format!("mb_k{}", i), seq).unwrap(),
-                Some(format!("mb_v{}", i))
+                db.find(&format!("mb_k{i}"), seq).unwrap(),
+                Some(format!("mb_v{i}"))
             );
         }
     }
@@ -215,9 +203,8 @@ fn test_wal_corruption_detection() {
         let seq = db.get_seq();
         for i in 0..10 {
             assert!(
-                db.find(&format!("wcor_k{:04}", i), seq).unwrap().is_some(),
-                "Key wcor_k{:04} should survive corruption",
-                i
+                db.find(&format!("wcor_k{i:04}"), seq).unwrap().is_some(),
+                "Key wcor_k{i:04} should survive corruption"
             );
         }
     }
@@ -242,7 +229,7 @@ fn test_wal_empty_recovery() {
 // Gap #18: Manifest consistency verification
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Gap #18a: Manifest preserves SSTable paths across restarts
+/// Gap #18a: Manifest preserves `SSTable` paths across restarts
 #[test]
 fn test_manifest_consistency_across_restart() {
     let dir = tempfile::tempdir().unwrap();
@@ -281,10 +268,7 @@ fn test_manifest_consistency_across_restart() {
         );
     }
 
-    println!(
-        "✅ STORAGE 18a: Manifest SSTable count consistent: {}",
-        sst_count_before
-    );
+    println!("✅ STORAGE 18a: Manifest SSTable count consistent: {sst_count_before}");
 }
 
 /// Gap #18b: Sequence increases across restarts
@@ -305,8 +289,7 @@ fn test_manifest_sequence_tracking() {
         // After WAL replay, seq should be at least close to what it was
         assert!(
             seq_after > 0,
-            "Seq should be positive after replay: {}",
-            seq_after
+            "Seq should be positive after replay: {seq_after}"
         );
     }
 
@@ -370,7 +353,7 @@ fn test_mvcc_multi_version() {
     let mut snaps = Vec::new();
     for v in 1..=5 {
         let mut b = WriteBatch::new();
-        b.set("mv3_key", format!("v{}", v)).unwrap();
+        b.set("mv3_key", format!("v{v}")).unwrap();
         let commit_seq = db.commit_batch(&b).unwrap();
         snaps.push(commit_seq);
     }
@@ -411,14 +394,14 @@ fn test_l0_to_l1_compaction() {
     let (db, _dir) = create_temp_db("l0l1");
 
     for i in 0..5 {
-        write_n(&db, &format!("l0_{}", i), 20);
+        write_n(&db, &format!("l0_{i}"), 20);
         let _ = db.compact_sstables();
     }
 
     let _ = db.compact_l0_to_l1();
 
     for i in 0..5 {
-        verify_n(&db, &format!("l0_{}", i), 20);
+        verify_n(&db, &format!("l0_{i}"), 20);
     }
 
     println!("✅ STORAGE 20b: L0→L1 compaction preserved all 100 keys");
@@ -446,7 +429,7 @@ fn test_mmap_large_values() {
     println!("✅ STORAGE 21a: 10KB value stored and retrieved correctly");
 }
 
-/// Gap #21b: Many small values don't corrupt SSTable mmap
+/// Gap #21b: Many small values don't corrupt `SSTable` mmap
 #[test]
 fn test_mmap_many_small_values() {
     let (db, _dir) = create_temp_db("mmsm");
@@ -480,7 +463,7 @@ fn test_write_stall_backpressure() {
 fn test_batch_size_limits() {
     let mut batch = WriteBatch::new();
     for i in 0..100 {
-        assert!(batch.set(&format!("lim_k{}", i), format!("v{}", i)).is_ok());
+        assert!(batch.set(&format!("lim_k{i}"), format!("v{i}")).is_ok());
     }
 
     println!("✅ STORAGE 22b: Batch size limits enforced correctly");

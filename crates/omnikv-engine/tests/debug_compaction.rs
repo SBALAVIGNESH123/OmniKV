@@ -1,8 +1,3 @@
-#![expect(
-    clippy::uninlined_format_args,
-    reason = "Debug reproduction test keeps compact diagnostic formatting."
-)]
-
 use omni_engine::{OmniKV, WriteBatch};
 #[test]
 fn test_debug_compaction() {
@@ -25,5 +20,5 @@ fn test_debug_compaction() {
 
     let snap = db.snapshot();
     let got = db.find("ckey00001", snap).unwrap();
-    println!("Found: {:?}", got);
+    println!("Found: {got:?}");
 }

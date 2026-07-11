@@ -4,15 +4,8 @@
 //! the chunked consumption path used by built-in streaming operators.
 //!
 //! Usage:
-//!   cargo bench -p omnikv-engine --bench volcano_dispatch
-//!   cargo bench -p omnikv-engine --bench volcano_dispatch -- --rows 200000 --rounds 5
-
-#![expect(
-    clippy::cast_precision_loss,
-    clippy::doc_markdown,
-    clippy::missing_const_for_fn,
-    reason = "Dispatch benchmark favors readable throughput math and CLI documentation over style-only rewrites."
-)]
+//!   cargo bench -p omnikv-engine --bench `volcano_dispatch`
+//!   cargo bench -p omnikv-engine --bench `volcano_dispatch` -- --rows 200000 --rounds 5
 
 use omni_engine::sql::{AggFunc, CmpOp, SelectColumn, SqlValue, WhereExpr};
 use omni_engine::sql_exec::Row;
@@ -21,6 +14,14 @@ use omni_engine::volcano::{
 };
 use std::time::{Duration, Instant};
 
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "Benchmark harness reports approximate rows/sec; f64 precision is sufficient for comparative diagnostics."
+)]
+fn rows_per_second(rows: usize, rounds: usize, elapsed: Duration) -> f64 {
+    (rows * rounds) as f64 / elapsed.as_secs_f64()
+}
+
 #[derive(Clone)]
 struct VecRowIter {
     rows: Vec<Row>,
@@ -28,7 +29,7 @@ struct VecRowIter {
 }
 
 impl VecRowIter {
-    fn new(rows: Vec<Row>) -> Self {
+    const fn new(rows: Vec<Row>) -> Self {
         Self { rows, pos: 0 }
     }
 }
@@ -118,8 +119,8 @@ fn run_case(
         chunk_total.elapsed += chunk.elapsed;
     }
 
-    let row_per_sec = (row_total.rows * rounds) as f64 / row_total.elapsed.as_secs_f64();
-    let chunk_per_sec = (chunk_total.rows * rounds) as f64 / chunk_total.elapsed.as_secs_f64();
+    let row_per_sec = rows_per_second(row_total.rows, rounds, row_total.elapsed);
+    let chunk_per_sec = rows_per_second(chunk_total.rows, rounds, chunk_total.elapsed);
     let ratio = chunk_per_sec / row_per_sec;
     println!(
         "{:<38} {:>10} {:>12.0} {:>12.0} {:>9.2}x",

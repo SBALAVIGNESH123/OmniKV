@@ -1,17 +1,9 @@
 //! Storage Performance Tests
 //! Validates throughput, compaction, cache, compression, and amplification.
 
-#![expect(
-    clippy::cast_lossless,
-    clippy::cast_precision_loss,
-    clippy::cast_sign_loss,
-    clippy::uninlined_format_args,
-    reason = "Performance tests use compact throughput math and generated key strings for readability."
-)]
-
 use omni_engine::{OmniKV, WriteBatch};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 fn create_db() -> (Arc<OmniKV>, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
@@ -19,6 +11,14 @@ fn create_db() -> (Arc<OmniKV>, tempfile::TempDir) {
     let w = dir.path().join("wal.bin");
     let db = OmniKV::open(m.to_str().unwrap(), w.to_str().unwrap()).unwrap();
     (db, dir)
+}
+
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "Performance tests report approximate throughput, where f64 precision is sufficient for human-readable ops/sec."
+)]
+fn ops_per_second(count: u64, elapsed: Duration) -> f64 {
+    count as f64 / elapsed.as_secs_f64()
 }
 
 // ─── Write Throughput ───────────────────────────────────────
@@ -30,13 +30,12 @@ fn test_sequential_write_throughput() {
     let start = Instant::now();
     for i in 0..n {
         let mut b = WriteBatch::new();
-        b.set(&format!("seq_{:08}", i), format!("val_{}", i))
-            .unwrap();
+        b.set(&format!("seq_{i:08}"), format!("val_{i}")).unwrap();
         db.commit_batch(&b).unwrap();
     }
-    let ops = n as f64 / start.elapsed().as_secs_f64();
-    assert!(ops > 50.0, "Sequential writes too slow: {:.0} ops/sec", ops);
-    println!("✅ PERF: Sequential writes = {:.0} ops/sec", ops);
+    let ops = f64::from(n) / start.elapsed().as_secs_f64();
+    assert!(ops > 50.0, "Sequential writes too slow: {ops:.0} ops/sec");
+    println!("✅ PERF: Sequential writes = {ops:.0} ops/sec");
 }
 
 #[test]
@@ -48,18 +47,15 @@ fn test_batch_write_throughput() {
     for i in 0..batches {
         let mut b = WriteBatch::new();
         for j in 0..per {
-            b.set(&format!("batch_{}_{:06}", i, j), format!("p_{}", j))
+            b.set(&format!("batch_{i}_{j:06}"), format!("p_{j}"))
                 .unwrap();
         }
         db.commit_batch(&b).unwrap();
     }
     let total = batches * per;
-    let ops = total as f64 / start.elapsed().as_secs_f64();
-    assert!(ops > 500.0, "Batch writes too slow: {:.0} ops/sec", ops);
-    println!(
-        "✅ PERF: Batch writes = {:.0} ops/sec ({}×{})",
-        ops, batches, per
-    );
+    let ops = f64::from(total) / start.elapsed().as_secs_f64();
+    assert!(ops > 500.0, "Batch writes too slow: {ops:.0} ops/sec");
+    println!("✅ PERF: Batch writes = {ops:.0} ops/sec ({batches}×{per})");
 }
 
 #[test]
@@ -70,19 +66,19 @@ fn test_large_value_write() {
     let start = Instant::now();
     for i in 0..n {
         let mut b = WriteBatch::new();
-        b.set(&format!("big_{}", i), big.clone()).unwrap();
+        b.set(&format!("big_{i}"), big.clone()).unwrap();
         db.commit_batch(&b).unwrap();
     }
     let elapsed = start.elapsed();
-    let mb = (n * 100_000) as f64 / 1_000_000.0 / elapsed.as_secs_f64();
-    assert!(mb > 1.0, "Large value writes too slow: {:.1} MB/s", mb);
+    let mb = f64::from(n * 100_000) / 1_000_000.0 / elapsed.as_secs_f64();
+    assert!(mb > 1.0, "Large value writes too slow: {mb:.1} MB/s");
     // Verify reads
     let seq = db.get_seq();
     for i in 0..n {
-        let v = db.find(&format!("big_{}", i), seq).unwrap().unwrap();
+        let v = db.find(&format!("big_{i}"), seq).unwrap().unwrap();
         assert_eq!(v.len(), 100_000);
     }
-    println!("✅ PERF: Large value (100KB) writes = {:.1} MB/s", mb);
+    println!("✅ PERF: Large value (100KB) writes = {mb:.1} MB/s");
 }
 
 // ─── Read Throughput ────────────────────────────────────────
@@ -93,22 +89,21 @@ fn test_point_read_throughput() {
     // Seed data
     for i in 0..5000 {
         let mut b = WriteBatch::new();
-        b.set(&format!("read_{:06}", i), format!("v_{}", i))
-            .unwrap();
+        b.set(&format!("read_{i:06}"), format!("v_{i}")).unwrap();
         db.commit_batch(&b).unwrap();
     }
     let seq = db.get_seq();
     let start = Instant::now();
     let mut found = 0u64;
     for i in 0..5000 {
-        if db.find(&format!("read_{:06}", i), seq).unwrap().is_some() {
+        if db.find(&format!("read_{i:06}"), seq).unwrap().is_some() {
             found += 1;
         }
     }
     let ops = 5000.0 / start.elapsed().as_secs_f64();
     assert_eq!(found, 5000);
-    assert!(ops > 1000.0, "Point reads too slow: {:.0} ops/sec", ops);
-    println!("✅ PERF: Point reads = {:.0} ops/sec (100% hit)", ops);
+    assert!(ops > 1000.0, "Point reads too slow: {ops:.0} ops/sec");
+    println!("✅ PERF: Point reads = {ops:.0} ops/sec (100% hit)");
 }
 
 #[test]
@@ -116,8 +111,7 @@ fn test_random_read_throughput() {
     let (db, _d) = create_db();
     for i in 0..5000 {
         let mut b = WriteBatch::new();
-        b.set(&format!("rand_{:06}", i), format!("v_{}", i))
-            .unwrap();
+        b.set(&format!("rand_{i:06}"), format!("v_{i}")).unwrap();
         db.commit_batch(&b).unwrap();
     }
     let seq = db.get_seq();
@@ -130,10 +124,10 @@ fn test_random_read_throughput() {
             found += 1;
         }
     }
-    let ops = n as f64 / start.elapsed().as_secs_f64();
+    let ops = ops_per_second(n, start.elapsed());
     assert_eq!(found, n);
-    assert!(ops > 500.0, "Random reads too slow: {:.0} ops/sec", ops);
-    println!("✅ PERF: Random reads = {:.0} ops/sec", ops);
+    assert!(ops > 500.0, "Random reads too slow: {ops:.0} ops/sec");
+    println!("✅ PERF: Random reads = {ops:.0} ops/sec");
 }
 
 #[test]
@@ -141,7 +135,7 @@ fn test_scan_throughput() {
     let (db, _d) = create_db();
     let mut b = WriteBatch::new();
     for i in 0..1000 {
-        b.set(&format!("scan_{:06}", i), format!("payload_{}", i))
+        b.set(&format!("scan_{i:06}"), format!("payload_{i}"))
             .unwrap();
     }
     db.commit_batch(&b).unwrap();
@@ -154,10 +148,9 @@ fn test_scan_throughput() {
     let rows_per_sec = 1000.0 / elapsed.as_secs_f64();
     assert!(
         rows_per_sec > 5000.0,
-        "Scan too slow: {:.0} rows/sec",
-        rows_per_sec
+        "Scan too slow: {rows_per_sec:.0} rows/sec"
     );
-    println!("✅ PERF: Scan 1K rows = {:.0} rows/sec", rows_per_sec);
+    println!("✅ PERF: Scan 1K rows = {rows_per_sec:.0} rows/sec");
 }
 
 #[test]
@@ -171,14 +164,11 @@ fn test_missing_key_read() {
     let n = 5000;
     let start = Instant::now();
     for i in 0..n {
-        let r = db.find(&format!("missing_{}", i), seq).unwrap();
+        let r = db.find(&format!("missing_{i}"), seq).unwrap();
         assert!(r.is_none());
     }
-    let ops = n as f64 / start.elapsed().as_secs_f64();
-    println!(
-        "✅ PERF: Missing key reads = {:.0} ops/sec (bloom filter skip)",
-        ops
-    );
+    let ops = f64::from(n) / start.elapsed().as_secs_f64();
+    println!("✅ PERF: Missing key reads = {ops:.0} ops/sec (bloom filter skip)");
 }
 
 // ─── Compaction ─────────────────────────────────────────────
@@ -188,8 +178,7 @@ fn test_memtable_flush_to_l0() {
     let (db, _d) = create_db();
     for i in 0..500 {
         let mut b = WriteBatch::new();
-        b.set(&format!("flush_{:06}", i), format!("v_{}", i))
-            .unwrap();
+        b.set(&format!("flush_{i:06}"), format!("v_{i}")).unwrap();
         db.commit_batch(&b).unwrap();
     }
     assert!(db.memtable_size() > 0);
@@ -215,7 +204,7 @@ fn test_l0_to_l1_compaction() {
     for round in 0..4 {
         for i in 0..200 {
             let mut b = WriteBatch::new();
-            b.set(&format!("l0l1_{}_{:06}", round, i), format!("v_{}", i))
+            b.set(&format!("l0l1_{round}_{i:06}"), format!("v_{i}"))
                 .unwrap();
             db.commit_batch(&b).unwrap();
         }
@@ -244,11 +233,8 @@ fn test_full_compaction_cycle() {
     for round in 0..4 {
         for i in 0..100 {
             let mut b = WriteBatch::new();
-            b.set(
-                &format!("full_{}_{:04}", round, i),
-                format!("r{}v{}", round, i),
-            )
-            .unwrap();
+            b.set(&format!("full_{round}_{i:04}"), format!("r{round}v{i}"))
+                .unwrap();
             db.commit_batch(&b).unwrap();
         }
         db.compact_sstables().unwrap();
@@ -262,8 +248,8 @@ fn test_full_compaction_cycle() {
     let seq = db.get_seq();
     for round in 0..4 {
         for i in 0..100 {
-            let v = db.find(&format!("full_{}_{:04}", round, i), seq).unwrap();
-            assert!(v.is_some(), "Missing full_{}_{:04}", round, i);
+            let v = db.find(&format!("full_{round}_{i:04}"), seq).unwrap();
+            assert!(v.is_some(), "Missing full_{round}_{i:04}");
         }
     }
     println!(
@@ -305,7 +291,10 @@ fn test_compression_ratio_tracking() {
     // Write repetitive data (high compression ratio)
     let repetitive = "ABCDEFGHIJ".repeat(1000); // 10KB, very compressible
     let random_ish: String = (0..10000)
-        .map(|i| (b'A' + (i % 26) as u8) as char)
+        .map(|i| {
+            let offset = u8::try_from(i % 26).expect("modulo 26 always fits in u8");
+            (b'A' + offset) as char
+        })
         .collect();
 
     let mut b = WriteBatch::new();
@@ -326,7 +315,7 @@ fn test_block_cache_hit_rate() {
     let (db, _d) = create_db();
     let mut b = WriteBatch::new();
     for i in 0..100 {
-        b.set(&format!("cache_{:04}", i), format!("value_{}", i))
+        b.set(&format!("cache_{i:04}"), format!("value_{i}"))
             .unwrap();
     }
     db.commit_batch(&b).unwrap();
@@ -335,14 +324,14 @@ fn test_block_cache_hit_rate() {
     // First pass: cold cache
     let start1 = Instant::now();
     for i in 0..100 {
-        db.find(&format!("cache_{:04}", i), seq).unwrap();
+        db.find(&format!("cache_{i:04}"), seq).unwrap();
     }
     let cold = start1.elapsed();
 
     // Second pass: warm cache
     let start2 = Instant::now();
     for i in 0..100 {
-        db.find(&format!("cache_{:04}", i), seq).unwrap();
+        db.find(&format!("cache_{i:04}"), seq).unwrap();
     }
     let warm = start2.elapsed();
 
@@ -365,7 +354,7 @@ fn test_write_stall_at_l0_threshold() {
     for _ in 0..15 {
         let mut b = WriteBatch::new();
         for j in 0..10 {
-            b.set(&format!("stall_{}_{}", created, j), format!("v_{}", j))
+            b.set(&format!("stall_{created}_{j}"), format!("v_{j}"))
                 .unwrap();
         }
         db.commit_batch(&b).unwrap();
@@ -492,8 +481,7 @@ fn test_concurrent_read_write_perf() {
     // Seed
     let mut b = WriteBatch::new();
     for i in 0..1000 {
-        b.set(&format!("conc_{:06}", i), format!("v_{}", i))
-            .unwrap();
+        b.set(&format!("conc_{i:06}"), format!("v_{i}")).unwrap();
     }
     db.commit_batch(&b).unwrap();
 
@@ -501,7 +489,7 @@ fn test_concurrent_read_write_perf() {
     let writer = std::thread::spawn(move || {
         for i in 0..500 {
             let mut b = WriteBatch::new();
-            b.set(&format!("conc_new_{:06}", i), format!("new_{}", i))
+            b.set(&format!("conc_new_{i:06}"), format!("new_{i}"))
                 .unwrap();
             db2.commit_batch(&b).unwrap();
         }
@@ -510,7 +498,7 @@ fn test_concurrent_read_write_perf() {
     let seq = db.get_seq();
     let mut reads = 0u64;
     for i in 0..1000 {
-        if db.find(&format!("conc_{:06}", i), seq).unwrap().is_some() {
+        if db.find(&format!("conc_{i:06}"), seq).unwrap().is_some() {
             reads += 1;
         }
     }
@@ -528,7 +516,7 @@ fn test_background_compaction_runs() {
     // Write enough to trigger auto-compaction
     for i in 0..200 {
         let mut b = WriteBatch::new();
-        b.set(&format!("bg_{:06}", i), format!("v_{}", i)).unwrap();
+        b.set(&format!("bg_{i:06}"), format!("v_{i}")).unwrap();
         db.commit_batch(&b).unwrap();
     }
     std::thread::sleep(std::time::Duration::from_millis(500));

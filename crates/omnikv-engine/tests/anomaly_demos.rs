@@ -1,15 +1,8 @@
 //! SSI Anomaly Prevention Demos
 //!
-//! These tests PROVE that OmniKV's SSI prevents real database anomalies.
+//! These tests PROVE that `OmniKV`'s SSI prevents real database anomalies.
 //! Each test sets up a scenario that would cause data corruption under
-//! weaker isolation levels, and verifies OmniKV detects and aborts it.
-
-#![expect(
-    clippy::doc_markdown,
-    clippy::or_fun_call,
-    clippy::uninlined_format_args,
-    reason = "Anomaly demos intentionally read like scenario walkthroughs with generated values and human-facing assertions."
-)]
+//! weaker isolation levels, and verifies `OmniKV` detects and aborts it.
 
 use omni_engine::transaction::TransactionManager;
 use omni_engine::{OmniKV, WriteBatch};
@@ -87,16 +80,10 @@ fn demo_write_skew_prevention() {
         .count();
     assert!(
         on_call_count >= 1,
-        "SAFETY VIOLATION: {} doctors on-call (alice={}, bob={})",
-        on_call_count,
-        alice_final,
-        bob_final
+        "SAFETY VIOLATION: {on_call_count} doctors on-call (alice={alice_final}, bob={bob_final})"
     );
 
-    println!(
-        "✅ WRITE SKEW PREVENTED: {} doctor(s) remain on-call",
-        on_call_count
-    );
+    println!("✅ WRITE SKEW PREVENTED: {on_call_count} doctor(s) remain on-call");
 }
 
 /// DEMO 2: Lost Update Prevention
@@ -158,7 +145,7 @@ fn demo_lost_update_prevention() {
     let final_bal2 = db.find("account:checking", db.get_seq()).unwrap().unwrap();
     assert_eq!(final_bal2, "1200", "Final balance must be $1200");
 
-    println!("✅ LOST UPDATE PREVENTED: Final balance = ${}", final_bal2);
+    println!("✅ LOST UPDATE PREVENTED: Final balance = ${final_bal2}");
 }
 
 /// DEMO 3: Read-Only Transaction Anomaly Prevention
@@ -207,16 +194,10 @@ fn demo_snapshot_consistency() {
     let sum = x_val + y_val;
     assert!(
         sum == 30 || sum == 40,
-        "Reads should be from a consistent state, got x={}, y={}, sum={}",
-        x_val,
-        y_val,
-        sum
+        "Reads should be from a consistent state, got x={x_val}, y={y_val}, sum={sum}"
     );
 
-    println!(
-        "✅ SNAPSHOT READ: T1 saw x={}, y={}, sum={}",
-        x_val, y_val, sum
-    );
+    println!("✅ SNAPSHOT READ: T1 saw x={x_val}, y={y_val}, sum={sum}");
 }
 
 /// DEMO 4: Concurrent Counter Correctness
@@ -242,7 +223,10 @@ fn demo_concurrent_counter() {
     for _ in 0..total_increments {
         loop {
             let mut txn = tm.begin();
-            let val = tm.get(&mut txn, "counter").unwrap().unwrap_or("0".into());
+            let val = tm
+                .get(&mut txn, "counter")
+                .unwrap()
+                .unwrap_or_else(|| "0".into());
             let current: i64 = val.parse().unwrap();
             let new_val = current + 1;
             tm.set(&mut txn, "counter", new_val.to_string()).unwrap();
@@ -261,12 +245,10 @@ fn demo_concurrent_counter() {
 
     assert_eq!(
         final_val, total_increments,
-        "COUNTER MISMATCH: expected {}, got {} ({} retries)",
-        total_increments, final_val, retries
+        "COUNTER MISMATCH: expected {total_increments}, got {final_val} ({retries} retries)"
     );
 
     println!(
-        "✅ CONCURRENT COUNTER CORRECT: {} == {} ({} SSI retries)",
-        final_val, total_increments, retries
+        "✅ CONCURRENT COUNTER CORRECT: {final_val} == {total_increments} ({retries} SSI retries)"
     );
 }

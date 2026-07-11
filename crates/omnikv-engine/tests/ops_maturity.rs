@@ -3,13 +3,6 @@
 //! Tests for configuration, diagnostics, metrics, health, rate limiting,
 //! group commit, graceful shutdown, and crash recovery.
 
-#![expect(
-    clippy::float_cmp,
-    clippy::significant_drop_tightening,
-    clippy::uninlined_format_args,
-    reason = "Operational maturity tests keep lock/diagnostic scopes explicit and scenario output readable."
-)]
-
 use omni_engine::hardening::{GroupCommitEngine, RateLimiter};
 use omni_engine::metrics_prometheus;
 use omni_engine::ops::{DiagnosticReport, LogFormat, OmniConfig};
@@ -61,7 +54,7 @@ fn test_config_from_env() {
     let cfg = OmniConfig::from_env();
     assert_eq!(cfg.memtable_flush_threshold, 5000);
     assert_eq!(cfg.log_format, LogFormat::Pretty);
-    assert_eq!(cfg.rate_limit_per_sec, 500.0);
+    assert!((cfg.rate_limit_per_sec - 500.0).abs() < f64::EPSILON);
     assert!(cfg.validate().is_ok());
 
     // Cleanup
@@ -99,7 +92,7 @@ fn test_config_summary() {
     assert!(summary.contains("memtable_flush"));
     assert!(summary.contains("cache"));
     assert!(summary.contains("rate_limit"));
-    println!("✅ OPS: Config summary: {}", summary);
+    println!("✅ OPS: Config summary: {summary}");
 }
 
 // ─── Diagnostics ────────────────────────────────────────────
@@ -126,7 +119,7 @@ fn test_diagnostic_report() {
     let json = serde_json::to_string_pretty(&report).unwrap();
     assert!(json.contains("global_seq"));
     assert!(json.contains("memtable_entries"));
-    println!("✅ OPS: Diagnostic report generated:\n{}", json);
+    println!("✅ OPS: Diagnostic report generated:\n{json}");
 }
 
 #[test]
@@ -137,7 +130,7 @@ fn test_diagnostic_after_compaction() {
 
     for i in 0..100 {
         let mut b = WriteBatch::new();
-        b.set(&format!("diag_{}", i), format!("v_{}", i)).unwrap();
+        b.set(&format!("diag_{i}"), format!("v_{i}")).unwrap();
         db.commit_batch(&b).unwrap();
     }
     db.compact_sstables().unwrap();
@@ -353,7 +346,7 @@ fn test_wal_recovery_multiple_batches() {
         let db = OmniKV::open(m.to_str().unwrap(), w.to_str().unwrap()).unwrap();
         for i in 0..50 {
             let mut b = WriteBatch::new();
-            b.set(&format!("wal_{:04}", i), format!("v_{}", i)).unwrap();
+            b.set(&format!("wal_{i:04}"), format!("v_{i}")).unwrap();
             db.commit_batch(&b).unwrap();
         }
     }
@@ -362,8 +355,8 @@ fn test_wal_recovery_multiple_batches() {
         let db = OmniKV::open(m.to_str().unwrap(), w.to_str().unwrap()).unwrap();
         let seq = db.get_seq();
         for i in 0..50 {
-            let v = db.find(&format!("wal_{:04}", i), seq).unwrap();
-            assert!(v.is_some(), "Missing key wal_{:04}", i);
+            let v = db.find(&format!("wal_{i:04}"), seq).unwrap();
+            assert!(v.is_some(), "Missing key wal_{i:04}");
         }
     }
     println!("✅ OPS: WAL recovery handles 50 batches across restart");
@@ -408,7 +401,7 @@ fn test_connection_pool_creation() {
 fn test_write_stall_returns_error() {
     // Verify the WriteStall error type exists and formats correctly
     let err = omni_engine::OmniError::WriteStall;
-    let msg = format!("{}", err);
+    let msg = format!("{err}");
     assert!(msg.contains("WriteStall"));
     println!("✅ OPS: WriteStall error type works for backpressure signaling");
 }
@@ -422,7 +415,7 @@ fn test_hdr_histogram_latency_tracking() {
     // Do some writes
     for i in 0..10 {
         let mut b = WriteBatch::new();
-        b.set(&format!("hist_{}", i), format!("v_{}", i)).unwrap();
+        b.set(&format!("hist_{i}"), format!("v_{i}")).unwrap();
         db.commit_batch(&b).unwrap();
     }
 
@@ -431,11 +424,9 @@ fn test_hdr_histogram_latency_tracking() {
     assert!(!hist.is_empty(), "Should have recorded commit latencies");
     let p50 = hist.value_at_quantile(0.5);
     let p99 = hist.value_at_quantile(0.99);
+    drop(hist);
     assert!(p99 >= p50, "p99 should be >= p50");
-    println!(
-        "✅ OPS: HdrHistogram latency tracking — p50={}µs p99={}µs",
-        p50, p99
-    );
+    println!("✅ OPS: HdrHistogram latency tracking — p50={p50}µs p99={p99}µs");
 }
 
 #[test]
@@ -452,10 +443,9 @@ fn test_hdr_histogram_read_latency() {
 
     let hist = db.metrics.read_latencies.lock().unwrap();
     assert!(!hist.is_empty());
-    println!(
-        "✅ OPS: Read latency histogram records {} samples",
-        hist.len()
-    );
+    let samples = hist.len();
+    drop(hist);
+    println!("✅ OPS: Read latency histogram records {samples} samples");
 }
 
 // ─── Error Handling ─────────────────────────────────────────
@@ -473,7 +463,7 @@ fn test_error_types_display() {
     ];
 
     for err in &errors {
-        let msg = format!("{}", err);
+        let msg = format!("{err}");
         assert!(!msg.is_empty());
     }
     println!("✅ OPS: All {} error types display correctly", errors.len());
@@ -483,9 +473,8 @@ fn test_error_types_display() {
 fn test_batch_too_large_rejected() {
     let mut b = WriteBatch::new();
     for i in 0..10_001 {
-        if let Err(omni_engine::OmniError::BatchTooLarge(_)) = b.set(&format!("k{}", i), "v".into())
-        {
-            println!("✅ OPS: BatchTooLarge rejected at {} entries", i);
+        if let Err(omni_engine::OmniError::BatchTooLarge(_)) = b.set(&format!("k{i}"), "v".into()) {
+            println!("✅ OPS: BatchTooLarge rejected at {i} entries");
             return;
         }
     }

@@ -1,8 +1,4 @@
-#![expect(
-    clippy::doc_markdown,
-    reason = "Crash consistency test documentation names engine files and recovery concepts directly for operator readability."
-)]
-//! Crash-consistency tests — these tests drive the **real OmniKV engine**.
+//! Crash-consistency tests — these tests drive the **real `OmniKV` engine**.
 //!
 //! Every test:
 //!   1. Opens the engine via `OmniKV::open()`
@@ -22,7 +18,7 @@ use tempfile::TempDir;
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Create a fresh temp directory and return (manifest_path, wal_path).
+/// Create a fresh temp directory and return (`manifest_path`, `wal_path`).
 fn fresh_db_paths(dir: &TempDir) -> (String, String) {
     let base = dir.path();
     let manifest = base.join("manifest.json").to_string_lossy().to_string();

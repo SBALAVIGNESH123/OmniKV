@@ -5,18 +5,20 @@
 //! before/after scan iterator changes to compare allocation-sensitive paths.
 //!
 //! Usage:
-//!   cargo bench -p omnikv-engine --bench scan_buffer_pool
-//!   cargo bench -p omnikv-engine --bench scan_buffer_pool -- --rows 20000 --rounds 20
-
-#![expect(
-    clippy::cast_precision_loss,
-    clippy::doc_markdown,
-    reason = "Scan benchmark keeps CLI docs and throughput math simple for before/after comparisons."
-)]
+//!   cargo bench -p omnikv-engine --bench `scan_buffer_pool`
+//!   cargo bench -p omnikv-engine --bench `scan_buffer_pool` -- --rows 20000 --rounds 20
 
 use omni_engine::{OmniKV, WriteBatch};
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
+
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "Benchmark harness reports approximate rows/sec; f64 precision is sufficient for comparative diagnostics."
+)]
+fn rows_per_second(rows: usize, elapsed: Duration) -> f64 {
+    rows as f64 / elapsed.as_secs_f64()
+}
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -47,7 +49,7 @@ fn main() {
         elapsed += start.elapsed();
     }
 
-    let rows_per_sec = total_rows as f64 / elapsed.as_secs_f64();
+    let rows_per_sec = rows_per_second(total_rows, elapsed);
     println!("Scan buffer pool benchmark");
     println!("Rows loaded: {rows}");
     println!("Rounds: {rounds}");

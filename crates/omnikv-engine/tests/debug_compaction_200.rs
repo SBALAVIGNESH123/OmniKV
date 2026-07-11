@@ -1,8 +1,3 @@
-#![expect(
-    clippy::uninlined_format_args,
-    reason = "Debug reproduction test keeps compact diagnostic formatting."
-)]
-
 use omni_engine::{OmniKV, WriteBatch};
 #[test]
 fn test_debug_compaction_200() {
@@ -17,13 +12,12 @@ fn test_debug_compaction_200() {
 
     for i in 0u64..200 {
         let mut b = WriteBatch::new();
-        b.set(&format!("ckey{:05}", i), format!("cval{}", i))
-            .unwrap();
+        b.set(&format!("ckey{i:05}"), format!("cval{i}")).unwrap();
         db.commit_batch(&b).unwrap();
     }
 
     db.compact_sstables().unwrap();
     let snap = db.snapshot();
     let got = db.find("ckey00000", snap).unwrap();
-    println!("GOT: {:?}", got);
+    println!("GOT: {got:?}");
 }

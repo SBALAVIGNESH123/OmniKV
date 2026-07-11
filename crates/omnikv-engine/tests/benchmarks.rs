@@ -1,4 +1,4 @@
-//! OmniKV Benchmark Suite
+//! `OmniKV` Benchmark Suite
 //!
 //! Comparative benchmarks against industry databases.
 //! Run with: `cargo bench -p omnikv-engine` or `cargo test -p omnikv-engine --test benchmarks --release`
@@ -11,15 +11,6 @@
 //! - Transaction commit throughput (txn/sec)
 //! - Batch write throughput (ops/sec)
 
-#![expect(
-    clippy::cast_precision_loss,
-    clippy::cast_sign_loss,
-    clippy::doc_markdown,
-    clippy::missing_const_for_fn,
-    clippy::uninlined_format_args,
-    reason = "Benchmark smoke tests prioritize stable, readable measurement code; strict clippy findings are documented as benchmark debt."
-)]
-
 use omni_engine::sql::{AggFunc, CmpOp, SelectColumn, SqlValue, WhereExpr};
 use omni_engine::sql_exec::Row;
 use omni_engine::transaction::TransactionManager;
@@ -28,7 +19,7 @@ use omni_engine::volcano::{
 };
 use omni_engine::{OmniKV, WriteBatch};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 fn create_bench_db() -> (Arc<OmniKV>, tempfile::TempDir) {
     let dir = tempfile::TempDir::new().expect("tempdir");
@@ -66,6 +57,22 @@ impl BenchResult {
     }
 }
 
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "Benchmark smoke tests report approximate human-readable throughput; f64 precision is sufficient for this diagnostic output."
+)]
+fn u64_per_second(count: u64, elapsed: Duration) -> f64 {
+    count as f64 / elapsed.as_secs_f64()
+}
+
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "Benchmark smoke tests report approximate human-readable throughput; f64 precision is sufficient for this diagnostic output."
+)]
+fn usize_per_second(count: usize, elapsed: Duration) -> f64 {
+    count as f64 / elapsed.as_secs_f64()
+}
+
 #[derive(Clone)]
 struct VecRowIter {
     rows: Vec<Row>,
@@ -73,7 +80,7 @@ struct VecRowIter {
 }
 
 impl VecRowIter {
-    fn new(rows: Vec<Row>) -> Self {
+    const fn new(rows: Vec<Row>) -> Self {
         Self { rows, pos: 0 }
     }
 }
@@ -186,7 +193,7 @@ fn consume_row_by_row(mut iter: Box<dyn RowIterator>) -> DispatchResult {
         rows,
         checksum,
         elapsed_us: elapsed.as_micros(),
-        rows_per_sec: rows as f64 / elapsed.as_secs_f64(),
+        rows_per_sec: usize_per_second(rows, elapsed),
     }
 }
 
@@ -212,7 +219,7 @@ fn consume_chunked(mut iter: Box<dyn RowIterator>) -> DispatchResult {
         rows,
         checksum,
         elapsed_us: elapsed.as_micros(),
-        rows_per_sec: rows as f64 / elapsed.as_secs_f64(),
+        rows_per_sec: usize_per_second(rows, elapsed),
     }
 }
 
@@ -257,8 +264,7 @@ fn bench_volcano_dispatch_smoke() {
     println!();
     println!("  Volcano dispatch benchmark: dyn row-at-a-time vs chunked batches");
     println!(
-        "  Chunk size: {} rows. Ratios are informational only; CI asserts semantic equivalence.",
-        DEFAULT_ROW_CHUNK_SIZE
+        "  Chunk size: {DEFAULT_ROW_CHUNK_SIZE} rows. Ratios are informational only; CI asserts semantic equivalence."
     );
 
     bench_dispatch_pipeline("scan only", &rows, scan_pipeline);
@@ -279,14 +285,14 @@ fn bench_sequential_writes(db: &Arc<OmniKV>, count: u64) -> BenchResult {
 
     for i in 0..count {
         let mut batch = WriteBatch::new();
-        let _ = batch.set(&format!("seq_{:08}", i), value.clone());
+        let _ = batch.set(&format!("seq_{i:08}"), value.clone());
         let _ = db.commit_batch(&batch);
     }
 
     let elapsed = start.elapsed();
-    let ops_per_sec = count as f64 / elapsed.as_secs_f64();
+    let ops_per_sec = u64_per_second(count, elapsed);
     let bytes = count * 100;
-    let mb_per_sec = bytes as f64 / elapsed.as_secs_f64() / 1_048_576.0;
+    let mb_per_sec = u64_per_second(bytes, elapsed) / 1_048_576.0;
 
     BenchResult {
         name: "Sequential Writes (100B values)".into(),
@@ -315,11 +321,11 @@ fn bench_batch_writes(db: &Arc<OmniKV>, total_keys: u64, batch_size: u64) -> Ben
     }
 
     let elapsed = start.elapsed();
-    let ops_per_sec = written as f64 / elapsed.as_secs_f64();
-    let mb_per_sec = (written * 100) as f64 / elapsed.as_secs_f64() / 1_048_576.0;
+    let ops_per_sec = u64_per_second(written, elapsed);
+    let mb_per_sec = u64_per_second(written * 100, elapsed) / 1_048_576.0;
 
     BenchResult {
-        name: format!("Batch Writes ({}keys/batch, 100B)", batch_size),
+        name: format!("Batch Writes ({batch_size}keys/batch, 100B)"),
         ops: written,
         elapsed_ms: elapsed.as_millis(),
         ops_per_sec,
@@ -342,10 +348,10 @@ fn bench_random_reads(db: &Arc<OmniKV>, count: u64) -> BenchResult {
     }
 
     let elapsed = start.elapsed();
-    let ops_per_sec = count as f64 / elapsed.as_secs_f64();
+    let ops_per_sec = u64_per_second(count, elapsed);
 
     BenchResult {
-        name: format!("Random Point Reads ({} found)", found),
+        name: format!("Random Point Reads ({found} found)"),
         ops: count,
         elapsed_ms: elapsed.as_millis(),
         ops_per_sec,
@@ -357,7 +363,7 @@ fn bench_random_reads(db: &Arc<OmniKV>, count: u64) -> BenchResult {
 fn bench_range_scan(db: &Arc<OmniKV>) -> BenchResult {
     let seq = db.get_seq();
     let start = Instant::now();
-    let iterations = 100;
+    let iterations = 100u64;
     let mut total_rows = 0u64;
 
     for _ in 0..iterations {
@@ -367,11 +373,11 @@ fn bench_range_scan(db: &Arc<OmniKV>) -> BenchResult {
     }
 
     let elapsed = start.elapsed();
-    let rows_per_sec = total_rows as f64 / elapsed.as_secs_f64();
+    let rows_per_sec = u64_per_second(total_rows, elapsed);
 
     BenchResult {
-        name: format!("Range Scan (1000 key range, {} total rows)", total_rows),
-        ops: iterations as u64,
+        name: format!("Range Scan (1000 key range, {total_rows} total rows)"),
+        ops: iterations,
         elapsed_ms: elapsed.as_millis(),
         ops_per_sec: rows_per_sec,
         mb_per_sec: None,
@@ -386,17 +392,17 @@ fn bench_transactions(db: &Arc<OmniKV>, count: u64) -> BenchResult {
 
     for i in 0..count {
         let mut txn = tm.begin();
-        let _ = tm.set(&mut txn, &format!("txn_{:08}", i), format!("txn_val_{}", i));
+        let _ = tm.set(&mut txn, &format!("txn_{i:08}"), format!("txn_val_{i}"));
         if tm.commit(&mut txn).is_ok() {
             committed += 1;
         }
     }
 
     let elapsed = start.elapsed();
-    let ops_per_sec = committed as f64 / elapsed.as_secs_f64();
+    let ops_per_sec = u64_per_second(committed, elapsed);
 
     BenchResult {
-        name: format!("SSI Transactions ({} committed)", committed),
+        name: format!("SSI Transactions ({committed} committed)"),
         ops: count,
         elapsed_ms: elapsed.as_millis(),
         ops_per_sec,
@@ -415,7 +421,7 @@ fn bench_mixed_workload(db: &Arc<OmniKV>, count: u64) -> BenchResult {
         if i % 5 == 0 {
             // 20% writes
             let mut batch = WriteBatch::new();
-            let _ = batch.set(&format!("mixed_{:08}", i), value.clone());
+            let _ = batch.set(&format!("mixed_{i:08}"), value.clone());
             let _ = db.commit_batch(&batch);
         } else {
             // 80% reads
@@ -425,7 +431,7 @@ fn bench_mixed_workload(db: &Arc<OmniKV>, count: u64) -> BenchResult {
     }
 
     let elapsed = start.elapsed();
-    let ops_per_sec = ops as f64 / elapsed.as_secs_f64();
+    let ops_per_sec = u64_per_second(ops, elapsed);
 
     BenchResult {
         name: "Mixed Workload (80% read, 20% write)".into(),
@@ -443,14 +449,14 @@ fn bench_large_values(db: &Arc<OmniKV>, count: u64) -> BenchResult {
 
     for i in 0..count {
         let mut batch = WriteBatch::new();
-        let _ = batch.set(&format!("large_{:08}", i), value.clone());
+        let _ = batch.set(&format!("large_{i:08}"), value.clone());
         let _ = db.commit_batch(&batch);
     }
 
     let elapsed = start.elapsed();
-    let ops_per_sec = count as f64 / elapsed.as_secs_f64();
+    let ops_per_sec = u64_per_second(count, elapsed);
     let bytes = count * 4096;
-    let mb_per_sec = bytes as f64 / elapsed.as_secs_f64() / 1_048_576.0;
+    let mb_per_sec = u64_per_second(bytes, elapsed) / 1_048_576.0;
 
     BenchResult {
         name: "Large Value Writes (4KB values)".into(),
