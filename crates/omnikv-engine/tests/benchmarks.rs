@@ -11,7 +11,12 @@
 //! - Transaction commit throughput (txn/sec)
 //! - Batch write throughput (ops/sec)
 
+use omni_engine::sql::{AggFunc, CmpOp, SelectColumn, SqlValue, WhereExpr};
+use omni_engine::sql_exec::Row;
 use omni_engine::transaction::TransactionManager;
+use omni_engine::volcano::{
+    AggregateIter, DEFAULT_ROW_CHUNK_SIZE, FilterIter, LimitIter, ProjectIter, RowIterator,
+};
 use omni_engine::{OmniKV, WriteBatch};
 use std::sync::Arc;
 use std::time::Instant;
@@ -50,6 +55,212 @@ impl BenchResult {
             );
         }
     }
+}
+
+#[derive(Clone)]
+struct VecRowIter {
+    rows: Vec<Row>,
+    pos: usize,
+}
+
+impl VecRowIter {
+    fn new(rows: Vec<Row>) -> Self {
+        Self { rows, pos: 0 }
+    }
+}
+
+impl RowIterator for VecRowIter {
+    fn next_row(&mut self) -> Option<Row> {
+        let row = self.rows.get(self.pos).cloned()?;
+        self.pos += 1;
+        Some(row)
+    }
+
+    fn reset(&mut self) {
+        self.pos = 0;
+    }
+
+    fn next_chunk(&mut self, max_rows: usize, out: &mut Vec<Row>) -> usize {
+        let remaining = self.rows.len().saturating_sub(self.pos);
+        let take = remaining.min(max_rows);
+        if take == 0 {
+            return 0;
+        }
+        out.extend(self.rows[self.pos..self.pos + take].iter().cloned());
+        self.pos += take;
+        take
+    }
+}
+
+struct DispatchResult {
+    rows: usize,
+    checksum: u64,
+    elapsed_us: u128,
+    rows_per_sec: f64,
+}
+
+fn synthetic_rows(count: usize) -> Vec<Row> {
+    (0..count)
+        .map(|i| {
+            let mut row = Row::new();
+            row.insert("id".into(), i.to_string());
+            row.insert(
+                "kind".into(),
+                if i % 3 == 0 { "hot" } else { "cold" }.into(),
+            );
+            row.insert("bucket".into(), format!("b{}", i % 16));
+            row.insert("payload".into(), format!("payload-{i:08}"));
+            row
+        })
+        .collect()
+}
+
+fn hot_filter() -> WhereExpr {
+    WhereExpr::Comparison {
+        column: "kind".into(),
+        op: CmpOp::Eq,
+        value: SqlValue::Text("hot".into()),
+    }
+}
+
+fn projection() -> Vec<SelectColumn> {
+    vec![
+        SelectColumn::Named("id".into()),
+        SelectColumn::Named("payload".into()),
+    ]
+}
+
+fn scan_pipeline(rows: &[Row]) -> Box<dyn RowIterator> {
+    Box::new(VecRowIter::new(rows.to_vec()))
+}
+
+fn filter_pipeline(rows: &[Row]) -> Box<dyn RowIterator> {
+    Box::new(FilterIter::new(scan_pipeline(rows), hot_filter()))
+}
+
+fn project_pipeline(rows: &[Row]) -> Box<dyn RowIterator> {
+    Box::new(ProjectIter::new(scan_pipeline(rows), projection()))
+}
+
+fn filter_project_limit_pipeline(rows: &[Row]) -> Box<dyn RowIterator> {
+    Box::new(LimitIter::new(
+        Box::new(ProjectIter::new(
+            Box::new(FilterIter::new(scan_pipeline(rows), hot_filter())),
+            projection(),
+        )),
+        2_048,
+    ))
+}
+
+fn aggregate_pipeline(rows: &[Row]) -> Box<dyn RowIterator> {
+    Box::new(AggregateIter::new(
+        scan_pipeline(rows),
+        vec!["bucket".into()],
+        vec![
+            SelectColumn::Named("bucket".into()),
+            SelectColumn::Aggregate(AggFunc::Count, "id".into()),
+        ],
+    ))
+}
+
+fn consume_row_by_row(mut iter: Box<dyn RowIterator>) -> DispatchResult {
+    let start = Instant::now();
+    let mut rows = 0usize;
+    let mut checksum = 0u64;
+    while let Some(row) = iter.next_row() {
+        checksum = checksum.wrapping_add(row_checksum(&row));
+        rows += 1;
+    }
+    let elapsed = start.elapsed();
+    std::hint::black_box(checksum);
+    DispatchResult {
+        rows,
+        checksum,
+        elapsed_us: elapsed.as_micros(),
+        rows_per_sec: rows as f64 / elapsed.as_secs_f64(),
+    }
+}
+
+fn consume_chunked(mut iter: Box<dyn RowIterator>) -> DispatchResult {
+    let start = Instant::now();
+    let mut rows = 0usize;
+    let mut checksum = 0u64;
+    let mut chunk = Vec::with_capacity(DEFAULT_ROW_CHUNK_SIZE);
+    loop {
+        chunk.clear();
+        let n = iter.next_chunk(DEFAULT_ROW_CHUNK_SIZE, &mut chunk);
+        if n == 0 {
+            break;
+        }
+        rows += n;
+        for row in &chunk {
+            checksum = checksum.wrapping_add(row_checksum(row));
+        }
+    }
+    let elapsed = start.elapsed();
+    std::hint::black_box(checksum);
+    DispatchResult {
+        rows,
+        checksum,
+        elapsed_us: elapsed.as_micros(),
+        rows_per_sec: rows as f64 / elapsed.as_secs_f64(),
+    }
+}
+
+fn row_checksum(row: &Row) -> u64 {
+    row.values().map(|v| v.len() as u64).sum()
+}
+
+fn bench_dispatch_pipeline(
+    name: &str,
+    rows: &[Row],
+    make_pipeline: fn(&[Row]) -> Box<dyn RowIterator>,
+) {
+    let row_by_row = consume_row_by_row(make_pipeline(rows));
+    let chunked = consume_chunked(make_pipeline(rows));
+
+    assert_eq!(row_by_row.rows, chunked.rows, "{name}: row count mismatch");
+    assert_eq!(
+        row_by_row.checksum, chunked.checksum,
+        "{name}: result checksum mismatch"
+    );
+
+    let speedup = if row_by_row.rows_per_sec > 0.0 {
+        chunked.rows_per_sec / row_by_row.rows_per_sec
+    } else {
+        0.0
+    };
+    println!(
+        "  {:40} rows={:>7} row={:>8}us chunk={:>8}us row/s={:>12.0} chunk/s={:>12.0} chunk_ratio={:>5.2}x",
+        name,
+        chunked.rows,
+        row_by_row.elapsed_us,
+        chunked.elapsed_us,
+        row_by_row.rows_per_sec,
+        chunked.rows_per_sec,
+        speedup
+    );
+}
+
+fn bench_volcano_dispatch_smoke() {
+    let rows = synthetic_rows(20_000);
+
+    println!();
+    println!("  Volcano dispatch benchmark: dyn row-at-a-time vs chunked batches");
+    println!(
+        "  Chunk size: {} rows. Ratios are informational only; CI asserts semantic equivalence.",
+        DEFAULT_ROW_CHUNK_SIZE
+    );
+
+    bench_dispatch_pipeline("scan only", &rows, scan_pipeline);
+    bench_dispatch_pipeline("scan + filter", &rows, filter_pipeline);
+    bench_dispatch_pipeline("scan + projection", &rows, project_pipeline);
+    bench_dispatch_pipeline(
+        "scan + filter + projection + limit",
+        &rows,
+        filter_project_limit_pipeline,
+    );
+    bench_dispatch_pipeline("scan + aggregate", &rows, aggregate_pipeline);
 }
 
 /// Benchmark: Sequential writes (single key per batch)
@@ -270,4 +481,6 @@ fn run_benchmarks() {
 
     // All benchmarks should complete without error
     assert!(results.len() == 7, "All benchmarks should run");
+
+    bench_volcano_dispatch_smoke();
 }

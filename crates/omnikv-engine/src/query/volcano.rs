@@ -35,9 +35,36 @@ use std::sync::Arc;
 // ─── Iterator Trait ─────────────────────────────────────────────────────────
 
 /// The core volcano iterator trait. Every operator implements this.
+///
+/// `next_row` remains the compatibility primitive for custom operators and
+/// complex nodes. Built-in streaming operators also override `next_chunk`, so a
+/// caller can measure and use batch dispatch for scan/filter/project/limit
+/// without closing the operator set. The default SQL path still uses
+/// row-at-a-time dispatch until benchmarks justify a targeted switch, as
+/// documented in
+/// `docs/volcano-dispatch.md`.
 pub trait RowIterator {
     /// Returns the next row, or None when exhausted.
     fn next_row(&mut self) -> Option<Row>;
+
+    /// Fill `out` with up to `max_rows` rows and return the number appended.
+    ///
+    /// Implementations must return `0` only when exhausted or when
+    /// `max_rows == 0`. The default preserves compatibility for existing and
+    /// third-party row-at-a-time operators.
+    fn next_chunk(&mut self, max_rows: usize, out: &mut Vec<Row>) -> usize {
+        let start_len = out.len();
+        if max_rows == 0 {
+            return 0;
+        }
+        while out.len() - start_len < max_rows {
+            match self.next_row() {
+                Some(row) => out.push(row),
+                None => break,
+            }
+        }
+        out.len() - start_len
+    }
 
     /// Reset the iterator to the beginning (for nested loops).
     fn reset(&mut self) {}
@@ -51,6 +78,12 @@ pub trait RowIterator {
         rows
     }
 }
+
+/// Default batch size for the chunked volcano path.
+///
+/// 1024 rows is intentionally conservative: it amortizes vtable dispatch while
+/// keeping per-operator scratch buffers modest for typical SQL result rows.
+pub const DEFAULT_ROW_CHUNK_SIZE: usize = 1024;
 
 // ─── Sequential Scan Iterator ───────────────────────────────────────────────
 
@@ -111,6 +144,17 @@ impl RowIterator for SeqScanIter {
     fn reset(&mut self) {
         self.pos = 0;
     }
+
+    fn next_chunk(&mut self, max_rows: usize, out: &mut Vec<Row>) -> usize {
+        let remaining = self.rows.len().saturating_sub(self.pos);
+        let take = remaining.min(max_rows);
+        if take == 0 {
+            return 0;
+        }
+        out.extend(self.rows[self.pos..self.pos + take].iter().cloned());
+        self.pos += take;
+        take
+    }
 }
 
 // ─── PK Lookup Iterator ────────────────────────────────────────────────────
@@ -152,6 +196,19 @@ impl RowIterator for PkLookupIter {
     fn reset(&mut self) {
         self.consumed = false;
     }
+
+    fn next_chunk(&mut self, max_rows: usize, out: &mut Vec<Row>) -> usize {
+        if max_rows == 0 || self.consumed {
+            return 0;
+        }
+        self.consumed = true;
+        if let Some(row) = &self.row {
+            out.push(row.clone());
+            1
+        } else {
+            0
+        }
+    }
 }
 
 // ─── Filter Iterator ────────────────────────────────────────────────────────
@@ -160,11 +217,16 @@ impl RowIterator for PkLookupIter {
 pub struct FilterIter {
     child: Box<dyn RowIterator>,
     predicate: WhereExpr,
+    scratch: Vec<Row>,
 }
 
 impl FilterIter {
     pub fn new(child: Box<dyn RowIterator>, predicate: WhereExpr) -> Self {
-        Self { child, predicate }
+        Self {
+            child,
+            predicate,
+            scratch: Vec::with_capacity(DEFAULT_ROW_CHUNK_SIZE),
+        }
     }
 }
 
@@ -177,6 +239,29 @@ impl RowIterator for FilterIter {
             }
         }
     }
+
+    fn next_chunk(&mut self, max_rows: usize, out: &mut Vec<Row>) -> usize {
+        let start_len = out.len();
+        if max_rows == 0 {
+            return 0;
+        }
+
+        while out.len() - start_len < max_rows {
+            self.scratch.clear();
+            let requested = max_rows - (out.len() - start_len);
+            let n = self.child.next_chunk(requested, &mut self.scratch);
+            if n == 0 {
+                break;
+            }
+            out.extend(
+                self.scratch
+                    .drain(..)
+                    .filter(|row| eval_where(row, &self.predicate)),
+            );
+        }
+
+        out.len() - start_len
+    }
 }
 
 // ─── Project Iterator ───────────────────────────────────────────────────────
@@ -185,48 +270,71 @@ impl RowIterator for FilterIter {
 pub struct ProjectIter {
     child: Box<dyn RowIterator>,
     columns: Vec<SelectColumn>,
+    scratch: Vec<Row>,
 }
 
 impl ProjectIter {
     pub fn new(child: Box<dyn RowIterator>, columns: Vec<SelectColumn>) -> Self {
-        Self { child, columns }
+        Self {
+            child,
+            columns,
+            scratch: Vec::with_capacity(DEFAULT_ROW_CHUNK_SIZE),
+        }
     }
 }
 
 impl RowIterator for ProjectIter {
     fn next_row(&mut self) -> Option<Row> {
         let row = self.child.next_row()?;
-        if self.columns.iter().any(|c| matches!(c, SelectColumn::Star)) {
-            return Some(row);
-        }
-        let mut projected = Row::new();
-        for col in &self.columns {
-            match col {
-                SelectColumn::Named(n) => {
-                    if let Some(v) = row.get(n) {
-                        projected.insert(n.clone(), v.clone());
-                    }
-                }
-                SelectColumn::Qualified(t, n) => {
-                    let key = format!("{}.{}", t, n);
-                    let val = row
-                        .get(&key)
-                        .or_else(|| row.get(n))
-                        .cloned()
-                        .unwrap_or_default();
-                    projected.insert(n.clone(), val);
-                }
-                SelectColumn::Aggregate(func, target) => {
-                    let name = format!("{}({})", format!("{:?}", func).to_lowercase(), target);
-                    if let Some(v) = row.get(&name) {
-                        projected.insert(name, v.clone());
-                    }
-                }
-                _ => {}
-            }
-        }
-        Some(projected)
+        Some(project_row(row, &self.columns))
     }
+
+    fn next_chunk(&mut self, max_rows: usize, out: &mut Vec<Row>) -> usize {
+        if max_rows == 0 {
+            return 0;
+        }
+        self.scratch.clear();
+        let n = self.child.next_chunk(max_rows, &mut self.scratch);
+        out.extend(
+            self.scratch
+                .drain(..)
+                .map(|row| project_row(row, &self.columns)),
+        );
+        n
+    }
+}
+
+fn project_row(row: Row, columns: &[SelectColumn]) -> Row {
+    if columns.iter().any(|c| matches!(c, SelectColumn::Star)) {
+        return row;
+    }
+    let mut projected = Row::new();
+    for col in columns {
+        match col {
+            SelectColumn::Named(n) => {
+                if let Some(v) = row.get(n) {
+                    projected.insert(n.clone(), v.clone());
+                }
+            }
+            SelectColumn::Qualified(t, n) => {
+                let key = format!("{}.{}", t, n);
+                let val = row
+                    .get(&key)
+                    .or_else(|| row.get(n))
+                    .cloned()
+                    .unwrap_or_default();
+                projected.insert(n.clone(), val);
+            }
+            SelectColumn::Aggregate(func, target) => {
+                let name = format!("{}({})", format!("{:?}", func).to_lowercase(), target);
+                if let Some(v) = row.get(&name) {
+                    projected.insert(name, v.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+    projected
 }
 
 // ─── Limit Iterator ─────────────────────────────────────────────────────────
@@ -256,6 +364,17 @@ impl RowIterator for LimitIter {
         let row = self.child.next_row()?;
         self.emitted += 1;
         Some(row)
+    }
+
+    fn next_chunk(&mut self, max_rows: usize, out: &mut Vec<Row>) -> usize {
+        if max_rows == 0 || self.emitted >= self.limit {
+            return 0;
+        }
+        let remaining = self.limit - self.emitted;
+        let requested = max_rows.min(remaining);
+        let n = self.child.next_chunk(requested, out);
+        self.emitted += n;
+        n
     }
 }
 
@@ -297,6 +416,17 @@ impl RowIterator for SortIter {
         } else {
             None
         }
+    }
+
+    fn next_chunk(&mut self, max_rows: usize, out: &mut Vec<Row>) -> usize {
+        let remaining = self.sorted.len().saturating_sub(self.pos);
+        let take = remaining.min(max_rows);
+        if take == 0 {
+            return 0;
+        }
+        out.extend(self.sorted[self.pos..self.pos + take].iter().cloned());
+        self.pos += take;
+        take
     }
 }
 
@@ -502,6 +632,17 @@ impl RowIterator for AggregateIter {
         } else {
             None
         }
+    }
+
+    fn next_chunk(&mut self, max_rows: usize, out: &mut Vec<Row>) -> usize {
+        let remaining = self.result.len().saturating_sub(self.pos);
+        let take = remaining.min(max_rows);
+        if take == 0 {
+            return 0;
+        }
+        out.extend(self.result[self.pos..self.pos + take].iter().cloned());
+        self.pos += take;
+        take
     }
 }
 
