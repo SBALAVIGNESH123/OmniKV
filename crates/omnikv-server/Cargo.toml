@@ -34,3 +34,6 @@ tower = { version = "0.5", features = ["util"] }
 [[bin]]
 name = "omnikv-server"
 path = "src/main.rs"
+
+[lints]
+workspace = true

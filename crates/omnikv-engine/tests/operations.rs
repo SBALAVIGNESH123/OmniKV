@@ -1,3 +1,10 @@
+#![expect(
+    clippy::doc_markdown,
+    clippy::redundant_clone,
+    clippy::stable_sort_primitive,
+    clippy::uninlined_format_args,
+    reason = "Operations tests keep scenario setup readable and deterministic; strict style findings are documented separately from correctness checks."
+)]
 // ═══════════════════════════════════════════════════════════════════════════
 // Operations & Edge Case Tests — Gaps #32 through #47
 // ═══════════════════════════════════════════════════════════════════════════

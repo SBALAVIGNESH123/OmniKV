@@ -3,6 +3,13 @@
 //! Tests for configuration, diagnostics, metrics, health, rate limiting,
 //! group commit, graceful shutdown, and crash recovery.
 
+#![expect(
+    clippy::float_cmp,
+    clippy::significant_drop_tightening,
+    clippy::uninlined_format_args,
+    reason = "Operational maturity tests keep lock/diagnostic scopes explicit and scenario output readable."
+)]
+
 use omni_engine::hardening::{GroupCommitEngine, RateLimiter};
 use omni_engine::metrics_prometheus;
 use omni_engine::ops::{DiagnosticReport, LogFormat, OmniConfig};

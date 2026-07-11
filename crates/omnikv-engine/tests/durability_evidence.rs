@@ -1,3 +1,10 @@
+#![expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::doc_markdown,
+    clippy::uninlined_format_args,
+    reason = "Durability evidence tests use generated crash-case data and compact diagnostic output to keep failure scenarios auditable."
+)]
 /// Phase 3 — Durability Evidence Test Suite
 ///
 /// These tests prove OmniKV survives real failure scenarios:

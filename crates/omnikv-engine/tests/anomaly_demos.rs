@@ -4,6 +4,13 @@
 //! Each test sets up a scenario that would cause data corruption under
 //! weaker isolation levels, and verifies OmniKV detects and aborts it.
 
+#![expect(
+    clippy::doc_markdown,
+    clippy::or_fun_call,
+    clippy::uninlined_format_args,
+    reason = "Anomaly demos intentionally read like scenario walkthroughs with generated values and human-facing assertions."
+)]
+
 use omni_engine::transaction::TransactionManager;
 use omni_engine::{OmniKV, WriteBatch};
 use std::sync::Arc;

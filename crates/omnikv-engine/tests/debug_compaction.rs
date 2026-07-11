@@ -1,3 +1,8 @@
+#![expect(
+    clippy::uninlined_format_args,
+    reason = "Debug reproduction test keeps compact diagnostic formatting."
+)]
+
 use omni_engine::{OmniKV, WriteBatch};
 #[test]
 fn test_debug_compaction() {

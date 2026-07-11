@@ -12,3 +12,15 @@ edition = "2024"
 authors = ["Balavignesh"]
 license = "MIT"
 repository = "https://github.com/SBALAVIGNESH123/OmniKV"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+
+[workspace.lints.rust]
+dead_code = "warn"
+unused_imports = "warn"
+unused_mut = "warn"
+unused_variables = "warn"
+mismatched_lifetime_syntaxes = "warn"

@@ -1,4 +1,8 @@
-#![allow(clippy::field_reassign_with_default)]
+#![expect(
+    clippy::field_reassign_with_default,
+    clippy::redundant_closure_for_method_calls,
+    reason = "Config tests intentionally mutate defaults one field at a time to isolate validation failures."
+)]
 use std::sync::Mutex;
 
 use omni_engine::config::{

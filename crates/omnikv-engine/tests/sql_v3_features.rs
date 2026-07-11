@@ -2,6 +2,11 @@
 // SQL v3 Feature Tests — OFFSET, HAVING, Subqueries, UNION, RIGHT JOIN
 // ═══════════════════════════════════════════════════════════════════════════
 
+#![expect(
+    clippy::uninlined_format_args,
+    reason = "SQL feature tests use generated query data extensively; style-only formatting cleanup is tracked separately."
+)]
+
 use omni_engine::OmniKV;
 use omni_engine::sql::*;
 use omni_engine::sql_exec::*;

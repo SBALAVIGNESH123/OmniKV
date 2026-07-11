@@ -3,12 +3,10 @@
 //! Executes queries using the optimizer's physical plan tree instead of
 //! the old hardcoded scan-filter-sort pipeline.
 
-#![allow(dead_code)]
-
 use crate::OmniKV;
 use crate::catalog::{Catalog, TableDef};
-use crate::optimizer::*;
-use crate::sql::*;
+use crate::optimizer::{AccessMethod, PlanNode};
+use crate::sql::{AggFunc, CmpOp, JoinType, OrderByItem, SelectColumn, WhereExpr};
 use crate::sql_exec::Row;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};

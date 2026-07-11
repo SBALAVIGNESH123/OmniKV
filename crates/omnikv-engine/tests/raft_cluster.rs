@@ -2,6 +2,17 @@
 //!
 //! Proves: log replication, leader election, crash recovery across 3 nodes.
 
+#![expect(
+    clippy::doc_markdown,
+    clippy::redundant_clone,
+    clippy::similar_names,
+    clippy::single_match_else,
+    clippy::too_many_lines,
+    clippy::uninlined_format_args,
+    clippy::used_underscore_binding,
+    reason = "Large Raft integration suite favors explicit node names, generated keys, and readable distributed-failure diagnostics."
+)]
+
 use omni_engine::OmniKV;
 use omni_engine::raft_storage::OmniRaftStorage;
 use std::sync::Arc;

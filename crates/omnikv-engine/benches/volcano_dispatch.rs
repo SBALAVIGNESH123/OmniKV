@@ -7,6 +7,13 @@
 //!   cargo bench -p omnikv-engine --bench volcano_dispatch
 //!   cargo bench -p omnikv-engine --bench volcano_dispatch -- --rows 200000 --rounds 5
 
+#![expect(
+    clippy::cast_precision_loss,
+    clippy::doc_markdown,
+    clippy::missing_const_for_fn,
+    reason = "Dispatch benchmark favors readable throughput math and CLI documentation over style-only rewrites."
+)]
+
 use omni_engine::sql::{AggFunc, CmpOp, SelectColumn, SqlValue, WhereExpr};
 use omni_engine::sql_exec::Row;
 use omni_engine::volcano::{

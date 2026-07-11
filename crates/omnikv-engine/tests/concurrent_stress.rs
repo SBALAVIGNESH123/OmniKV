@@ -3,6 +3,12 @@
 //! These tests prove correctness under REAL parallel thread contention —
 //! not simulated single-threaded scenarios.
 
+#![expect(
+    clippy::or_fun_call,
+    clippy::uninlined_format_args,
+    reason = "Stress tests favor scenario clarity and repeated generated keys over style-only rewrites."
+)]
+
 use omni_engine::transaction::TransactionManager;
 use omni_engine::{OmniKV, WriteBatch};
 use std::sync::Arc;

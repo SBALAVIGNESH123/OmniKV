@@ -482,7 +482,10 @@ struct PreparedState {
     /// The prepared write batch (ready to commit).
     batch: WriteBatch,
     /// Sequence at which this was prepared (for recovery).
-    #[allow(dead_code)]
+    #[expect(
+        dead_code,
+        reason = "Prepared sequence is retained for recovery/audit semantics even though the current participant tests do not read it directly yet."
+    )]
     prepare_seq: u64,
     /// When this was prepared.
     prepared_at: Instant,

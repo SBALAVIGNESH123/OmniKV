@@ -1,8 +1,62 @@
-#![allow(dead_code)]
-#![allow(unused_imports)]
-#![allow(unused_variables)]
-#![allow(unused_mut)]
-#![allow(mismatched_lifetime_syntaxes)]
+#![expect(
+    dead_code,
+    unused_imports,
+    unused_variables,
+    reason = "Legacy modules still expose staged database features and compatibility shims; issue #64 makes this debt explicit instead of hiding it behind broad allow attributes."
+)]
+#![expect(
+    clippy::assigning_clones,
+    clippy::bool_to_int_with_if,
+    clippy::branches_sharing_code,
+    clippy::cast_lossless,
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss,
+    clippy::collapsible_else_if,
+    clippy::collection_is_never_read,
+    clippy::derive_partial_eq_without_eq,
+    clippy::doc_markdown,
+    clippy::explicit_iter_loop,
+    clippy::format_collect,
+    clippy::format_push_string,
+    clippy::if_not_else,
+    clippy::ignored_unit_patterns,
+    clippy::items_after_statements,
+    clippy::manual_let_else,
+    clippy::manual_string_new,
+    clippy::map_unwrap_or,
+    clippy::match_same_arms,
+    clippy::match_wildcard_for_single_variants,
+    clippy::missing_const_for_fn,
+    clippy::missing_errors_doc,
+    clippy::missing_panics_doc,
+    clippy::must_use_candidate,
+    clippy::needless_collect,
+    clippy::needless_continue,
+    clippy::needless_pass_by_value,
+    clippy::non_std_lazy_statics,
+    clippy::option_if_let_else,
+    clippy::or_fun_call,
+    clippy::redundant_clone,
+    clippy::redundant_closure_for_method_calls,
+    clippy::redundant_else,
+    clippy::self_only_used_in_recursion,
+    clippy::semicolon_if_nothing_returned,
+    clippy::significant_drop_tightening,
+    clippy::single_char_pattern,
+    clippy::single_match_else,
+    clippy::suboptimal_flops,
+    clippy::too_long_first_doc_paragraph,
+    clippy::too_many_lines,
+    clippy::uninlined_format_args,
+    clippy::unnecessary_wraps,
+    clippy::unreadable_literal,
+    clippy::unused_self,
+    clippy::use_self,
+    clippy::used_underscore_binding,
+    reason = "Strict clippy::pedantic and clippy::nursery are now enabled. These legacy findings are documented debt to burn down in focused follow-up PRs while preventing new undocumented lint categories."
+)]
 
 pub mod storage {
     pub mod core;

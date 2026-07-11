@@ -1,3 +1,12 @@
+#![expect(
+    clippy::doc_markdown,
+    clippy::explicit_iter_loop,
+    clippy::many_single_char_names,
+    clippy::match_same_arms,
+    clippy::uninlined_format_args,
+    reason = "Storage correctness scenarios use compact generated keys and explicit loops to make crash cases auditable."
+)]
+
 /// Stage 1 — Single-node storage correctness test suite.
 ///
 /// Each test simulates a specific crash or failure point and verifies:

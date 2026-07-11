@@ -3,6 +3,15 @@
 //! This test scans production `src/` files and fails if bare `.unwrap()` appears
 //! outside of approved locations.  See docs/PANIC_POLICY.md for the full policy.
 
+#![expect(
+    clippy::doc_markdown,
+    clippy::manual_assert,
+    clippy::manual_let_else,
+    clippy::single_match_else,
+    clippy::uninlined_format_args,
+    reason = "The audit test intentionally formats policy failures as grouped diagnostics; style cleanup is secondary to readable CI failure output."
+)]
+
 use std::fs;
 use std::path::Path;
 

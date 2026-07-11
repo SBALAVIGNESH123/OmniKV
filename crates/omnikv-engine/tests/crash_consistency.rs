@@ -1,3 +1,7 @@
+#![expect(
+    clippy::doc_markdown,
+    reason = "Crash consistency test documentation names engine files and recovery concepts directly for operator readability."
+)]
 //! Crash-consistency tests — these tests drive the **real OmniKV engine**.
 //!
 //! Every test:

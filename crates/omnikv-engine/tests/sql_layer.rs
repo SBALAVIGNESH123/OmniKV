@@ -2,6 +2,12 @@
 // SQL Layer Integration Tests — Gaps #23 through #31
 // ═══════════════════════════════════════════════════════════════════════════
 
+#![expect(
+    clippy::doc_markdown,
+    clippy::uninlined_format_args,
+    reason = "SQL integration tests use human-readable query labels and generated paths; style cleanup is documented separately from SQL correctness."
+)]
+
 use omni_engine::OmniKV;
 use omni_engine::sql::*;
 use omni_engine::sql_exec::*;

@@ -1,6 +1,14 @@
 //! Storage Performance Tests
 //! Validates throughput, compaction, cache, compression, and amplification.
 
+#![expect(
+    clippy::cast_lossless,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss,
+    clippy::uninlined_format_args,
+    reason = "Performance tests use compact throughput math and generated key strings for readability."
+)]
+
 use omni_engine::{OmniKV, WriteBatch};
 use std::sync::Arc;
 use std::time::Instant;

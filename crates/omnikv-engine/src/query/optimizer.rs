@@ -9,11 +9,12 @@
 //!
 //! The optimizer produces a `QueryPlan` tree that the executor walks.
 
-#![allow(dead_code)]
-
 use crate::catalog::Catalog;
 use crate::secondary_index::{IndexCatalog, IndexDefinition};
-use crate::sql::*;
+use crate::sql::{
+    CmpOp, FromClause, JoinType, OrderByItem, SelectColumn, SqlStatement, SqlValue, WhereExpr,
+    parse_sql,
+};
 use std::fmt;
 use std::sync::Arc;
 

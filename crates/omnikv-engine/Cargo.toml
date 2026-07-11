@@ -15,6 +15,9 @@ path = "src/lib.rs"
 default = []
 failpoints = []
 
+[lints]
+workspace = true
+
 [dependencies]
 memmap2 = "0.9.11"
 tokio = { version = "1.52.1", features = ["full", "macros"] }
