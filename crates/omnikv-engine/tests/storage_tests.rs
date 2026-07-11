@@ -1,7 +1,7 @@
 //! Integration tests for the OmniKV storage engine.
 //! These test the full write path, read path, compaction, TTL, MVCC, and crash recovery.
 
-use omni_engine::{OmniError, OmniKV, WriteBatch};
+use omni_engine::{OmniError, OmniKV, OmniRecord, SSTableReader, SSTableWriter, WriteBatch};
 use std::sync::Arc;
 use tempfile::TempDir;
 
@@ -28,6 +28,102 @@ fn test_basic_set_get() {
     let seq = db.get_seq();
     let val = db.find("hello", seq).unwrap();
     assert_eq!(val, Some("world".to_string()));
+}
+
+#[test]
+fn test_database_lock_rejects_second_open_until_drop() {
+    let dir = TempDir::new().expect("tempdir");
+    let manifest = dir
+        .path()
+        .join("test_manifest")
+        .to_string_lossy()
+        .to_string();
+    let wal = dir.path().join("test_wal").to_string_lossy().to_string();
+
+    let first = OmniKV::open(&manifest, &wal).expect("first open should acquire LOCK");
+    let second = OmniKV::open(&manifest, &wal);
+
+    assert!(
+        matches!(second, Err(OmniError::DatabaseAlreadyOpen { .. })),
+        "second open should fail with DatabaseAlreadyOpen"
+    );
+
+    drop(first);
+
+    let reopened = OmniKV::open(&manifest, &wal);
+    assert!(
+        reopened.is_ok(),
+        "database LOCK should be released after final handle is dropped"
+    );
+}
+
+#[test]
+fn test_truncated_sstable_reader_fails_closed_without_panic() {
+    let record = OmniRecord::new(1, b"safe-key".to_vec(), 0, 10, 123, 0);
+    let mut encoded = record.encode();
+    encoded.truncate(encoded.len() - 3);
+
+    let reader = SSTableReader::new(&encoded);
+
+    assert_eq!(reader.find(b"safe-key", 10), None);
+    assert_eq!(reader.iter_from(b"").count(), 0);
+}
+
+#[test]
+fn test_existing_mmap_reader_survives_compaction_root_swap() {
+    let (db, _dir) = create_test_db();
+
+    for i in 0..24 {
+        let mut batch = WriteBatch::new();
+        batch
+            .set(&format!("held-map-{i:03}"), format!("value-{i:03}"))
+            .unwrap();
+        db.commit_batch(&batch).unwrap();
+    }
+    db.compact_sstables().unwrap();
+
+    let held_l0_mmap = {
+        let roots = db.load_roots();
+        assert_eq!(roots.sstables.len(), 1);
+        roots.sstables[0].0.clone()
+    };
+
+    db.compact_l0_to_l1().unwrap();
+    assert_eq!(db.sstable_count(), 0);
+    assert_eq!(db.l1_sstable_count(), 1);
+
+    let held_reader = SSTableReader::new(&held_l0_mmap);
+    let rec = held_reader
+        .find(b"held-map-007", db.get_seq())
+        .expect("held mmap should remain readable after root swap");
+    let uncompressed_flag = 1_u64 << 63;
+    assert_eq!(rec.1 & !uncompressed_flag, "value-007".len() as u64);
+}
+
+#[test]
+fn test_sstable_reader_handles_truncated_v2_index_trailer_without_panic() {
+    let dir = TempDir::new().expect("tempdir");
+    let table_path = dir.path().join("truncated-index.sst");
+    let file = std::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .read(true)
+        .open(&table_path)
+        .expect("create table");
+
+    let mut writer = SSTableWriter::new(&file);
+    writer
+        .append(&OmniRecord::new(1, b"v2-key".to_vec(), 0, 5, 99, 0))
+        .unwrap();
+    writer.finish().unwrap();
+    file.sync_all().unwrap();
+
+    let mut bytes = std::fs::read(&table_path).unwrap();
+    bytes.truncate(bytes.len() - 6);
+    let reader = SSTableReader::new(&bytes);
+
+    assert_eq!(reader.find(b"v2-key", 10), Some((0, 5, 99, 0)));
+    assert_eq!(reader.iter_from(b"").count(), 1);
 }
 
 #[test]

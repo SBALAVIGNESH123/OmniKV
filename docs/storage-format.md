@@ -17,6 +17,24 @@
 }
 ```
 
+## Database Directory Lock (`LOCK`)
+
+Every OmniKV database directory contains a `LOCK` file. It is not part of the
+logical data model; it exists to protect the physical files in the directory.
+
+On `OmniKV::open()`, the engine:
+
+1. resolves the parent directory of the manifest path,
+2. creates or opens `<database-directory>/LOCK`,
+3. acquires a non-blocking exclusive OS lock,
+4. only then starts manifest recovery, WAL replay, heap opening, and SSTable
+   mmap creation.
+
+If another live engine already owns the lock, open fails with
+`OmniError::DatabaseAlreadyOpen`. The lock is held for the full lifetime of the
+`OmniKV` handle and is released only after mmap-bearing storage roots and file
+handles are dropped.
+
 ### Version compatibility
 
 | `format_version` | Behaviour |
@@ -49,6 +67,24 @@ Append-only raw value blobs. Each value pointer in the memtable holds
 
 Sorted key-value pairs with Bloom filter footer. No explicit version byte
 in v1 — future incompatible changes require a `SSTABLE_FORMAT_VERSION` magic prefix.
+
+### mmap Safety Invariants
+
+OmniKV maps SSTable/base files read-only. The format relies on these invariants:
+
+- A database-directory `LOCK` prevents two OmniKV processes from opening and
+  mutating the same database files concurrently.
+- Mapped SSTable/base files are immutable. New content is written to new files,
+  synced, mapped, and then installed through an atomic root swap.
+- Compaction and garbage collection never truncate a file that might still have
+  a live mapping. Old files are removed only after the root has moved away, and
+  live readers keep `Arc<Mmap>` handles until they finish.
+- Corrupt or truncated SSTable records fail closed during decode. Readers stop
+  at the invalid record instead of panicking or reading past the mapped slice.
+- Unix, Linux, macOS, and Windows all use the same high-level invariant: no
+  mutable writer may operate on an actively mapped database file. Windows may
+  reject deletion of a still-mapped file; cleanup treats that as a safe deferred
+  deletion rather than a correctness failure.
 
 ---
 
