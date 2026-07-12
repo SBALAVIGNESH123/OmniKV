@@ -11,6 +11,7 @@
 use axum::{
     Json, Router,
     body::Body,
+    extract::DefaultBodyLimit,
     extract::Request,
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode, header},
@@ -21,6 +22,15 @@ use omni_engine::{OmniError, OmniKV, WriteBatch};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tower_http::cors::CorsLayer;
+
+/// Default number of rows returned by REST `/scan` when no limit is supplied.
+const DEFAULT_REST_SCAN_LIMIT: usize = 1_000;
+
+/// Hard cap for REST `/scan` responses.
+const MAX_REST_SCAN_LIMIT: usize = 10_000;
+
+/// Hard cap for JSON request bodies accepted by the REST API.
+const MAX_REST_BODY_BYTES: usize = 1024 * 1024;
 
 /// Application state shared across all handlers.
 #[derive(Clone)]
@@ -190,6 +200,7 @@ pub fn build_router(state: AppState) -> Router {
         .merge(read_routes)
         .merge(write_routes)
         .merge(admin_routes)
+        .layer(DefaultBodyLimit::max(MAX_REST_BODY_BYTES))
         .layer(CorsLayer::permissive())
         .with_state(state)
 }
@@ -386,13 +397,21 @@ async fn scan_handler(
     State(state): State<AppState>,
     Query(q): Query<ScanQuery>,
 ) -> impl IntoResponse {
+    let limit = match bounded_rest_scan_limit(q.limit) {
+        Ok(limit) => limit,
+        Err(msg) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                ApiResponse::<Vec<KeyValue>>::err(&msg),
+            );
+        }
+    };
     let start = q.start.as_deref().unwrap_or("");
     let end = q.end.as_deref().unwrap_or("\x7F");
     let seq = state.db.get_seq();
 
     match state.db.scan(start, end, seq) {
         Ok(results) => {
-            let limit = q.limit.unwrap_or(1000);
             let items: Vec<KeyValue> = results
                 .into_iter()
                 .take(limit)
@@ -404,6 +423,16 @@ async fn scan_handler(
             StatusCode::INTERNAL_SERVER_ERROR,
             ApiResponse::<Vec<KeyValue>>::err(&sanitize_storage_err(&e)),
         ),
+    }
+}
+
+fn bounded_rest_scan_limit(limit: Option<usize>) -> Result<usize, String> {
+    match limit {
+        Some(limit) if limit > MAX_REST_SCAN_LIMIT => Err(format!(
+            "scan limit {limit} exceeds maximum of {MAX_REST_SCAN_LIMIT}"
+        )),
+        Some(limit) => Ok(limit),
+        None => Ok(DEFAULT_REST_SCAN_LIMIT),
     }
 }
 
@@ -606,5 +635,26 @@ mod tests {
             .expect("response");
 
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn scan_rejects_limits_above_rest_cap() {
+        let (router, _dir, secret) = test_router();
+        let token = crate::auth::generate_token("reader", "read", &secret, 60).expect("read token");
+        let oversized = MAX_REST_SCAN_LIMIT + 1;
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(format!("/scan?limit={oversized}"))
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 }
