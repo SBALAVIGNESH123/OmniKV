@@ -98,6 +98,7 @@ On Windows/MSVC, full debug test linking can require significant free disk space
 ## Operations docs
 
 - [Backup and restore](docs/backup_restore.md)
+- [Protocol and result-size limits](docs/protocol-limits.md)
 - [SQL support matrix](docs/sql-support.md)
 
 ## Workspace layout
