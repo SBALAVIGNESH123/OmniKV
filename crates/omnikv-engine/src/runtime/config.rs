@@ -73,6 +73,12 @@ pub struct ServerConfig {
     pub jwt_secret: String,
     #[serde(default = "default_bootstrap_admin_key")]
     pub bootstrap_admin_key: String,
+    #[serde(default = "default_rate_limit_per_sec")]
+    pub rate_limit_per_sec: f64,
+    #[serde(default = "default_rate_limit_burst")]
+    pub rate_limit_burst: u32,
+    #[serde(default = "default_rate_limit_max_users")]
+    pub rate_limit_max_users: usize,
     #[serde(default)]
     pub tls_cert_path: Option<String>,
     #[serde(default)]
@@ -109,6 +115,18 @@ fn default_bootstrap_admin_key() -> String {
     DEV_BOOTSTRAP_ADMIN_KEY.into()
 }
 
+fn default_rate_limit_per_sec() -> f64 {
+    1000.0
+}
+
+fn default_rate_limit_burst() -> u32 {
+    100
+}
+
+fn default_rate_limit_max_users() -> usize {
+    10_000
+}
+
 fn default_log_level() -> String {
     "info".into()
 }
@@ -123,6 +141,9 @@ impl Default for ServerConfig {
             tcp_addr: default_tcp_addr(),
             jwt_secret: default_jwt_secret(),
             bootstrap_admin_key: default_bootstrap_admin_key(),
+            rate_limit_per_sec: default_rate_limit_per_sec(),
+            rate_limit_burst: default_rate_limit_burst(),
+            rate_limit_max_users: default_rate_limit_max_users(),
             tls_cert_path: None,
             tls_key_path: None,
             tls_insecure_skip: false,
@@ -187,6 +208,19 @@ impl ServerConfig {
         } else if let Ok(v) = std::env::var("OMNI_BOOTSTRAP_ADMIN_KEY") {
             self.bootstrap_admin_key = v;
         }
+        if let Ok(v) =
+            std::env::var("OMNIKV_RATE_LIMIT_PER_SEC").or_else(|_| std::env::var("OMNI_RATE_LIMIT"))
+        {
+            self.rate_limit_per_sec = v.parse().unwrap_or(self.rate_limit_per_sec);
+        }
+        if let Ok(v) =
+            std::env::var("OMNIKV_RATE_LIMIT_BURST").or_else(|_| std::env::var("OMNI_RATE_BURST"))
+        {
+            self.rate_limit_burst = v.parse().unwrap_or(self.rate_limit_burst);
+        }
+        if let Ok(v) = std::env::var("OMNIKV_RATE_LIMIT_MAX_USERS") {
+            self.rate_limit_max_users = v.parse().unwrap_or(self.rate_limit_max_users);
+        }
         if let Ok(v) = std::env::var("OMNIKV_TLS_CERT_PATH") {
             self.tls_cert_path = Some(v);
         }
@@ -234,6 +268,21 @@ impl ServerConfig {
         if self.bootstrap_admin_key == self.jwt_secret {
             return Err(ConfigError(
                 "bootstrap admin key must be different from the JWT secret".into(),
+            ));
+        }
+        if self.rate_limit_per_sec <= 0.0 {
+            return Err(ConfigError(
+                "OMNIKV_RATE_LIMIT_PER_SEC must be greater than 0".into(),
+            ));
+        }
+        if self.rate_limit_burst == 0 {
+            return Err(ConfigError(
+                "OMNIKV_RATE_LIMIT_BURST must be greater than 0".into(),
+            ));
+        }
+        if self.rate_limit_max_users == 0 {
+            return Err(ConfigError(
+                "OMNIKV_RATE_LIMIT_MAX_USERS must be greater than 0".into(),
             ));
         }
         if !self.tls_insecure_skip {

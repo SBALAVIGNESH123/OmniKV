@@ -102,6 +102,14 @@ fn test_defaults_mode_is_development() {
 }
 
 #[test]
+fn test_defaults_rate_limits_are_enabled() {
+    let cfg = ServerConfig::default();
+    assert!((cfg.rate_limit_per_sec - 1000.0).abs() < f64::EPSILON);
+    assert_eq!(cfg.rate_limit_burst, 100);
+    assert_eq!(cfg.rate_limit_max_users, 10_000);
+}
+
+#[test]
 fn test_defaults_tls_disabled() {
     let cfg = ServerConfig::default();
     assert!(cfg.tls_cert_path.is_none());
@@ -190,6 +198,38 @@ fn test_env_override_mode_production() {
         cfg.apply_env();
         assert_eq!(cfg.mode, ServerMode::Production);
     });
+}
+
+#[test]
+fn test_env_override_rate_limits() {
+    with_env(
+        &[
+            ("OMNIKV_RATE_LIMIT_PER_SEC", "42.5"),
+            ("OMNIKV_RATE_LIMIT_BURST", "9"),
+            ("OMNIKV_RATE_LIMIT_MAX_USERS", "1234"),
+        ],
+        || {
+            let mut cfg = ServerConfig::default();
+            cfg.apply_env();
+            assert!((cfg.rate_limit_per_sec - 42.5).abs() < f64::EPSILON);
+            assert_eq!(cfg.rate_limit_burst, 9);
+            assert_eq!(cfg.rate_limit_max_users, 1234);
+        },
+    );
+}
+
+#[test]
+fn test_env_legacy_rate_limit_aliases() {
+    with_env_removed(
+        &[("OMNI_RATE_LIMIT", "24"), ("OMNI_RATE_BURST", "8")],
+        &["OMNIKV_RATE_LIMIT_PER_SEC", "OMNIKV_RATE_LIMIT_BURST"],
+        || {
+            let mut cfg = ServerConfig::default();
+            cfg.apply_env();
+            assert!((cfg.rate_limit_per_sec - 24.0).abs() < f64::EPSILON);
+            assert_eq!(cfg.rate_limit_burst, 8);
+        },
+    );
 }
 
 #[test]
@@ -283,6 +323,48 @@ fn test_prod_rejects_missing_tls() {
     };
     let err = cfg.validate_production().unwrap_err();
     assert!(err.0.contains("TLS"), "got: {err}");
+}
+
+#[test]
+fn test_prod_rejects_disabled_rate_per_second() {
+    let cfg = ServerConfig {
+        mode: ServerMode::Production,
+        jwt_secret: "a-very-long-secret-value-here-ok".into(),
+        bootstrap_admin_key: "bootstrap-admin-key-value-here-ok".into(),
+        tls_insecure_skip: true,
+        rate_limit_per_sec: 0.0,
+        ..Default::default()
+    };
+    let err = cfg.validate_production().unwrap_err();
+    assert!(err.0.contains("RATE_LIMIT_PER_SEC"), "got: {err}");
+}
+
+#[test]
+fn test_prod_rejects_disabled_rate_limit_burst() {
+    let cfg = ServerConfig {
+        mode: ServerMode::Production,
+        jwt_secret: "a-very-long-secret-value-here-ok".into(),
+        bootstrap_admin_key: "bootstrap-admin-key-value-here-ok".into(),
+        tls_insecure_skip: true,
+        rate_limit_burst: 0,
+        ..Default::default()
+    };
+    let err = cfg.validate_production().unwrap_err();
+    assert!(err.0.contains("RATE_LIMIT_BURST"), "got: {err}");
+}
+
+#[test]
+fn test_prod_rejects_disabled_rate_limit_identity_capacity() {
+    let cfg = ServerConfig {
+        mode: ServerMode::Production,
+        jwt_secret: "a-very-long-secret-value-here-ok".into(),
+        bootstrap_admin_key: "bootstrap-admin-key-value-here-ok".into(),
+        tls_insecure_skip: true,
+        rate_limit_max_users: 0,
+        ..Default::default()
+    };
+    let err = cfg.validate_production().unwrap_err();
+    assert!(err.0.contains("RATE_LIMIT_MAX_USERS"), "got: {err}");
 }
 
 #[test]

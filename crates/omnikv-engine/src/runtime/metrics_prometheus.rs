@@ -4,8 +4,8 @@
 
 use lazy_static::lazy_static;
 use prometheus::{
-    Encoder, Histogram, HistogramOpts, IntCounter, IntGauge, TextEncoder, register_histogram,
-    register_int_counter, register_int_gauge,
+    Encoder, Histogram, HistogramOpts, IntCounter, IntCounterVec, IntGauge, TextEncoder,
+    register_histogram, register_int_counter, register_int_counter_vec, register_int_gauge,
 };
 
 lazy_static! {
@@ -59,6 +59,12 @@ lazy_static! {
         register_int_counter!("omnikv_commits_total", "Total number of committed batches").expect(
             "OmniKV metric registration failed at startup: duplicate or invalid metric name"
         );
+    pub static ref RATE_LIMIT_REJECTIONS_TOTAL: IntCounterVec = register_int_counter_vec!(
+        "omnikv_rate_limit_rejections_total",
+        "Total number of rejected requests by protocol due to rate limiting",
+        &["protocol"]
+    )
+    .expect("OmniKV metric registration failed at startup: duplicate or invalid metric name");
 }
 
 /// Render all metrics in Prometheus text format.
@@ -77,4 +83,11 @@ pub fn record_db_stats(seq: u64, sstable_count: usize, uptime_secs: u64) {
     DB_SEQUENCE.set(seq as i64);
     SSTABLE_COUNT.set(sstable_count as i64);
     UPTIME_SECONDS.set(uptime_secs as i64);
+}
+
+/// Record that a public protocol rejected a request because of rate limiting.
+pub fn record_rate_limit_rejection(protocol: &str) {
+    RATE_LIMIT_REJECTIONS_TOTAL
+        .with_label_values(&[protocol])
+        .inc();
 }

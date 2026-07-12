@@ -13,13 +13,17 @@ use axum::{
     body::Body,
     extract::DefaultBodyLimit,
     extract::Request,
+    extract::connect_info::ConnectInfo,
     extract::{Path, Query, State},
-    http::{HeaderMap, StatusCode, header},
+    http::{HeaderMap, HeaderValue, StatusCode, header},
     middleware,
     response::{IntoResponse, Response},
 };
+use omni_engine::hardening::RateLimiter;
+use omni_engine::metrics_prometheus;
 use omni_engine::{OmniError, OmniKV, WriteBatch};
 use serde::{Deserialize, Serialize};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use tower_http::cors::CorsLayer;
 
@@ -40,6 +44,7 @@ pub struct AppState {
     pub bootstrap_admin_key: String,
     pub manifest_path: String,
     pub wal_path: String,
+    pub rate_limiter: Arc<RateLimiter>,
 }
 
 #[derive(Deserialize)]
@@ -200,9 +205,75 @@ pub fn build_router(state: AppState) -> Router {
         .merge(read_routes)
         .merge(write_routes)
         .merge(admin_routes)
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            rest_rate_limit,
+        ))
         .layer(DefaultBodyLimit::max(MAX_REST_BODY_BYTES))
         .layer(CorsLayer::permissive())
         .with_state(state)
+}
+
+async fn rest_rate_limit(
+    State(state): State<AppState>,
+    req: Request<Body>,
+    next: middleware::Next,
+) -> Result<Response, Response> {
+    let peer_addr = req
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ConnectInfo(addr)| *addr);
+    let identity = rest_rate_limit_identity(req.headers(), &state.jwt_secret, peer_addr);
+    match state.rate_limiter.try_acquire(&identity) {
+        Ok(_) => Ok(next.run(req).await),
+        Err(retry_after_ms) => {
+            metrics_prometheus::record_rate_limit_rejection("rest");
+            Err(rate_limit_response(retry_after_ms))
+        }
+    }
+}
+
+fn rest_rate_limit_identity(
+    headers: &HeaderMap,
+    jwt_secret: &str,
+    peer_addr: Option<SocketAddr>,
+) -> String {
+    if let Some(header_value) = headers.get(header::AUTHORIZATION)
+        && let Ok(header_value) = header_value.to_str()
+        && let Some(token) = crate::auth::extract_bearer(header_value)
+        && let Ok(claims) = crate::auth::verify_token(token, jwt_secret)
+    {
+        return format!("rest:user:{}", claims.sub);
+    }
+
+    if let Some(addr) = peer_addr {
+        return format!("rest:ip:{}", addr.ip());
+    }
+
+    if let Some(forwarded_for) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok())
+        && let Some(first_ip) = forwarded_for.split(',').next()
+    {
+        return format!("rest:ip:{}", first_ip.trim());
+    }
+
+    if let Some(real_ip) = headers.get("x-real-ip").and_then(|v| v.to_str().ok()) {
+        return format!("rest:ip:{}", real_ip.trim());
+    }
+
+    "rest:anonymous".to_string()
+}
+
+fn rate_limit_response(retry_after_ms: u64) -> Response {
+    let retry_after_secs = retry_after_ms.div_ceil(1000).max(1);
+    let mut response = (
+        StatusCode::TOO_MANY_REQUESTS,
+        ApiResponse::<()>::err("rate limit exceeded"),
+    )
+        .into_response();
+    if let Ok(value) = HeaderValue::from_str(&retry_after_secs.to_string()) {
+        response.headers_mut().insert(header::RETRY_AFTER, value);
+    }
+    response
 }
 
 async fn require_read(
@@ -554,6 +625,7 @@ mod tests {
             bootstrap_admin_key,
             manifest_path: manifest.to_string_lossy().to_string(),
             wal_path: wal.to_string_lossy().to_string(),
+            rate_limiter: Arc::new(RateLimiter::new(1000.0, 100, 10_000)),
         });
         (router, dir, jwt_secret)
     }
@@ -656,5 +728,56 @@ mod tests {
             .expect("response");
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn rest_rate_limiter_rejects_abusive_authenticated_client() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let manifest = dir.path().join("manifest.json");
+        let wal = dir.path().join("wal.bin");
+        let db = OmniKV::open(
+            manifest.to_str().expect("manifest path"),
+            wal.to_str().expect("wal path"),
+        )
+        .expect("open db");
+        let jwt_secret = "0123456789abcdef0123456789abcdef".to_string();
+        let router = build_router(AppState {
+            db,
+            jwt_secret: jwt_secret.clone(),
+            bootstrap_admin_key: "bootstrap-admin-key-0123456789abcdef".to_string(),
+            manifest_path: manifest.to_string_lossy().to_string(),
+            wal_path: wal.to_string_lossy().to_string(),
+            rate_limiter: Arc::new(RateLimiter::new(0.01, 1, 10)),
+        });
+        let token =
+            crate::auth::generate_token("reader", "read", &jwt_secret, 60).expect("read token");
+
+        let first = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/kv/missing")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("first response");
+        assert_ne!(first.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        let second = router
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/kv/missing")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("second response");
+        assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(second.headers().contains_key(header::RETRY_AFTER));
     }
 }

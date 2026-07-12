@@ -15,7 +15,6 @@
     clippy::doc_markdown,
     clippy::format_push_string,
     clippy::ignored_unit_patterns,
-    clippy::items_after_statements,
     clippy::manual_let_else,
     clippy::match_same_arms,
     clippy::missing_const_for_fn,
@@ -34,7 +33,7 @@ mod raft_routes;
 
 use std::sync::Arc;
 
-use omni_engine::{OmniKV, config::ServerConfig};
+use omni_engine::{OmniKV, config::ServerConfig, hardening::RateLimiter};
 
 fn print_banner(cfg: &ServerConfig) {
     println!();
@@ -102,12 +101,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "Database opened"
     );
 
+    let rate_limiter = Arc::new(RateLimiter::new(
+        cfg.rate_limit_per_sec,
+        cfg.rate_limit_burst,
+        cfg.rate_limit_max_users,
+    ));
+    tracing::info!(
+        rate_limit_per_sec = cfg.rate_limit_per_sec,
+        rate_limit_burst = cfg.rate_limit_burst,
+        rate_limit_max_users = cfg.rate_limit_max_users,
+        "Shared protocol rate limiter configured"
+    );
+
     let app_state = api::AppState {
         db: db.clone(),
         jwt_secret: cfg.jwt_secret.clone(),
         bootstrap_admin_key: cfg.bootstrap_admin_key.clone(),
         manifest_path,
         wal_path,
+        rate_limiter: rate_limiter.clone(),
     };
 
     let router = api::build_router(app_state);
@@ -132,7 +144,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let http_handle = tokio::spawn(async move {
         tracing::info!("HTTP/1.1 + HTTP/2 server starting on {http_addr_str}");
         if let Err(e) = axum_server::bind_rustls(http_addr, tls_config)
-            .serve(router.into_make_service())
+            .serve(router.into_make_service_with_connect_info::<std::net::SocketAddr>())
             .await
         {
             tracing::error!("HTTP server error: {e}");
@@ -143,16 +155,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (quic_certs, quic_key) = quic_server::generate_self_signed_cert()?;
     let quic_endpoint = quic_server::create_server_endpoint(&quic_addr_str, quic_certs, quic_key)?;
     let quic_db = db.clone();
+    let quic_rate_limiter = rate_limiter.clone();
     let quic_handle = tokio::spawn(async move {
-        quic_server::run_quic_server(quic_endpoint, quic_db).await;
+        quic_server::run_quic_server(quic_endpoint, quic_db, quic_rate_limiter).await;
     });
 
     // ─── 3. PostgreSQL Wire Protocol ───────────────────────────
     let pgwire_db = db.clone();
+    let pgwire_rate_limiter = rate_limiter.clone();
     let _pgwire_handle = std::thread::spawn(move || {
         // Log before moving pgwire_addr_str into PgWireServer::new.
         tracing::info!("PostgreSQL wire protocol starting on {pgwire_addr_str}");
-        let server = omni_engine::pgwire::PgWireServer::new(pgwire_db, &pgwire_addr_str);
+        let server = omni_engine::pgwire::PgWireServer::with_rate_limiter(
+            pgwire_db,
+            &pgwire_addr_str,
+            pgwire_rate_limiter,
+        );
         if let Err(e) = server.start() {
             tracing::error!("PgWire server error: {e}");
         }
