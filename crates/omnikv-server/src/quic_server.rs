@@ -4,12 +4,12 @@
 //! Raft consensus and cluster communication. Uses Quinn for
 //! UDP-based, TLS 1.3 encrypted transport.
 
+use omni_engine::hardening::RateLimiter;
+use omni_engine::metrics_prometheus;
 use omni_engine::{OmniKV, WriteBatch};
 use quinn::{ClientConfig, Endpoint, ServerConfig};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use std::sync::Arc;
-
-use base64::Engine as _;
 
 /// Binary protocol command opcodes.
 #[repr(u8)]
@@ -133,7 +133,7 @@ pub fn create_client_endpoint(insecure_skip_verify: bool) -> Result<Endpoint, St
 }
 
 /// Run the QUIC server loop, handling binary protocol requests.
-pub async fn run_quic_server(endpoint: Endpoint, db: Arc<OmniKV>) {
+pub async fn run_quic_server(endpoint: Endpoint, db: Arc<OmniKV>, rate_limiter: Arc<RateLimiter>) {
     tracing::info!(
         "QUIC/HTTP3 server listening on {}",
         endpoint.local_addr().unwrap()
@@ -141,6 +141,7 @@ pub async fn run_quic_server(endpoint: Endpoint, db: Arc<OmniKV>) {
 
     while let Some(incoming) = endpoint.accept().await {
         let db = db.clone();
+        let rate_limiter = rate_limiter.clone();
         tokio::spawn(async move {
             match incoming.await {
                 Ok(conn) => {
@@ -149,14 +150,19 @@ pub async fn run_quic_server(endpoint: Endpoint, db: Arc<OmniKV>) {
                     while let Ok((mut send, mut recv)) = conn.accept_bi().await {
                         let db = db.clone();
                         let secret = jwt_secret.clone();
+                        let rate_limiter = rate_limiter.clone();
                         tokio::spawn(async move {
                             let mut buf = vec![0u8; 65536];
                             match recv.read(&mut buf).await {
                                 Ok(Some(n)) if n > 0 => {
                                     // First frame must begin with "AUTH <token>\n"
                                     // followed by the actual command bytes.
-                                    let response =
-                                        handle_authenticated_request(&db, &buf[..n], &secret);
+                                    let response = handle_authenticated_request(
+                                        &db,
+                                        &buf[..n],
+                                        &secret,
+                                        &rate_limiter,
+                                    );
                                     let _ = send.write_all(&response).await;
                                     let _ = send.finish();
                                 }
@@ -180,7 +186,12 @@ pub async fn run_quic_server(endpoint: Endpoint, db: Arc<OmniKV>) {
 ///   `AUTH <jwt-token>\n`
 /// followed immediately by the command bytes.
 /// Returns an error response frame if auth fails.
-fn handle_authenticated_request(db: &Arc<OmniKV>, buf: &[u8], jwt_secret: &str) -> Vec<u8> {
+fn handle_authenticated_request(
+    db: &Arc<OmniKV>,
+    buf: &[u8],
+    jwt_secret: &str,
+    rate_limiter: &RateLimiter,
+) -> Vec<u8> {
     if jwt_secret.is_empty() {
         tracing::error!("OMNI_JWT_SECRET not set — rejecting QUIC request");
         return b"ERR AUTH_NOT_CONFIGURED\n".to_vec();
@@ -209,32 +220,17 @@ fn handle_authenticated_request(db: &Arc<OmniKV>, buf: &[u8], jwt_secret: &str) 
         return b"ERR MISSING_AUTH_TOKEN\n".to_vec();
     }
 
-    // Validate JWT using HMAC-SHA256
-    // We do a lightweight structural check: header.payload.signature
-    // Full validation delegated to the same logic as REST auth.
-    let parts: Vec<&str> = token.split('.').collect();
-    if parts.len() != 3 {
-        tracing::warn!("QUIC invalid JWT structure");
-        return b"ERR INVALID_TOKEN\n".to_vec();
-    }
-
-    // Verify HMAC-SHA256 signature
-    let signing_input = format!("{}.{}", parts[0], parts[1]);
-    use hmac::{Hmac, KeyInit, Mac};
-    use sha2::Sha256;
-    let mut mac = match Hmac::<Sha256>::new_from_slice(jwt_secret.as_bytes()) {
-        Ok(m) => m,
+    let claims = match crate::auth::verify_token(token, jwt_secret) {
+        Ok(claims) => claims,
         Err(_) => {
-            tracing::warn!("QUIC invalid JWT secret");
+            tracing::warn!("QUIC JWT verification failed");
             return b"ERR INVALID_TOKEN\n".to_vec();
         }
     };
-    mac.update(signing_input.as_bytes());
-    let expected_sig_bytes = mac.finalize().into_bytes();
-    let expected_b64 = base64_url_encode(expected_sig_bytes.as_slice());
-    if expected_b64 != parts[2] {
-        tracing::warn!("QUIC JWT signature verification failed");
-        return b"ERR INVALID_TOKEN\n".to_vec();
+
+    let identity = format!("quic:user:{}", claims.sub);
+    if let Err(retry_after_ms) = acquire_quic_request_permit(rate_limiter, &identity) {
+        return format!("ERR RATE_LIMITED retry_after_ms={retry_after_ms}\n").into_bytes();
     }
 
     if payload.is_empty() {
@@ -244,8 +240,13 @@ fn handle_authenticated_request(db: &Arc<OmniKV>, buf: &[u8], jwt_secret: &str) 
     handle_binary_request(db, payload)
 }
 
-fn base64_url_encode(input: &[u8]) -> String {
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(input)
+fn acquire_quic_request_permit(rate_limiter: &RateLimiter, identity: &str) -> Result<(), u64> {
+    rate_limiter
+        .try_acquire(identity)
+        .map(|_| ())
+        .inspect_err(|_| {
+            metrics_prometheus::record_rate_limit_rejection("quic");
+        })
 }
 
 fn handle_binary_request(db: &Arc<OmniKV>, data: &[u8]) -> Vec<u8> {
@@ -315,6 +316,40 @@ fn handle_binary_request(db: &Arc<OmniKV>, data: &[u8]) -> Vec<u8> {
         }
 
         _ => vec![0xFF], // Unknown opcode
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn open_temp_db() -> (Arc<OmniKV>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let manifest = dir.path().join("manifest.json");
+        let wal = dir.path().join("wal.bin");
+        let db = OmniKV::open(
+            manifest.to_str().expect("manifest path"),
+            wal.to_str().expect("wal path"),
+        )
+        .expect("open db");
+        (db, dir)
+    }
+
+    #[test]
+    fn quic_rate_limiter_rejects_abusive_authenticated_streams() {
+        let (db, _dir) = open_temp_db();
+        let secret = "0123456789abcdef0123456789abcdef";
+        let token = crate::auth::generate_token("client-a", "write", secret, 60).expect("token");
+        let mut frame = format!("AUTH {token}\n").into_bytes();
+        frame.push(OpCode::Ping as u8);
+        let rate_limiter = RateLimiter::new(0.01, 1, 10);
+
+        assert_eq!(
+            handle_authenticated_request(&db, &frame, secret, &rate_limiter),
+            vec![OpCode::Pong as u8]
+        );
+        let second = handle_authenticated_request(&db, &frame, secret, &rate_limiter);
+        assert!(String::from_utf8_lossy(&second).starts_with("ERR RATE_LIMITED"));
     }
 }
 

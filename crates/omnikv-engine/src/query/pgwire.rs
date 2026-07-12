@@ -22,6 +22,8 @@ use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::sync::Arc;
 
+use crate::hardening::RateLimiter;
+use crate::metrics_prometheus;
 use crate::query;
 use crate::transaction::{Transaction, TransactionManager, TxnState};
 use crate::{OmniKV, WriteBatch};
@@ -35,6 +37,10 @@ const MAX_PGWIRE_PACKET_BYTES: usize = 4 * 1024 * 1024;
 /// range and force the server to allocate or stream a huge response. Explicit
 /// LIMIT clauses above this cap are rejected with a protocol error.
 const MAX_PGWIRE_RESULT_ROWS: usize = 10_000;
+
+const DEFAULT_PGWIRE_RATE_LIMIT_PER_SEC: f64 = 1000.0;
+const DEFAULT_PGWIRE_RATE_LIMIT_BURST: u32 = 100;
+const DEFAULT_PGWIRE_RATE_LIMIT_MAX_USERS: usize = 10_000;
 
 /// PostgreSQL wire protocol message types (server -> client)
 const AUTH_OK: u8 = b'R';
@@ -88,6 +94,7 @@ pub struct PgWireServer {
     db: Arc<OmniKV>,
     bind_addr: String,
     max_connections: usize,
+    rate_limiter: Arc<RateLimiter>,
 }
 
 impl PgWireServer {
@@ -96,6 +103,7 @@ impl PgWireServer {
             db,
             bind_addr: bind_addr.to_string(),
             max_connections: 32,
+            rate_limiter: default_pgwire_rate_limiter(),
         }
     }
 
@@ -105,6 +113,21 @@ impl PgWireServer {
             db,
             bind_addr: bind_addr.to_string(),
             max_connections,
+            rate_limiter: default_pgwire_rate_limiter(),
+        }
+    }
+
+    /// Creates a PgWireServer with caller-supplied rate limiter state.
+    pub fn with_rate_limiter(
+        db: Arc<OmniKV>,
+        bind_addr: &str,
+        rate_limiter: Arc<RateLimiter>,
+    ) -> Self {
+        Self {
+            db,
+            bind_addr: bind_addr.to_string(),
+            max_connections: 32,
+            rate_limiter,
         }
     }
 
@@ -138,9 +161,10 @@ impl PgWireServer {
                         break;
                     }
                     let db = self.db.clone();
+                    let rate_limiter = self.rate_limiter.clone();
                     let release_tx = permit_tx.clone();
                     std::thread::spawn(move || {
-                        if let Err(e) = handle_connection(db, stream) {
+                        if let Err(e) = handle_connection(db, stream, rate_limiter) {
                             eprintln!("[OmniKV] Connection error: {}", e);
                         }
                         // Release permit back to pool
@@ -154,8 +178,20 @@ impl PgWireServer {
     }
 }
 
+fn default_pgwire_rate_limiter() -> Arc<RateLimiter> {
+    Arc::new(RateLimiter::new(
+        DEFAULT_PGWIRE_RATE_LIMIT_PER_SEC,
+        DEFAULT_PGWIRE_RATE_LIMIT_BURST,
+        DEFAULT_PGWIRE_RATE_LIMIT_MAX_USERS,
+    ))
+}
+
 /// Handle a single PostgreSQL client connection.
-fn handle_connection(db: Arc<OmniKV>, mut stream: std::net::TcpStream) -> std::io::Result<()> {
+fn handle_connection(
+    db: Arc<OmniKV>,
+    mut stream: std::net::TcpStream,
+    rate_limiter: Arc<RateLimiter>,
+) -> std::io::Result<()> {
     // Phase 1: Startup handshake
     let pgwire_password = std::env::var("OMNI_PGWIRE_PASSWORD").unwrap_or_default();
     if pgwire_password.is_empty() {
@@ -170,6 +206,10 @@ fn handle_connection(db: Arc<OmniKV>, mut stream: std::net::TcpStream) -> std::i
     // Per-connection state: transaction manager and session state
     let tm = Arc::new(TransactionManager::new(db.clone()));
     let mut conn = ConnectionState::new();
+    let client_id = stream
+        .peer_addr()
+        .map(|addr| format!("pgwire:ip:{}", addr.ip()))
+        .unwrap_or_else(|_| "pgwire:unknown".to_string());
 
     // Phase 2: Query loop
     loop {
@@ -186,6 +226,17 @@ fn handle_connection(db: Arc<OmniKV>, mut stream: std::net::TcpStream) -> std::i
         match msg_type[0] {
             QUERY_MSG => {
                 let sql = read_query_message(&mut stream)?;
+                if let Err(retry_after_ms) = acquire_pgwire_query_permit(&rate_limiter, &client_id)
+                {
+                    send_error(
+                        &mut stream,
+                        "ERROR",
+                        "53300",
+                        &format!("rate limit exceeded; retry after {retry_after_ms}ms"),
+                    )?;
+                    send_ready_for_query_status(&mut stream, conn.ready_status())?;
+                    continue;
+                }
                 handle_query(&db, &tm, &mut conn, &mut stream, &sql)?;
             }
             TERMINATE_MSG => {
@@ -204,6 +255,15 @@ fn handle_connection(db: Arc<OmniKV>, mut stream: std::net::TcpStream) -> std::i
         }
     }
     Ok(())
+}
+
+fn acquire_pgwire_query_permit(rate_limiter: &RateLimiter, client_id: &str) -> Result<(), u64> {
+    rate_limiter
+        .try_acquire(client_id)
+        .map(|_| ())
+        .inspect_err(|_| {
+            metrics_prometheus::record_rate_limit_rejection("pgwire");
+        })
 }
 
 /// Handle the startup handshake with password authentication.
@@ -902,5 +962,13 @@ mod tests {
 
         let too_wide = parse_sql("SELECT * FROM users LIMIT 10000 OFFSET 1").expect("parse");
         assert!(enforce_pgwire_statement_limits(too_wide).is_err());
+    }
+
+    #[test]
+    fn pgwire_rate_limiter_rejects_abusive_client_identity() {
+        let rate_limiter = RateLimiter::new(0.01, 1, 10);
+        assert!(acquire_pgwire_query_permit(&rate_limiter, "pgwire:ip:127.0.0.1").is_ok());
+        assert!(acquire_pgwire_query_permit(&rate_limiter, "pgwire:ip:127.0.0.1").is_err());
+        assert!(acquire_pgwire_query_permit(&rate_limiter, "pgwire:ip:127.0.0.2").is_ok());
     }
 }

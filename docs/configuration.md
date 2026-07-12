@@ -51,6 +51,9 @@ cargo run -p omnikv-server
 | `OMNIKV_MAX_OPEN_FILES` | `512` | Max open file descriptors |
 | `OMNIKV_WRITE_BUFFER_MB` | `64` | Write buffer size (MB) |
 | `OMNIKV_COMPACTION_WORKERS` | `2` | Compaction worker threads |
+| `OMNIKV_RATE_LIMIT_PER_SEC` | `1000` | Sustained requests per second per user/IP across REST, PgWire, and QUIC |
+| `OMNIKV_RATE_LIMIT_BURST` | `100` | Maximum burst tokens per user/IP |
+| `OMNIKV_RATE_LIMIT_MAX_USERS` | `10000` | Maximum tracked rate-limit identities before oldest-bucket eviction |
 
 ---
 
@@ -64,6 +67,8 @@ cargo run -p omnikv-server
   or `OMNIKV_TLS_INSECURE_SKIP=true` must be set explicitly
   (a warning is printed to stderr when this override is active).
 - **Missing TLS files** cause a hard startup failure with a clear error message.
+- **Rate-limit settings** must be positive so production cannot accidentally
+  start with disabled or nonsensical throttling.
 
 ---
 
@@ -73,3 +78,5 @@ cargo run -p omnikv-server
 - Rotate `OMNIKV_JWT_SECRET` on a regular schedule in production.
 - Use a secrets manager (Vault, AWS Secrets Manager, K8s Secrets) rather than
   plain environment variables in production deployments.
+- Tune rate limits for your workload and alert on
+  `omnikv_rate_limit_rejections_total{protocol=...}`.
