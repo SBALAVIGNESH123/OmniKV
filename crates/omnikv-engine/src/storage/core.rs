@@ -11,7 +11,7 @@ use std::cmp::Reverse;
 use std::collections::{BTreeMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::hash::{Hash, Hasher};
-use std::io::{BufWriter, Read, Write};
+use std::io::{BufWriter, ErrorKind, Read, Write};
 #[cfg(unix)]
 use std::os::unix::fs::FileExt;
 #[cfg(windows)]
@@ -76,6 +76,48 @@ static PROCESS_DB_LOCKS: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
 
 fn process_db_locks() -> &'static Mutex<HashSet<PathBuf>> {
     PROCESS_DB_LOCKS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CleanupDeleteOutcome {
+    Deleted,
+    NotFound,
+    Failed,
+}
+
+fn cleanup_obsolete_file(path: impl AsRef<Path>, context: &'static str) -> CleanupDeleteOutcome {
+    cleanup_obsolete_file_with(path.as_ref(), context, |path| std::fs::remove_file(path))
+}
+
+fn cleanup_obsolete_sstable_pair(path: &str, context: &'static str) {
+    cleanup_obsolete_file(path, context);
+    cleanup_obsolete_file(path.replace(".sst", ".bloom"), context);
+}
+
+fn cleanup_obsolete_file_with<F>(
+    path: &Path,
+    context: &'static str,
+    remove_file: F,
+) -> CleanupDeleteOutcome
+where
+    F: FnOnce(&Path) -> std::io::Result<()>,
+{
+    match remove_file(path) {
+        Ok(()) => CleanupDeleteOutcome::Deleted,
+        Err(err) if err.kind() == ErrorKind::NotFound => CleanupDeleteOutcome::NotFound,
+        Err(err) => {
+            let error_kind = err.kind();
+            metrics_prometheus::record_cleanup_delete_failure(context, error_kind);
+            tracing::warn!(
+                cleanup_context = context,
+                path = %path.display(),
+                error = %err,
+                error_kind = ?error_kind,
+                "best-effort cleanup failed to delete obsolete file"
+            );
+            CleanupDeleteOutcome::Failed
+        }
+    }
 }
 
 fn database_lock_path(manifest_path: &str) -> Result<PathBuf, OmniError> {
@@ -2172,8 +2214,7 @@ impl OmniKV {
             std::thread::spawn(move || {
                 std::thread::sleep(std::time::Duration::from_secs(5));
                 for path in old_paths {
-                    let _ = std::fs::remove_file(&path);
-                    let _ = std::fs::remove_file(path.replace(".sst", ".bloom"));
+                    cleanup_obsolete_sstable_pair(&path, "l0_empty_cleanup");
                 }
             });
 
@@ -2235,8 +2276,7 @@ impl OmniKV {
         std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_secs(5));
             for path in old_paths {
-                let _ = std::fs::remove_file(&path);
-                let _ = std::fs::remove_file(path.replace(".sst", ".bloom"));
+                cleanup_obsolete_sstable_pair(&path, "l0_to_l1_cleanup");
             }
         });
 
@@ -2373,10 +2413,9 @@ impl OmniKV {
             .collect();
         std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_secs(5));
-            let _ = std::fs::remove_file(&old_base_path);
+            cleanup_obsolete_file(&old_base_path, "l1_to_base_cleanup");
             for path in old_paths {
-                let _ = std::fs::remove_file(&path);
-                let _ = std::fs::remove_file(path.replace(".sst", ".bloom"));
+                cleanup_obsolete_sstable_pair(&path, "l1_to_base_cleanup");
             }
         });
 
@@ -2607,15 +2646,14 @@ impl OmniKV {
 
         std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_secs(5));
-            let _ = std::fs::remove_file(&old_manifest.heap_path);
-            let _ = std::fs::remove_file(&old_manifest.base_path);
+            cleanup_obsolete_file(&old_manifest.heap_path, "heap_gc_cleanup");
+            cleanup_obsolete_file(&old_manifest.base_path, "heap_gc_cleanup");
             for p in old_manifest
                 .sstables
                 .iter()
                 .chain(old_manifest.l1_sstables.iter())
             {
-                let _ = std::fs::remove_file(p);
-                let _ = std::fs::remove_file(p.replace(".sst", ".bloom"));
+                cleanup_obsolete_sstable_pair(p, "heap_gc_cleanup");
             }
         });
 
@@ -2684,5 +2722,41 @@ impl OmniKV {
                 }
             })
             .expect("Failed to spawn compaction thread")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io;
+
+    #[test]
+    fn cleanup_obsolete_file_treats_not_found_as_benign() {
+        let outcome = cleanup_obsolete_file_with(
+            Path::new("already-gone.sst"),
+            "unit_test_cleanup_not_found",
+            |_| Err(io::Error::from(ErrorKind::NotFound)),
+        );
+
+        assert_eq!(outcome, CleanupDeleteOutcome::NotFound);
+        assert!(
+            !metrics_prometheus::render_metrics().contains("unit_test_cleanup_not_found"),
+            "not-found cleanup should not be counted as a failure"
+        );
+    }
+
+    #[test]
+    fn cleanup_obsolete_file_records_delete_failures() {
+        let outcome = cleanup_obsolete_file_with(
+            Path::new("locked.sst"),
+            "unit_test_cleanup_failure",
+            |_| Err(io::Error::from(ErrorKind::PermissionDenied)),
+        );
+
+        assert_eq!(outcome, CleanupDeleteOutcome::Failed);
+        let metrics = metrics_prometheus::render_metrics();
+        assert!(metrics.contains("omnikv_cleanup_delete_failures_total"));
+        assert!(metrics.contains("context=\"unit_test_cleanup_failure\""));
+        assert!(metrics.contains("error_kind=\"PermissionDenied\""));
     }
 }

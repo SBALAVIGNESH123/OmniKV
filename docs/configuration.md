@@ -95,3 +95,6 @@ cargo run -p omnikv-server -- --config /etc/omnikv/omnikv.toml
   plain environment variables in production deployments.
 - Tune rate limits for your workload and alert on
   `omnikv_rate_limit_rejections_total{protocol=...}`.
+- Alert on `omnikv_cleanup_delete_failures_total{context=...,error_kind=...}`;
+  non-zero values usually mean obsolete compaction or GC files could not be
+  deleted due to permissions, file locks, or storage problems.

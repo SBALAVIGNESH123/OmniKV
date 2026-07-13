@@ -7,6 +7,7 @@ use prometheus::{
     Encoder, Histogram, HistogramOpts, IntCounter, IntCounterVec, IntGauge, TextEncoder,
     register_histogram, register_int_counter, register_int_counter_vec, register_int_gauge,
 };
+use std::io::ErrorKind;
 
 lazy_static! {
     pub static ref WRITES_TOTAL: IntCounter =
@@ -65,6 +66,12 @@ lazy_static! {
         &["protocol"]
     )
     .expect("OmniKV metric registration failed at startup: duplicate or invalid metric name");
+    pub static ref CLEANUP_DELETE_FAILURES_TOTAL: IntCounterVec = register_int_counter_vec!(
+        "omnikv_cleanup_delete_failures_total",
+        "Total number of obsolete-file cleanup delete failures by context and error kind",
+        &["context", "error_kind"]
+    )
+    .expect("OmniKV metric registration failed at startup: duplicate or invalid metric name");
 }
 
 /// Render all metrics in Prometheus text format.
@@ -89,5 +96,13 @@ pub fn record_db_stats(seq: u64, sstable_count: usize, uptime_secs: u64) {
 pub fn record_rate_limit_rejection(protocol: &str) {
     RATE_LIMIT_REJECTIONS_TOTAL
         .with_label_values(&[protocol])
+        .inc();
+}
+
+/// Record that best-effort obsolete-file cleanup failed to delete a file.
+pub fn record_cleanup_delete_failure(context: &str, error_kind: ErrorKind) {
+    let error_kind = format!("{error_kind:?}");
+    CLEANUP_DELETE_FAILURES_TOTAL
+        .with_label_values(&[context, &error_kind])
         .inc();
 }
