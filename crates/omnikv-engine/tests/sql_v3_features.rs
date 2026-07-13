@@ -376,7 +376,7 @@ fn test_subquery_empty_result() {
 
 #[test]
 fn test_config_defaults() {
-    let config = omni_engine::config::ServerConfig::load_dev();
+    let config = omni_engine::config::ServerConfig::load_dev().unwrap();
     assert!(config.http_addr.contains(':'));
     assert!(config.pgwire_addr.contains(':'));
     assert!(!config.jwt_secret.is_empty());

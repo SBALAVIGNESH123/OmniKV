@@ -77,10 +77,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .json()
         .init();
 
-    // The standalone server is a network-facing binary, so it starts in
-    // production-validation mode. Tests and embedders can still use
-    // ServerConfig::load_dev() explicitly.
-    let cfg = ServerConfig::load_production()?;
+    // Load the single authoritative server runtime config.
+    //
+    // Precedence is: defaults < config file < environment variables.
+    // `--config <path>` selects the config file ahead of OMNIKV_CONFIG /
+    // legacy OMNI_CONFIG. Production mode then fails closed on invalid or
+    // unsafe settings.
+    let cfg = ServerConfig::load_server_from_args(std::env::args().skip(1))?;
     print_banner(&cfg);
     tracing::info!(
         mode = ?cfg.mode,

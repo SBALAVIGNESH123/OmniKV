@@ -51,7 +51,7 @@ fn test_config_from_env() {
         );
     }
 
-    let cfg = OmniConfig::from_env();
+    let cfg = OmniConfig::from_env().unwrap();
     assert_eq!(cfg.memtable_flush_threshold, 5000);
     assert_eq!(cfg.log_format, LogFormat::Pretty);
     assert!((cfg.rate_limit_per_sec - 500.0).abs() < f64::EPSILON);
@@ -66,6 +66,40 @@ fn test_config_from_env() {
         std::env::remove_var("OMNI_BOOTSTRAP_ADMIN_KEY");
     }
     println!("✅ OPS: Config loads from env vars correctly");
+}
+
+#[test]
+fn test_config_from_env_rejects_invalid_numeric_values() {
+    unsafe {
+        std::env::set_var("OMNI_RATE_LIMIT", "fast");
+    }
+
+    let errors = OmniConfig::from_env().unwrap_err();
+    assert!(
+        errors.iter().any(|e| e.contains("OMNI_RATE_LIMIT")),
+        "got: {errors:?}"
+    );
+
+    unsafe {
+        std::env::remove_var("OMNI_RATE_LIMIT");
+    }
+}
+
+#[test]
+fn test_config_from_env_rejects_invalid_log_format() {
+    unsafe {
+        std::env::set_var("OMNI_LOG_FORMAT", "xml");
+    }
+
+    let errors = OmniConfig::from_env().unwrap_err();
+    assert!(
+        errors.iter().any(|e| e.contains("OMNI_LOG_FORMAT")),
+        "got: {errors:?}"
+    );
+
+    unsafe {
+        std::env::remove_var("OMNI_LOG_FORMAT");
+    }
 }
 
 #[test]
