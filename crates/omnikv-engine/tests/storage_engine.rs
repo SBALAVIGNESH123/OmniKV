@@ -408,6 +408,90 @@ fn test_l0_to_l1_compaction() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+#[test]
+fn test_l0_to_l1_preserves_active_snapshot_across_delete() {
+    let (db, _dir) = create_temp_db("l0l1_mvcc_delete");
+
+    let mut write = WriteBatch::new();
+    write
+        .set("mvcc_delete_key", "before-delete".into())
+        .unwrap();
+    db.commit_batch(&write).unwrap();
+    let old_snapshot = db.snapshot();
+
+    let mut delete = WriteBatch::new();
+    delete.delete("mvcc_delete_key").unwrap();
+    db.commit_batch(&delete).unwrap();
+
+    db.compact_sstables().unwrap();
+    db.compact_l0_to_l1().unwrap();
+
+    assert_eq!(
+        db.find("mvcc_delete_key", old_snapshot).unwrap(),
+        Some("before-delete".into()),
+        "active old snapshot must survive L0-to-L1 tombstone compaction"
+    );
+    assert_eq!(
+        db.find("mvcc_delete_key", db.get_seq()).unwrap(),
+        None,
+        "latest read must still observe the tombstone"
+    );
+
+    db.unregister_snapshot(old_snapshot);
+}
+
+#[test]
+fn test_l1_to_base_and_gc_preserve_active_snapshot_across_delete() {
+    let (db, _dir) = create_temp_db("base_gc_mvcc_delete");
+
+    let mut write = WriteBatch::new();
+    write.set("base_delete_key", "base-value".into()).unwrap();
+    db.commit_batch(&write).unwrap();
+    db.compact_sstables().unwrap();
+    db.compact_l0_to_l1().unwrap();
+    db.compact_l1_to_l2().unwrap();
+
+    let old_snapshot = db.snapshot();
+
+    let mut delete = WriteBatch::new();
+    delete.delete("base_delete_key").unwrap();
+    db.commit_batch(&delete).unwrap();
+    db.compact_sstables().unwrap();
+    db.compact_l0_to_l1().unwrap();
+    db.compact_l1_to_l2().unwrap();
+
+    assert_eq!(
+        db.find("base_delete_key", old_snapshot).unwrap(),
+        Some("base-value".into()),
+        "active old snapshot must survive L1-to-base tombstone compaction"
+    );
+    assert_eq!(
+        db.find("base_delete_key", db.get_seq()).unwrap(),
+        None,
+        "latest read must still observe the tombstone after L1-to-base compaction"
+    );
+
+    db.run_garbage_collection().unwrap();
+    assert_eq!(
+        db.find("base_delete_key", old_snapshot).unwrap(),
+        Some("base-value".into()),
+        "active old snapshot must survive heap GC"
+    );
+    assert_eq!(
+        db.find("base_delete_key", db.get_seq()).unwrap(),
+        None,
+        "latest read must still observe the tombstone after heap GC"
+    );
+
+    db.unregister_snapshot(old_snapshot);
+    db.run_garbage_collection().unwrap();
+    assert_eq!(
+        db.find("base_delete_key", db.get_seq()).unwrap(),
+        None,
+        "after the old snapshot closes, GC may remove history but not resurrect data"
+    );
+}
+
 // Gap #21: Memory-mapped I/O edge cases
 // ═══════════════════════════════════════════════════════════════════════════
 

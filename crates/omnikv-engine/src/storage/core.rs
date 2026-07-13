@@ -479,6 +479,30 @@ type SharedMemtable = Arc<Memtable>;
 type SstableHandle = (Arc<Mmap>, Arc<BloomFilter>, String);
 type SharedSstables = Arc<Vec<SstableHandle>>;
 
+fn retain_versions_needed_by_snapshots(
+    versions: &mut VersionedValuePointers,
+    oldest_active_snapshot: Option<u64>,
+) {
+    let Some(latest_seq) = versions.keys().next_back().copied() else {
+        return;
+    };
+    let predecessor_for_oldest_snapshot = oldest_active_snapshot
+        .and_then(|snapshot| versions.range(..=snapshot).next_back().map(|(&seq, _)| seq));
+
+    versions.retain(|seq, _| {
+        *seq == latest_seq
+            || oldest_active_snapshot.is_some_and(|snapshot| *seq >= snapshot)
+            || predecessor_for_oldest_snapshot == Some(*seq)
+    });
+}
+
+fn insert_record_version(merged: &mut BTreeMap<Vec<u8>, VersionedValuePointers>, rec: &OmniRecord) {
+    merged.entry(rec.key.clone()).or_default().insert(
+        rec.seq,
+        (rec.offset, rec.length, rec.payload_crc32, rec.expiry),
+    );
+}
+
 #[inline]
 pub fn shard_idx(key: &[u8]) -> usize {
     let mut h = FnvHasher::default();
@@ -1337,6 +1361,13 @@ impl OmniKV {
             .unwrap_or_else(|| self.get_seq().saturating_sub(1))
     }
 
+    fn oldest_active_snapshot(&self) -> Result<Option<u64>, OmniError> {
+        self.active_snapshots
+            .lock()
+            .map_err(|_| OmniError::LockPoisoned("active_snapshots".into()))
+            .map(|snapshots| snapshots.keys().next().copied())
+    }
+
     pub fn memtable_size(&self) -> usize {
         let roots = self.roots.load();
         let mut sum = roots
@@ -2175,10 +2206,6 @@ impl OmniKV {
             (old_memtable.1, old_memtable.0)
         };
 
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
         let mut records = Vec::new();
 
         for shard in frozen_arc.iter() {
@@ -2186,15 +2213,11 @@ impl OmniKV {
                 let key = entry.key().0.clone();
                 let seq = entry.key().1.0;
                 let val = entry.value();
-                if val.3 == 0 || val.3 > now {
-                    if val.1 == 0 {
-                        stats.tombstones += 1;
-                    }
-                    stats.bytes_rewritten += val.1 & !UNCOMPRESSED_FLAG;
-                    records.push(OmniRecord::new(seq, key, val.0, val.1, val.2, val.3));
-                } else {
-                    stats.expired_records_dropped += 1;
+                if val.1 == 0 {
+                    stats.tombstones += 1;
                 }
+                stats.bytes_rewritten += val.1 & !UNCOMPRESSED_FLAG;
+                records.push(OmniRecord::new(seq, key, val.0, val.1, val.2, val.3));
             }
         }
 
@@ -2270,8 +2293,8 @@ impl OmniKV {
         Ok(())
     }
 
-    /// Compacts multiple L0 SSTables into a single L1 SSTable,
-    /// dropping expired or obsolete records.
+    /// Compacts multiple L0 SSTables into a single L1 SSTable while preserving
+    /// deletion markers so lower-level values cannot reappear.
     pub fn compact_l0_to_l1(&self) -> Result<(), OmniError> {
         let started_at = std::time::Instant::now();
         let mut stats = CompactionStats::default();
@@ -2284,11 +2307,8 @@ impl OmniKV {
             return Ok(());
         }
 
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let mut merged: BTreeMap<Vec<u8>, (u64, u64, u64, u32, u64)> = BTreeMap::new();
+        let oldest_active_snapshot = self.oldest_active_snapshot()?;
+        let mut merged: BTreeMap<Vec<u8>, VersionedValuePointers> = BTreeMap::new();
 
         for (mmap, _, _) in &**sstables {
             let reader = SSTableReader::from_mmap(mmap.clone());
@@ -2297,30 +2317,24 @@ impl OmniKV {
                     if rec.length == 0 {
                         stats.tombstones += 1;
                     }
-                    let existing = merged.get(&rec.key);
-                    if existing.is_none_or(|existing| existing.0 < rec.seq) {
-                        merged.insert(
-                            rec.key.clone(),
-                            (
-                                rec.seq,
-                                rec.offset,
-                                rec.length,
-                                rec.payload_crc32,
-                                rec.expiry,
-                            ),
-                        );
-                    }
+                    insert_record_version(&mut merged, &rec);
                 }
             }
         }
 
         let mut records = Vec::new();
-        for (key, (seq, offset, length, crc, expiry)) in merged {
-            if expiry == 0 || expiry > now {
+        for (key, mut versions) in merged {
+            retain_versions_needed_by_snapshots(&mut versions, oldest_active_snapshot);
+            for (seq, (offset, length, crc, expiry)) in versions {
                 stats.bytes_rewritten += length & !UNCOMPRESSED_FLAG;
-                records.push(OmniRecord::new(seq, key, offset, length, crc, expiry));
-            } else {
-                stats.expired_records_dropped += 1;
+                records.push(OmniRecord::new(
+                    seq,
+                    key.clone(),
+                    offset,
+                    length,
+                    crc,
+                    expiry,
+                ));
             }
         }
 
@@ -2423,25 +2437,18 @@ impl OmniKV {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        let mut merged: BTreeMap<Vec<u8>, (u64, u64, u64, u32, u64)> = BTreeMap::new();
+        let oldest_active_snapshot = self.oldest_active_snapshot()?;
+        let preserve_deletion_markers = oldest_active_snapshot.is_some();
+        let mut merged: BTreeMap<Vec<u8>, VersionedValuePointers> = BTreeMap::new();
 
         let base_mmap = self.roots.load().base_mmap.clone();
         let reader = SSTableReader::from_mmap(base_mmap);
         for rec in reader.iter_from(b"") {
             if rec.is_valid() {
-                let existing = merged.get(&rec.key);
-                if existing.is_none_or(|existing| existing.0 < rec.seq) {
-                    merged.insert(
-                        rec.key,
-                        (
-                            rec.seq,
-                            rec.offset,
-                            rec.length,
-                            rec.payload_crc32,
-                            rec.expiry,
-                        ),
-                    );
+                if rec.length == 0 {
+                    stats.tombstones += 1;
                 }
+                insert_record_version(&mut merged, &rec);
             }
         }
 
@@ -2455,33 +2462,34 @@ impl OmniKV {
             let reader = SSTableReader::from_mmap(mmap.clone());
             for rec in reader.iter_from(b"") {
                 if rec.is_valid() {
-                    let existing = merged.get(&rec.key);
-                    if existing.is_none_or(|existing| existing.0 < rec.seq) {
-                        merged.insert(
-                            rec.key,
-                            (
-                                rec.seq,
-                                rec.offset,
-                                rec.length,
-                                rec.payload_crc32,
-                                rec.expiry,
-                            ),
-                        );
+                    if rec.length == 0 {
+                        stats.tombstones += 1;
                     }
+                    insert_record_version(&mut merged, &rec);
                 }
             }
         }
 
         let mut records = Vec::new();
-        for (key, (seq, offset, length, crc, expiry)) in merged {
-            // Drop tombstones and expired entries
-            if length > 0 && (expiry == 0 || expiry > now) {
+        for (key, mut versions) in merged {
+            retain_versions_needed_by_snapshots(&mut versions, oldest_active_snapshot);
+            for (seq, (offset, length, crc, expiry)) in versions {
+                let expired = expiry > 0 && expiry <= now;
+                if (length == 0 || expired) && !preserve_deletion_markers {
+                    if expired {
+                        stats.expired_records_dropped += 1;
+                    }
+                    continue;
+                }
                 stats.bytes_rewritten += length & !UNCOMPRESSED_FLAG;
-                records.push(OmniRecord::new(seq, key, offset, length, crc, expiry));
-            } else if length == 0 {
-                stats.tombstones += 1;
-            } else {
-                stats.expired_records_dropped += 1;
+                records.push(OmniRecord::new(
+                    seq,
+                    key.clone(),
+                    offset,
+                    length,
+                    crc,
+                    expiry,
+                ));
             }
         }
 
@@ -2572,25 +2580,14 @@ impl OmniKV {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        let min_seq = self.min_active_snapshot();
+        let oldest_active_snapshot = self.oldest_active_snapshot()?;
+        let preserve_deletion_markers = oldest_active_snapshot.is_some();
         let mut merged: BTreeMap<Vec<u8>, VersionedValuePointers> = BTreeMap::new();
 
         let mut add_to_merged =
             |key: Vec<u8>, seq: u64, offset: u64, length: u64, crc: u32, expiry: u64| {
                 let versions = merged.entry(key).or_default();
                 versions.insert(seq, (offset, length, crc, expiry));
-
-                // keep the latest version PLUS any versions >= min_seq
-                let max_seq = versions.keys().next_back().copied().unwrap_or(0);
-                let mut keys_to_remove = Vec::new();
-                for &s in versions.keys() {
-                    if s < min_seq && s < max_seq {
-                        keys_to_remove.push(s);
-                    }
-                }
-                for k in keys_to_remove {
-                    versions.remove(&k);
-                }
             };
 
         let base_mmap = self.roots.load().base_mmap.clone();
@@ -2694,12 +2691,23 @@ impl OmniKV {
         let mut current_offset = 0;
 
         for (k, versions) in merged {
+            let mut versions = versions;
+            retain_versions_needed_by_snapshots(&mut versions, oldest_active_snapshot);
             for (seq, (old_offset, length, crc, expiry)) in versions {
                 if length == 0 {
                     stats.tombstones += 1;
+                    if preserve_deletion_markers {
+                        let mut h = FnvHasher::default();
+                        k.hash(&mut h);
+                        bloom.add(h.finish());
+
+                        let rec = OmniRecord::new(seq, k.clone(), 0, 0, crc, expiry);
+                        base_sst_writer.append(&rec)?;
+                        final_records.push(rec);
+                    }
                     continue;
                 }
-                if expiry > 0 && expiry <= now {
+                if expiry > 0 && expiry <= now && !preserve_deletion_markers {
                     stats.expired_records_dropped += 1;
                     continue;
                 }
@@ -2929,6 +2937,24 @@ mod tests {
         assert!(
             matches!(err, OmniError::InvalidCompactionPolicy(_)),
             "expected InvalidCompactionPolicy, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn version_retention_keeps_predecessor_for_oldest_snapshot() {
+        let mut versions = VersionedValuePointers::new();
+        versions.insert(1, (10, UNCOMPRESSED_FLAG | 3, 0, 0));
+        versions.insert(5, (20, UNCOMPRESSED_FLAG | 3, 0, 0));
+        versions.insert(8, (30, UNCOMPRESSED_FLAG | 3, 0, 0));
+        versions.insert(10, (40, UNCOMPRESSED_FLAG | 3, 0, 0));
+
+        retain_versions_needed_by_snapshots(&mut versions, Some(7));
+
+        let retained: Vec<u64> = versions.keys().copied().collect();
+        assert_eq!(
+            retained,
+            vec![5, 8, 10],
+            "oldest snapshot 7 needs predecessor 5, plus versions >= 7 and latest"
         );
     }
 
