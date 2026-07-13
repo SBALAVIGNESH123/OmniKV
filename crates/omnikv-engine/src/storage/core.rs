@@ -1032,20 +1032,19 @@ impl OmniKV {
         manifest_path: &str,
         wal_path: &str,
     ) -> Result<RecoveredStorage, OmniError> {
-        let manifest = match Manifest::load(manifest_path) {
-            Ok(m) => m,
-            Err(_) => {
-                let m = Manifest {
-                    format_version: MANIFEST_FORMAT_VERSION,
-                    heap_path: format!("{}_heap.bin", manifest_path),
-                    base_path: format!("{}_base.bin", manifest_path),
-                    sstables: vec![],
-                    l1_sstables: vec![],
-                    max_seq: 0,
-                };
-                m.save(manifest_path)?;
-                m
-            }
+        let manifest = if Path::new(manifest_path).exists() {
+            Manifest::load(manifest_path)?
+        } else {
+            let m = Manifest {
+                format_version: MANIFEST_FORMAT_VERSION,
+                heap_path: format!("{}_heap.bin", manifest_path),
+                base_path: format!("{}_base.bin", manifest_path),
+                sstables: vec![],
+                l1_sstables: vec![],
+                max_seq: 0,
+            };
+            m.save(manifest_path)?;
+            m
         };
 
         let base_file = OpenOptions::new()
