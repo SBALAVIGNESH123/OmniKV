@@ -43,7 +43,7 @@ const OMNIKV_CONFIG_ENV: &str = "OMNIKV_CONFIG";
 const LEGACY_OMNI_CONFIG_ENV: &str = "OMNI_CONFIG";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(default, deny_unknown_fields)]
 pub struct StorageConfig {
     pub manifest_path: String,
     pub wal_path: String,
@@ -51,6 +51,13 @@ pub struct StorageConfig {
     pub max_open_files: u32,
     pub write_buffer_mb: u32,
     pub compaction_workers: u32,
+    pub memtable_flush_threshold: usize,
+    pub l0_compaction_trigger: usize,
+    pub l1_compaction_trigger: usize,
+    pub l0_write_stall_threshold: usize,
+    pub write_stall_wait_attempts: u32,
+    pub write_stall_wait_ms: u64,
+    pub compaction_check_interval_ms: u64,
 }
 
 impl Default for StorageConfig {
@@ -62,6 +69,25 @@ impl Default for StorageConfig {
             max_open_files: 512,
             write_buffer_mb: 64,
             compaction_workers: 2,
+            memtable_flush_threshold: 10_000,
+            l0_compaction_trigger: 4,
+            l1_compaction_trigger: 4,
+            l0_write_stall_threshold: 12,
+            write_stall_wait_attempts: 50,
+            write_stall_wait_ms: 100,
+            compaction_check_interval_ms: 500,
+        }
+    }
+}
+
+impl StorageConfig {
+    pub fn compaction_policy(&self) -> crate::CompactionPolicy {
+        crate::CompactionPolicy {
+            l0_compaction_trigger: self.l0_compaction_trigger,
+            l1_compaction_trigger: self.l1_compaction_trigger,
+            l0_write_stall_threshold: self.l0_write_stall_threshold,
+            write_stall_wait_attempts: self.write_stall_wait_attempts,
+            write_stall_wait_ms: self.write_stall_wait_ms,
         }
     }
 }
@@ -300,6 +326,33 @@ impl ServerConfig {
         if let Ok(v) = std::env::var("OMNIKV_COMPACTION_WORKERS") {
             self.storage.compaction_workers = parse_env_value("OMNIKV_COMPACTION_WORKERS", &v)?;
         }
+        if let Ok(v) = std::env::var("OMNIKV_MEMTABLE_FLUSH_THRESHOLD") {
+            self.storage.memtable_flush_threshold =
+                parse_env_value("OMNIKV_MEMTABLE_FLUSH_THRESHOLD", &v)?;
+        }
+        if let Ok(v) = std::env::var("OMNIKV_L0_COMPACTION_TRIGGER") {
+            self.storage.l0_compaction_trigger =
+                parse_env_value("OMNIKV_L0_COMPACTION_TRIGGER", &v)?;
+        }
+        if let Ok(v) = std::env::var("OMNIKV_L1_COMPACTION_TRIGGER") {
+            self.storage.l1_compaction_trigger =
+                parse_env_value("OMNIKV_L1_COMPACTION_TRIGGER", &v)?;
+        }
+        if let Ok(v) = std::env::var("OMNIKV_L0_WRITE_STALL_THRESHOLD") {
+            self.storage.l0_write_stall_threshold =
+                parse_env_value("OMNIKV_L0_WRITE_STALL_THRESHOLD", &v)?;
+        }
+        if let Ok(v) = std::env::var("OMNIKV_WRITE_STALL_WAIT_ATTEMPTS") {
+            self.storage.write_stall_wait_attempts =
+                parse_env_value("OMNIKV_WRITE_STALL_WAIT_ATTEMPTS", &v)?;
+        }
+        if let Ok(v) = std::env::var("OMNIKV_WRITE_STALL_WAIT_MS") {
+            self.storage.write_stall_wait_ms = parse_env_value("OMNIKV_WRITE_STALL_WAIT_MS", &v)?;
+        }
+        if let Ok(v) = std::env::var("OMNIKV_COMPACTION_CHECK_INTERVAL_MS") {
+            self.storage.compaction_check_interval_ms =
+                parse_env_value("OMNIKV_COMPACTION_CHECK_INTERVAL_MS", &v)?;
+        }
         Ok(())
     }
 
@@ -396,6 +449,20 @@ impl ServerConfig {
                 "storage.compaction_workers must be greater than 0".into(),
             ));
         }
+        if self.storage.memtable_flush_threshold == 0 {
+            return Err(ConfigError(
+                "storage.memtable_flush_threshold must be greater than 0".into(),
+            ));
+        }
+        if self.storage.compaction_check_interval_ms == 0 {
+            return Err(ConfigError(
+                "storage.compaction_check_interval_ms must be greater than 0".into(),
+            ));
+        }
+        self.storage
+            .compaction_policy()
+            .validate()
+            .map_err(|err| ConfigError(err.to_string()))?;
         if self.rate_limit_per_sec <= 0.0 {
             return Err(ConfigError(
                 "OMNIKV_RATE_LIMIT_PER_SEC must be greater than 0".into(),

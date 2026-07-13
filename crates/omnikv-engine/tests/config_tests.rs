@@ -270,6 +270,13 @@ fn test_env_override_storage_numeric_settings() {
             ("OMNIKV_MAX_OPEN_FILES", "2048"),
             ("OMNIKV_WRITE_BUFFER_MB", "128"),
             ("OMNIKV_COMPACTION_WORKERS", "8"),
+            ("OMNIKV_MEMTABLE_FLUSH_THRESHOLD", "4096"),
+            ("OMNIKV_L0_COMPACTION_TRIGGER", "3"),
+            ("OMNIKV_L1_COMPACTION_TRIGGER", "5"),
+            ("OMNIKV_L0_WRITE_STALL_THRESHOLD", "9"),
+            ("OMNIKV_WRITE_STALL_WAIT_ATTEMPTS", "7"),
+            ("OMNIKV_WRITE_STALL_WAIT_MS", "25"),
+            ("OMNIKV_COMPACTION_CHECK_INTERVAL_MS", "250"),
         ],
         || {
             let mut cfg = ServerConfig::default();
@@ -277,6 +284,14 @@ fn test_env_override_storage_numeric_settings() {
             assert_eq!(cfg.storage.max_open_files, 2048);
             assert_eq!(cfg.storage.write_buffer_mb, 128);
             assert_eq!(cfg.storage.compaction_workers, 8);
+            assert_eq!(cfg.storage.memtable_flush_threshold, 4096);
+            assert_eq!(cfg.storage.l0_compaction_trigger, 3);
+            assert_eq!(cfg.storage.l1_compaction_trigger, 5);
+            assert_eq!(cfg.storage.l0_write_stall_threshold, 9);
+            assert_eq!(cfg.storage.write_stall_wait_attempts, 7);
+            assert_eq!(cfg.storage.write_stall_wait_ms, 25);
+            assert_eq!(cfg.storage.compaction_check_interval_ms, 250);
+            assert_eq!(cfg.storage.compaction_policy().l0_compaction_trigger, 3);
         },
     );
 }
@@ -315,6 +330,20 @@ fn test_invalid_storage_numeric_env_fails_closed() {
         let err = cfg.apply_env().unwrap_err();
         assert!(err.0.contains("OMNIKV_COMPACTION_WORKERS"), "got: {err}");
     });
+}
+
+#[test]
+fn test_invalid_compaction_thresholds_fail_closed() {
+    let cfg = ServerConfig {
+        storage: omni_engine::config::StorageConfig {
+            l0_compaction_trigger: 4,
+            l0_write_stall_threshold: 4,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let err = cfg.validate_runtime().unwrap_err();
+    assert!(err.0.contains("l0_write_stall_threshold"), "got: {err}");
 }
 
 #[test]
@@ -367,6 +396,27 @@ fn test_env_values_override_config_file_values() {
             assert_eq!(cfg.http_addr, "127.0.0.1:9595");
         },
     );
+}
+
+#[test]
+fn test_partial_storage_config_uses_defaults_for_omitted_fields() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("omni.toml");
+    std::fs::write(
+        &config,
+        "[storage]\nmanifest_path = \"/tmp/omnikv-manifest.json\"\n",
+    )
+    .unwrap();
+
+    let cfg = ServerConfig::load_server_from_args([
+        "--config".to_string(),
+        config.to_string_lossy().to_string(),
+    ])
+    .unwrap();
+
+    assert_eq!(cfg.storage.manifest_path, "/tmp/omnikv-manifest.json");
+    assert_eq!(cfg.storage.l0_compaction_trigger, 4);
+    assert_eq!(cfg.storage.l0_write_stall_threshold, 12);
 }
 
 #[test]
