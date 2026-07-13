@@ -479,20 +479,20 @@ type SharedMemtable = Arc<Memtable>;
 type SstableHandle = (Arc<Mmap>, Arc<BloomFilter>, String);
 type SharedSstables = Arc<Vec<SstableHandle>>;
 
-fn retain_versions_needed_by_snapshots(
+fn retain_versions_needed_by_floor(
     versions: &mut VersionedValuePointers,
-    oldest_active_snapshot: Option<u64>,
+    retention_floor: Option<u64>,
 ) {
     let Some(latest_seq) = versions.keys().next_back().copied() else {
         return;
     };
-    let predecessor_for_oldest_snapshot = oldest_active_snapshot
-        .and_then(|snapshot| versions.range(..=snapshot).next_back().map(|(&seq, _)| seq));
+    let predecessor_for_retention_floor =
+        retention_floor.and_then(|floor| versions.range(..=floor).next_back().map(|(&seq, _)| seq));
 
     versions.retain(|seq, _| {
         *seq == latest_seq
-            || oldest_active_snapshot.is_some_and(|snapshot| *seq >= snapshot)
-            || predecessor_for_oldest_snapshot == Some(*seq)
+            || retention_floor.is_some_and(|floor| *seq >= floor)
+            || predecessor_for_retention_floor == Some(*seq)
     });
 }
 
@@ -1028,6 +1028,7 @@ pub struct OmniKV {
     pub(crate) manifest_path: String,
     pub metrics: Arc<Metrics>,
     pub(crate) active_snapshots: Mutex<std::collections::BTreeMap<u64, usize>>,
+    pub(crate) replica_retention_floors: Mutex<BTreeMap<String, u64>>,
     pub(crate) block_cache: moka::sync::Cache<u64, String>,
     scan_buffer_pool: Arc<ScanBufferPool>,
     compaction_policy: RwLock<CompactionPolicy>,
@@ -1076,6 +1077,7 @@ impl OmniKV {
             manifest_path: manifest_path.to_string(),
             metrics: Arc::new(Metrics::new()),
             active_snapshots: Mutex::new(std::collections::BTreeMap::new()),
+            replica_retention_floors: Mutex::new(BTreeMap::new()),
             block_cache: moka::sync::Cache::builder().max_capacity(100_000).build(),
             scan_buffer_pool: Arc::new(ScanBufferPool::default()),
             compaction_policy: RwLock::new(CompactionPolicy::default()),
@@ -1366,6 +1368,73 @@ impl OmniKV {
             .lock()
             .map_err(|_| OmniError::LockPoisoned("active_snapshots".into()))
             .map(|snapshots| snapshots.keys().next().copied())
+    }
+
+    /// Pins the oldest storage sequence that a replica or external catch-up
+    /// consumer may still need. Compaction and heap GC treat this like an
+    /// external snapshot until the caller releases it.
+    ///
+    /// Re-pinning the same replica id replaces its previous floor, which lets
+    /// replication code advance the retention point as the follower catches up.
+    pub fn pin_replica_retention(
+        &self,
+        replica_id: impl Into<String>,
+        seq: u64,
+    ) -> Result<(), OmniError> {
+        let replica_id = replica_id.into();
+        let replica_id = replica_id.trim();
+        if replica_id.is_empty() {
+            return Err(OmniError::IoError(
+                "replica retention id must not be empty".into(),
+            ));
+        }
+
+        let floor = {
+            let mut floors = self
+                .replica_retention_floors
+                .lock()
+                .map_err(|_| OmniError::LockPoisoned("replica_retention_floors".into()))?;
+            floors.insert(replica_id.to_owned(), seq);
+            floors.values().min().copied()
+        };
+        metrics_prometheus::record_replica_retention_floor(floor);
+        Ok(())
+    }
+
+    /// Releases a replica retention pin after that replica has caught up or
+    /// switched to snapshot install. Releasing an unknown id is intentionally
+    /// idempotent so recovery code can clean up defensively.
+    pub fn release_replica_retention(&self, replica_id: &str) -> Result<(), OmniError> {
+        let floor = {
+            let mut floors = self
+                .replica_retention_floors
+                .lock()
+                .map_err(|_| OmniError::LockPoisoned("replica_retention_floors".into()))?;
+            floors.remove(replica_id.trim());
+            floors.values().min().copied()
+        };
+        metrics_prometheus::record_replica_retention_floor(floor);
+        Ok(())
+    }
+
+    /// Returns the oldest sequence retained for replica catch-up, if any.
+    pub fn min_replica_retention(&self) -> Result<Option<u64>, OmniError> {
+        self.replica_retention_floors
+            .lock()
+            .map_err(|_| OmniError::LockPoisoned("replica_retention_floors".into()))
+            .map(|floors| floors.values().min().copied())
+    }
+
+    fn compaction_retention_floor(&self) -> Result<Option<u64>, OmniError> {
+        match (
+            self.oldest_active_snapshot()?,
+            self.min_replica_retention()?,
+        ) {
+            (Some(snapshot), Some(replica)) => Ok(Some(snapshot.min(replica))),
+            (Some(snapshot), None) => Ok(Some(snapshot)),
+            (None, Some(replica)) => Ok(Some(replica)),
+            (None, None) => Ok(None),
+        }
     }
 
     pub fn memtable_size(&self) -> usize {
@@ -2307,7 +2376,7 @@ impl OmniKV {
             return Ok(());
         }
 
-        let oldest_active_snapshot = self.oldest_active_snapshot()?;
+        let retention_floor = self.compaction_retention_floor()?;
         let mut merged: BTreeMap<Vec<u8>, VersionedValuePointers> = BTreeMap::new();
 
         for (mmap, _, _) in &**sstables {
@@ -2324,7 +2393,7 @@ impl OmniKV {
 
         let mut records = Vec::new();
         for (key, mut versions) in merged {
-            retain_versions_needed_by_snapshots(&mut versions, oldest_active_snapshot);
+            retain_versions_needed_by_floor(&mut versions, retention_floor);
             for (seq, (offset, length, crc, expiry)) in versions {
                 stats.bytes_rewritten += length & !UNCOMPRESSED_FLAG;
                 records.push(OmniRecord::new(
@@ -2437,8 +2506,8 @@ impl OmniKV {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        let oldest_active_snapshot = self.oldest_active_snapshot()?;
-        let preserve_deletion_markers = oldest_active_snapshot.is_some();
+        let retention_floor = self.compaction_retention_floor()?;
+        let preserve_deletion_markers = retention_floor.is_some();
         let mut merged: BTreeMap<Vec<u8>, VersionedValuePointers> = BTreeMap::new();
 
         let base_mmap = self.roots.load().base_mmap.clone();
@@ -2472,7 +2541,7 @@ impl OmniKV {
 
         let mut records = Vec::new();
         for (key, mut versions) in merged {
-            retain_versions_needed_by_snapshots(&mut versions, oldest_active_snapshot);
+            retain_versions_needed_by_floor(&mut versions, retention_floor);
             for (seq, (offset, length, crc, expiry)) in versions {
                 let expired = expiry > 0 && expiry <= now;
                 if (length == 0 || expired) && !preserve_deletion_markers {
@@ -2580,8 +2649,8 @@ impl OmniKV {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        let oldest_active_snapshot = self.oldest_active_snapshot()?;
-        let preserve_deletion_markers = oldest_active_snapshot.is_some();
+        let retention_floor = self.compaction_retention_floor()?;
+        let preserve_deletion_markers = retention_floor.is_some();
         let mut merged: BTreeMap<Vec<u8>, VersionedValuePointers> = BTreeMap::new();
 
         let mut add_to_merged =
@@ -2692,7 +2761,7 @@ impl OmniKV {
 
         for (k, versions) in merged {
             let mut versions = versions;
-            retain_versions_needed_by_snapshots(&mut versions, oldest_active_snapshot);
+            retain_versions_needed_by_floor(&mut versions, retention_floor);
             for (seq, (old_offset, length, crc, expiry)) in versions {
                 if length == 0 {
                     stats.tombstones += 1;
@@ -2948,7 +3017,7 @@ mod tests {
         versions.insert(8, (30, UNCOMPRESSED_FLAG | 3, 0, 0));
         versions.insert(10, (40, UNCOMPRESSED_FLAG | 3, 0, 0));
 
-        retain_versions_needed_by_snapshots(&mut versions, Some(7));
+        retain_versions_needed_by_floor(&mut versions, Some(7));
 
         let retained: Vec<u64> = versions.keys().copied().collect();
         assert_eq!(

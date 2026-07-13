@@ -62,6 +62,11 @@ lazy_static! {
         "Current compaction backlog measured as L0 plus L1 SSTables"
     )
     .expect("OmniKV metric registration failed at startup: duplicate or invalid metric name");
+    pub static ref REPLICA_RETENTION_FLOOR: IntGauge = register_int_gauge!(
+        "omnikv_replica_retention_floor",
+        "Oldest sequence retained for lagging replicas or external catch-up consumers; 0 means none"
+    )
+    .expect("OmniKV metric registration failed at startup: duplicate or invalid metric name");
     pub static ref WRITE_STALLS_TOTAL: IntCounter = register_int_counter!(
         "omnikv_write_stalls_total",
         "Total writes rejected because compaction backlog exceeded the write-stall threshold"
@@ -159,6 +164,12 @@ pub fn record_compaction(
 /// Update the observable compaction backlog gauge.
 pub fn record_compaction_backlog(backlog_sstables: usize) {
     COMPACTION_BACKLOG_SSTABLES.set(backlog_sstables as i64);
+}
+
+/// Update the oldest sequence retained for lagging replicas.
+pub fn record_replica_retention_floor(floor: Option<u64>) {
+    let floor = floor.map_or(0, |seq| seq.min(i64::MAX as u64) as i64);
+    REPLICA_RETENTION_FLOOR.set(floor);
 }
 
 /// Record a write stall caused by an excessive compaction backlog.
