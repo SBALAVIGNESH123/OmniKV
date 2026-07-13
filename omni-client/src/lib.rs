@@ -289,3 +289,83 @@ impl OmniClientBuilder {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    use tokio::net::TcpListener;
+
+    async fn spawn_one_response(
+        status: &'static str,
+        body: &'static str,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test HTTP server");
+        let addr = listener.local_addr().expect("test HTTP server address");
+        let handle = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept test client");
+            let mut request = [0_u8; 1024];
+            let _read = stream
+                .read(&mut request)
+                .await
+                .expect("read client request");
+            let response = format!(
+                "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("write test response");
+        });
+
+        (format!("http://{addr}"), handle)
+    }
+
+    #[tokio::test]
+    async fn client_contract_health_smoke_accepts_stable_rest_envelope() {
+        let body = r#"{"success":true,"data":{"status":"ok","version":"0.3.0","uptime_secs":7,"sstable_count":2},"error":null}"#;
+        let (base_url, server) = spawn_one_response("200 OK", body).await;
+
+        let health = OmniClient::new(&base_url).health().await.expect("health");
+        server.await.expect("server task");
+
+        assert_eq!(health.status, "ok");
+        assert_eq!(health.version, "0.3.0");
+        assert_eq!(health.uptime_secs, 7);
+        assert_eq!(health.sstable_count, 2);
+    }
+
+    #[tokio::test]
+    async fn client_contract_missing_key_maps_to_none() {
+        let body = r#"{"success":false,"data":null,"error":"Key not found"}"#;
+        let (base_url, server) = spawn_one_response("404 Not Found", body).await;
+
+        let value = OmniClient::new(&base_url)
+            .get("missing")
+            .await
+            .expect("missing key maps to Ok(None)");
+        server.await.expect("server task");
+
+        assert_eq!(value, None);
+    }
+
+    #[tokio::test]
+    async fn client_contract_api_error_preserves_stable_error_code() {
+        let body = r#"{"success":false,"data":null,"error":"VALUE_TOO_LARGE"}"#;
+        let (base_url, server) = spawn_one_response("400 Bad Request", body).await;
+
+        let err = OmniClient::new(&base_url)
+            .set("large", "value")
+            .await
+            .expect_err("server error");
+        server.await.expect("server task");
+
+        match err {
+            OmniClientError::Api(message) => assert_eq!(message, "VALUE_TOO_LARGE"),
+            OmniClientError::Http(error) => panic!("expected API error, got HTTP error: {error}"),
+        }
+    }
+}

@@ -182,13 +182,13 @@ fn http_status_for_storage_err(e: &OmniError) -> StatusCode {
 
 pub fn build_router(state: AppState) -> Router {
     let read_routes = Router::new()
-        .route("/kv/{key}", axum::routing::get(get_handler))
+        .route("/kv/:key", axum::routing::get(get_handler))
         .route("/scan", axum::routing::get(scan_handler))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_read));
 
     let write_routes = Router::new()
         .route("/kv", axum::routing::post(set_handler))
-        .route("/kv/{key}", axum::routing::delete(delete_handler))
+        .route("/kv/:key", axum::routing::delete(delete_handler))
         .route("/batch", axum::routing::post(batch_handler))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_write));
 
@@ -369,8 +369,11 @@ async fn ready_handler(State(state): State<AppState>) -> impl IntoResponse {
 }
 
 async fn get_handler(State(state): State<AppState>, Path(key): Path<String>) -> impl IntoResponse {
-    let seq = state.db.get_seq();
-    match state.db.find(&key, seq) {
+    let seq = state.db.snapshot();
+    let result = state.db.find(&key, seq);
+    state.db.unregister_snapshot(seq);
+
+    match result {
         Ok(Some(val)) => (
             StatusCode::OK,
             ApiResponse::ok(KeyValue { key, value: val }),
@@ -479,9 +482,11 @@ async fn scan_handler(
     };
     let start = q.start.as_deref().unwrap_or("");
     let end = q.end.as_deref().unwrap_or("\x7F");
-    let seq = state.db.get_seq();
+    let seq = state.db.snapshot();
+    let results = state.db.scan(start, end, seq);
+    state.db.unregister_snapshot(seq);
 
-    match state.db.scan(start, end, seq) {
+    match results {
         Ok(results) => {
             let items: Vec<KeyValue> = results
                 .into_iter()
@@ -605,7 +610,8 @@ mod tests {
     use super::*;
     use axum::body::Body;
     use axum::http::{Method, Request};
-    use serde_json::json;
+    use axum::response::Response;
+    use serde_json::{Value, json};
     use tower::ServiceExt;
 
     fn test_router() -> (Router, tempfile::TempDir, String) {
@@ -628,6 +634,183 @@ mod tests {
             rate_limiter: Arc::new(RateLimiter::new(1000.0, 100, 10_000)),
         });
         (router, dir, jwt_secret)
+    }
+
+    async fn response_json(response: Response) -> Value {
+        let bytes = axum::body::to_bytes(response.into_body(), MAX_REST_BODY_BYTES)
+            .await
+            .expect("response body bytes");
+        serde_json::from_slice(&bytes).expect("json response body")
+    }
+
+    #[tokio::test]
+    async fn rest_contract_health_envelope_is_stable() {
+        let (router, _dir, _secret) = test_router();
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/health")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["success"], true);
+        assert_eq!(body["error"], Value::Null);
+        assert_eq!(body["data"]["status"], "ok");
+        assert_eq!(body["data"]["version"], env!("CARGO_PKG_VERSION"));
+        assert!(
+            body["data"]["uptime_secs"].is_u64(),
+            "health uptime must remain a numeric field"
+        );
+        assert!(
+            body["data"]["sstable_count"].is_u64(),
+            "health sstable_count must remain a numeric field"
+        );
+    }
+
+    #[tokio::test]
+    async fn rest_contract_write_then_read_envelopes_are_stable() {
+        let (router, _dir, secret) = test_router();
+        let write_token =
+            crate::auth::generate_token("writer", "write", &secret, 60).expect("write token");
+        let read_token =
+            crate::auth::generate_token("reader", "read", &secret, 60).expect("read token");
+
+        let write_response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/kv")
+                    .header(header::AUTHORIZATION, format!("Bearer {write_token}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({"key":"contract-key","value":"contract-value"}).to_string(),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("write response");
+
+        assert_eq!(write_response.status(), StatusCode::CREATED);
+        let write_body = response_json(write_response).await;
+        assert_eq!(write_body["success"], true);
+        assert_eq!(write_body["error"], Value::Null);
+        assert!(
+            write_body["data"]["seq"].as_u64().unwrap_or_default() > 0,
+            "write contract must expose a positive sequence number"
+        );
+
+        let read_response = router
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/kv/contract-key")
+                    .header(header::AUTHORIZATION, format!("Bearer {read_token}"))
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("read response");
+
+        assert_eq!(read_response.status(), StatusCode::OK);
+        let read_body = response_json(read_response).await;
+        assert_eq!(
+            read_body,
+            json!({
+                "success": true,
+                "data": {
+                    "key": "contract-key",
+                    "value": "contract-value"
+                },
+                "error": null
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn rest_contract_missing_bearer_token_error_is_stable() {
+        let (router, _dir, _secret) = test_router();
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/kv")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(json!({"key":"a","value":"b"}).to_string()))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            response_json(response).await,
+            json!({
+                "success": false,
+                "data": null,
+                "error": "missing bearer token"
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn rest_contract_scan_limit_error_is_stable() {
+        let (router, _dir, secret) = test_router();
+        let token = crate::auth::generate_token("reader", "read", &secret, 60).expect("read token");
+        let oversized = MAX_REST_SCAN_LIMIT + 1;
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(format!("/scan?limit={oversized}"))
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            response_json(response).await,
+            json!({
+                "success": false,
+                "data": null,
+                "error": "scan limit 10001 exceeds maximum of 10000"
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn rest_contract_admin_endpoint_auth_error_is_stable() {
+        let (router, _dir, _secret) = test_router();
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/admin/compact")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            response_json(response).await,
+            json!({
+                "success": false,
+                "data": null,
+                "error": "missing bearer token"
+            })
+        );
     }
 
     #[tokio::test]

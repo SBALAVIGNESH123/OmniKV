@@ -97,9 +97,20 @@ On Windows/MSVC, full debug test linking can require significant free disk space
 
 ## Operations docs
 
+- [API and client compatibility](docs/api-compatibility.md)
 - [Backup and restore](docs/backup_restore.md)
 - [Protocol and result-size limits](docs/protocol-limits.md)
 - [SQL support matrix](docs/sql-support.md)
+
+## Compatibility status
+
+| Surface | Current status | Guardrail |
+| --- | --- | --- |
+| Embedded Rust API | Beta | Workspace build, clippy, storage, durability, SQL, transaction, and ops tests |
+| REST API | Beta | Stable JSON envelope and golden response contract tests |
+| PgWire protocol | Beta subset | SQLSTATE, command tag, ReadyForQuery, and result-limit contract tests |
+| Rust REST client | Beta | HTTP smoke tests against stable REST response envelopes |
+| Python / Go clients | Not official yet | No compatibility promise until clients live in this repo and run in CI |
 
 ## Workspace layout
 

@@ -804,11 +804,15 @@ fn send_ready_for_query_status(
     stream: &mut std::net::TcpStream,
     status: u8,
 ) -> std::io::Result<()> {
+    stream.write_all(&ready_for_query_bytes(status))
+}
+
+fn ready_for_query_bytes(status: u8) -> Vec<u8> {
     let mut buf = Vec::new();
     buf.push(READY_FOR_QUERY);
     buf.extend_from_slice(&5i32.to_be_bytes());
     buf.push(status);
-    stream.write_all(&buf)
+    buf
 }
 
 fn send_parameter_status(
@@ -872,6 +876,10 @@ fn send_data_row(stream: &mut std::net::TcpStream, values: &[&str]) -> std::io::
 }
 
 fn send_command_complete(stream: &mut std::net::TcpStream, tag: &str) -> std::io::Result<()> {
+    stream.write_all(&command_complete_bytes(tag))
+}
+
+fn command_complete_bytes(tag: &str) -> Vec<u8> {
     let mut body = Vec::new();
     body.extend_from_slice(tag.as_bytes());
     body.push(0);
@@ -880,7 +888,7 @@ fn send_command_complete(stream: &mut std::net::TcpStream, tag: &str) -> std::io
     buf.push(COMMAND_COMPLETE);
     buf.extend_from_slice(&((body.len() + 4) as i32).to_be_bytes());
     buf.extend_from_slice(&body);
-    stream.write_all(&buf)
+    buf
 }
 
 fn send_error(
@@ -889,6 +897,10 @@ fn send_error(
     code: &str,
     message: &str,
 ) -> std::io::Result<()> {
+    stream.write_all(&error_response_bytes(severity, code, message))
+}
+
+fn error_response_bytes(severity: &str, code: &str, message: &str) -> Vec<u8> {
     let mut body = Vec::new();
     body.push(b'S');
     body.extend_from_slice(severity.as_bytes());
@@ -908,13 +920,47 @@ fn send_error(
     buf.push(ERROR_RESPONSE);
     buf.extend_from_slice(&((body.len() + 4) as i32).to_be_bytes());
     buf.extend_from_slice(&body);
-    stream.write_all(&buf)
+    buf
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::sql::{SqlStatement, parse_sql};
+
+    fn pgwire_frame_length(frame: &[u8]) -> usize {
+        let length_bytes: [u8; 4] = frame[1..5].try_into().expect("length bytes");
+        let encoded = u32::from_be_bytes(length_bytes);
+        usize::try_from(encoded).expect("frame length fits usize")
+    }
+
+    #[test]
+    fn pgwire_contract_ready_for_query_frames_are_stable() {
+        assert_eq!(ready_for_query_bytes(b'I'), vec![b'Z', 0, 0, 0, 5, b'I']);
+        assert_eq!(ready_for_query_bytes(b'T'), vec![b'Z', 0, 0, 0, 5, b'T']);
+        assert_eq!(ready_for_query_bytes(b'E'), vec![b'Z', 0, 0, 0, 5, b'E']);
+    }
+
+    #[test]
+    fn pgwire_contract_command_complete_frame_is_stable() {
+        let frame = command_complete_bytes("SELECT 1");
+
+        assert_eq!(frame[0], b'C');
+        assert_eq!(pgwire_frame_length(&frame), frame.len() - 1);
+        assert_eq!(&frame[5..], b"SELECT 1\0");
+    }
+
+    #[test]
+    fn pgwire_contract_error_response_fields_are_stable() {
+        let frame = error_response_bytes("ERROR", "42601", "Parse error: invalid query");
+
+        assert_eq!(frame[0], b'E');
+        assert_eq!(pgwire_frame_length(&frame), frame.len() - 1);
+        assert_eq!(
+            &frame[5..],
+            b"SERROR\0VERROR\0C42601\0MParse error: invalid query\0\0"
+        );
+    }
 
     #[test]
     fn pgwire_frame_length_validation_rejects_invalid_lengths_before_allocation() {
