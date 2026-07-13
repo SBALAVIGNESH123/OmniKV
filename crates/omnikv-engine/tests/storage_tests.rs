@@ -1,7 +1,9 @@
 //! Integration tests for the `OmniKV` storage engine.
 //! These test the full write path, read path, compaction, TTL, MVCC, and crash recovery.
 
-use omni_engine::{OmniError, OmniKV, OmniRecord, SSTableReader, SSTableWriter, WriteBatch};
+use omni_engine::{
+    CompactionPolicy, OmniError, OmniKV, OmniRecord, SSTableReader, SSTableWriter, WriteBatch,
+};
 use std::sync::Arc;
 use tempfile::TempDir;
 
@@ -376,11 +378,44 @@ fn test_compaction_preserves_latest_version() {
 
 #[test]
 fn test_write_stall_backpressure() {
-    // Verify that WriteStall is returned when L0 SSTables pile up.
-    // This is a design validation — we don't actually create 12 SSTables,
-    // just verify the error type exists and is handled.
-    let err = OmniError::WriteStall;
-    assert_eq!(format!("{err:?}"), "WriteStall");
+    let (db, _dir) = create_test_db();
+    db.set_compaction_policy(CompactionPolicy {
+        l0_compaction_trigger: 1,
+        l1_compaction_trigger: 4,
+        l0_write_stall_threshold: 2,
+        write_stall_wait_attempts: 0,
+        write_stall_wait_ms: 0,
+    })
+    .expect("valid test compaction policy");
+
+    for idx in 0..2 {
+        let mut batch = WriteBatch::new();
+        batch
+            .set(&format!("stall-key-{idx}"), format!("value-{idx}"))
+            .unwrap();
+        db.commit_batch(&batch).unwrap();
+        db.compact_sstables().unwrap();
+    }
+
+    assert_eq!(
+        db.sstable_count(),
+        2,
+        "test setup should create two L0 SSTables"
+    );
+
+    let mut stalled_batch = WriteBatch::new();
+    stalled_batch
+        .set("stall-key-final", "value-final".to_string())
+        .unwrap();
+    let err = db.commit_batch(&stalled_batch).unwrap_err();
+    assert!(
+        matches!(err, OmniError::WriteStall),
+        "expected WriteStall, got {err:?}"
+    );
+
+    let metrics = omni_engine::metrics_prometheus::render_metrics();
+    assert!(metrics.contains("omnikv_write_stalls_total"));
+    assert!(metrics.contains("omnikv_compaction_backlog_sstables"));
 }
 
 #[test]

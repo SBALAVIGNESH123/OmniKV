@@ -60,6 +60,8 @@ jobs:
         key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
     - name: Storage tests (76 tests)
       run: cargo test -p omnikv-engine --test storage_tests -- --test-threads=1
+    - name: Storage core unit tests
+      run: cargo test -p omnikv-engine storage::core::tests --lib -- --test-threads=1
     - name: Storage correctness (14 tests)
       run: cargo test -p omnikv-engine --test storage_correctness -- --test-threads=1
     - name: Storage engine (19 tests)

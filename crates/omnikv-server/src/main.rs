@@ -66,6 +66,28 @@ fn print_banner(cfg: &ServerConfig) {
     println!();
 }
 
+fn start_storage_maintenance(
+    db: &Arc<OmniKV>,
+    cfg: &ServerConfig,
+) -> Result<std::thread::JoinHandle<()>, omni_engine::OmniError> {
+    db.set_compaction_policy(cfg.storage.compaction_policy())?;
+    Ok(db.start_background_compaction(
+        cfg.storage.compaction_check_interval_ms,
+        cfg.storage.memtable_flush_threshold,
+    ))
+}
+
+fn log_database_opened(db: &OmniKV, cfg: &ServerConfig) {
+    tracing::info!(
+        seq = db.get_seq(),
+        sstables = db.sstable_count(),
+        l0_compaction_trigger = cfg.storage.l0_compaction_trigger,
+        l1_compaction_trigger = cfg.storage.l1_compaction_trigger,
+        l0_write_stall_threshold = cfg.storage.l0_write_stall_threshold,
+        "Database opened"
+    );
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize structured logging
@@ -98,11 +120,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Open the database using configured paths.
     let db = OmniKV::open(&manifest_path, &wal_path)?;
-    tracing::info!(
-        seq = db.get_seq(),
-        sstables = db.sstable_count(),
-        "Database opened"
-    );
+    let _compaction_handle = start_storage_maintenance(&db, &cfg)?;
+    log_database_opened(&db, &cfg);
 
     let rate_limiter = Arc::new(RateLimiter::new(
         cfg.rate_limit_per_sec,

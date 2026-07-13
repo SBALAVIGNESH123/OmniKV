@@ -49,6 +49,7 @@ pub enum OmniError {
     HashCollision,
     LockPoisoned(String),
     WriteStall,
+    InvalidCompactionPolicy(String),
     /// The on-disk format version is newer than this binary understands.
     /// The `found` version was read; `supported` is the maximum this build accepts.
     UnsupportedVersion {
@@ -67,8 +68,73 @@ impl std::fmt::Display for OmniError {
                 f,
                 "unsupported manifest version {found}: this build supports up to {supported}"
             ),
+            OmniError::InvalidCompactionPolicy(reason) => {
+                write!(f, "invalid compaction policy: {reason}")
+            }
             other => write!(f, "{other:?}"),
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompactionPolicy {
+    pub l0_compaction_trigger: usize,
+    pub l1_compaction_trigger: usize,
+    pub l0_write_stall_threshold: usize,
+    pub write_stall_wait_attempts: u32,
+    pub write_stall_wait_ms: u64,
+}
+
+impl Default for CompactionPolicy {
+    fn default() -> Self {
+        Self {
+            l0_compaction_trigger: 4,
+            l1_compaction_trigger: 4,
+            l0_write_stall_threshold: 12,
+            write_stall_wait_attempts: 50,
+            write_stall_wait_ms: 100,
+        }
+    }
+}
+
+impl CompactionPolicy {
+    pub fn validate(self) -> Result<Self, OmniError> {
+        if self.l0_compaction_trigger == 0 {
+            return Err(OmniError::InvalidCompactionPolicy(
+                "l0_compaction_trigger must be greater than 0".into(),
+            ));
+        }
+        if self.l1_compaction_trigger == 0 {
+            return Err(OmniError::InvalidCompactionPolicy(
+                "l1_compaction_trigger must be greater than 0".into(),
+            ));
+        }
+        if self.l0_write_stall_threshold <= self.l0_compaction_trigger {
+            return Err(OmniError::InvalidCompactionPolicy(
+                "l0_write_stall_threshold must be greater than l0_compaction_trigger".into(),
+            ));
+        }
+        Ok(self)
+    }
+}
+
+#[derive(Default)]
+struct CompactionStats {
+    bytes_rewritten: u64,
+    tombstones: u64,
+    expired_records_dropped: u64,
+}
+
+impl CompactionStats {
+    fn record(&self, stage: &str, started_at: std::time::Instant, backlog_sstables: usize) {
+        metrics_prometheus::record_compaction(
+            stage,
+            started_at.elapsed(),
+            self.bytes_rewritten,
+            self.tombstones,
+            self.expired_records_dropped,
+            backlog_sstables,
+        );
     }
 }
 
@@ -940,6 +1006,7 @@ pub struct OmniKV {
     pub(crate) active_snapshots: Mutex<std::collections::BTreeMap<u64, usize>>,
     pub(crate) block_cache: moka::sync::Cache<u64, String>,
     scan_buffer_pool: Arc<ScanBufferPool>,
+    compaction_policy: RwLock<CompactionPolicy>,
 
     // ── Group commit engine ──
     // Batches concurrent fsyncs: N writers → 1 fsync instead of N fsyncs.
@@ -987,6 +1054,7 @@ impl OmniKV {
             active_snapshots: Mutex::new(std::collections::BTreeMap::new()),
             block_cache: moka::sync::Cache::builder().max_capacity(100_000).build(),
             scan_buffer_pool: Arc::new(ScanBufferPool::default()),
+            compaction_policy: RwLock::new(CompactionPolicy::default()),
             // Group commit: wait up to 200µs for more writers to join each batch.
             // On SSDs, this batches 5-50 concurrent writes into a single fsync.
             group_commit: crate::hardening::GroupCommitEngine::new(200),
@@ -1014,6 +1082,44 @@ impl OmniKV {
     #[inline]
     pub fn l1_sstable_count(&self) -> usize {
         self.roots.load().l1_sstables.len()
+    }
+
+    pub fn compaction_policy(&self) -> Result<CompactionPolicy, OmniError> {
+        self.compaction_policy
+            .read()
+            .map(|policy| *policy)
+            .map_err(|_| OmniError::LockPoisoned("compaction_policy".into()))
+    }
+
+    pub fn set_compaction_policy(&self, policy: CompactionPolicy) -> Result<(), OmniError> {
+        let policy = policy.validate()?;
+        let mut current = self
+            .compaction_policy
+            .write()
+            .map_err(|_| OmniError::LockPoisoned("compaction_policy".into()))?;
+        *current = policy;
+        Ok(())
+    }
+
+    #[inline]
+    fn compaction_backlog_sstables(&self) -> usize {
+        self.sstable_count() + self.l1_sstable_count()
+    }
+
+    fn remove_frozen_memtable(&self, frozen_idx: usize) -> Result<(), OmniError> {
+        let _guard = self
+            .write_mutex
+            .lock()
+            .map_err(|_| OmniError::LockPoisoned("compact".into()))?;
+        let mut frozen = self.roots.load().frozen_memtables.clone().as_ref().clone();
+        if frozen_idx < frozen.len() {
+            frozen.remove(frozen_idx);
+            self.update_roots(|r| StorageRoots {
+                frozen_memtables: Arc::new(frozen),
+                ..r.clone()
+            });
+        }
+        Ok(())
     }
 
     /// Compaction helper: apply a topology mutation function and publish the result atomically.
@@ -1371,16 +1477,22 @@ impl OmniKV {
         // Write Backpressure: If L0 SSTables exceed threshold, wait for compaction
         // to catch up before rejecting the write. This avoids spurious failures
         // under bursty write loads where compaction just needs a moment.
-        if self.sstable_count() >= 12 {
+        let compaction_policy = self.compaction_policy()?;
+        let l0_sstables = self.sstable_count();
+        metrics_prometheus::record_compaction_backlog(self.compaction_backlog_sstables());
+        if l0_sstables >= compaction_policy.l0_write_stall_threshold {
             let mut stalled = true;
-            for _ in 0..50 {
-                std::thread::sleep(std::time::Duration::from_millis(100));
-                if self.sstable_count() < 12 {
+            for _ in 0..compaction_policy.write_stall_wait_attempts {
+                std::thread::sleep(std::time::Duration::from_millis(
+                    compaction_policy.write_stall_wait_ms,
+                ));
+                if self.sstable_count() < compaction_policy.l0_write_stall_threshold {
                     stalled = false;
                     break;
                 }
             }
             if stalled {
+                metrics_prometheus::record_write_stall();
                 return Err(OmniError::WriteStall);
             }
         }
@@ -2031,6 +2143,8 @@ impl OmniKV {
 
     /// Flushes the active memtable to disk as an L0 SSTable.
     pub fn compact_sstables(&self) -> Result<(), OmniError> {
+        let started_at = std::time::Instant::now();
+        let mut stats = CompactionStats::default();
         let (frozen_idx, frozen_arc) = {
             let _guard = self
                 .write_mutex
@@ -2073,12 +2187,24 @@ impl OmniKV {
                 let seq = entry.key().1.0;
                 let val = entry.value();
                 if val.3 == 0 || val.3 > now {
+                    if val.1 == 0 {
+                        stats.tombstones += 1;
+                    }
+                    stats.bytes_rewritten += val.1 & !UNCOMPRESSED_FLAG;
                     records.push(OmniRecord::new(seq, key, val.0, val.1, val.2, val.3));
+                } else {
+                    stats.expired_records_dropped += 1;
                 }
             }
         }
 
         if records.is_empty() {
+            self.remove_frozen_memtable(frozen_idx)?;
+            stats.record(
+                "memtable_to_l0",
+                started_at,
+                self.compaction_backlog_sstables(),
+            );
             return Ok(());
         }
         records.sort_by_key(|a| a.key.clone());
@@ -2134,18 +2260,12 @@ impl OmniKV {
             ..r.clone()
         });
 
-        let _guard = self
-            .write_mutex
-            .lock()
-            .map_err(|_| OmniError::LockPoisoned("compact".into()))?;
-        let mut frozen = self.roots.load().frozen_memtables.clone().as_ref().clone();
-        if frozen_idx < frozen.len() {
-            frozen.remove(frozen_idx);
-            self.update_roots(|r| StorageRoots {
-                frozen_memtables: Arc::new(frozen),
-                ..r.clone()
-            });
-        }
+        self.remove_frozen_memtable(frozen_idx)?;
+        stats.record(
+            "memtable_to_l0",
+            started_at,
+            self.compaction_backlog_sstables(),
+        );
 
         Ok(())
     }
@@ -2153,6 +2273,8 @@ impl OmniKV {
     /// Compacts multiple L0 SSTables into a single L1 SSTable,
     /// dropping expired or obsolete records.
     pub fn compact_l0_to_l1(&self) -> Result<(), OmniError> {
+        let started_at = std::time::Instant::now();
+        let mut stats = CompactionStats::default();
         let _guard = self
             .write_mutex
             .lock()
@@ -2172,6 +2294,9 @@ impl OmniKV {
             let reader = SSTableReader::from_mmap(mmap.clone());
             for rec in reader.iter_from(b"") {
                 if rec.is_valid() {
+                    if rec.length == 0 {
+                        stats.tombstones += 1;
+                    }
                     let existing = merged.get(&rec.key);
                     if existing.is_none_or(|existing| existing.0 < rec.seq) {
                         merged.insert(
@@ -2192,7 +2317,10 @@ impl OmniKV {
         let mut records = Vec::new();
         for (key, (seq, offset, length, crc, expiry)) in merged {
             if expiry == 0 || expiry > now {
+                stats.bytes_rewritten += length & !UNCOMPRESSED_FLAG;
                 records.push(OmniRecord::new(seq, key, offset, length, crc, expiry));
+            } else {
+                stats.expired_records_dropped += 1;
             }
         }
 
@@ -2217,6 +2345,7 @@ impl OmniKV {
                 }
             });
 
+            stats.record("l0_to_l1", started_at, self.compaction_backlog_sstables());
             return Ok(());
         }
 
@@ -2279,10 +2408,13 @@ impl OmniKV {
             }
         });
 
+        stats.record("l0_to_l1", started_at, self.compaction_backlog_sstables());
         Ok(())
     }
 
     pub fn compact_l1_to_l2(&self) -> Result<(), OmniError> {
+        let started_at = std::time::Instant::now();
+        let mut stats = CompactionStats::default();
         let _guard = self
             .write_mutex
             .lock()
@@ -2344,7 +2476,12 @@ impl OmniKV {
         for (key, (seq, offset, length, crc, expiry)) in merged {
             // Drop tombstones and expired entries
             if length > 0 && (expiry == 0 || expiry > now) {
+                stats.bytes_rewritten += length & !UNCOMPRESSED_FLAG;
                 records.push(OmniRecord::new(seq, key, offset, length, crc, expiry));
+            } else if length == 0 {
+                stats.tombstones += 1;
+            } else {
+                stats.expired_records_dropped += 1;
             }
         }
 
@@ -2418,12 +2555,15 @@ impl OmniKV {
             }
         });
 
+        stats.record("l1_to_base", started_at, self.compaction_backlog_sstables());
         Ok(())
     }
 
     /// Runs the garbage collection process on the heap file, compacting it
     /// and freeing space taken up by obsolete values.
     pub fn run_garbage_collection(&self) -> Result<(), OmniError> {
+        let started_at = std::time::Instant::now();
+        let mut stats = CompactionStats::default();
         let _guard = self
             .write_mutex
             .lock()
@@ -2555,7 +2695,12 @@ impl OmniKV {
 
         for (k, versions) in merged {
             for (seq, (old_offset, length, crc, expiry)) in versions {
-                if length == 0 || (expiry > 0 && expiry <= now) {
+                if length == 0 {
+                    stats.tombstones += 1;
+                    continue;
+                }
+                if expiry > 0 && expiry <= now {
+                    stats.expired_records_dropped += 1;
                     continue;
                 }
 
@@ -2575,6 +2720,7 @@ impl OmniKV {
                 }
                 let new_crc = crc;
                 let new_length = length;
+                stats.bytes_rewritten += new_length & !UNCOMPRESSED_FLAG;
 
                 new_heap_writer.write_all(&final_bytes)?;
 
@@ -2660,6 +2806,7 @@ impl OmniKV {
             let _ = wal.clear();
         }
 
+        stats.record("heap_gc", started_at, self.compaction_backlog_sstables());
         Ok(())
     }
 
@@ -2681,6 +2828,14 @@ impl OmniKV {
                     std::thread::sleep(std::time::Duration::from_millis(check_interval_ms));
 
                     let mut did_compact = false;
+                    let compaction_policy = match db.compaction_policy() {
+                        Ok(policy) => policy,
+                        Err(e) => {
+                            eprintln!("[COMPACTION] Policy read error: {:?}", e);
+                            continue;
+                        }
+                    };
+                    metrics_prometheus::record_compaction_backlog(db.compaction_backlog_sstables());
 
                     // Phase 1: Flush memtable to L0 if it exceeds threshold
                     if db.memtable_size() > memtable_flush_threshold {
@@ -2692,7 +2847,7 @@ impl OmniKV {
                     }
 
                     // Phase 2: Compact L0 → L1 if too many L0 SSTables
-                    if db.sstable_count() >= 4 {
+                    if db.sstable_count() >= compaction_policy.l0_compaction_trigger {
                         if let Err(e) = db.compact_l0_to_l1() {
                             eprintln!("[COMPACTION] L0→L1 error: {:?}", e);
                         } else {
@@ -2701,7 +2856,7 @@ impl OmniKV {
                     }
 
                     // Phase 3: Compact L1 → L2 (base) if too many L1 SSTables
-                    if db.l1_sstable_count() >= 4 {
+                    if db.l1_sstable_count() >= compaction_policy.l1_compaction_trigger {
                         if let Err(e) = db.compact_l1_to_l2() {
                             eprintln!("[COMPACTION] L1→L2 error: {:?}", e);
                         } else {
@@ -2728,6 +2883,7 @@ impl OmniKV {
 mod tests {
     use super::*;
     use std::io;
+    use tempfile::TempDir;
 
     #[test]
     fn cleanup_obsolete_file_treats_not_found_as_benign() {
@@ -2757,5 +2913,43 @@ mod tests {
         assert!(metrics.contains("omnikv_cleanup_delete_failures_total"));
         assert!(metrics.contains("context=\"unit_test_cleanup_failure\""));
         assert!(metrics.contains("error_kind=\"PermissionDenied\""));
+    }
+
+    #[test]
+    fn compaction_policy_rejects_stall_threshold_at_trigger() {
+        let policy = CompactionPolicy {
+            l0_compaction_trigger: 4,
+            l1_compaction_trigger: 4,
+            l0_write_stall_threshold: 4,
+            write_stall_wait_attempts: 50,
+            write_stall_wait_ms: 100,
+        };
+
+        let err = policy.validate().unwrap_err();
+        assert!(
+            matches!(err, OmniError::InvalidCompactionPolicy(_)),
+            "expected InvalidCompactionPolicy, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn empty_memtable_compaction_removes_frozen_memtable() {
+        let dir = TempDir::new().expect("tempdir");
+        let manifest = dir.path().join("manifest").to_string_lossy().to_string();
+        let wal = dir.path().join("wal").to_string_lossy().to_string();
+        let db = OmniKV::open(&manifest, &wal).expect("open");
+
+        db.compact_sstables()
+            .expect("empty compaction should succeed");
+
+        assert_eq!(
+            db.roots.load().frozen_memtables.len(),
+            0,
+            "empty compaction must not leave an unreachable frozen memtable"
+        );
+        assert!(
+            metrics_prometheus::render_metrics().contains("omnikv_compaction_latency_seconds"),
+            "empty compaction should still emit compaction metrics"
+        );
     }
 }
