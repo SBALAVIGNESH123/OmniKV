@@ -86,6 +86,25 @@ OmniKV maps SSTable/base files read-only. The format relies on these invariants:
   reject deletion of a still-mapped file; cleanup treats that as a safe deferred
   deletion rather than a correctness failure.
 
+### MVCC Compaction and Tombstone Retention
+
+Compaction must preserve every version that can still be observed by an active
+snapshot. For each key, OmniKV keeps:
+
+- the latest version overall,
+- every version at or newer than the oldest active snapshot, and
+- the newest predecessor at or before the oldest active snapshot.
+
+That predecessor rule is important. If the oldest active snapshot is sequence
+`7` and a key has versions at `1`, `5`, `8`, and `10`, snapshot `7` must still
+see version `5`; keeping only versions `>= 7` would break snapshot isolation.
+
+Tombstones and expired-value markers are deletion markers. L0-to-L1 compaction
+preserves them so lower-level values cannot reappear. L1-to-base compaction and
+heap garbage collection may drop deletion markers only when no active snapshot
+requires retained history; while snapshots are active, deletion markers remain
+in the compacted table so latest reads do not resurrect older values.
+
 ### Scan Iterator Ownership and Buffer Reuse
 
 SSTable range iterators own a lightweight handle to their backing table data.
