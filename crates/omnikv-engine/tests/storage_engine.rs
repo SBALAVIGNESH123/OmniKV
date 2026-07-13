@@ -492,6 +492,120 @@ fn test_l1_to_base_and_gc_preserve_active_snapshot_across_delete() {
     );
 }
 
+#[test]
+fn test_replica_retention_floor_lifecycle() {
+    let (db, _dir) = create_temp_db("replica_retention_lifecycle");
+
+    assert_eq!(db.min_replica_retention().unwrap(), None);
+    db.pin_replica_retention("replica-b", 20).unwrap();
+    db.pin_replica_retention("replica-a", 10).unwrap();
+    assert_eq!(db.min_replica_retention().unwrap(), Some(10));
+
+    db.release_replica_retention("replica-a").unwrap();
+    assert_eq!(db.min_replica_retention().unwrap(), Some(20));
+    db.release_replica_retention("replica-b").unwrap();
+    assert_eq!(db.min_replica_retention().unwrap(), None);
+
+    let metrics = omni_engine::metrics_prometheus::render_metrics();
+    assert!(
+        metrics.contains("omnikv_replica_retention_floor"),
+        "replica retention floor should be observable for operations"
+    );
+}
+
+#[test]
+fn test_l0_to_l1_preserves_replica_retention_floor_across_delete() {
+    let (db, _dir) = create_temp_db("l0l1_replica_delete");
+
+    let mut write = WriteBatch::new();
+    write
+        .set("replica_l0_key", "before-replica-delete".into())
+        .unwrap();
+    let replica_floor = db.commit_batch(&write).unwrap();
+    db.pin_replica_retention("replica-a", replica_floor)
+        .unwrap();
+
+    let mut delete = WriteBatch::new();
+    delete.delete("replica_l0_key").unwrap();
+    db.commit_batch(&delete).unwrap();
+
+    db.compact_sstables().unwrap();
+    db.compact_l0_to_l1().unwrap();
+
+    assert_eq!(
+        db.find("replica_l0_key", replica_floor).unwrap(),
+        Some("before-replica-delete".into()),
+        "replica retention floor must preserve the predecessor version through L0-to-L1"
+    );
+    assert_eq!(
+        db.find("replica_l0_key", db.get_seq()).unwrap(),
+        None,
+        "latest read must still observe the tombstone while replica history is retained"
+    );
+
+    db.release_replica_retention("replica-a").unwrap();
+}
+
+#[test]
+fn test_l1_to_base_and_gc_preserve_replica_retention_floor_across_delete() {
+    let (db, _dir) = create_temp_db("base_gc_replica_delete");
+
+    let mut write = WriteBatch::new();
+    write
+        .set("replica_base_key", "base-replica-value".into())
+        .unwrap();
+    let replica_floor = db.commit_batch(&write).unwrap();
+    db.compact_sstables().unwrap();
+    db.compact_l0_to_l1().unwrap();
+    db.compact_l1_to_l2().unwrap();
+
+    db.pin_replica_retention("replica-a", replica_floor)
+        .unwrap();
+
+    let mut delete = WriteBatch::new();
+    delete.delete("replica_base_key").unwrap();
+    db.commit_batch(&delete).unwrap();
+    db.compact_sstables().unwrap();
+    db.compact_l0_to_l1().unwrap();
+    db.compact_l1_to_l2().unwrap();
+
+    assert_eq!(
+        db.find("replica_base_key", replica_floor).unwrap(),
+        Some("base-replica-value".into()),
+        "replica retention floor must survive L1-to-base tombstone compaction"
+    );
+    assert_eq!(
+        db.find("replica_base_key", db.get_seq()).unwrap(),
+        None,
+        "latest read must still observe the tombstone after L1-to-base compaction"
+    );
+
+    db.run_garbage_collection().unwrap();
+    assert_eq!(
+        db.find("replica_base_key", replica_floor).unwrap(),
+        Some("base-replica-value".into()),
+        "replica retention floor must survive heap GC"
+    );
+    assert_eq!(
+        db.find("replica_base_key", db.get_seq()).unwrap(),
+        None,
+        "latest read must still observe the tombstone after heap GC"
+    );
+
+    db.release_replica_retention("replica-a").unwrap();
+    db.run_garbage_collection().unwrap();
+    assert_eq!(
+        db.find("replica_base_key", db.get_seq()).unwrap(),
+        None,
+        "after the replica releases retention, GC may remove history without resurrection"
+    );
+    assert_eq!(
+        db.find("replica_base_key", replica_floor).unwrap(),
+        None,
+        "after release, obsolete predecessor history can be reclaimed"
+    );
+}
+
 // Gap #21: Memory-mapped I/O edge cases
 // ═══════════════════════════════════════════════════════════════════════════
 

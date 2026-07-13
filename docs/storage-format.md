@@ -89,21 +89,29 @@ OmniKV maps SSTable/base files read-only. The format relies on these invariants:
 ### MVCC Compaction and Tombstone Retention
 
 Compaction must preserve every version that can still be observed by an active
-snapshot. For each key, OmniKV keeps:
+snapshot or by a lagging replica that has pinned a retention floor. For each
+key, OmniKV keeps:
 
 - the latest version overall,
-- every version at or newer than the oldest active snapshot, and
-- the newest predecessor at or before the oldest active snapshot.
+- every version at or newer than the oldest retention floor, and
+- the newest predecessor at or before the oldest retention floor.
 
 That predecessor rule is important. If the oldest active snapshot is sequence
 `7` and a key has versions at `1`, `5`, `8`, and `10`, snapshot `7` must still
 see version `5`; keeping only versions `>= 7` would break snapshot isolation.
 
+Replica catch-up uses the same retention rule. Replication code can call
+`pin_replica_retention(replica_id, seq)` while a follower still needs history at
+or after `seq`, then `release_replica_retention(replica_id)` after the follower
+catches up or switches to snapshot install. The effective compaction floor is
+the minimum of active local snapshots and replica retention pins.
+
 Tombstones and expired-value markers are deletion markers. L0-to-L1 compaction
 preserves them so lower-level values cannot reappear. L1-to-base compaction and
 heap garbage collection may drop deletion markers only when no active snapshot
-requires retained history; while snapshots are active, deletion markers remain
-in the compacted table so latest reads do not resurrect older values.
+or replica retention floor requires retained history; while any retention floor
+is active, deletion markers remain in the compacted table so latest reads do not
+resurrect older values.
 
 ### Scan Iterator Ownership and Buffer Reuse
 

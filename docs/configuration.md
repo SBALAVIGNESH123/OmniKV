@@ -110,6 +110,7 @@ Prometheus metrics expose maintenance health:
 - `omnikv_compaction_tombstones_total{stage=...}`
 - `omnikv_compaction_expired_records_dropped_total{stage=...}`
 - `omnikv_compaction_backlog_sstables`
+- `omnikv_replica_retention_floor` (`0` means no replica retention pin is active)
 - `omnikv_write_stalls_total`
 
 ---
