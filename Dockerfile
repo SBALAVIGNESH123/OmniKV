@@ -24,6 +24,7 @@ RUN chown omnikv:omnikv /etc/omni/omni.toml
 EXPOSE 8080 8443 4433 5433
 
 ENV RUST_LOG=info,omni_engine=debug
+ENV OMNIKV_CONFIG=/etc/omni/omni.toml
 ENV OMNI_CONFIG=/etc/omni/omni.toml
 
 USER omnikv

@@ -1,8 +1,13 @@
 //! OmniKV Operational Configuration
 //!
-//! Centralized, production-grade configuration system.
-//! All settings have safe defaults and can be overridden via environment variables.
+//! Operational diagnostics configuration.
+//!
+//! The network-facing server uses [`crate::config::ServerConfig`] as the
+//! authoritative runtime configuration. This module remains for diagnostics and
+//! staged operational helpers, but it now fails closed on malformed
+//! environment overrides instead of silently falling back to defaults.
 
+use std::str::FromStr;
 use std::time::Duration;
 
 /// Complete configuration for an OmniKV node.
@@ -103,9 +108,13 @@ impl Default for OmniConfig {
 }
 
 impl OmniConfig {
-    /// Load configuration from environment variables, falling back to defaults.
-    pub fn from_env() -> Self {
+    /// Load configuration from environment variables.
+    ///
+    /// Invalid numeric or enum values return errors rather than silently
+    /// falling back to defaults.
+    pub fn from_env() -> Result<Self, Vec<String>> {
         let mut cfg = Self::default();
+        let mut errors = Vec::new();
 
         if let Ok(v) = std::env::var("OMNI_DATA_DIR") {
             cfg.data_dir = v.clone();
@@ -118,17 +127,25 @@ impl OmniConfig {
         if let Ok(v) = std::env::var("OMNI_WAL_PATH") {
             cfg.wal_path = v;
         }
-        if let Ok(v) = std::env::var("OMNI_MEMTABLE_FLUSH") {
-            cfg.memtable_flush_threshold = v.parse().unwrap_or(cfg.memtable_flush_threshold);
+        if let Ok(v) = std::env::var("OMNI_MEMTABLE_FLUSH")
+            && let Some(parsed) = parse_env("OMNI_MEMTABLE_FLUSH", &v, &mut errors)
+        {
+            cfg.memtable_flush_threshold = parsed;
         }
-        if let Ok(v) = std::env::var("OMNI_L0_TRIGGER") {
-            cfg.l0_compaction_trigger = v.parse().unwrap_or(cfg.l0_compaction_trigger);
+        if let Ok(v) = std::env::var("OMNI_L0_TRIGGER")
+            && let Some(parsed) = parse_env("OMNI_L0_TRIGGER", &v, &mut errors)
+        {
+            cfg.l0_compaction_trigger = parsed;
         }
-        if let Ok(v) = std::env::var("OMNI_L1_TRIGGER") {
-            cfg.l1_compaction_trigger = v.parse().unwrap_or(cfg.l1_compaction_trigger);
+        if let Ok(v) = std::env::var("OMNI_L1_TRIGGER")
+            && let Some(parsed) = parse_env("OMNI_L1_TRIGGER", &v, &mut errors)
+        {
+            cfg.l1_compaction_trigger = parsed;
         }
-        if let Ok(v) = std::env::var("OMNI_BLOCK_CACHE") {
-            cfg.block_cache_capacity = v.parse().unwrap_or(cfg.block_cache_capacity);
+        if let Ok(v) = std::env::var("OMNI_BLOCK_CACHE")
+            && let Some(parsed) = parse_env("OMNI_BLOCK_CACHE", &v, &mut errors)
+        {
+            cfg.block_cache_capacity = parsed;
         }
         if let Ok(v) = std::env::var("OMNI_HTTP_ADDR") {
             cfg.http_addr = v;
@@ -152,29 +169,45 @@ impl OmniConfig {
             cfg.log_level = v;
         }
         if let Ok(v) = std::env::var("OMNI_LOG_FORMAT") {
-            cfg.log_format = if v == "pretty" {
-                LogFormat::Pretty
-            } else {
-                LogFormat::Json
-            };
+            match v.as_str() {
+                "json" => cfg.log_format = LogFormat::Json,
+                "pretty" => cfg.log_format = LogFormat::Pretty,
+                _ => errors.push(format!(
+                    "OMNI_LOG_FORMAT must be either 'json' or 'pretty', got {v:?}"
+                )),
+            }
         }
-        if let Ok(v) = std::env::var("OMNI_TXN_TIMEOUT_SECS") {
-            cfg.txn_timeout = Duration::from_secs(v.parse().unwrap_or(30));
+        if let Ok(v) = std::env::var("OMNI_TXN_TIMEOUT_SECS")
+            && let Some(secs) = parse_env("OMNI_TXN_TIMEOUT_SECS", &v, &mut errors)
+        {
+            cfg.txn_timeout = Duration::from_secs(secs);
         }
-        if let Ok(v) = std::env::var("OMNI_RATE_LIMIT") {
-            cfg.rate_limit_per_sec = v.parse().unwrap_or(cfg.rate_limit_per_sec);
+        if let Ok(v) = std::env::var("OMNI_RATE_LIMIT")
+            && let Some(parsed) = parse_env("OMNI_RATE_LIMIT", &v, &mut errors)
+        {
+            cfg.rate_limit_per_sec = parsed;
         }
-        if let Ok(v) = std::env::var("OMNI_RATE_BURST") {
-            cfg.rate_limit_burst = v.parse().unwrap_or(cfg.rate_limit_burst);
+        if let Ok(v) = std::env::var("OMNI_RATE_BURST")
+            && let Some(parsed) = parse_env("OMNI_RATE_BURST", &v, &mut errors)
+        {
+            cfg.rate_limit_burst = parsed;
         }
-        if let Ok(v) = std::env::var("OMNI_GROUP_COMMIT_US") {
-            cfg.group_commit_wait_us = v.parse().unwrap_or(cfg.group_commit_wait_us);
+        if let Ok(v) = std::env::var("OMNI_GROUP_COMMIT_US")
+            && let Some(parsed) = parse_env("OMNI_GROUP_COMMIT_US", &v, &mut errors)
+        {
+            cfg.group_commit_wait_us = parsed;
         }
-        if let Ok(v) = std::env::var("OMNI_POOL_SIZE") {
-            cfg.connection_pool_size = v.parse().unwrap_or(cfg.connection_pool_size);
+        if let Ok(v) = std::env::var("OMNI_POOL_SIZE")
+            && let Some(parsed) = parse_env("OMNI_POOL_SIZE", &v, &mut errors)
+        {
+            cfg.connection_pool_size = parsed;
         }
 
-        cfg
+        if errors.is_empty() {
+            Ok(cfg)
+        } else {
+            Err(errors)
+        }
     }
 
     /// Validates the configuration, returning errors for invalid settings.
@@ -225,6 +258,20 @@ impl OmniConfig {
             self.rate_limit_per_sec,
             self.txn_timeout
         )
+    }
+}
+
+fn parse_env<T>(name: &str, value: &str, errors: &mut Vec<String>) -> Option<T>
+where
+    T: FromStr,
+    T::Err: std::fmt::Display,
+{
+    match value.parse() {
+        Ok(parsed) => Some(parsed),
+        Err(e) => {
+            errors.push(format!("invalid value for {name}={value:?}: {e}"));
+            None
+        }
     }
 }
 
