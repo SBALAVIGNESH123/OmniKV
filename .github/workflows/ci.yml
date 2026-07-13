@@ -115,6 +115,29 @@ jobs:
     - name: Ops maturity (24 tests)
       run: cargo test -p omnikv-engine --test ops_maturity -- --test-threads=1 --nocapture
 
+  test-api-contract:
+    name: API & Client Contract Tests
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+    - uses: actions/checkout@v5
+      with:
+        persist-credentials: false
+    - uses: dtolnay/rust-toolchain@stable
+    - uses: actions/cache@v5
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target
+        key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+    - name: REST API response contracts
+      run: cargo test -p omnikv-server rest_contract -- --test-threads=1
+    - name: PgWire protocol frame contracts
+      run: cargo test -p omnikv-engine pgwire_contract --lib -- --test-threads=1
+    - name: Rust client smoke contracts
+      run: cargo test -p omni-client client_contract -- --test-threads=1
+
   test-raft:
     name: Raft Consensus Tests
     runs-on: ubuntu-latest
