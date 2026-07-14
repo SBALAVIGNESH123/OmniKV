@@ -13,14 +13,20 @@ cargo test -p omnikv-engine --test storage_tests -- --test-threads=1
 
 ## Running the full test suite
 
+OmniKV separates release-gate tests, regression tests, demonstration tests, performance smoke tests, and manual/long-running evidence. See [Test suite taxonomy](docs/test-suite-taxonomy.md) before using test results as production-readiness evidence.
+
 ```bash
 # Storage
 cargo test -p omnikv-engine --test storage_tests -- --test-threads=1
 cargo test -p omnikv-engine --test storage_correctness -- --test-threads=1
 cargo test -p omnikv-engine --test storage_engine -- --test-threads=1
-cargo test -p omnikv-engine --test storage_perf -- --test-threads=1
 
-# Transactions and concurrency
+# Storage regression tests
+cargo test -p omnikv-engine --test compaction_regression -- --test-threads=1
+cargo test -p omnikv-engine --test compaction_many_records_regression -- --test-threads=1
+cargo test -p omnikv-engine --test reopen_regression -- --test-threads=1
+
+# Transactions, concurrency, and demonstrations
 cargo test -p omnikv-engine --test anomaly_demos -- --test-threads=1
 cargo test -p omnikv-engine --test concurrent_stress -- --test-threads=1
 
@@ -32,6 +38,10 @@ cargo test -p omnikv-engine --test raft_cluster -- --test-threads=1
 
 # Operational
 cargo test -p omnikv-engine --test ops_maturity -- --test-threads=1
+
+# Performance smoke, not formal benchmark evidence
+cargo test -p omnikv-engine --test storage_perf -- --test-threads=1 --nocapture
+cargo test -p omnikv-engine --test benchmarks --release -- --test-threads=1 --nocapture
 ```
 
 ## Architecture

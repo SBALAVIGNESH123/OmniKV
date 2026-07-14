@@ -1,6 +1,7 @@
 use omni_engine::{OmniKV, WriteBatch};
+
 #[test]
-fn test_debug_compaction_200() {
+fn compaction_preserves_many_committed_keys() {
     let dir = tempfile::TempDir::new().unwrap();
     let manifest = dir
         .path()
@@ -18,6 +19,14 @@ fn test_debug_compaction_200() {
 
     db.compact_sstables().unwrap();
     let snap = db.snapshot();
-    let got = db.find("ckey00000", snap).unwrap();
-    println!("GOT: {got:?}");
+    for i in [0u64, 99, 199] {
+        let key = format!("ckey{i:05}");
+        let got = db.find(&key, snap).unwrap();
+        assert_eq!(
+            got,
+            Some(format!("cval{i}")),
+            "manual compaction must preserve {key}"
+        );
+    }
+    db.unregister_snapshot(snap);
 }
