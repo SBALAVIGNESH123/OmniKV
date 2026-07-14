@@ -14,7 +14,7 @@ use axum::{
     extract::DefaultBodyLimit,
     extract::Request,
     extract::connect_info::ConnectInfo,
-    extract::{Path, Query, State},
+    extract::{Extension, MatchedPath, Path, Query, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     middleware,
     response::{IntoResponse, Response},
@@ -35,6 +35,14 @@ const MAX_REST_SCAN_LIMIT: usize = 10_000;
 
 /// Hard cap for JSON request bodies accepted by the REST API.
 const MAX_REST_BODY_BYTES: usize = 1024 * 1024;
+
+/// Default JWT lifetime minted by the bootstrap token endpoint.
+const DEFAULT_TOKEN_TTL_SECS: u64 = 60 * 60;
+
+/// Maximum JWT lifetime accepted by the bootstrap token endpoint.
+const MAX_TOKEN_TTL_SECS: u64 = 24 * 60 * 60;
+
+const VALID_TOKEN_ROLES: &[&str] = &["read", "write", "backup", "restore", "cluster", "admin"];
 
 /// Application state shared across all handlers.
 #[derive(Clone)]
@@ -137,17 +145,90 @@ pub struct MetricsOutput {
 enum RequiredRole {
     Read,
     Write,
+    Backup,
     Admin,
 }
 
 impl RequiredRole {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Read => "read",
+            Self::Write => "write",
+            Self::Backup => "backup",
+            Self::Admin => "admin",
+        }
+    }
+
     fn allows(self, role: &str) -> bool {
         match self {
             Self::Read => matches!(role, "read" | "write" | "admin"),
             Self::Write => matches!(role, "write" | "admin"),
+            Self::Backup => matches!(role, "backup" | "admin"),
             Self::Admin => role == "admin",
         }
     }
+}
+
+#[derive(Clone, Copy)]
+enum AuditOutcome {
+    Success,
+    Denied,
+    Failure,
+}
+
+impl AuditOutcome {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::Denied => "denied",
+            Self::Failure => "failure",
+        }
+    }
+}
+
+fn audit_event(
+    event: &'static str,
+    outcome: AuditOutcome,
+    subject: &str,
+    role: &str,
+    route: &str,
+    reason: &str,
+) {
+    tracing::info!(
+        target: "omnikv.audit",
+        audit_event = event,
+        outcome = outcome.as_str(),
+        subject,
+        role,
+        route,
+        reason,
+        "security audit event"
+    );
+}
+
+fn audit_claims_event(
+    event: &'static str,
+    outcome: AuditOutcome,
+    claims: &crate::auth::Claims,
+    route: &str,
+    reason: &str,
+) {
+    audit_event(event, outcome, &claims.sub, &claims.role, route, reason);
+}
+
+fn audit_anonymous_event(event: &'static str, outcome: AuditOutcome, route: &str, reason: &str) {
+    audit_event(event, outcome, "anonymous", "unknown", route, reason);
+}
+
+fn matched_route_template(req: &Request<Body>) -> String {
+    req.extensions().get::<MatchedPath>().map_or_else(
+        || req.uri().path().to_string(),
+        |path| path.as_str().to_string(),
+    )
+}
+
+fn is_valid_token_role(role: &str) -> bool {
+    VALID_TOKEN_ROLES.contains(&role)
 }
 
 /// Map internal storage errors to stable, sanitized client-facing error codes.
@@ -192,9 +273,15 @@ pub fn build_router(state: AppState) -> Router {
         .route("/batch", axum::routing::post(batch_handler))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_write));
 
+    let backup_routes = Router::new()
+        .route("/admin/backup", axum::routing::post(backup_handler))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_backup,
+        ));
+
     let admin_routes = Router::new()
         .route("/metrics", axum::routing::get(metrics_handler))
-        .route("/admin/backup", axum::routing::post(backup_handler))
         .route("/admin/compact", axum::routing::post(compact_handler))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_admin));
 
@@ -204,6 +291,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/auth/token", axum::routing::post(token_handler))
         .merge(read_routes)
         .merge(write_routes)
+        .merge(backup_routes)
         .merge(admin_routes)
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -292,6 +380,14 @@ async fn require_write(
     require_role(state, req, next, RequiredRole::Write).await
 }
 
+async fn require_backup(
+    State(state): State<AppState>,
+    req: Request<Body>,
+    next: middleware::Next,
+) -> Result<Response, Response> {
+    require_role(state, req, next, RequiredRole::Backup).await
+}
+
 async fn require_admin(
     State(state): State<AppState>,
     req: Request<Body>,
@@ -306,16 +402,35 @@ async fn require_role(
     next: middleware::Next,
     required: RequiredRole,
 ) -> Result<Response, Response> {
+    let route = matched_route_template(&req);
     let Some(header_value) = req.headers().get(header::AUTHORIZATION) else {
+        audit_anonymous_event(
+            "auth.failure",
+            AuditOutcome::Denied,
+            &route,
+            "missing_bearer_token",
+        );
         return Err(auth_error(StatusCode::UNAUTHORIZED, "missing bearer token"));
     };
     let Ok(header_value) = header_value.to_str() else {
+        audit_anonymous_event(
+            "auth.failure",
+            AuditOutcome::Denied,
+            &route,
+            "invalid_authorization_header",
+        );
         return Err(auth_error(
             StatusCode::UNAUTHORIZED,
             "invalid authorization header",
         ));
     };
     let Some(token) = crate::auth::extract_bearer(header_value) else {
+        audit_anonymous_event(
+            "auth.failure",
+            AuditOutcome::Denied,
+            &route,
+            "invalid_authorization_scheme",
+        );
         return Err(auth_error(
             StatusCode::UNAUTHORIZED,
             "authorization header must use Bearer token",
@@ -323,9 +438,30 @@ async fn require_role(
     };
 
     match crate::auth::verify_token(token, &state.jwt_secret) {
-        Ok(claims) if required.allows(&claims.role) => Ok(next.run(req).await),
-        Ok(_) => Err(auth_error(StatusCode::FORBIDDEN, "insufficient role")),
-        Err(_) => Err(auth_error(StatusCode::UNAUTHORIZED, "invalid bearer token")),
+        Ok(claims) if required.allows(&claims.role) => {
+            let mut req = req;
+            req.extensions_mut().insert(claims);
+            Ok(next.run(req).await)
+        }
+        Ok(claims) => {
+            audit_claims_event(
+                "authz.denied",
+                AuditOutcome::Denied,
+                &claims,
+                &route,
+                required.as_str(),
+            );
+            Err(auth_error(StatusCode::FORBIDDEN, "insufficient role"))
+        }
+        Err(_) => {
+            audit_anonymous_event(
+                "auth.failure",
+                AuditOutcome::Denied,
+                &route,
+                "invalid_bearer_token",
+            );
+            Err(auth_error(StatusCode::UNAUTHORIZED, "invalid bearer token"))
+        }
     }
 }
 
@@ -416,29 +552,59 @@ async fn set_handler(
 
 async fn delete_handler(
     State(state): State<AppState>,
+    Extension(claims): Extension<crate::auth::Claims>,
     Path(key): Path<String>,
 ) -> impl IntoResponse {
     let mut batch = WriteBatch::new();
     match batch.delete(&key) {
         Ok(_) => match state.db.commit_batch(&batch) {
-            Ok(seq) => (StatusCode::OK, ApiResponse::ok(WriteResult { seq })),
-            Err(e) => (
+            Ok(seq) => {
+                audit_claims_event(
+                    "data.delete",
+                    AuditOutcome::Success,
+                    &claims,
+                    "/kv/:key",
+                    "delete_committed",
+                );
+                (StatusCode::OK, ApiResponse::ok(WriteResult { seq }))
+            }
+            Err(e) => {
+                audit_claims_event(
+                    "data.delete",
+                    AuditOutcome::Failure,
+                    &claims,
+                    "/kv/:key",
+                    "delete_failed",
+                );
+                (
+                    http_status_for_storage_err(&e),
+                    ApiResponse::<WriteResult>::err(&sanitize_storage_err(&e)),
+                )
+            }
+        },
+        Err(e) => {
+            audit_claims_event(
+                "data.delete",
+                AuditOutcome::Failure,
+                &claims,
+                "/kv/:key",
+                "delete_rejected",
+            );
+            (
                 http_status_for_storage_err(&e),
                 ApiResponse::<WriteResult>::err(&sanitize_storage_err(&e)),
-            ),
-        },
-        Err(e) => (
-            http_status_for_storage_err(&e),
-            ApiResponse::<WriteResult>::err(&sanitize_storage_err(&e)),
-        ),
+            )
+        }
     }
 }
 
 async fn batch_handler(
     State(state): State<AppState>,
+    Extension(claims): Extension<crate::auth::Claims>,
     Json(req): Json<BatchRequest>,
 ) -> impl IntoResponse {
     let mut batch = WriteBatch::new();
+    let has_delete = req.operations.iter().any(|op| op.op == "delete");
     for op in &req.operations {
         match op.op.as_str() {
             "set" => {
@@ -459,11 +625,33 @@ async fn batch_handler(
     }
 
     match state.db.commit_batch(&batch) {
-        Ok(seq) => (StatusCode::OK, ApiResponse::ok(WriteResult { seq })),
-        Err(e) => (
-            http_status_for_storage_err(&e),
-            ApiResponse::<WriteResult>::err(&sanitize_storage_err(&e)),
-        ),
+        Ok(seq) => {
+            if has_delete {
+                audit_claims_event(
+                    "data.batch_delete",
+                    AuditOutcome::Success,
+                    &claims,
+                    "/batch",
+                    "batch_with_delete_committed",
+                );
+            }
+            (StatusCode::OK, ApiResponse::ok(WriteResult { seq }))
+        }
+        Err(e) => {
+            if has_delete {
+                audit_claims_event(
+                    "data.batch_delete",
+                    AuditOutcome::Failure,
+                    &claims,
+                    "/batch",
+                    "batch_with_delete_failed",
+                );
+            }
+            (
+                http_status_for_storage_err(&e),
+                ApiResponse::<WriteResult>::err(&sanitize_storage_err(&e)),
+            )
+        }
     }
 }
 
@@ -524,11 +712,14 @@ async fn metrics_handler() -> impl IntoResponse {
     )
 }
 
-async fn backup_handler(State(state): State<AppState>) -> impl IntoResponse {
+async fn backup_handler(
+    State(state): State<AppState>,
+    Extension(claims): Extension<crate::auth::Claims>,
+) -> impl IntoResponse {
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
-        .as_secs();
+        .as_millis();
     let backup_path = format!("backup_{}.tar.gz", timestamp);
 
     match omni_engine::backup::create_backup_with_wal(
@@ -537,24 +728,63 @@ async fn backup_handler(State(state): State<AppState>) -> impl IntoResponse {
         &state.wal_path,
         &backup_path,
     ) {
-        Ok(path) => (StatusCode::OK, ApiResponse::ok(path)),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            ApiResponse::<String>::err(&e),
-        ),
+        Ok(path) => {
+            audit_claims_event(
+                "backup.created",
+                AuditOutcome::Success,
+                &claims,
+                "/admin/backup",
+                "backup_created",
+            );
+            (StatusCode::OK, ApiResponse::ok(path))
+        }
+        Err(e) => {
+            audit_claims_event(
+                "backup.created",
+                AuditOutcome::Failure,
+                &claims,
+                "/admin/backup",
+                "backup_failed",
+            );
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ApiResponse::<String>::err(&sanitize_err(&e)),
+            )
+        }
     }
 }
 
-async fn compact_handler(State(state): State<AppState>) -> impl IntoResponse {
+async fn compact_handler(
+    State(state): State<AppState>,
+    Extension(claims): Extension<crate::auth::Claims>,
+) -> impl IntoResponse {
     match state.db.compact_sstables() {
-        Ok(()) => (
-            StatusCode::OK,
-            ApiResponse::ok("Compaction complete".to_string()),
-        ),
-        Err(e) => (
-            http_status_for_storage_err(&e),
-            ApiResponse::<String>::err(&sanitize_storage_err(&e)),
-        ),
+        Ok(()) => {
+            audit_claims_event(
+                "admin.compact",
+                AuditOutcome::Success,
+                &claims,
+                "/admin/compact",
+                "compaction_complete",
+            );
+            (
+                StatusCode::OK,
+                ApiResponse::ok("Compaction complete".to_string()),
+            )
+        }
+        Err(e) => {
+            audit_claims_event(
+                "admin.compact",
+                AuditOutcome::Failure,
+                &claims,
+                "/admin/compact",
+                "compaction_failed",
+            );
+            (
+                http_status_for_storage_err(&e),
+                ApiResponse::<String>::err(&sanitize_storage_err(&e)),
+            )
+        }
     }
 }
 
@@ -562,6 +792,7 @@ async fn compact_handler(State(state): State<AppState>) -> impl IntoResponse {
 pub struct TokenRequest {
     pub username: String,
     pub role: Option<String>,
+    pub ttl_seconds: Option<u64>,
 }
 
 async fn token_handler(
@@ -570,18 +801,36 @@ async fn token_handler(
     Json(req): Json<TokenRequest>,
 ) -> impl IntoResponse {
     let Some(header_value) = headers.get("x-omni-admin-key") else {
+        audit_anonymous_event(
+            "auth.token.denied",
+            AuditOutcome::Denied,
+            "/auth/token",
+            "missing_bootstrap_admin_key",
+        );
         return (
             StatusCode::UNAUTHORIZED,
             ApiResponse::<String>::err("missing bootstrap admin key"),
         );
     };
     let Ok(provided_key) = header_value.to_str() else {
+        audit_anonymous_event(
+            "auth.token.denied",
+            AuditOutcome::Denied,
+            "/auth/token",
+            "invalid_bootstrap_admin_key_header",
+        );
         return (
             StatusCode::UNAUTHORIZED,
             ApiResponse::<String>::err("invalid bootstrap admin key"),
         );
     };
     if !crate::auth::validate_api_key(provided_key, &state.bootstrap_admin_key) {
+        audit_anonymous_event(
+            "auth.token.denied",
+            AuditOutcome::Denied,
+            "/auth/token",
+            "invalid_bootstrap_admin_key",
+        );
         return (
             StatusCode::UNAUTHORIZED,
             ApiResponse::<String>::err("invalid bootstrap admin key"),
@@ -589,19 +838,65 @@ async fn token_handler(
     }
 
     let role = req.role.as_deref().unwrap_or("read");
-    if !matches!(role, "read" | "write" | "admin") {
+    if !is_valid_token_role(role) {
+        audit_event(
+            "auth.token.denied",
+            AuditOutcome::Denied,
+            &req.username,
+            role,
+            "/auth/token",
+            "invalid_role",
+        );
         return (
             StatusCode::BAD_REQUEST,
-            ApiResponse::<String>::err("role must be read, write, or admin"),
+            ApiResponse::<String>::err(
+                "role must be one of: read, write, backup, restore, cluster, admin",
+            ),
         );
     }
 
-    match crate::auth::generate_token(&req.username, role, &state.jwt_secret, 86400) {
-        Ok(token) => (StatusCode::OK, ApiResponse::ok(token)),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            ApiResponse::<String>::err(&e),
-        ),
+    let ttl_seconds = req.ttl_seconds.unwrap_or(DEFAULT_TOKEN_TTL_SECS);
+    if ttl_seconds == 0 || ttl_seconds > MAX_TOKEN_TTL_SECS {
+        audit_event(
+            "auth.token.denied",
+            AuditOutcome::Denied,
+            &req.username,
+            role,
+            "/auth/token",
+            "invalid_ttl_seconds",
+        );
+        return (
+            StatusCode::BAD_REQUEST,
+            ApiResponse::<String>::err("ttl_seconds must be between 1 and 86400"),
+        );
+    }
+
+    match crate::auth::generate_token(&req.username, role, &state.jwt_secret, ttl_seconds) {
+        Ok(token) => {
+            audit_event(
+                "auth.token.created",
+                AuditOutcome::Success,
+                &req.username,
+                role,
+                "/auth/token",
+                "token_created",
+            );
+            (StatusCode::OK, ApiResponse::ok(token))
+        }
+        Err(e) => {
+            audit_event(
+                "auth.token.failed",
+                AuditOutcome::Failure,
+                &req.username,
+                role,
+                "/auth/token",
+                "token_generation_failed",
+            );
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ApiResponse::<String>::err(&e),
+            )
+        }
     }
 }
 
@@ -873,6 +1168,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn backup_token_can_create_backup_but_cannot_compact() {
+        let (router, _dir, secret) = test_router();
+        let token =
+            crate::auth::generate_token("backup-bot", "backup", &secret, 60).expect("backup token");
+
+        let backup_response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/admin/backup")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("backup response");
+
+        assert_eq!(backup_response.status(), StatusCode::OK);
+        let body = response_json(backup_response).await;
+        let backup_path = body["data"].as_str().expect("backup path in response");
+        assert!(backup_path.starts_with("backup_"));
+        assert!(backup_path.ends_with(".tar.gz"));
+        let _ = std::fs::remove_file(backup_path);
+
+        let compact_response = router
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/admin/compact")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("compact response");
+
+        assert_eq!(compact_response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn write_token_cannot_create_backup() {
+        let (router, _dir, secret) = test_router();
+        let token =
+            crate::auth::generate_token("writer", "write", &secret, 60).expect("write token");
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/admin/backup")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
     async fn token_endpoint_requires_bootstrap_key() {
         let (router, _dir, _secret) = test_router();
         let response = router
@@ -890,6 +1247,98 @@ mod tests {
             .expect("response");
 
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn token_endpoint_mints_scoped_token_with_bounded_ttl() {
+        let (router, _dir, secret) = test_router();
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/auth/token")
+                    .header("x-omni-admin-key", "bootstrap-admin-key-0123456789abcdef")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "username": "backup-bot",
+                            "role": "backup",
+                            "ttl_seconds": 300
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        let token = body["data"].as_str().expect("token in response");
+        let claims = crate::auth::verify_token(token, &secret).expect("valid token");
+        assert_eq!(claims.sub, "backup-bot");
+        assert_eq!(claims.role, "backup");
+        assert!(claims.exp > claims.iat);
+        assert!(claims.exp - claims.iat <= 300);
+    }
+
+    #[tokio::test]
+    async fn token_endpoint_rejects_ttl_above_security_cap() {
+        let (router, _dir, _secret) = test_router();
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/auth/token")
+                    .header("x-omni-admin-key", "bootstrap-admin-key-0123456789abcdef")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "username": "admin",
+                            "role": "admin",
+                            "ttl_seconds": MAX_TOKEN_TTL_SECS + 1
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            response_json(response).await,
+            json!({
+                "success": false,
+                "data": null,
+                "error": "ttl_seconds must be between 1 and 86400"
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn rest_body_limit_rejects_oversized_json_payloads() {
+        let (router, _dir, secret) = test_router();
+        let token =
+            crate::auth::generate_token("writer", "write", &secret, 60).expect("write token");
+        let oversized_value = "x".repeat(MAX_REST_BODY_BYTES + 1);
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/kv")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({"key":"oversized","value": oversized_value}).to_string(),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 
     #[tokio::test]

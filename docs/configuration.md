@@ -30,6 +30,7 @@ cargo run -p omnikv-server
 ```bash
 export OMNIKV_MODE=production
 export OMNIKV_JWT_SECRET="$(openssl rand -hex 32)"
+export OMNIKV_BOOTSTRAP_ADMIN_KEY="$(openssl rand -hex 32)"
 export OMNIKV_TLS_CERT_PATH=/etc/omnikv/tls/cert.pem
 export OMNIKV_TLS_KEY_PATH=/etc/omnikv/tls/key.pem
 export OMNIKV_DATA_DIR=/var/lib/omnikv/data
@@ -51,6 +52,7 @@ cargo run -p omnikv-server -- --config /etc/omnikv/omnikv.toml
 | `OMNIKV_PGWIRE_ADDR` | `127.0.0.1:5432` | PostgreSQL wire protocol address |
 | `OMNIKV_TCP_ADDR` | `127.0.0.1:7072` | TCP command interface address |
 | `OMNIKV_JWT_SECRET` | dev default | JWT signing secret (≥ 32 chars required in production) |
+| `OMNIKV_BOOTSTRAP_ADMIN_KEY` | dev default | Bootstrap key for `POST /auth/token` (≥ 32 chars required in production) |
 | `OMNIKV_TLS_CERT_PATH` | _(none)_ | Path to TLS certificate (PEM) |
 | `OMNIKV_TLS_KEY_PATH` | _(none)_ | Path to TLS private key (PEM) |
 | `OMNIKV_TLS_INSECURE_SKIP` | `false` | Skip TLS checks — prints a warning; not recommended |
@@ -85,6 +87,9 @@ cargo run -p omnikv-server -- --config /etc/omnikv/omnikv.toml
   values fail startup instead of falling back to defaults.
 - **JWT secret** must not be the development default.
 - **JWT secret** must be ≥ 32 characters.
+- **Bootstrap admin key** must not be the development default.
+- **Bootstrap admin key** must be ≥ 32 characters and different from the JWT
+  secret.
 - **TLS** must be configured via `OMNIKV_TLS_CERT_PATH` + `OMNIKV_TLS_KEY_PATH`,
   or `OMNIKV_TLS_INSECURE_SKIP=true` must be set explicitly
   (a warning is printed to stderr when this override is active).
@@ -118,9 +123,12 @@ Prometheus metrics expose maintenance health:
 ## Security notes
 
 - Never commit `omnikv.toml` containing real secrets to version control.
-- Rotate `OMNIKV_JWT_SECRET` on a regular schedule in production.
+- Rotate `OMNIKV_JWT_SECRET` and `OMNIKV_BOOTSTRAP_ADMIN_KEY` on a regular
+  schedule in production.
 - Use a secrets manager (Vault, AWS Secrets Manager, K8s Secrets) rather than
   plain environment variables in production deployments.
+- Use scoped, short-lived REST tokens for read, write, backup, and admin
+  automation. See [Security model](security.md).
 - Tune rate limits for your workload and alert on
   `omnikv_rate_limit_rejections_total{protocol=...}`.
 - Alert on `omnikv_cleanup_delete_failures_total{context=...,error_kind=...}`;

@@ -95,6 +95,8 @@ Confirm:
 - `OMNIKV_MODE=production` fails closed on weak config;
 - TLS config is documented;
 - JWT secret rotation guidance is current;
+- bootstrap admin key rotation guidance is current;
+- REST role boundaries and audit events are documented;
 - rate-limit behavior is tested;
 - security audit is green or documented with accepted risk.
 
