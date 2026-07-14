@@ -53,6 +53,12 @@ Run packaging smoke:
 bash scripts/docker-compose-smoke.sh
 ```
 
+Run reproducible benchmark smoke:
+
+```bash
+cargo bench -p omnikv-engine --bench reproducible_bench -- --profile smoke --json-out target/omnikv-benchmark-smoke.json
+```
+
 ## Storage-format gate
 
 If the change touches disk format:
@@ -135,6 +141,7 @@ Image digest: <digest>
 - backup/restore:
 - crash consistency:
 - durability evidence:
+- benchmark smoke:
 - Docker smoke:
 - security audit:
 

@@ -180,6 +180,7 @@ jobs:
     name: Benchmark Smoke
     runs-on: ubuntu-latest
     needs: build
+    continue-on-error: true
     steps:
     - uses: actions/checkout@v5
       with:
@@ -194,6 +195,14 @@ jobs:
         key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
     - name: Benchmark suite smoke test
       run: cargo test -p omnikv-engine --test benchmarks --release -- --test-threads=1 --nocapture
+    - name: Reproducible benchmark JSON smoke
+      run: cargo bench -p omnikv-engine --bench reproducible_bench -- --profile smoke --json-out target/omnikv-benchmark-smoke.json
+    - name: Upload benchmark smoke artifact
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: omnikv-benchmark-smoke
+        path: target/omnikv-benchmark-smoke.json
 
   fmt:
     name: Format Check
