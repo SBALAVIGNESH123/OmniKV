@@ -113,6 +113,7 @@ On Windows/MSVC, full debug test linking can require significant free disk space
 
 ## Operations docs
 
+- [Operational runbooks](docs/runbooks/README.md)
 - [API and client compatibility](docs/api-compatibility.md)
 - [Backup and restore](docs/backup_restore.md)
 - [Protocol and result-size limits](docs/protocol-limits.md)
