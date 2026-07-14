@@ -69,6 +69,20 @@ docker compose up --build
 
 Compose validates that the variables are present. OmniKV validates at startup that the secrets are strong, at least 32 characters, and not reused.
 
+For CI-style package validation, run the single-node authenticated write/read/restart smoke:
+
+```bash
+bash scripts/docker-compose-smoke.sh
+```
+
+On Windows PowerShell:
+
+```powershell
+.\scripts\docker-compose-smoke.ps1
+```
+
+For Kubernetes examples, release smoke, and SBOM guidance, see [Docker, Compose, Kubernetes, and release smoke](docs/docker-kubernetes-release.md).
+
 ## Embedded library example
 
 ```rust
@@ -105,6 +119,7 @@ On Windows/MSVC, full debug test linking can require significant free disk space
 - [Real-data replay harness](docs/real-data-replay.md)
 - [SQL support matrix](docs/sql-support.md)
 - [Test suite taxonomy](docs/test-suite-taxonomy.md)
+- [Docker, Compose, Kubernetes, and release smoke](docs/docker-kubernetes-release.md)
 
 ## Compatibility status
 

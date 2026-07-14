@@ -88,6 +88,15 @@ fn log_database_opened(db: &OmniKV, cfg: &ServerConfig) {
     );
 }
 
+fn install_rustls_crypto_provider() {
+    match rustls::crypto::ring::default_provider().install_default() {
+        Ok(()) => {}
+        Err(_) => {
+            tracing::debug!("rustls crypto provider was already installed");
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize structured logging
@@ -98,6 +107,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .json()
         .init();
+
+    install_rustls_crypto_provider();
 
     // Load the single authoritative server runtime config.
     //

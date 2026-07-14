@@ -42,6 +42,9 @@ cargo test -p omnikv-engine --test ops_maturity -- --test-threads=1
 # Performance smoke, not formal benchmark evidence
 cargo test -p omnikv-engine --test storage_perf -- --test-threads=1 --nocapture
 cargo test -p omnikv-engine --test benchmarks --release -- --test-threads=1 --nocapture
+
+# Container smoke
+bash scripts/docker-compose-smoke.sh
 ```
 
 ## Architecture
