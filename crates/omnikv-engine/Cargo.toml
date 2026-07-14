@@ -53,6 +53,7 @@ regex = "1.11"
 openraft = { version = "0.9.24", features = ["serde"] }
 
 [dev-dependencies]
+proptest = "1.9.0"
 tempfile = "3.15"
 
 [[bench]]

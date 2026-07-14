@@ -145,6 +145,32 @@ jobs:
     - name: Rust client smoke contracts
       run: cargo test -p omni-client client_contract -- --test-threads=1
 
+  fuzz-property:
+    name: Fuzz Smoke & Property Tests
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+    - uses: actions/checkout@v5
+      with:
+        persist-credentials: false
+    - uses: dtolnay/rust-toolchain@stable
+    - uses: actions/cache@v5
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target
+          fuzz/target
+        key: ${{ runner.os }}-cargo-fuzz-property-${{ hashFiles('**/Cargo.lock', 'fuzz/Cargo.toml') }}
+    - name: Build cargo-fuzz targets
+      run: cargo check --manifest-path fuzz/Cargo.toml --bins
+    - name: Storage property tests
+      run: cargo test -p omnikv-engine --test property_storage -- --test-threads=1
+    - name: Fuzz corpus regression smoke
+      run: |
+        cargo test -p omnikv-engine --test fuzz_regressions -- --test-threads=1
+        cargo test -p omnikv-server --test fuzz_api_regressions -- --test-threads=1
+
   test-raft:
     name: Raft Consensus Tests
     runs-on: ubuntu-latest

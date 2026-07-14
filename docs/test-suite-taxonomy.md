@@ -14,6 +14,8 @@ These suites are expected to pass before a production-readiness PR is merged:
 | Storage correctness | Core storage API behavior | `cargo test -p omnikv-engine --test storage_tests -- --test-threads=1` |
 | Storage invariants | Storage edge cases and format behavior | `cargo test -p omnikv-engine --test storage_correctness -- --test-threads=1` |
 | Storage engine contracts | LSM, WAL, and engine behavior | `cargo test -p omnikv-engine --test storage_engine -- --test-threads=1` |
+| Property tests | Generated storage operations for snapshot visibility, range scans, and compaction equivalence | `cargo test -p omnikv-engine --test property_storage -- --test-threads=1` |
+| Fuzz smoke | Builds fuzz targets and replays checked-in corpus/regression inputs | `cargo check --manifest-path fuzz/Cargo.toml --bins` plus `fuzz_regressions` tests |
 | Backup/restore | Backup, restore, and metadata validation | `cargo test -p omnikv-engine --test backup_restore -- --test-threads=1` |
 | Transactions/concurrency | SSI, operations, and concurrent stress coverage | `cargo test -p omnikv-engine --test concurrent_stress -- --test-threads=1` |
 | SQL and operations | SQL layer, SQL v3 features, and ops maturity | `cargo test -p omnikv-engine --test sql_layer -- --test-threads=1` |
@@ -70,7 +72,7 @@ These checks are valuable before a release announcement, but they are not normal
 - long soak tests and recovery loops;
 - cargo bench runs with recorded hardware metadata;
 - partition/failover testing for distributed behavior;
-- fuzzing and property-based testing.
+- long-duration fuzz corpus growth beyond the short CI smoke path.
 
 For the current distributed guarantee boundary, see
 [Distributed correctness](distributed-correctness.md).

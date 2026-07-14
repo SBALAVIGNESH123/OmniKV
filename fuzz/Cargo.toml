@@ -1,0 +1,53 @@
+[package]
+name = "omnikv-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+members = ["."]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+omni_engine = { package = "omnikv-engine", path = "../crates/omnikv-engine" }
+omnikv-server = { path = "../crates/omnikv-server" }
+serde_json = "1.0"
+tempfile = "3.15"
+
+[[bin]]
+name = "sql_parser"
+path = "fuzz_targets/sql_parser.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "api_json"
+path = "fuzz_targets/api_json.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "wal_record"
+path = "fuzz_targets/wal_record.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "backup_restore"
+path = "fuzz_targets/backup_restore.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "raft_log"
+path = "fuzz_targets/raft_log.rs"
+test = false
+doc = false
+bench = false
