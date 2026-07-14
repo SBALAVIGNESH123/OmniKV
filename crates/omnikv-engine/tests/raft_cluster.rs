@@ -4,6 +4,7 @@
 
 use omni_engine::OmniKV;
 use omni_engine::raft_storage::OmniRaftStorage;
+use openraft::storage::{RaftSnapshotBuilder, RaftStorage};
 use std::sync::Arc;
 
 fn create_node(name: &str) -> (Arc<OmniKV>, OmniRaftStorage, tempfile::TempDir) {
@@ -13,6 +14,14 @@ fn create_node(name: &str) -> (Arc<OmniKV>, OmniRaftStorage, tempfile::TempDir) 
     let db = OmniKV::open(manifest.to_str().unwrap(), wal.to_str().unwrap()).unwrap();
     let storage = OmniRaftStorage::new(db.clone());
     (db, storage, dir)
+}
+
+fn create_node_in_dir(dir: &std::path::Path, name: &str) -> (Arc<OmniKV>, OmniRaftStorage) {
+    let manifest = dir.join(format!("{name}_manifest.json"));
+    let wal = dir.join(format!("{name}_wal.bin"));
+    let db = OmniKV::open(manifest.to_str().unwrap(), wal.to_str().unwrap()).unwrap();
+    let storage = OmniRaftStorage::new(db.clone());
+    (db, storage)
 }
 
 /// Simulate leader replicating log entries to followers
@@ -506,6 +515,175 @@ fn test_snapshot_and_compaction() {
 //   - Minority partition's stale leader cannot commit (no quorum)
 //   - Data converges after the partition heals
 // ═══════════════════════════════════════════════════════════════════════════
+
+/// Gap #4b: Real snapshot install across partition catch-up and restart.
+///
+/// A lagging node receives entries 1-40, is isolated while the majority commits
+/// entries 41-120, then catches up by installing the leader's real Raft
+/// snapshot. The test verifies snapshot data survives restart, minority-only
+/// stale data is absent, and post-snapshot logs can still be applied.
+#[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "Snapshot install integration scenario keeps partition setup, install, restart, and post-snapshot assertions together."
+)]
+async fn test_snapshot_install_after_partition_and_restart() {
+    let (leader_db, leader, _leader_dir) = create_node("snap_install_leader");
+    let (_majority_db, majority_follower, _majority_dir) = create_node("snap_install_majority");
+    let lagging_dir = tempfile::tempdir().unwrap();
+    let (lagging_db, lagging) = create_node_in_dir(lagging_dir.path(), "snap_install_lagging");
+
+    for i in 1..=40 {
+        leader
+            .append_log(i, &format!("SET si_base_k{i} si_base_v{i}"))
+            .unwrap();
+    }
+    replicate_to_set(&leader, &[&majority_follower, &lagging], 1, 41);
+    for node in [&leader, &majority_follower, &lagging] {
+        apply_range(node, 1, 41);
+    }
+
+    for i in 41..=45 {
+        lagging
+            .append_log(i, &format!("SET si_stale_k{i} si_stale_v{i}"))
+            .unwrap();
+    }
+    apply_range(&lagging, 41, 46);
+    let stale_seq = lagging_db.get_seq();
+    for i in 41..=45 {
+        assert_eq!(
+            lagging_db
+                .find(&format!("si_stale_k{i}"), stale_seq)
+                .unwrap(),
+            Some(format!("si_stale_v{i}")),
+            "test setup should create stale minority state {i} before snapshot install"
+        );
+    }
+
+    for i in 41..=120 {
+        leader
+            .append_log(i, &format!("SET si_majority_k{i} si_majority_v{i}"))
+            .unwrap();
+    }
+    replicate_to_set(&leader, &[&majority_follower], 41, 121);
+    for node in [&leader, &majority_follower] {
+        apply_range(node, 41, 121);
+    }
+
+    leader.delete_log_range(1, 81).unwrap();
+    for i in 1..=80 {
+        assert!(
+            leader.read_log(i).is_none(),
+            "leader should have purged log {i}"
+        );
+    }
+
+    let mut snapshot_builder = leader.clone();
+    let snapshot = snapshot_builder.build_snapshot().await.unwrap();
+    let snapshot_meta = snapshot.meta.clone();
+    let mut lagging_installer = lagging.clone();
+    lagging_installer
+        .install_snapshot(&snapshot_meta, snapshot.snapshot)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        lagging.last_applied_index(),
+        120,
+        "installed snapshot should advance lagging node to the leader's applied index"
+    );
+
+    let lagging_seq = lagging_db.get_seq();
+    for i in 1..=40 {
+        assert_eq!(
+            lagging_db
+                .find(&format!("si_base_k{i}"), lagging_seq)
+                .unwrap(),
+            Some(format!("si_base_v{i}")),
+            "lagging node missing pre-partition key {i} after snapshot install"
+        );
+    }
+    for i in 41..=120 {
+        assert_eq!(
+            lagging_db
+                .find(&format!("si_majority_k{i}"), lagging_seq)
+                .unwrap(),
+            Some(format!("si_majority_v{i}")),
+            "lagging node missing majority key {i} after snapshot install"
+        );
+    }
+    for i in 41..=45 {
+        assert_eq!(
+            lagging_db
+                .find(&format!("si_stale_k{i}"), lagging_seq)
+                .unwrap(),
+            None,
+            "minority-only stale key {i} must not survive snapshot install"
+        );
+        assert!(
+            lagging.read_log(i).is_none(),
+            "minority-only stale log {i} must not survive snapshot install"
+        );
+    }
+
+    drop(lagging_installer);
+    drop(lagging);
+    drop(lagging_db);
+    let (reopened_db, reopened_lagging) =
+        create_node_in_dir(lagging_dir.path(), "snap_install_lagging");
+
+    assert_eq!(
+        reopened_lagging.last_applied_index(),
+        120,
+        "snapshot metadata should survive lagging node restart"
+    );
+    let reopened_seq = reopened_db.get_seq();
+    assert_eq!(
+        reopened_db.find("si_majority_k120", reopened_seq).unwrap(),
+        Some("si_majority_v120".into()),
+        "snapshot data should survive lagging node restart"
+    );
+    assert_eq!(
+        reopened_db.find("si_stale_k41", reopened_seq).unwrap(),
+        None,
+        "stale minority data should remain absent after restart"
+    );
+    for i in 41..=45 {
+        assert!(
+            reopened_lagging.read_log(i).is_none(),
+            "minority-only stale log {i} should remain absent after restart"
+        );
+    }
+
+    for i in 121..=130 {
+        leader
+            .append_log(i, &format!("SET si_post_k{i} si_post_v{i}"))
+            .unwrap();
+    }
+    replicate_to_set(&leader, &[&reopened_lagging], 121, 131);
+    apply_range(&reopened_lagging, 121, 131);
+
+    let final_seq = reopened_db.get_seq();
+    for i in 121..=130 {
+        assert_eq!(
+            reopened_db
+                .find(&format!("si_post_k{i}"), final_seq)
+                .unwrap(),
+            Some(format!("si_post_v{i}")),
+            "lagging node missing post-snapshot log entry {i}"
+        );
+    }
+
+    let leader_seq = leader_db.get_seq();
+    assert_eq!(
+        leader_db.find("si_majority_k120", leader_seq).unwrap(),
+        Some("si_majority_v120".into())
+    );
+
+    println!(
+        "snapshot install: lagging node installed real snapshot, restarted, and applied logs 121-130"
+    );
+}
 
 fn create_5_node_cluster() -> Vec<(std::sync::Arc<OmniKV>, OmniRaftStorage, tempfile::TempDir)> {
     (1..=5)

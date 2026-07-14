@@ -557,18 +557,8 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
         }
 
         // ── Determine paths from current manifest ──
-        let (manifest_path, wal_path) = {
-            let manifest = self.db.roots.load().manifest.clone();
-            let data_dir = std::path::Path::new(&self.db.manifest_path)
-                .parent()
-                .unwrap_or(std::path::Path::new("."))
-                .to_path_buf();
-            let tmp_dir = data_dir.join("tmp_snapshot_install");
-            (
-                self.db.manifest_path.clone(),
-                format!("{}/raft_snapshot.wal", tmp_dir.display()),
-            )
-        };
+        let manifest_path = self.db.manifest_path.clone();
+        let wal_path = self.db.wal_path.clone();
 
         // ── Phase A: Acquire EXCLUSIVE transition lock (freezes all writers) ──
         let _exclusive = self
@@ -581,7 +571,16 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
             .parent()
             .unwrap_or(std::path::Path::new("."))
             .to_path_buf();
-        let tmp_dir = std::env::temp_dir().join(format!(
+        let wal_dir = std::path::Path::new(&wal_path)
+            .parent()
+            .unwrap_or(std::path::Path::new("."))
+            .to_path_buf();
+        if wal_dir != data_dir {
+            return Err(io_err(
+                "snapshot install requires manifest and WAL paths in the same directory",
+            ));
+        }
+        let tmp_dir = data_dir.join(format!(
             "omni_snapshot_{}",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -594,8 +593,17 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
         fs::create_dir_all(&tmp_dir).map_err(|e| io_err(&format!("mkdir tmp: {}", e)))?;
 
         // ── Phase C: Write snapshot entries into a fresh WriteBatch in tmp engine ──
-        let tmp_manifest_path = tmp_dir.join("manifest.json").to_string_lossy().to_string();
-        let tmp_wal_path = tmp_dir.join("raft.wal").to_string_lossy().to_string();
+        let manifest_file_name = std::path::Path::new(&manifest_path)
+            .file_name()
+            .ok_or_else(|| io_err("manifest path has no file name"))?;
+        let wal_file_name = std::path::Path::new(&wal_path)
+            .file_name()
+            .ok_or_else(|| io_err("WAL path has no file name"))?;
+        let tmp_manifest_path = tmp_dir
+            .join(manifest_file_name)
+            .to_string_lossy()
+            .to_string();
+        let tmp_wal_path = tmp_dir.join(wal_file_name).to_string_lossy().to_string();
         let tmp_heap_path = tmp_dir.join("data_heap.bin").to_string_lossy().to_string();
         let tmp_base_path = tmp_dir.join("data_base.bin").to_string_lossy().to_string();
 
@@ -646,22 +654,95 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
         }
         drop(tmp_db);
 
-        // ── Phase D: Atomic directory swap ──
+        let rebase_snapshot_path = |path: &str| -> Option<String> {
+            let file_name = std::path::Path::new(path).file_name()?;
+            Some(data_dir.join(file_name).to_string_lossy().to_string())
+        };
+        let mut installed_manifest = crate::Manifest::load(&tmp_manifest_path)
+            .map_err(|e| io_err(&format!("load installed snapshot manifest: {e}")))?;
+        installed_manifest.heap_path = rebase_snapshot_path(&installed_manifest.heap_path)
+            .ok_or_else(|| {
+                io_err(&format!(
+                    "snapshot path has no file name: {}",
+                    installed_manifest.heap_path
+                ))
+            })?;
+        installed_manifest.base_path = rebase_snapshot_path(&installed_manifest.base_path)
+            .ok_or_else(|| {
+                io_err(&format!(
+                    "snapshot path has no file name: {}",
+                    installed_manifest.base_path
+                ))
+            })?;
+        let mut rebased_sstables = Vec::with_capacity(installed_manifest.sstables.len());
+        for path in &installed_manifest.sstables {
+            rebased_sstables.push(
+                rebase_snapshot_path(path)
+                    .ok_or_else(|| io_err(&format!("snapshot path has no file name: {path}")))?,
+            );
+        }
+        installed_manifest.sstables = rebased_sstables;
+        let mut rebased_l1_sstables = Vec::with_capacity(installed_manifest.l1_sstables.len());
+        for path in &installed_manifest.l1_sstables {
+            rebased_l1_sstables.push(
+                rebase_snapshot_path(path)
+                    .ok_or_else(|| io_err(&format!("snapshot path has no file name: {path}")))?,
+            );
+        }
+        installed_manifest.l1_sstables = rebased_l1_sstables;
+        installed_manifest
+            .save(&tmp_manifest_path)
+            .map_err(|e| io_err(&format!("save installed snapshot manifest: {e}")))?;
+
+        // ── Phase D: Same-filesystem directory promotion ──
         let old_dir = data_dir.join("old_snapshot");
         if old_dir.exists() {
-            fs::remove_dir_all(&old_dir).ok();
+            fs::remove_dir_all(&old_dir)
+                .map_err(|e| io_err(&format!("remove old snapshot dir: {e}")))?;
         }
-        fs::create_dir_all(&old_dir).ok();
+        fs::create_dir_all(&old_dir)
+            .map_err(|e| io_err(&format!("create old snapshot dir: {e}")))?;
+
+        let tmp_dir_name = tmp_dir
+            .file_name()
+            .ok_or_else(|| io_err("temporary snapshot directory has no file name"))?
+            .to_os_string();
+        let restore_active_files = || {
+            if let Ok(entries) = fs::read_dir(&data_dir) {
+                for entry in entries.flatten() {
+                    let name = entry.file_name();
+                    if name != "old_snapshot" && name != "LOCK" && name != tmp_dir_name {
+                        let _ = fs::rename(entry.path(), tmp_dir.join(&name));
+                    }
+                }
+            }
+            if let Ok(entries) = fs::read_dir(&old_dir) {
+                for entry in entries.flatten() {
+                    let name = entry.file_name();
+                    if name != "LOCK" {
+                        let _ = fs::rename(entry.path(), data_dir.join(&name));
+                    }
+                }
+            }
+        };
 
         // Move current files to old_dir
         for entry in
             fs::read_dir(&data_dir).map_err(|e| io_err(&format!("read data dir: {}", e)))?
         {
             let entry = entry.map_err(|e| io_err(&format!("read data dir entry: {}", e)))?;
-            let name = entry.file_name().to_string_lossy().to_string();
-            if name != "old_snapshot" {
-                fs::rename(entry.path(), old_dir.join(&name))
-                    .map_err(|e| io_err(&format!("move current snapshot file {}: {}", name, e)))?;
+            let name = entry.file_name();
+            if name != "old_snapshot"
+                && name != "LOCK"
+                && name != tmp_dir_name
+                && let Err(e) = fs::rename(entry.path(), old_dir.join(&name))
+            {
+                restore_active_files();
+                return Err(io_err(&format!(
+                    "move current snapshot file {}: {}",
+                    name.to_string_lossy(),
+                    e
+                )));
             }
         }
 
@@ -671,13 +752,17 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
         {
             let entry = entry.map_err(|e| io_err(&format!("read temp snapshot entry: {}", e)))?;
             let name = entry.file_name();
-            fs::rename(entry.path(), data_dir.join(&name)).map_err(|e| {
-                io_err(&format!(
+            if name == "LOCK" {
+                continue;
+            }
+            if let Err(e) = fs::rename(entry.path(), data_dir.join(&name)) {
+                restore_active_files();
+                return Err(io_err(&format!(
                     "install snapshot file {}: {}",
                     name.to_string_lossy(),
                     e
-                ))
-            })?;
+                )));
+            }
         }
 
         let _ = fs::remove_dir_all(&tmp_dir);

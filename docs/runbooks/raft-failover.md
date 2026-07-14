@@ -19,6 +19,8 @@ cargo test -p omnikv-engine --test raft_cluster -- --test-threads=1
 
 This suite exercises single-process Raft cluster behavior, log replication,
 snapshot-related paths, partition-style scenarios, and logical ordering checks.
+For the exact guarantee boundary and non-goals, see
+[Distributed correctness](../distributed-correctness.md).
 
 ## Operator expectations
 
@@ -50,8 +52,9 @@ In a healthy Raft deployment:
 6. Confirm logs converge.
 7. Run read smoke on every node.
 
-This drill should be part of issue #16 hardening before multi-node mode is
-marketed as production-ready.
+This drill is covered in the deterministic test harness. Real multi-process
+partition drills are still required before multi-node mode is marketed as
+production high availability.
 
 ## Incident response
 
