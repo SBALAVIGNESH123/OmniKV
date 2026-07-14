@@ -28,6 +28,7 @@ cargo build --all-targets
 Run storage and recovery gates:
 
 ```bash
+cargo test -p omnikv-engine --test embedded_api -- --test-threads=1
 cargo test -p omnikv-engine --test backup_restore -- --test-threads=1 --nocapture
 cargo test -p omnikv-engine --test crash_consistency -- --test-threads=1 --nocapture
 cargo test -p omnikv-engine --test durability_evidence -- --test-threads=1 --nocapture

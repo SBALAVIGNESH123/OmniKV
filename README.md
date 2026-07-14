@@ -3,7 +3,7 @@
 **A Rust database engine built from the ground up, focused on trust, durability, and practical systems learning.**
 
 ![Rust](https://img.shields.io/badge/language-Rust-orange?style=for-the-badge&logo=rust)
-![Tests](https://img.shields.io/badge/tests-323%20passing-brightgreen?style=for-the-badge)
+![CI](https://img.shields.io/badge/CI-green-brightgreen?style=for-the-badge)
 ![Crash](https://img.shields.io/badge/crash%20cycles-1000%20%2F%200%20lost-brightgreen?style=for-the-badge)
 ![Soak](https://img.shields.io/badge/soak-10%20min%20%2F%200%20errors-brightgreen?style=for-the-badge)
 ![License](https://img.shields.io/badge/license-MIT-blue?style=for-the-badge)
@@ -11,6 +11,8 @@
 OmniKV is an experimental database engine written from scratch in Rust. It is not a wrapper around RocksDB and it is not a fork of SQLite. It includes its own storage engine, write-ahead log, transaction manager, SQL parser, and Raft-oriented consensus work.
 
 The primary goal is correctness and durability. The project includes crash-recovery checks, corruption-detection tests, concurrent stress tests, SQL coverage, operational diagnostics, and Raft cluster tests.
+
+For SketchLog, OmniKV is the durable embedded storage foundation: local telemetry replay buffers, sketch-state persistence, backup/restore, and future edge/offline storage.
 
 > Status: beta / research-grade. OmniKV is suitable for learning, experiments, demos, and non-critical prototypes. Do not put critical production data on it until the remaining consistency, fuzzing, long-soak, and operational hardening work is complete.
 
@@ -24,6 +26,7 @@ The primary goal is correctness and durability. The project includes crash-recov
 - Consensus: Raft integration for multi-node replication and leader failover experiments.
 - Operations: health checks, metrics, diagnostics, Docker packaging, and example config.
 - Recovery: portable plain/encrypted backup and restore APIs with restore-time metadata validation.
+- Embedded API: stable directory-based Rust facade with namespaces, batch writes, snapshots, scans, backup/restore, SQL execution, and SketchLog-oriented integration docs.
 
 ## Quick start
 
@@ -86,18 +89,23 @@ For Kubernetes examples, release smoke, and SBOM guidance, see [Docker, Compose,
 ## Embedded library example
 
 ```rust
-use omni_engine::{OmniKV, WriteBatch};
+use omni_engine::{EmbeddedBatch, EmbeddedConfig, EmbeddedOmniKv};
 
-let db = OmniKV::open("manifest.json", "data.wal").unwrap();
+let store = EmbeddedOmniKv::open(
+    EmbeddedConfig::new("./data/omnikv").namespace("sketchlog"),
+).unwrap();
 
-let mut batch = WriteBatch::new();
-batch.set("user:1", r#"{"name":"Alice"}"#.into()).unwrap();
-db.commit_batch(&batch).unwrap();
+store.write_batch(
+    EmbeddedBatch::new()
+        .put("telemetry/api/00000000000000000001", r#"{"latency_ms":42}"#)
+        .put("sketches/api/p99", "91.4"),
+).unwrap();
 
-let snap = db.snapshot();
-let alice = db.find("user:1", snap).unwrap();
-db.unregister_snapshot(snap);
+let p99 = store.get("sketches/api/p99").unwrap();
+let replay = store.scan_prefix("telemetry/api/", Some(1000)).unwrap();
 ```
+
+For the full SketchLog integration contract, see [Embedded API for SketchLog integration](docs/embedded-api.md).
 
 ## Testing
 
@@ -118,6 +126,7 @@ On Windows/MSVC, full debug test linking can require significant free disk space
 - [Backup and restore](docs/backup_restore.md)
 - [Security model](docs/security.md)
 - [Distributed correctness](docs/distributed-correctness.md)
+- [Embedded API for SketchLog integration](docs/embedded-api.md)
 - [Fuzzing and property testing](docs/fuzzing.md)
 - [Reproducible benchmarks](docs/benchmarks.md)
 - [Protocol and result-size limits](docs/protocol-limits.md)
@@ -130,7 +139,7 @@ On Windows/MSVC, full debug test linking can require significant free disk space
 
 | Surface | Current status | Guardrail |
 | --- | --- | --- |
-| Embedded Rust API | Beta | Workspace build, clippy, storage, durability, SQL, transaction, and ops tests |
+| Embedded Rust API | Beta | Stable facade tests for namespacing, reopen durability, backup/restore, encrypted backup/restore, SQL, plus workspace build, clippy, storage, durability, transaction, and ops tests |
 | REST API | Beta | Stable JSON envelope and golden response contract tests |
 | PgWire protocol | Beta subset | SQLSTATE, command tag, ReadyForQuery, and result-limit contract tests |
 | Rust REST client | Beta | HTTP smoke tests against stable REST response envelopes |
@@ -153,7 +162,7 @@ The engine source is grouped by domain under `storage/`, `query/`, `raft/`, and 
 - SeqScan currently materializes rows before yielding them. True streaming directly from the storage engine is planned.
 - Long-running stability still needs a 24-hour soak test.
 - Fuzz/property testing is now seeded for SQL, API JSON, WAL, backup restore, Raft log operations, and storage visibility. It still needs long-duration corpus growth before fuzzing can be treated as mature assurance.
-- The project is not yet recommended as the default storage engine for critical production workloads.
+- The embedded API is ready for SketchLog integration experiments and non-critical durable telemetry paths, but the project is not yet recommended as the default storage engine for critical production workloads.
 
 ## Roadmap
 
@@ -162,8 +171,9 @@ The engine source is grouped by domain under `storage/`, `query/`, `raft/`, and 
 - [x] Phase 3 - Durability: crash-recovery cycles and corruption detection.
 - [x] Phase 4 - Benchmarks: throughput measurements and short soak tests.
 - [x] Phase 5 - Multi-node: Raft cluster tests and partition-handling experiments.
-- [ ] Phase 6 - Consistency: Jepsen-style testing and failure-model documentation.
-- [ ] Phase 7 - Production: long-duration fuzz corpus growth, 24-hour soak, operational runbooks, repeated restore drills, and migration guarantees.
+- [x] Phase 6 - Integration: stable embedded API for SketchLog-style durable telemetry state.
+- [ ] Phase 7 - Consistency: Jepsen-style testing and failure-model documentation.
+- [ ] Phase 8 - Production: long-duration fuzz corpus growth, 24-hour soak, operational runbooks, repeated restore drills, and migration guarantees.
 
 ## Contributing
 

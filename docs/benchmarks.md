@@ -55,7 +55,7 @@ The benchmark emits:
   "schema_version": 1,
   "generated_at_unix_seconds": 0,
   "metadata": {
-    "package_version": "0.3.0",
+    "package_version": "0.4.0",
     "profile": "smoke",
     "os": "linux",
     "arch": "x86_64",

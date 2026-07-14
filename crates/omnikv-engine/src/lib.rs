@@ -73,6 +73,12 @@ pub mod transaction;
 #[path = "storage/wal.rs"]
 pub mod wal;
 
+pub mod embedded;
+pub use embedded::{
+    EmbeddedBatch, EmbeddedConfig, EmbeddedError, EmbeddedOmniKv, EmbeddedSnapshot,
+    EmbeddedSqlResult, EmbeddedStats, EmbeddedWrite, KeyValue,
+};
+
 #[path = "query/catalog.rs"]
 pub mod catalog;
 #[path = "query/optimizer.rs"]
