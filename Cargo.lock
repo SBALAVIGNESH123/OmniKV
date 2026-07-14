@@ -1896,7 +1896,7 @@ dependencies = [
 
 [[package]]
 name = "omnikv-engine"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "aes-gcm",
  "arc-swap",
@@ -1936,7 +1936,7 @@ dependencies = [
 
 [[package]]
 name = "omnikv-server"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "axum",
  "axum-server",

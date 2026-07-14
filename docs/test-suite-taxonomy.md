@@ -14,6 +14,7 @@ These suites are expected to pass before a production-readiness PR is merged:
 | Storage correctness | Core storage API behavior | `cargo test -p omnikv-engine --test storage_tests -- --test-threads=1` |
 | Storage invariants | Storage edge cases and format behavior | `cargo test -p omnikv-engine --test storage_correctness -- --test-threads=1` |
 | Storage engine contracts | LSM, WAL, and engine behavior | `cargo test -p omnikv-engine --test storage_engine -- --test-threads=1` |
+| Embedded API contract | SketchLog-facing embedded facade: namespaces, reopen durability, backup/restore, encrypted backup/restore, SQL execution | `cargo test -p omnikv-engine --test embedded_api -- --test-threads=1` |
 | Property tests | Generated storage operations for snapshot visibility, range scans, and compaction equivalence | `cargo test -p omnikv-engine --test property_storage -- --test-threads=1` |
 | Fuzz smoke | Builds fuzz targets and replays checked-in corpus/regression inputs | `cargo check --manifest-path fuzz/Cargo.toml --bins` plus `fuzz_regressions` tests |
 | Backup/restore | Backup, restore, and metadata validation | `cargo test -p omnikv-engine --test backup_restore -- --test-threads=1` |
