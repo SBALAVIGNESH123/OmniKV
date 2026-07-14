@@ -57,9 +57,10 @@ Performance smoke tests are deterministic enough for CI, but their thresholds ar
 ```bash
 cargo test -p omnikv-engine --test storage_perf -- --test-threads=1 --nocapture
 cargo test -p omnikv-engine --test benchmarks --release -- --test-threads=1 --nocapture
+cargo bench -p omnikv-engine --bench reproducible_bench -- --profile smoke --json-out target/omnikv-benchmark-smoke.json
 ```
 
-Formal performance claims should come from the reproducible benchmark workflow and should record hardware, OS, commit SHA, dataset size, workload shape, and raw output.
+Formal performance claims should come from the [reproducible benchmark workflow](benchmarks.md) and should record hardware, OS, commit SHA, dataset size, workload shape, and raw output.
 
 ## Manual and long-running evidence
 

@@ -69,3 +69,8 @@ harness = false
 name = "scan_buffer_pool"
 path = "benches/scan_buffer_pool.rs"
 harness = false
+
+[[bench]]
+name = "reproducible_bench"
+path = "benches/reproducible_bench.rs"
+harness = false
