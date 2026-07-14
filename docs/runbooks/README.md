@@ -45,8 +45,10 @@ Safe operations:
 - Keep backups outside the active data directory.
 - Restore into an empty directory first, then promote after validation.
 - Prefer immutable backup archives and off-host copies.
-- Use `OMNIKV_MODE=production` with explicit TLS, JWT secret, data directory,
-  backup directory, and rate limits for production-style deployments.
+- Use `OMNIKV_MODE=production` with explicit TLS, JWT secret, bootstrap admin
+  key, data directory, backup directory, and rate limits for production-style
+  deployments.
+- Follow the REST role and token guidance in [Security model](../security.md).
 - Run restore drills before trusting a backup policy.
 
 Unsafe operations:

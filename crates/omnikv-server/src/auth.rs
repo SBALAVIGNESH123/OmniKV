@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Claims {
     pub sub: String,  // Subject (user/service ID)
-    pub role: String, // "admin", "read", "write"
+    pub role: String, // "read", "write", "backup", "restore", "cluster", or "admin"
     pub exp: u64,     // Expiration (UNIX timestamp)
     pub iat: u64,     // Issued at
 }

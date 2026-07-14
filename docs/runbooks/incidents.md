@@ -120,10 +120,11 @@ Actions:
 
 1. Rotate `OMNIKV_JWT_SECRET`.
 2. Rotate TLS certificates if private keys may be exposed.
-3. Revoke exposed deployment secrets.
-4. Preserve logs.
-5. Increase rate-limit strictness if under abuse.
-6. Rebuild and redeploy from a known commit if binary integrity is uncertain.
+3. Rotate `OMNIKV_BOOTSTRAP_ADMIN_KEY`.
+4. Revoke exposed deployment secrets and re-mint scoped short-lived tokens.
+5. Preserve logs, including `omnikv.audit` records.
+6. Increase rate-limit strictness if under abuse.
+7. Rebuild and redeploy from a known commit if binary integrity is uncertain.
 
 ## Evidence to capture
 

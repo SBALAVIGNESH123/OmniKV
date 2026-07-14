@@ -26,6 +26,7 @@ internet-facing deployment.
 ```bash
 export OMNIKV_MODE=production
 export OMNIKV_JWT_SECRET="$(openssl rand -hex 32)"
+export OMNIKV_BOOTSTRAP_ADMIN_KEY="$(openssl rand -hex 32)"
 export OMNIKV_TLS_CERT_PATH=/etc/omnikv/tls/cert.pem
 export OMNIKV_TLS_KEY_PATH=/etc/omnikv/tls/key.pem
 export OMNIKV_DATA_DIR=/var/lib/omnikv/data
@@ -45,11 +46,19 @@ After startup:
 ```bash
 curl -k https://127.0.0.1:8443/health
 curl -k https://127.0.0.1:8443/ready
-curl -k https://127.0.0.1:8443/metrics
+ADMIN_TOKEN="$(
+  curl -sk -X POST https://127.0.0.1:8443/auth/token \
+    -H "x-omni-admin-key: ${OMNIKV_BOOTSTRAP_ADMIN_KEY}" \
+    -H "content-type: application/json" \
+    -d '{"username":"ops-smoke","role":"admin","ttl_seconds":300}' \
+  | jq -r '.data'
+)"
+curl -k -H "Authorization: Bearer ${ADMIN_TOKEN}" https://127.0.0.1:8443/metrics
 ```
 
 `/health` confirms the process is alive and can report storage stats.
-`/ready` is the readiness gate. `/metrics` exposes Prometheus text metrics.
+`/ready` is the readiness gate. `/metrics` exposes Prometheus text metrics and
+requires an admin bearer token.
 
 ## Docker image smoke
 
@@ -99,7 +108,8 @@ Before a production-style rollout:
 
 - choose a dedicated `OMNIKV_DATA_DIR`;
 - choose a backup directory outside the active data directory;
-- configure TLS and a non-development JWT secret;
+- configure TLS, a JWT secret of at least 32 characters, and a bootstrap admin
+  key of at least 32 characters that is different from the JWT secret;
 - set rate limits appropriate for the expected workload;
 - verify the process has enough file descriptors and disk space;
 - configure log collection;
