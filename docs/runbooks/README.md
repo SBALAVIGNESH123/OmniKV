@@ -17,6 +17,7 @@ failure mode has already been proven under years of real traffic.
 | [Incidents](incidents.md) | Handling disk pressure, corruption, WAL recovery, latency, or failed health checks |
 | [SLOs and alerts](slo-alerts.md) | Building dashboards and alerts from `/metrics`, host metrics, and synthetic checks |
 | [Raft failover](raft-failover.md) | Evaluating leader failover and multi-node behavior |
+| [Distributed correctness](../distributed-correctness.md) | Understanding current Raft guarantees, evidence, and non-goals |
 | [Database release checklist](release-checklist.md) | Preparing storage, WAL, SQL, Raft, or packaging changes for release |
 
 ## Current operational evidence

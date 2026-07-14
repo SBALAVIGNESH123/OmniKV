@@ -117,6 +117,7 @@ On Windows/MSVC, full debug test linking can require significant free disk space
 - [API and client compatibility](docs/api-compatibility.md)
 - [Backup and restore](docs/backup_restore.md)
 - [Security model](docs/security.md)
+- [Distributed correctness](docs/distributed-correctness.md)
 - [Reproducible benchmarks](docs/benchmarks.md)
 - [Protocol and result-size limits](docs/protocol-limits.md)
 - [Real-data replay harness](docs/real-data-replay.md)
@@ -147,6 +148,7 @@ The engine source is grouped by domain under `storage/`, `query/`, `raft/`, and 
 ## Known limitations
 
 - Distributed transactions are not Jepsen-tested. The 2PC protocol is implemented, but has not been rigorously tested against network partitions or coordinator crashes.
+- Multi-node Raft has deterministic partition, failover, membership, snapshot, and restart evidence, but it is not yet Jepsen-grade or validated under real multi-process network faults.
 - SeqScan currently materializes rows before yielding them. True streaming directly from the storage engine is planned.
 - Long-running stability still needs a 24-hour soak test.
 - Fuzz testing is not in place yet for the SQL parser, wire protocol, and storage file formats.

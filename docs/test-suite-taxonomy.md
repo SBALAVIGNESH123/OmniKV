@@ -18,7 +18,7 @@ These suites are expected to pass before a production-readiness PR is merged:
 | Transactions/concurrency | SSI, operations, and concurrent stress coverage | `cargo test -p omnikv-engine --test concurrent_stress -- --test-threads=1` |
 | SQL and operations | SQL layer, SQL v3 features, and ops maturity | `cargo test -p omnikv-engine --test sql_layer -- --test-threads=1` |
 | API contracts | REST, PgWire, and Rust client contract tests | `cargo test -p omnikv-server rest_contract -- --test-threads=1` |
-| Raft consensus | Single-process Raft cluster behavior | `cargo test -p omnikv-engine --test raft_cluster -- --test-threads=1` |
+| Raft consensus | Single-process Raft cluster behavior, including partition-style scenarios, membership changes, and snapshot install catch-up | `cargo test -p omnikv-engine --test raft_cluster -- --test-threads=1` |
 | Security audit | Dependency vulnerability gate | `cargo audit --deny warnings` |
 | Docker build | Container image buildability | `docker build --pull --tag omnikv:ci .` |
 
@@ -71,5 +71,8 @@ These checks are valuable before a release announcement, but they are not normal
 - cargo bench runs with recorded hardware metadata;
 - partition/failover testing for distributed behavior;
 - fuzzing and property-based testing.
+
+For the current distributed guarantee boundary, see
+[Distributed correctness](distributed-correctness.md).
 
 When closing a production-readiness issue, include the PR number, commit SHA, commands run, and a short explanation of what the evidence proves and what it does not prove.
