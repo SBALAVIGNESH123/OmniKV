@@ -2,6 +2,9 @@
 
 OmniKV provides a library-level backup and restore contract for creating self-contained restore points.
 
+For the operator workflow, restore drills, failure response, and release evidence, see
+[Backup and restore runbook](runbooks/backup-restore.md).
+
 The backup format is a gzip-compressed tar archive containing:
 
 - `manifest.json` rewritten for restore portability
