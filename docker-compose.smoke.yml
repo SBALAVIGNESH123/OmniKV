@@ -1,0 +1,26 @@
+services:
+  omnikv:
+    image: ${OMNIKV_IMAGE:-omnikv:smoke}
+    ports:
+      - "${OMNIKV_HTTP_PORT:-18443}:8443"
+      - "${OMNIKV_PGWIRE_PORT:-15433}:5433"
+      - "${OMNIKV_TCP_PORT:-18080}:8080"
+    volumes:
+      - omnikv-smoke-data:/data
+    environment:
+      OMNIKV_MODE: "production"
+      OMNIKV_HTTP_ADDR: "0.0.0.0:8443"
+      OMNIKV_PGWIRE_ADDR: "0.0.0.0:5433"
+      OMNIKV_TCP_ADDR: "0.0.0.0:8080"
+      OMNIKV_QUIC_ADDR: "0.0.0.0:4433"
+      OMNIKV_MANIFEST_PATH: "/data/manifest.json"
+      OMNIKV_WAL_PATH: "/data/wal.bin"
+      OMNIKV_BACKUP_DIR: "/data/backups"
+      OMNIKV_TLS_INSECURE_SKIP: "true"
+      OMNIKV_JWT_SECRET: "${OMNIKV_JWT_SECRET:?set OMNIKV_JWT_SECRET for smoke tests}"
+      OMNIKV_BOOTSTRAP_ADMIN_KEY: "${OMNIKV_BOOTSTRAP_ADMIN_KEY:?set OMNIKV_BOOTSTRAP_ADMIN_KEY for smoke tests}"
+      RUST_LOG: "${RUST_LOG:-info}"
+    restart: unless-stopped
+
+volumes:
+  omnikv-smoke-data:

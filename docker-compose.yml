@@ -28,7 +28,7 @@ services:
       OMNI_PEERS: "omni-node-2:4433,omni-node-3:4433"
       OMNIKV_MANIFEST_PATH: "/data/manifest.json"
       OMNIKV_WAL_PATH: "/data/wal.bin"
-      RUST_LOG: "info,omni_engine=debug"
+      RUST_LOG: "${RUST_LOG:-info}"
     networks:
       - omni-cluster
     restart: unless-stopped
@@ -48,7 +48,7 @@ services:
       OMNI_PEERS: "omni-node-1:4433,omni-node-3:4433"
       OMNIKV_MANIFEST_PATH: "/data/manifest.json"
       OMNIKV_WAL_PATH: "/data/wal.bin"
-      RUST_LOG: "info,omni_engine=debug"
+      RUST_LOG: "${RUST_LOG:-info}"
     networks:
       - omni-cluster
     restart: unless-stopped
@@ -68,7 +68,7 @@ services:
       OMNI_PEERS: "omni-node-1:4433,omni-node-2:4433"
       OMNIKV_MANIFEST_PATH: "/data/manifest.json"
       OMNIKV_WAL_PATH: "/data/wal.bin"
-      RUST_LOG: "info,omni_engine=debug"
+      RUST_LOG: "${RUST_LOG:-info}"
     networks:
       - omni-cluster
     restart: unless-stopped

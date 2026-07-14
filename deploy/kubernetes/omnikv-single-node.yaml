@@ -1,0 +1,126 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: omnikv
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: omnikv-secrets
+  namespace: omnikv
+type: Opaque
+stringData:
+  # Replace these before applying. Do not commit real production secrets.
+  jwt-secret: "replace-with-32-plus-character-jwt-secret"
+  bootstrap-admin-key: "replace-with-different-32-plus-character-admin-key"
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: omnikv-data
+  namespace: omnikv
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: omnikv
+  namespace: omnikv
+spec:
+  type: ClusterIP
+  selector:
+    app: omnikv
+  ports:
+    - name: https
+      port: 8443
+      targetPort: https
+    - name: pgwire
+      port: 5433
+      targetPort: pgwire
+    - name: tcp
+      port: 8080
+      targetPort: tcp
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: omnikv
+  namespace: omnikv
+spec:
+  serviceName: omnikv
+  replicas: 1
+  selector:
+    matchLabels:
+      app: omnikv
+  template:
+    metadata:
+      labels:
+        app: omnikv
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+      containers:
+        - name: omnikv
+          image: ghcr.io/sbalavignesh123/omnikv:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: https
+              containerPort: 8443
+            - name: pgwire
+              containerPort: 5433
+            - name: tcp
+              containerPort: 8080
+          env:
+            - name: OMNIKV_MODE
+              value: production
+            - name: OMNIKV_HTTP_ADDR
+              value: 0.0.0.0:8443
+            - name: OMNIKV_PGWIRE_ADDR
+              value: 0.0.0.0:5433
+            - name: OMNIKV_TCP_ADDR
+              value: 0.0.0.0:8080
+            - name: OMNIKV_QUIC_ADDR
+              value: 0.0.0.0:4433
+            - name: OMNIKV_MANIFEST_PATH
+              value: /data/manifest.json
+            - name: OMNIKV_WAL_PATH
+              value: /data/wal.bin
+            - name: OMNIKV_BACKUP_DIR
+              value: /data/backups
+            - name: OMNIKV_TLS_INSECURE_SKIP
+              value: "true"
+            - name: OMNIKV_JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: omnikv-secrets
+                  key: jwt-secret
+            - name: OMNIKV_BOOTSTRAP_ADMIN_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: omnikv-secrets
+                  key: bootstrap-admin-key
+          readinessProbe:
+            exec:
+              command: ["curl", "-kfsS", "https://127.0.0.1:8443/ready"]
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            exec:
+              command: ["curl", "-kfsS", "https://127.0.0.1:8443/health"]
+            initialDelaySeconds: 30
+            periodSeconds: 30
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: omnikv-data
