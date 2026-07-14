@@ -7,11 +7,16 @@ on:
         description: Published image to pull and smoke test
         required: true
         default: ghcr.io/sbalavignesh123/omnikv:latest
+      publish:
+        description: Build and push the image before smoke testing it
+        required: false
+        default: "false"
   release:
     types: [published]
 
 permissions:
   contents: read
+  packages: write
 
 concurrency:
   group: omnikv-release-smoke-${{ github.workflow }}-${{ github.ref }}
@@ -23,12 +28,26 @@ jobs:
     runs-on: ubuntu-latest
     env:
       OMNIKV_IMAGE: ${{ github.event_name == 'workflow_dispatch' && inputs.image || format('ghcr.io/sbalavignesh123/omnikv:{0}', github.event.release.tag_name) }}
+      OMNIKV_PUBLISH_IMAGE: ${{ github.event_name == 'release' || inputs.publish == 'true' }}
       OMNIKV_SMOKE_BUILD: "false"
     steps:
       - uses: actions/checkout@v5
         with:
           persist-credentials: false
+      - name: Login to GitHub Container Registry
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+      - name: Build and publish release image
+        if: env.OMNIKV_PUBLISH_IMAGE == 'true'
+        run: |
+          docker build --pull --tag "$OMNIKV_IMAGE" .
+          docker push "$OMNIKV_IMAGE"
+
+          if [[ "${{ github.event_name }}" == "release" && "$OMNIKV_IMAGE" != "ghcr.io/sbalavignesh123/omnikv:latest" ]]; then
+            docker tag "$OMNIKV_IMAGE" ghcr.io/sbalavignesh123/omnikv:latest
+            docker push ghcr.io/sbalavignesh123/omnikv:latest
+          fi
       - name: Pull published image
+        if: env.OMNIKV_PUBLISH_IMAGE != 'true'
         run: docker pull "$OMNIKV_IMAGE"
       - name: Authenticated write/read/restart smoke
         run: bash scripts/docker-compose-smoke.sh
