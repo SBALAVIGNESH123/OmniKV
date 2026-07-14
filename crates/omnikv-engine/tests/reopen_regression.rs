@@ -1,6 +1,7 @@
 use omni_engine::{OmniKV, WriteBatch};
+
 #[test]
-fn test_debug_reopen() {
+fn reopen_after_compaction_preserves_values_and_sequence() {
     let dir = tempfile::TempDir::new().unwrap();
     let manifest = dir
         .path()
@@ -17,14 +18,25 @@ fn test_debug_reopen() {
             db.commit_batch(&b).unwrap();
         }
         db.compact_sstables().unwrap();
-        let md = std::fs::metadata(&wal).unwrap();
-        println!("WAL size before drop: {}", md.len());
     }
 
     {
-        let md = std::fs::metadata(&wal).unwrap();
-        println!("WAL size before reopen: {}", md.len());
         let db = OmniKV::open(&manifest, &wal).unwrap();
-        println!("After reopen seq: {}", db.get_seq());
+        assert!(
+            db.get_seq() >= 200,
+            "reopening must recover sequence progress; got {}",
+            db.get_seq()
+        );
+
+        let seq = db.get_seq();
+        for i in [0u64, 99, 199] {
+            let key = format!("ckey{i:05}");
+            let got = db.find(&key, seq).unwrap();
+            assert_eq!(
+                got,
+                Some(format!("cval{i}")),
+                "reopen after compaction must preserve {key}"
+            );
+        }
     }
 }

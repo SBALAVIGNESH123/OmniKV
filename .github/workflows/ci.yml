@@ -68,7 +68,12 @@ jobs:
       run: cargo test -p omnikv-engine --test storage_engine -- --test-threads=1
     - name: Backup/restore contract
       run: cargo test -p omnikv-engine --test backup_restore -- --test-threads=1
-    - name: Storage perf (21 tests)
+    - name: Compaction and reopen regression tests
+      run: |
+        cargo test -p omnikv-engine --test compaction_regression -- --test-threads=1
+        cargo test -p omnikv-engine --test compaction_many_records_regression -- --test-threads=1
+        cargo test -p omnikv-engine --test reopen_regression -- --test-threads=1
+    - name: Storage performance smoke (21 tests)
       run: cargo test -p omnikv-engine --test storage_perf -- --test-threads=1 --nocapture
 
   test-transactions:
@@ -87,7 +92,7 @@ jobs:
           ~/.cargo/git
           target
         key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-    - name: SSI anomaly demos (4 tests)
+    - name: SSI anomaly demonstration tests (4 tests)
       run: cargo test -p omnikv-engine --test anomaly_demos -- --test-threads=1
     - name: Concurrent stress tests (6 tests)
       run: cargo test -p omnikv-engine --test concurrent_stress -- --test-threads=1 --nocapture

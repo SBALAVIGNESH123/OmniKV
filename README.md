@@ -93,6 +93,8 @@ OmniKV has a broad test suite covering storage durability, SQL features, concurr
 cargo test --workspace --all-targets
 ```
 
+For production-readiness work, use the suite taxonomy instead of treating every test as the same kind of evidence. Release gates, regression tests, demonstration tests, performance smoke tests, and manual long-running checks are documented in [Test suite taxonomy](docs/test-suite-taxonomy.md).
+
 On Windows/MSVC, full debug test linking can require significant free disk space because large PDB/debug artifacts are generated. If you hit linker errors such as `LNK1140` or `os error 112`, free disk space or run smaller test groups from `CONTRIBUTING.md`.
 
 ## Operations docs
@@ -102,6 +104,7 @@ On Windows/MSVC, full debug test linking can require significant free disk space
 - [Protocol and result-size limits](docs/protocol-limits.md)
 - [Real-data replay harness](docs/real-data-replay.md)
 - [SQL support matrix](docs/sql-support.md)
+- [Test suite taxonomy](docs/test-suite-taxonomy.md)
 
 ## Compatibility status
 
