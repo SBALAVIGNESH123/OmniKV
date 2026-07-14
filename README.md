@@ -118,6 +118,7 @@ On Windows/MSVC, full debug test linking can require significant free disk space
 - [Backup and restore](docs/backup_restore.md)
 - [Security model](docs/security.md)
 - [Distributed correctness](docs/distributed-correctness.md)
+- [Fuzzing and property testing](docs/fuzzing.md)
 - [Reproducible benchmarks](docs/benchmarks.md)
 - [Protocol and result-size limits](docs/protocol-limits.md)
 - [Real-data replay harness](docs/real-data-replay.md)
@@ -151,7 +152,7 @@ The engine source is grouped by domain under `storage/`, `query/`, `raft/`, and 
 - Multi-node Raft has deterministic partition, failover, membership, snapshot, and restart evidence, but it is not yet Jepsen-grade or validated under real multi-process network faults.
 - SeqScan currently materializes rows before yielding them. True streaming directly from the storage engine is planned.
 - Long-running stability still needs a 24-hour soak test.
-- Fuzz testing is not in place yet for the SQL parser, wire protocol, and storage file formats.
+- Fuzz/property testing is now seeded for SQL, API JSON, WAL, backup restore, Raft log operations, and storage visibility. It still needs long-duration corpus growth before fuzzing can be treated as mature assurance.
 - The project is not yet recommended as the default storage engine for critical production workloads.
 
 ## Roadmap
@@ -162,7 +163,7 @@ The engine source is grouped by domain under `storage/`, `query/`, `raft/`, and 
 - [x] Phase 4 - Benchmarks: throughput measurements and short soak tests.
 - [x] Phase 5 - Multi-node: Raft cluster tests and partition-handling experiments.
 - [ ] Phase 6 - Consistency: Jepsen-style testing and failure-model documentation.
-- [ ] Phase 7 - Production: fuzz testing, 24-hour soak, operational runbooks, repeated restore drills, and migration guarantees.
+- [ ] Phase 7 - Production: long-duration fuzz corpus growth, 24-hour soak, operational runbooks, repeated restore drills, and migration guarantees.
 
 ## Contributing
 

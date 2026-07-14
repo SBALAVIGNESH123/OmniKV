@@ -1,0 +1,1 @@
+EXPLAIN SELECT * FROM users UNION ALL SELECT * FROM archived_users

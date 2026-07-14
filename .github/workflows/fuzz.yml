@@ -1,0 +1,58 @@
+name: OmniKV Fuzzing
+
+on:
+  workflow_dispatch:
+    inputs:
+      max_total_time:
+        description: "Seconds to run each target"
+        required: false
+        default: "60"
+      targets:
+        description: "Space-separated targets, or empty for all"
+        required: false
+        default: "sql_parser api_json wal_record backup_restore raft_log"
+  schedule:
+    - cron: "43 2 * * 0"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: omnikv-fuzz-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fuzz:
+    name: Scheduled/manual fuzz run
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cargo/bin/cargo-fuzz
+            target
+            fuzz/target
+          key: ${{ runner.os }}-cargo-fuzz-${{ hashFiles('**/Cargo.lock', 'fuzz/Cargo.toml') }}
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      - name: Build fuzz targets
+        run: cargo fuzz build
+      - name: Run fuzz targets
+        env:
+          INPUT_TARGETS: ${{ inputs.targets || 'sql_parser api_json wal_record backup_restore raft_log' }}
+          MAX_TOTAL_TIME: ${{ inputs.max_total_time || '60' }}
+        run: |
+          for target in ${INPUT_TARGETS}; do
+            echo "Running ${target} for ${MAX_TOTAL_TIME}s"
+            cargo fuzz run "${target}" "fuzz/corpus/${target}" -- -max_total_time="${MAX_TOTAL_TIME}"
+          done
