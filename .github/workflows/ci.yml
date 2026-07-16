@@ -145,6 +145,34 @@ jobs:
     - name: Rust client smoke contracts
       run: cargo test -p omni-client client_contract -- --test-threads=1
 
+  python-embedded-bridge:
+    name: Python Embedded Bridge
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+    - uses: actions/checkout@v5
+      with:
+        persist-credentials: false
+    - uses: dtolnay/rust-toolchain@stable
+    - uses: actions/setup-python@v6
+      with:
+        python-version: "3.12"
+    - uses: actions/cache@v5
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target
+        key: ${{ runner.os }}-cargo-python-bridge-${{ hashFiles('**/Cargo.lock') }}
+    - name: Build Python bridge crate
+      run: cargo check -p omnikv-python
+    - name: Install Python bridge
+      run: |
+        python -m pip install pytest
+        python -m pip install ./bindings/python
+    - name: Run Python bridge contract tests
+      run: python -m pytest bindings/python/tests -q
+
   fuzz-property:
     name: Fuzz Smoke & Property Tests
     runs-on: ubuntu-latest

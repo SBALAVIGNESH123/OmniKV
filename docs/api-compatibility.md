@@ -16,7 +16,8 @@ intentional, documented, and covered by migration notes.
 | REST API | Beta | JSON envelopes use `success`, `data`, and `error`. Stable error strings are used for auth, scan limits, and sanitized storage failures. | `cargo test -p omnikv-server rest_contract -- --test-threads=1` |
 | PgWire protocol | Beta subset | Startup, query result frames, command-complete tags, ReadyForQuery state bytes, SQLSTATE error fields, and result-size limits are tested. | `cargo test -p omnikv-engine pgwire_contract --lib -- --test-threads=1` |
 | Rust REST client (`omni-client`) | Beta | The client must continue to deserialize stable REST envelopes, map missing keys to `Ok(None)`, and preserve API error codes. | `cargo test -p omni-client client_contract -- --test-threads=1` |
-| Python / Go clients | Not official yet | No compatibility promise until packages are added to this repository and CI. | Not applicable. |
+| Python embedded bridge (`omnikv`) | Beta | The PyO3 bridge must keep the SketchLog-compatible `open_embedded`, `EmbeddedOmniKv.open/open_dir`, `put`, `get`, `delete`, `scan_prefix`, `sync`, `close`, and `stats` contract. | `python -m pytest bindings/python/tests` after installing `./bindings/python`. |
+| Go client | Not official yet | No compatibility promise until a package is added to this repository and CI. | Not applicable. |
 
 ## REST response envelope
 

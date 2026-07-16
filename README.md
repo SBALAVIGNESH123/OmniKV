@@ -26,7 +26,7 @@ For SketchLog, OmniKV is the durable embedded storage foundation: local telemetr
 - Consensus: Raft integration for multi-node replication and leader failover experiments.
 - Operations: health checks, metrics, diagnostics, Docker packaging, and example config.
 - Recovery: portable plain/encrypted backup and restore APIs with restore-time metadata validation.
-- Embedded API: stable directory-based Rust facade with namespaces, batch writes, snapshots, scans, backup/restore, SQL execution, and SketchLog-oriented integration docs.
+- Embedded API: stable directory-based Rust facade and Python/native bridge with namespaces, batch writes, snapshots, scans, backup/restore, SQL execution, and SketchLog-oriented integration docs.
 
 ## Quick start
 
@@ -107,6 +107,26 @@ let replay = store.scan_prefix("telemetry/api/", Some(1000)).unwrap();
 
 For the full SketchLog integration contract, see [Embedded API for SketchLog integration](docs/embedded-api.md).
 
+Python callers can install the native bridge and use the same embedded storage
+contract:
+
+```bash
+python -m pip install "maturin>=1.14,<2"
+python -m pip install ./bindings/python
+```
+
+```python
+import omnikv
+
+store = omnikv.open_embedded("./data/omnikv", namespace="sketchlog")
+store.put("sketches/api/p99", "91.4")
+assert store.get("sketches/api/p99") == "91.4"
+store.sync()
+store.close()
+```
+
+For packaging and SketchLog environment variables, see [Python embedded bridge](docs/python-bridge.md).
+
 ## Testing
 
 OmniKV has a broad test suite covering storage durability, SQL features, concurrent stress, operations, and Raft cluster behavior.
@@ -127,6 +147,7 @@ On Windows/MSVC, full debug test linking can require significant free disk space
 - [Security model](docs/security.md)
 - [Distributed correctness](docs/distributed-correctness.md)
 - [Embedded API for SketchLog integration](docs/embedded-api.md)
+- [Python embedded bridge](docs/python-bridge.md)
 - [Fuzzing and property testing](docs/fuzzing.md)
 - [Reproducible benchmarks](docs/benchmarks.md)
 - [Protocol and result-size limits](docs/protocol-limits.md)
@@ -143,7 +164,8 @@ On Windows/MSVC, full debug test linking can require significant free disk space
 | REST API | Beta | Stable JSON envelope and golden response contract tests |
 | PgWire protocol | Beta subset | SQLSTATE, command tag, ReadyForQuery, and result-limit contract tests |
 | Rust REST client | Beta | HTTP smoke tests against stable REST response envelopes |
-| Python / Go clients | Not official yet | No compatibility promise until clients live in this repo and run in CI |
+| Python embedded bridge | Beta | PyO3 package exposes the SketchLog-compatible `open_embedded`, `EmbeddedOmniKv.open/open_dir`, key-value methods, sync, close, and stats contract |
+| Go client | Not official yet | No compatibility promise until it lives in this repo and runs in CI |
 
 ## Workspace layout
 
@@ -152,6 +174,9 @@ OmniKV is organized as a Cargo workspace:
 - `crates/omnikv-engine` — embeddable library crate, exposed to Rust code as `omni_engine`.
 - `crates/omnikv-server` — executable server crate for REST, QUIC, TCP, and PgWire.
 - `omni-client` — Rust client package.
+
+- `bindings/python` is the PyO3/maturin package exposed to Python as
+  `omnikv`.
 
 The engine source is grouped by domain under `storage/`, `query/`, `raft/`, and `runtime/`. The benchmark driver lives under `crates/omnikv-engine/benches/` instead of the library source root.
 
