@@ -1,0 +1,19 @@
+[package]
+name = "omnikv-python"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Python/native bridge for OmniKV's embedded storage API."
+
+[lib]
+name = "omnikv"
+crate-type = ["cdylib"]
+
+[dependencies]
+omni_engine = { package = "omnikv-engine", path = "../../crates/omnikv-engine" }
+pyo3 = { version = "0.29.0", features = ["extension-module"] }
+
+[lints]
+workspace = true

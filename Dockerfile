@@ -2,6 +2,7 @@ FROM rust:1.96-slim AS builder
 
 WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
+COPY bindings/python/ ./bindings/python/
 COPY crates/ ./crates/
 COPY omni-client/ ./omni-client/
 
