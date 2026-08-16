@@ -146,8 +146,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "Shared protocol rate limiter configured"
     );
 
+    let catalog = Arc::new(omni_engine::catalog::Catalog::new(db.clone()));
+
     let app_state = api::AppState {
         db: db.clone(),
+        catalog,
         jwt_secret: cfg.jwt_secret.clone(),
         bootstrap_admin_key: cfg.bootstrap_admin_key.clone(),
         manifest_path,
