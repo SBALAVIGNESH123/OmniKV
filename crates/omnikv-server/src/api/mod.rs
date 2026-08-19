@@ -287,18 +287,36 @@ pub fn build_router(state: AppState) -> Router {
         .route("/metrics", axum::routing::get(metrics_handler))
         .route("/admin/compact", axum::routing::post(compact_handler))
         .route("/api/v1/tables", axum::routing::get(table_api::list_tables))
-        .route("/api/v1/tables/:name", axum::routing::get(table_api::get_table))
+        .route(
+            "/api/v1/tables/:name",
+            axum::routing::get(table_api::get_table),
+        )
         .route_layer(middleware::from_fn_with_state(state.clone(), require_admin));
 
     let table_read_routes = Router::new()
-        .route("/api/v1/data/:table", axum::routing::get(table_api::query_table))
-        .route("/api/v1/data/:table/:id", axum::routing::get(table_api::get_row))
+        .route(
+            "/api/v1/data/:table",
+            axum::routing::get(table_api::query_table),
+        )
+        .route(
+            "/api/v1/data/:table/:id",
+            axum::routing::get(table_api::get_row),
+        )
         .route_layer(middleware::from_fn_with_state(state.clone(), require_read));
 
     let table_write_routes = Router::new()
-        .route("/api/v1/data/:table", axum::routing::post(table_api::insert_row))
-        .route("/api/v1/data/:table/:id", axum::routing::patch(table_api::update_row))
-        .route("/api/v1/data/:table/:id", axum::routing::delete(table_api::delete_row))
+        .route(
+            "/api/v1/data/:table",
+            axum::routing::post(table_api::insert_row),
+        )
+        .route(
+            "/api/v1/data/:table/:id",
+            axum::routing::patch(table_api::update_row),
+        )
+        .route(
+            "/api/v1/data/:table/:id",
+            axum::routing::delete(table_api::delete_row),
+        )
         .route("/api/v1/sql", axum::routing::post(table_api::execute_sql))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_write));
 

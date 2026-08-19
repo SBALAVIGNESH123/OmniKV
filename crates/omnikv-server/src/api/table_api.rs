@@ -3,10 +3,10 @@
 //! Exposes routes for CRUD operations, raw SQL execution, and serving the admin dashboard.
 
 use axum::{
+    Json,
     extract::{Path, Query, State},
     http::StatusCode,
     response::{Html, IntoResponse},
-    Json,
 };
 use omni_engine::sql::parse_sql;
 use omni_engine::sql_exec::{ExecResult, SqlExecutor};
@@ -89,7 +89,11 @@ pub async fn get_table(
     if let Some(table) = state.catalog.get_table(&name) {
         (StatusCode::OK, ApiResponse::ok(table)).into_response()
     } else {
-        (StatusCode::NOT_FOUND, ApiResponse::<()>::err("Table not found")).into_response()
+        (
+            StatusCode::NOT_FOUND,
+            ApiResponse::<()>::err("Table not found"),
+        )
+            .into_response()
     }
 }
 
@@ -110,18 +114,36 @@ pub async fn execute_sql(
     };
 
     let executor = SqlExecutor::new(state.db.clone(), state.catalog.clone());
+    let result = executor.execute(&stmt);
     let execution_time_ms = start.elapsed().as_secs_f64() * 1000.0;
 
-    match executor.execute(&stmt) {
-        Ok(ExecResult::Rows { columns, rows }) => {
-            (StatusCode::OK, ApiResponse::ok(SqlResponseData::Select { columns, rows, execution_time_ms })).into_response()
-        }
-        Ok(ExecResult::Modified { count, command }) => {
-            (StatusCode::OK, ApiResponse::ok(SqlResponseData::Dml { count, command, execution_time_ms: Some(execution_time_ms) })).into_response()
-        }
-        Ok(ExecResult::Ok(message)) => {
-            (StatusCode::OK, ApiResponse::ok(SqlResponseData::Ok { message, execution_time_ms: Some(execution_time_ms) })).into_response()
-        }
+    match result {
+        Ok(ExecResult::Rows { columns, rows }) => (
+            StatusCode::OK,
+            ApiResponse::ok(SqlResponseData::Select {
+                columns,
+                rows,
+                execution_time_ms,
+            }),
+        )
+            .into_response(),
+        Ok(ExecResult::Modified { count, command }) => (
+            StatusCode::OK,
+            ApiResponse::ok(SqlResponseData::Dml {
+                count,
+                command,
+                execution_time_ms: Some(execution_time_ms),
+            }),
+        )
+            .into_response(),
+        Ok(ExecResult::Ok(message)) => (
+            StatusCode::OK,
+            ApiResponse::ok(SqlResponseData::Ok {
+                message,
+                execution_time_ms: Some(execution_time_ms),
+            }),
+        )
+            .into_response(),
         Err(e) => (StatusCode::BAD_REQUEST, ApiResponse::<()>::err(&e)).into_response(),
     }
 }
@@ -132,15 +154,43 @@ pub async fn query_table(
     Path(table): Path<String>,
     Query(q): Query<PaginationQuery>,
 ) -> impl IntoResponse {
-    if state.catalog.get_table(&table).is_none() {
-        return (StatusCode::NOT_FOUND, ApiResponse::<()>::err("Table not found")).into_response();
-    }
+    let table_def = match state.catalog.get_table(&table) {
+        Some(t) => t,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                ApiResponse::<()>::err("Table not found"),
+            )
+                .into_response();
+        }
+    };
 
     let page = q.page.unwrap_or(1).max(1);
     let per_page = q.per_page.unwrap_or(50).clamp(1, 1000);
-    let offset = (page - 1) * per_page;
+    let offset = match (page - 1).checked_mul(per_page) {
+        Some(o) => o,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                ApiResponse::<()>::err("Page value too large"),
+            )
+                .into_response();
+        }
+    };
 
-    let order_clause = if let Some(order_by) = q.order_by {
+    // Validate order_by against table columns to prevent SQL injection
+    let order_clause = if let Some(ref order_by) = q.order_by {
+        let valid = table_def
+            .columns
+            .iter()
+            .any(|c| c.name.eq_ignore_ascii_case(order_by));
+        if !valid {
+            return (
+                StatusCode::BAD_REQUEST,
+                ApiResponse::<()>::err(&format!("Invalid order_by column: '{}'", order_by)),
+            )
+                .into_response();
+        }
         let desc_str = if q.desc.unwrap_or(false) { " DESC" } else { "" };
         format!(" ORDER BY {}{}", order_by, desc_str)
     } else {
@@ -160,7 +210,8 @@ pub async fn query_table(
 
     let executor = SqlExecutor::new(state.db.clone(), state.catalog.clone());
     let total = match executor.execute(&count_stmt) {
-        Ok(ExecResult::Rows { rows, .. }) => rows.first()
+        Ok(ExecResult::Rows { rows, .. }) => rows
+            .first()
             .and_then(|r| r.first())
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(0),
@@ -173,11 +224,23 @@ pub async fn query_table(
     };
 
     match executor.execute(&stmt) {
-        Ok(ExecResult::Rows { columns, rows }) => {
-            (StatusCode::OK, ApiResponse::ok(PaginatedData { columns, rows, total, page, per_page })).into_response()
-        }
+        Ok(ExecResult::Rows { columns, rows }) => (
+            StatusCode::OK,
+            ApiResponse::ok(PaginatedData {
+                columns,
+                rows,
+                total,
+                page,
+                per_page,
+            }),
+        )
+            .into_response(),
         Err(e) => (StatusCode::BAD_REQUEST, ApiResponse::<()>::err(&e)).into_response(),
-        _ => (StatusCode::INTERNAL_SERVER_ERROR, ApiResponse::<()>::err("Unexpected result")).into_response(),
+        _ => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            ApiResponse::<()>::err("Unexpected result"),
+        )
+            .into_response(),
     }
 }
 
@@ -188,7 +251,13 @@ pub async fn get_row(
 ) -> impl IntoResponse {
     let table = match state.catalog.get_table(&table_name) {
         Some(t) => t,
-        None => return (StatusCode::NOT_FOUND, ApiResponse::<()>::err("Table not found")).into_response(),
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                ApiResponse::<()>::err("Table not found"),
+            )
+                .into_response();
+        }
     };
 
     let sql = format!(
@@ -207,7 +276,11 @@ pub async fn get_row(
     match executor.execute(&stmt) {
         Ok(ExecResult::Rows { columns, mut rows }) => {
             if rows.is_empty() {
-                (StatusCode::NOT_FOUND, ApiResponse::<()>::err("Row not found")).into_response()
+                (
+                    StatusCode::NOT_FOUND,
+                    ApiResponse::<()>::err("Row not found"),
+                )
+                    .into_response()
             } else {
                 let row = rows.remove(0);
                 let mut data = HashMap::new();
@@ -218,7 +291,11 @@ pub async fn get_row(
             }
         }
         Err(e) => (StatusCode::BAD_REQUEST, ApiResponse::<()>::err(&e)).into_response(),
-        _ => (StatusCode::INTERNAL_SERVER_ERROR, ApiResponse::<()>::err("Unexpected result")).into_response(),
+        _ => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            ApiResponse::<()>::err("Unexpected result"),
+        )
+            .into_response(),
     }
 }
 
@@ -229,7 +306,11 @@ pub async fn insert_row(
     Json(req): Json<InsertRequest>,
 ) -> impl IntoResponse {
     if state.catalog.get_table(&table_name).is_none() {
-        return (StatusCode::NOT_FOUND, ApiResponse::<()>::err("Table not found")).into_response();
+        return (
+            StatusCode::NOT_FOUND,
+            ApiResponse::<()>::err("Table not found"),
+        )
+            .into_response();
     }
 
     let mut cols = Vec::new();
@@ -253,11 +334,21 @@ pub async fn insert_row(
 
     let executor = SqlExecutor::new(state.db.clone(), state.catalog.clone());
     match executor.execute(&stmt) {
-        Ok(ExecResult::Modified { count, command }) => {
-            (StatusCode::CREATED, ApiResponse::ok(SqlResponseData::Dml { count, command, execution_time_ms: None })).into_response()
-        }
+        Ok(ExecResult::Modified { count, command }) => (
+            StatusCode::CREATED,
+            ApiResponse::ok(SqlResponseData::Dml {
+                count,
+                command,
+                execution_time_ms: None,
+            }),
+        )
+            .into_response(),
         Err(e) => (StatusCode::BAD_REQUEST, ApiResponse::<()>::err(&e)).into_response(),
-        _ => (StatusCode::INTERNAL_SERVER_ERROR, ApiResponse::<()>::err("Unexpected result")).into_response(),
+        _ => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            ApiResponse::<()>::err("Unexpected result"),
+        )
+            .into_response(),
     }
 }
 
@@ -269,7 +360,13 @@ pub async fn update_row(
 ) -> impl IntoResponse {
     let table = match state.catalog.get_table(&table_name) {
         Some(t) => t,
-        None => return (StatusCode::NOT_FOUND, ApiResponse::<()>::err("Table not found")).into_response(),
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                ApiResponse::<()>::err("Table not found"),
+            )
+                .into_response();
+        }
     };
 
     let mut sets = Vec::new();
@@ -278,7 +375,11 @@ pub async fn update_row(
     }
 
     if sets.is_empty() {
-        return (StatusCode::BAD_REQUEST, ApiResponse::<()>::err("Empty update")).into_response();
+        return (
+            StatusCode::BAD_REQUEST,
+            ApiResponse::<()>::err("Empty update"),
+        )
+            .into_response();
     }
 
     let sql = format!(
@@ -298,13 +399,29 @@ pub async fn update_row(
     match executor.execute(&stmt) {
         Ok(ExecResult::Modified { count, command }) => {
             if count == 0 {
-                (StatusCode::NOT_FOUND, ApiResponse::<()>::err("Row not found")).into_response()
+                (
+                    StatusCode::NOT_FOUND,
+                    ApiResponse::<()>::err("Row not found"),
+                )
+                    .into_response()
             } else {
-                (StatusCode::OK, ApiResponse::ok(SqlResponseData::Dml { count, command, execution_time_ms: None })).into_response()
+                (
+                    StatusCode::OK,
+                    ApiResponse::ok(SqlResponseData::Dml {
+                        count,
+                        command,
+                        execution_time_ms: None,
+                    }),
+                )
+                    .into_response()
             }
         }
         Err(e) => (StatusCode::BAD_REQUEST, ApiResponse::<()>::err(&e)).into_response(),
-        _ => (StatusCode::INTERNAL_SERVER_ERROR, ApiResponse::<()>::err("Unexpected result")).into_response(),
+        _ => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            ApiResponse::<()>::err("Unexpected result"),
+        )
+            .into_response(),
     }
 }
 
@@ -315,7 +432,13 @@ pub async fn delete_row(
 ) -> impl IntoResponse {
     let table = match state.catalog.get_table(&table_name) {
         Some(t) => t,
-        None => return (StatusCode::NOT_FOUND, ApiResponse::<()>::err("Table not found")).into_response(),
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                ApiResponse::<()>::err("Table not found"),
+            )
+                .into_response();
+        }
     };
 
     let sql = format!(
@@ -334,12 +457,28 @@ pub async fn delete_row(
     match executor.execute(&stmt) {
         Ok(ExecResult::Modified { count, command }) => {
             if count == 0 {
-                (StatusCode::NOT_FOUND, ApiResponse::<()>::err("Row not found")).into_response()
+                (
+                    StatusCode::NOT_FOUND,
+                    ApiResponse::<()>::err("Row not found"),
+                )
+                    .into_response()
             } else {
-                (StatusCode::OK, ApiResponse::ok(SqlResponseData::Dml { count, command, execution_time_ms: None })).into_response()
+                (
+                    StatusCode::OK,
+                    ApiResponse::ok(SqlResponseData::Dml {
+                        count,
+                        command,
+                        execution_time_ms: None,
+                    }),
+                )
+                    .into_response()
             }
         }
         Err(e) => (StatusCode::BAD_REQUEST, ApiResponse::<()>::err(&e)).into_response(),
-        _ => (StatusCode::INTERNAL_SERVER_ERROR, ApiResponse::<()>::err("Unexpected result")).into_response(),
+        _ => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            ApiResponse::<()>::err("Unexpected result"),
+        )
+            .into_response(),
     }
 }

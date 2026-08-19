@@ -4,7 +4,9 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>OmniKV Console</title>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" crossorigin="anonymous">
+    <!-- Local font fallback for air-gapped deployments -->
+    <style>@font-face { font-family: 'Inter Fallback'; src: local('Segoe UI'), local('Roboto'), local('Helvetica Neue'), local('Arial'); } @font-face { font-family: 'JetBrains Mono Fallback'; src: local('Cascadia Code'), local('Consolas'), local('Courier New'); }</style>
     <style>
         :root {
             --bg-base: #0f1115;
@@ -649,16 +651,15 @@
             btn.textContent = 'Authenticating...';
             
             try {
-                // Mock API call since actual endpoint isn't fully spec'd for testing
                 const res = await fetch(API_BASE + '/auth/token', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ key })
-                }).catch(() => ({ ok: true, json: async () => ({ token: 'mock-token-' + key }) })); // Mock fallback
+                });
                 
                 const data = await res.json();
-                if (res.ok || data.token) {
-                    authToken = data.token || 'mock';
+                if (res.ok && data.token) {
+                    authToken = data.token;
                     localStorage.setItem('omnikv_token', authToken);
                     document.getElementById('auth-modal').classList.remove('active');
                     initDashboard();
@@ -676,6 +677,14 @@
             }
         });
 
+        // --- HTML Escape Helper (XSS prevention) ---
+        function esc(str) {
+            if (str === null || str === undefined) return '';
+            const div = document.createElement('div');
+            div.appendChild(document.createTextNode(String(str)));
+            return div.innerHTML;
+        }
+
         // --- API Helper ---
         async function apiCall(method, path, body = null) {
             const headers = {
@@ -683,39 +692,21 @@
                 'Content-Type': 'application/json'
             };
             
-            try {
-                // Mock responses for UI demonstration if real server isn't running
-                let mockDelay = () => new Promise(r => setTimeout(r, 300));
-                
-                const res = await fetch(API_BASE + path, {
-                    method,
-                    headers,
-                    body: body ? JSON.stringify(body) : null
-                }).catch(async (e) => {
-                    // Fallback Mock Data for UI demonstration
-                    await mockDelay();
-                    console.log('Mocking API call:', method, path);
-                    if (path === '/health') return { ok: true, json: () => Promise.resolve({status:'ok', version:'1.2.4', uptime_secs: 14520, sstable_count: 42}) };
-                    if (path === '/api/v1/tables') return { ok: true, json: () => Promise.resolve({success:true, data: [{name:'users', columns:3, row_count:1250}, {name:'events', columns:5, row_count:84200}]}) };
-                    if (path.startsWith('/api/v1/tables/')) return { ok: true, json: () => Promise.resolve({success:true, data: {name: path.split('/').pop(), columns: [{name:'id', type:'INTEGER', primary_key:true}, {name:'name', type:'TEXT'}], created_at:'2024-01-01'}}) };
-                    if (path.startsWith('/api/v1/data/') && method === 'GET') return { ok: true, json: () => Promise.resolve({success:true, data: {columns: ['id','name'], rows: [[1, 'Alice'], [2, 'Bob']], total: 2}}) };
-                    if (path === '/api/v1/sql') return { ok: true, json: () => Promise.resolve({success:true, data: {columns: ['id','result'], rows: [[1, 'ok']]}}) };
-                    throw e;
-                });
-                
-                if (!res.ok) {
-                    if (res.status === 401 || res.status === 403) {
-                        localStorage.removeItem('omnikv_token');
-                        window.location.reload();
-                    }
-                    const text = await res.text();
-                    throw new Error(text);
+            const res = await fetch(API_BASE + path, {
+                method,
+                headers,
+                body: body ? JSON.stringify(body) : null
+            });
+            
+            if (!res.ok) {
+                if (res.status === 401 || res.status === 403) {
+                    localStorage.removeItem('omnikv_token');
+                    window.location.reload();
                 }
-                return await res.json();
-            } catch (err) {
-                console.error("API Error:", err);
-                throw err;
+                const text = await res.text();
+                throw new Error(text);
             }
+            return await res.json();
         }
 
         // --- Tables View ---
@@ -731,22 +722,26 @@
                 }
                 
                 listEl.innerHTML = state.tables.map(t => `
-                    <div class="table-list-item" onclick="viewTable('${t.name}')">
+                    <div class="table-list-item" data-table="${esc(t.name)}">
                         <div class="table-info">
                             <div class="table-icon">
                                 <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
                             </div>
                             <div>
-                                <div style="font-weight: 500; color: white;">${t.name}</div>
+                                <div style="font-weight: 500; color: white;">${esc(t.name)}</div>
                                 <div class="table-stats">
-                                    <span>${t.columns} columns</span>
-                                    <span>${(t.row_count || 0).toLocaleString()} rows</span>
+                                    <span>${parseInt(t.columns) || 0} columns</span>
+                                    <span>${(parseInt(t.row_count) || 0).toLocaleString()} rows</span>
                                 </div>
                             </div>
                         </div>
                         <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="var(--text-muted)" stroke-width="2"><polyline points="9 18 15 12 9 6"></polyline></svg>
                     </div>
                 `).join('');
+                // Attach click listeners safely (no inline onclick)
+                listEl.querySelectorAll('.table-list-item').forEach(el => {
+                    el.addEventListener('click', () => viewTable(el.dataset.table));
+                });
                 
             } catch (e) {
                 listEl.innerHTML = `<div style="padding:40px; text-align:center; color:var(--danger);">Error loading tables. Check connection.</div>`;
@@ -791,28 +786,37 @@
                 // Render headers
                 head.innerHTML = state.tableColumns.map(c => `
                     <th>
-                        ${c.name} 
-                        <span class="type-badge">${c.type}</span>
+                        ${esc(c.name)} 
+                        <span class="type-badge">${esc(c.type)}</span>
                         ${c.primary_key ? '<span style="color:var(--accent); margin-left:4px;" title="Primary Key">🔑</span>' : ''}
                     </th>
                 `).join('') + `<th>Actions</th>`;
                 
-                // Render rows
-                if (data.rows && data.rows.length > 0) {
-                    body.innerHTML = data.rows.map(row => {
-                        const rowHtml = row.map(cell => `<td onclick="copyToClipboard('${String(cell).replace(/'/g, "\\'")}')" style="cursor:pointer;" title="Click to copy">${cell !== null ? cell : '<span class="text-muted">NULL</span>'}</td>`).join('');
+                // Render rows with XSS-safe escaping
+                const rows = data.rows || [];
+                if (rows.length > 0) {
+                    body.innerHTML = rows.map(row => {
+                        const rowHtml = row.map(cell => `<td class="copyable" data-value="${esc(String(cell))}" style="cursor:pointer;" title="Click to copy">${cell !== null ? esc(cell) : '<span class="text-muted">NULL</span>'}</td>`).join('');
                         const pkIndex = state.tableColumns.findIndex(c => c.primary_key);
                         const rowId = pkIndex >= 0 ? row[pkIndex] : null;
-                        const delBtn = rowId !== null ? `<button class="btn btn-danger" style="padding: 2px 6px; font-size:0.7rem;" onclick="deleteRow('${rowId}')">Del</button>` : '';
+                        const delBtn = rowId !== null ? `<button class="btn btn-danger del-row-btn" data-row-id="${esc(String(rowId))}" style="padding: 2px 6px; font-size:0.7rem;">Del</button>` : '';
                         return `<tr>${rowHtml}<td>${delBtn}</td></tr>`;
                     }).join('');
+                    // Attach listeners safely
+                    body.querySelectorAll('.copyable').forEach(td => {
+                        td.addEventListener('click', () => copyToClipboard(td.dataset.value));
+                    });
+                    body.querySelectorAll('.del-row-btn').forEach(btn => {
+                        btn.addEventListener('click', () => deleteRow(btn.dataset.rowId));
+                    });
                 } else {
                     body.innerHTML = `<tr><td colspan="${state.tableColumns.length + 1}" style="text-align:center; padding: 20px; color: var(--text-muted);">No data in this table</td></tr>`;
                 }
                 
-                // Pagination
+                // Pagination (guard data.rows)
                 const total = data.total || 0;
-                document.getElementById('data-pagination-info').textContent = `Showing ${data.rows.length} rows (Total: ${total})`;
+                const rowCount = rows.length;
+                document.getElementById('data-pagination-info').textContent = `Showing ${rowCount} rows (Total: ${total})`;
                 
                 document.getElementById('btn-prev-page').disabled = state.tablePage <= 1;
                 document.getElementById('btn-next-page').disabled = (state.tablePage * state.tablePerPage) >= total;
@@ -994,9 +998,9 @@
                 timeEl.textContent = `${ms}ms`;
                 
                 if (res.data && res.data.columns && res.data.rows) {
-                    // It's a SELECT
-                    const head = res.data.columns.map(c => `<th>${c}</th>`).join('');
-                    const body = res.data.rows.map(r => `<tr>${r.map(cell => `<td>${cell !== null ? cell : '<span class="text-muted">NULL</span>'}</td>`).join('')}</tr>`).join('');
+                    // It's a SELECT — escape all values
+                    const head = res.data.columns.map(c => `<th>${esc(c)}</th>`).join('');
+                    const body = res.data.rows.map(r => `<tr>${r.map(cell => `<td>${cell !== null ? esc(cell) : '<span class="text-muted">NULL</span>'}</td>`).join('')}</tr>`).join('');
                     
                     wrapper.innerHTML = `
                         <table class="data-table">
@@ -1086,7 +1090,7 @@
             const container = document.getElementById('toast-container');
             const toast = document.createElement('div');
             toast.className = `toast ${type}`;
-            toast.innerHTML = msg;
+            toast.textContent = msg;
             container.appendChild(toast);
             
             // Trigger animation
