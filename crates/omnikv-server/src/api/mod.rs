@@ -8,6 +8,8 @@
 //! - JWT authentication middleware
 //! - Health checks
 
+pub mod table_api;
+
 use axum::{
     Json, Router,
     body::Body,
@@ -48,6 +50,7 @@ const VALID_TOKEN_ROLES: &[&str] = &["read", "write", "backup", "restore", "clus
 #[derive(Clone)]
 pub struct AppState {
     pub db: Arc<OmniKV>,
+    pub catalog: Arc<omni_engine::catalog::Catalog>,
     pub jwt_secret: String,
     pub bootstrap_admin_key: String,
     pub manifest_path: String,
@@ -283,7 +286,43 @@ pub fn build_router(state: AppState) -> Router {
     let admin_routes = Router::new()
         .route("/metrics", axum::routing::get(metrics_handler))
         .route("/admin/compact", axum::routing::post(compact_handler))
+        .route("/api/v1/tables", axum::routing::get(table_api::list_tables))
+        .route(
+            "/api/v1/tables/:name",
+            axum::routing::get(table_api::get_table),
+        )
         .route_layer(middleware::from_fn_with_state(state.clone(), require_admin));
+
+    let table_read_routes = Router::new()
+        .route(
+            "/api/v1/data/:table",
+            axum::routing::get(table_api::query_table),
+        )
+        .route(
+            "/api/v1/data/:table/:id",
+            axum::routing::get(table_api::get_row),
+        )
+        .route_layer(middleware::from_fn_with_state(state.clone(), require_read));
+
+    let table_write_routes = Router::new()
+        .route(
+            "/api/v1/data/:table",
+            axum::routing::post(table_api::insert_row),
+        )
+        .route(
+            "/api/v1/data/:table/:id",
+            axum::routing::patch(table_api::update_row),
+        )
+        .route(
+            "/api/v1/data/:table/:id",
+            axum::routing::delete(table_api::delete_row),
+        )
+        .route("/api/v1/sql", axum::routing::post(table_api::execute_sql))
+        .route_layer(middleware::from_fn_with_state(state.clone(), require_write));
+
+    let dashboard_routes = Router::new()
+        .route("/admin", axum::routing::get(table_api::dashboard))
+        .route("/admin/", axum::routing::get(table_api::dashboard));
 
     Router::new()
         .route("/health", axum::routing::get(health_handler))
@@ -293,6 +332,9 @@ pub fn build_router(state: AppState) -> Router {
         .merge(write_routes)
         .merge(backup_routes)
         .merge(admin_routes)
+        .merge(table_read_routes)
+        .merge(table_write_routes)
+        .merge(dashboard_routes)
         .layer(middleware::from_fn_with_state(
             state.clone(),
             rest_rate_limit,
@@ -920,6 +962,7 @@ mod tests {
         .expect("open db");
         let jwt_secret = "0123456789abcdef0123456789abcdef".to_string();
         let bootstrap_admin_key = "bootstrap-admin-key-0123456789abcdef".to_string();
+        let catalog = Arc::new(omni_engine::catalog::Catalog::new(db.clone()));
         let router = build_router(AppState {
             db,
             jwt_secret: jwt_secret.clone(),
@@ -927,6 +970,7 @@ mod tests {
             manifest_path: manifest.to_string_lossy().to_string(),
             wal_path: wal.to_string_lossy().to_string(),
             rate_limiter: Arc::new(RateLimiter::new(1000.0, 100, 10_000)),
+            catalog,
         });
         (router, dir, jwt_secret)
     }
@@ -1373,6 +1417,7 @@ mod tests {
         )
         .expect("open db");
         let jwt_secret = "0123456789abcdef0123456789abcdef".to_string();
+        let catalog = Arc::new(omni_engine::catalog::Catalog::new(db.clone()));
         let router = build_router(AppState {
             db,
             jwt_secret: jwt_secret.clone(),
@@ -1380,6 +1425,7 @@ mod tests {
             manifest_path: manifest.to_string_lossy().to_string(),
             wal_path: wal.to_string_lossy().to_string(),
             rate_limiter: Arc::new(RateLimiter::new(0.01, 1, 10)),
+            catalog,
         });
         let token =
             crate::auth::generate_token("reader", "read", &jwt_secret, 60).expect("read token");

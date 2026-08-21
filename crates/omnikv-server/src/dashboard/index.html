@@ -1,0 +1,1112 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>OmniKV Console</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" crossorigin="anonymous">
+    <!-- Local font fallback for air-gapped deployments -->
+    <style>@font-face { font-family: 'Inter Fallback'; src: local('Segoe UI'), local('Roboto'), local('Helvetica Neue'), local('Arial'); } @font-face { font-family: 'JetBrains Mono Fallback'; src: local('Cascadia Code'), local('Consolas'), local('Courier New'); }</style>
+    <style>
+        :root {
+            --bg-base: #0f1115;
+            --bg-panel: #161920;
+            --bg-panel-hover: #1e222a;
+            --bg-glass: rgba(22, 25, 32, 0.7);
+            --border: #2a2f3a;
+            --border-highlight: #3b4252;
+            --text-main: #e2e8f0;
+            --text-muted: #94a3b8;
+            --accent: #6366f1;
+            --accent-hover: #4f46e5;
+            --accent-gradient: linear-gradient(135deg, #6366f1, #8b5cf6);
+            --danger: #ef4444;
+            --danger-hover: #dc2626;
+            --success: #10b981;
+            
+            --font-sans: 'Inter', sans-serif;
+            --font-mono: 'JetBrains Mono', monospace;
+            
+            --radius-md: 8px;
+            --radius-lg: 12px;
+            --radius-xl: 16px;
+            
+            --transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+        }
+
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        body {
+            font-family: var(--font-sans);
+            background-color: var(--bg-base);
+            color: var(--text-main);
+            display: flex;
+            height: 100vh;
+            overflow: hidden;
+            -webkit-font-smoothing: antialiased;
+        }
+
+        /* Scrollbar */
+        ::-webkit-scrollbar { width: 8px; height: 8px; }
+        ::-webkit-scrollbar-track { background: transparent; }
+        ::-webkit-scrollbar-thumb { background: #333a45; border-radius: 4px; }
+        ::-webkit-scrollbar-thumb:hover { background: #4a5568; }
+
+        /* Typography */
+        h1, h2, h3 { font-weight: 600; color: #fff; }
+        p { color: var(--text-muted); line-height: 1.5; }
+        a { color: var(--accent); text-decoration: none; transition: var(--transition); }
+        a:hover { color: #8b5cf6; }
+
+        /* Glass Panel */
+        .glass-panel {
+            background: var(--bg-glass);
+            backdrop-filter: blur(12px);
+            -webkit-backdrop-filter: blur(12px);
+            border: 1px solid var(--border);
+            border-radius: var(--radius-lg);
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);
+        }
+
+        /* Buttons */
+        .btn {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            gap: 8px;
+            padding: 8px 16px;
+            border-radius: var(--radius-md);
+            font-size: 0.875rem;
+            font-weight: 500;
+            cursor: pointer;
+            transition: var(--transition);
+            border: 1px solid transparent;
+            font-family: var(--font-sans);
+        }
+        .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+        
+        .btn-primary {
+            background: var(--accent-gradient);
+            color: white;
+            border: none;
+            box-shadow: 0 0 15px rgba(99, 102, 241, 0.3);
+        }
+        .btn-primary:hover:not(:disabled) { box-shadow: 0 0 20px rgba(99, 102, 241, 0.5); transform: translateY(-1px); }
+        
+        .btn-secondary {
+            background: transparent;
+            border-color: var(--border);
+            color: var(--text-main);
+        }
+        .btn-secondary:hover { background: var(--bg-panel-hover); border-color: var(--border-highlight); }
+        
+        .btn-danger {
+            background: rgba(239, 68, 68, 0.1);
+            color: var(--danger);
+            border-color: rgba(239, 68, 68, 0.2);
+        }
+        .btn-danger:hover { background: var(--danger); color: white; }
+
+        /* Inputs */
+        .input, .textarea, .select {
+            background: #090a0c;
+            border: 1px solid var(--border);
+            border-radius: var(--radius-md);
+            padding: 10px 12px;
+            color: var(--text-main);
+            font-family: var(--font-sans);
+            font-size: 0.875rem;
+            width: 100%;
+            transition: var(--transition);
+            outline: none;
+        }
+        .input:focus, .textarea:focus, .select:focus { border-color: var(--accent); box-shadow: 0 0 0 2px rgba(99, 102, 241, 0.2); }
+        .textarea { font-family: var(--font-mono); resize: vertical; min-height: 100px; }
+
+        /* Layout */
+        .sidebar {
+            width: 260px;
+            background: var(--bg-panel);
+            border-right: 1px solid var(--border);
+            display: flex;
+            flex-direction: column;
+            transition: var(--transition);
+            z-index: 10;
+        }
+        
+        .sidebar-header {
+            padding: 24px 20px;
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            border-bottom: 1px solid var(--border);
+        }
+        .logo-icon {
+            width: 32px; height: 32px;
+            background: var(--accent-gradient);
+            border-radius: 8px;
+            display: flex; align-items: center; justify-content: center;
+            color: white; font-weight: bold; font-size: 1.2rem;
+            box-shadow: 0 0 15px rgba(99, 102, 241, 0.4);
+        }
+        .logo-text { font-size: 1.25rem; font-weight: 700; letter-spacing: -0.5px; }
+        .version-badge {
+            background: rgba(99, 102, 241, 0.1); color: var(--accent);
+            font-size: 0.65rem; padding: 2px 6px; border-radius: 12px;
+            margin-left: auto; border: 1px solid rgba(99, 102, 241, 0.2);
+        }
+
+        .nav-links { padding: 16px 12px; display: flex; flex-direction: column; gap: 4px; flex-grow: 1; }
+        .nav-item {
+            display: flex; align-items: center; gap: 12px;
+            padding: 10px 12px; border-radius: var(--radius-md);
+            color: var(--text-muted); cursor: pointer; transition: var(--transition);
+            font-weight: 500; font-size: 0.9rem;
+        }
+        .nav-item:hover { color: var(--text-main); background: rgba(255, 255, 255, 0.03); }
+        .nav-item.active {
+            background: linear-gradient(90deg, rgba(99, 102, 241, 0.1), transparent);
+            color: var(--accent); border-left: 2px solid var(--accent);
+        }
+        .nav-item svg { width: 18px; height: 18px; opacity: 0.8; }
+        .nav-item.active svg { opacity: 1; stroke: var(--accent); }
+
+        .main-content {
+            flex-grow: 1;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+            position: relative;
+        }
+        .topbar {
+            height: 64px;
+            border-bottom: 1px solid var(--border);
+            display: flex; align-items: center; justify-content: space-between;
+            padding: 0 24px; background: rgba(15, 17, 21, 0.8);
+            backdrop-filter: blur(8px); z-index: 5;
+        }
+        .view-title { font-size: 1.1rem; font-weight: 600; display: flex; align-items: center; gap: 8px; }
+        
+        .content-area {
+            flex-grow: 1;
+            overflow-y: auto;
+            padding: 24px;
+            display: none;
+        }
+        .content-area.active { display: block; animation: fadeIn 0.3s ease; }
+        
+        @keyframes fadeIn { from { opacity: 0; transform: translateY(5px); } to { opacity: 1; transform: translateY(0); } }
+
+        /* Tables & Data Grid */
+        .card { background: var(--bg-panel); border: 1px solid var(--border); border-radius: var(--radius-lg); overflow: hidden; margin-bottom: 24px; }
+        .card-header { padding: 16px 20px; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; }
+        .card-title { font-size: 1rem; font-weight: 600; }
+        
+        .data-table { width: 100%; border-collapse: collapse; text-align: left; font-size: 0.875rem; }
+        .data-table th {
+            background: #0f1115; color: var(--text-muted); font-weight: 500;
+            padding: 12px 16px; border-bottom: 1px solid var(--border); white-space: nowrap;
+        }
+        .data-table td {
+            padding: 12px 16px; border-bottom: 1px solid var(--border);
+            color: var(--text-main); font-family: var(--font-mono); font-size: 0.8rem;
+        }
+        .data-table tbody tr { transition: var(--transition); }
+        .data-table tbody tr:hover { background: rgba(255,255,255,0.02); }
+        
+        .type-badge {
+            font-size: 0.65rem; background: #2a2f3a; color: #a1a1aa;
+            padding: 2px 6px; border-radius: 4px; margin-left: 6px; font-family: var(--font-mono);
+        }
+        
+        .table-list-item {
+            display: flex; align-items: center; justify-content: space-between;
+            padding: 16px 20px; border-bottom: 1px solid var(--border);
+            cursor: pointer; transition: var(--transition);
+        }
+        .table-list-item:hover { background: rgba(255,255,255,0.02); }
+        .table-info { display: flex; align-items: center; gap: 12px; }
+        .table-icon { background: rgba(99, 102, 241, 0.1); padding: 8px; border-radius: 8px; color: var(--accent); }
+        .table-stats { font-size: 0.8rem; color: var(--text-muted); display: flex; gap: 16px; }
+
+        /* SQL Console */
+        .sql-editor-container { position: relative; border-radius: var(--radius-lg); overflow: hidden; border: 1px solid var(--border); margin-bottom: 16px; }
+        #sql-input {
+            width: 100%; min-height: 200px; background: #090a0c; color: #e2e8f0;
+            padding: 16px; font-family: var(--font-mono); font-size: 0.9rem;
+            border: none; outline: none; resize: vertical; line-height: 1.5;
+        }
+        .sql-actions {
+            display: flex; justify-content: space-between; align-items: center;
+            background: var(--bg-panel); padding: 12px 16px; border-top: 1px solid var(--border);
+        }
+        .keyboard-hint { font-size: 0.75rem; color: var(--text-muted); }
+        .sql-results { background: var(--bg-panel); border-radius: var(--radius-lg); border: 1px solid var(--border); overflow-x: auto; min-height: 100px;}
+        .sql-error { color: var(--danger); padding: 16px; background: rgba(239, 68, 68, 0.05); border-left: 3px solid var(--danger); font-family: var(--font-mono); font-size: 0.85rem; }
+
+        /* System Monitor */
+        .grid-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 20px; margin-bottom: 24px; }
+        .stat-card {
+            background: var(--bg-panel); border: 1px solid var(--border); border-radius: var(--radius-lg);
+            padding: 20px; display: flex; flex-direction: column; gap: 12px;
+            position: relative; overflow: hidden;
+        }
+        .stat-card::before {
+            content: ''; position: absolute; top: 0; left: 0; width: 100%; height: 2px;
+            background: var(--accent-gradient); opacity: 0.5;
+        }
+        .stat-title { color: var(--text-muted); font-size: 0.85rem; font-weight: 500; text-transform: uppercase; letter-spacing: 0.5px; }
+        .stat-value { font-size: 2rem; font-weight: 700; color: white; display: flex; align-items: baseline; gap: 8px; }
+        .stat-unit { font-size: 0.9rem; color: var(--text-muted); font-weight: 400; }
+
+        /* Modal */
+        .modal-overlay {
+            position: fixed; top: 0; left: 0; right: 0; bottom: 0;
+            background: rgba(0, 0, 0, 0.7); backdrop-filter: blur(4px);
+            display: flex; align-items: center; justify-content: center;
+            z-index: 100; opacity: 0; pointer-events: none; transition: var(--transition);
+        }
+        .modal-overlay.active { opacity: 1; pointer-events: auto; }
+        .modal {
+            background: var(--bg-panel); border: 1px solid var(--border);
+            border-radius: var(--radius-lg); width: 100%; max-width: 500px;
+            transform: translateY(20px); transition: var(--transition); box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.5);
+        }
+        .modal-overlay.active .modal { transform: translateY(0); }
+        .modal-header { padding: 20px 24px; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; }
+        .modal-body { padding: 24px; max-height: 70vh; overflow-y: auto; }
+        .modal-footer { padding: 16px 24px; border-top: 1px solid var(--border); display: flex; justify-content: flex-end; gap: 12px; background: rgba(0,0,0,0.2); border-bottom-left-radius: var(--radius-lg); border-bottom-right-radius: var(--radius-lg); }
+        
+        .form-group { margin-bottom: 16px; }
+        .form-label { display: block; margin-bottom: 6px; font-size: 0.85rem; color: var(--text-muted); }
+        
+        .col-builder-row { display: flex; gap: 8px; margin-bottom: 8px; align-items: center; }
+        
+        /* Toast */
+        .toast-container { position: fixed; bottom: 24px; right: 24px; z-index: 1000; display: flex; flex-direction: column; gap: 10px; }
+        .toast {
+            background: var(--bg-panel); border: 1px solid var(--border); border-radius: var(--radius-md);
+            padding: 12px 16px; color: white; font-size: 0.875rem; display: flex; align-items: center; gap: 12px;
+            box-shadow: 0 10px 15px -3px rgba(0,0,0,0.2); transform: translateX(120%); transition: transform 0.3s cubic-bezier(0.68, -0.55, 0.27, 1.55);
+        }
+        .toast.show { transform: translateX(0); }
+        .toast.success { border-left: 3px solid var(--success); }
+        .toast.error { border-left: 3px solid var(--danger); }
+
+        /* API Docs */
+        .api-endpoint { background: #090a0c; border: 1px solid var(--border); border-radius: var(--radius-md); margin-bottom: 16px; overflow: hidden; }
+        .api-header { display: flex; align-items: center; padding: 12px 16px; cursor: pointer; background: rgba(255,255,255,0.01); }
+        .api-method { font-family: var(--font-mono); font-size: 0.75rem; font-weight: 700; padding: 4px 8px; border-radius: 4px; margin-right: 12px; }
+        .method-get { background: rgba(16, 185, 129, 0.15); color: #10b981; }
+        .method-post { background: rgba(59, 130, 246, 0.15); color: #3b82f6; }
+        .method-delete { background: rgba(239, 68, 68, 0.15); color: #ef4444; }
+        .api-path { font-family: var(--font-mono); font-size: 0.9rem; color: #fff; flex-grow: 1; }
+        .api-desc { color: var(--text-muted); font-size: 0.85rem; }
+        
+        .api-details { padding: 16px; border-top: 1px solid var(--border); display: none; }
+        .api-endpoint.open .api-details { display: block; }
+        .code-block { background: #161920; padding: 12px; border-radius: 6px; font-family: var(--font-mono); font-size: 0.8rem; color: #a1a1aa; overflow-x: auto; margin-top: 8px; border: 1px solid #2a2f3a; }
+        
+        /* Utility */
+        .hidden { display: none !important; }
+        .flex { display: flex; }
+        .items-center { align-items: center; }
+        .gap-2 { gap: 8px; }
+        .text-sm { font-size: 0.875rem; }
+        .text-muted { color: var(--text-muted); }
+        
+        /* Mobile */
+        @media (max-width: 768px) {
+            .sidebar { position: fixed; height: 100vh; transform: translateX(-100%); }
+            .sidebar.open { transform: translateX(0); }
+            #mobile-menu-btn { display: block; }
+            .grid-cards { grid-template-columns: 1fr; }
+        }
+        #mobile-menu-btn { display: none; background: transparent; border: none; color: white; cursor: pointer; padding: 8px; }
+
+        /* Syntax Highlight simple */
+        .syn-kw { color: #c678dd; } /* keyword */
+        .syn-str { color: #98c379; } /* string */
+        .syn-num { color: #d19a66; } /* number */
+        .syn-func { color: #61afef; } /* function */
+    </style>
+</head>
+<body>
+
+    <!-- Auth Modal -->
+    <div id="auth-modal" class="modal-overlay">
+        <div class="modal">
+            <div class="modal-header">
+                <h3 style="display: flex; align-items: center; gap: 10px;">
+                    <div class="logo-icon" style="width:24px; height:24px; font-size:0.9rem;">O</div>
+                    OmniKV Authentication
+                </h3>
+            </div>
+            <div class="modal-body">
+                <p style="margin-bottom: 20px; font-size: 0.9rem;">Please enter the admin bootstrap key to access the dashboard.</p>
+                <div class="form-group">
+                    <label class="form-label">Bootstrap Key</label>
+                    <input type="password" id="auth-key" class="input" placeholder="••••••••••••••••">
+                </div>
+                <div id="auth-error" class="sql-error hidden" style="margin-top:10px; padding:8px;"></div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-primary" id="btn-login" style="width: 100%;">Authenticate</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Sidebar -->
+    <aside class="sidebar" id="sidebar">
+        <div class="sidebar-header">
+            <div class="logo-icon">O</div>
+            <div class="logo-text">OmniKV</div>
+            <div class="version-badge" id="app-version">v1.0</div>
+        </div>
+        <div class="nav-links">
+            <div class="nav-item active" data-view="view-tables">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+                Tables
+            </div>
+            <div class="nav-item" data-view="view-sql">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 17 10 11 4 5"></polyline><line x1="12" y1="19" x2="20" y2="19"></line></svg>
+                SQL Console
+            </div>
+            <div class="nav-item" data-view="view-system">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="14" rx="2" ry="2"></rect><line x1="8" y1="21" x2="16" y2="21"></line><line x1="12" y1="17" x2="12" y2="21"></line></svg>
+                System Monitor
+            </div>
+            <div class="nav-item" data-view="view-api">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path><polyline points="14 2 14 8 20 8"></polyline><line x1="16" y1="13" x2="8" y2="13"></line><line x1="16" y1="17" x2="8" y2="17"></line><polyline points="10 9 9 9 8 9"></polyline></svg>
+                API Docs
+            </div>
+        </div>
+        <div style="padding: 20px; font-size: 0.75rem; color: var(--text-muted); text-align: center; border-top: 1px solid var(--border);">
+            <button id="btn-logout" class="btn btn-secondary" style="width:100%; padding: 6px;">Logout</button>
+        </div>
+    </aside>
+
+    <!-- Main Content -->
+    <main class="main-content">
+        <header class="topbar">
+            <div class="view-title">
+                <button id="mobile-menu-btn">
+                    <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="3" y1="12" x2="21" y2="12"></line><line x1="3" y1="6" x2="21" y2="6"></line><line x1="3" y1="18" x2="21" y2="18"></line></svg>
+                </button>
+                <span id="topbar-title">Tables</span>
+            </div>
+            <div class="topbar-actions" id="topbar-actions">
+                <!-- Dynamic actions based on view -->
+            </div>
+        </header>
+
+        <!-- View: Tables -->
+        <div id="view-tables" class="content-area active">
+            <div class="card" id="table-list-container">
+                <div class="card-header">
+                    <h3 class="card-title">Database Tables</h3>
+                    <button class="btn btn-primary" onclick="showModal('create-table-modal')">
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="5" x2="12" y2="19"></line><line x1="5" y1="12" x2="19" y2="12"></line></svg>
+                        Create Table
+                    </button>
+                </div>
+                <div id="table-list">
+                    <!-- Loaded via JS -->
+                    <div style="padding:40px; text-align:center; color:var(--text-muted);">Loading tables...</div>
+                </div>
+            </div>
+            
+            <div class="card hidden" id="table-data-container">
+                <div class="card-header">
+                    <div class="flex items-center gap-2">
+                        <button class="btn btn-secondary" style="padding: 4px; border:none;" onclick="showTableList()">
+                            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="19" y1="12" x2="5" y2="12"></line><polyline points="12 19 5 12 12 5"></polyline></svg>
+                        </button>
+                        <h3 class="card-title" id="current-table-name">table_name</h3>
+                    </div>
+                    <div class="flex gap-2">
+                        <button class="btn btn-secondary" onclick="showInsertRowModal()">Insert Row</button>
+                        <button class="btn btn-danger" onclick="promptDropTable()">Drop Table</button>
+                    </div>
+                </div>
+                <div style="overflow-x: auto; min-height:300px;">
+                    <table class="data-table" id="data-table-view">
+                        <thead><tr id="data-table-head"></tr></thead>
+                        <tbody id="data-table-body"></tbody>
+                    </table>
+                </div>
+                <div class="card-header" style="border-top: 1px solid var(--border); border-bottom: none; justify-content: space-between;">
+                    <div class="text-sm text-muted" id="data-pagination-info">Showing 0 rows</div>
+                    <div class="flex gap-2">
+                        <button class="btn btn-secondary" id="btn-prev-page" disabled>Previous</button>
+                        <button class="btn btn-secondary" id="btn-next-page" disabled>Next</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- View: SQL Console -->
+        <div id="view-sql" class="content-area">
+            <div class="sql-editor-container">
+                <textarea id="sql-input" placeholder="SELECT * FROM users;&#10;-- Press Ctrl+Enter to execute"></textarea>
+                <div class="sql-actions">
+                    <div class="keyboard-hint">Ctrl + Enter to run</div>
+                    <button class="btn btn-primary" id="btn-run-sql">
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="5 3 19 12 5 21 5 3"></polygon></svg>
+                        Run Query
+                    </button>
+                </div>
+            </div>
+            
+            <div id="sql-result-container" class="sql-results hidden">
+                <div class="card-header" style="border-bottom: 1px solid var(--border);">
+                    <div class="card-title flex items-center gap-2" style="font-size:0.9rem;">
+                        Results <span class="version-badge" style="margin-left:8px;" id="sql-time">0ms</span>
+                    </div>
+                </div>
+                <div style="overflow-x: auto;" id="sql-table-wrapper">
+                    <!-- Results table injected here -->
+                </div>
+            </div>
+            <div id="sql-error-container" class="sql-error hidden"></div>
+        </div>
+
+        <!-- View: System Monitor -->
+        <div id="view-system" class="content-area">
+            <div class="grid-cards">
+                <div class="stat-card">
+                    <div class="stat-title">Status</div>
+                    <div class="stat-value" id="sys-status" style="color: var(--success);">Online</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-title">Uptime</div>
+                    <div class="stat-value" id="sys-uptime">0<span class="stat-unit">s</span></div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-title">SSTables</div>
+                    <div class="stat-value" id="sys-sstables">0</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-title">Version</div>
+                    <div class="stat-value" id="sys-version" style="font-size: 1.5rem;">-</div>
+                </div>
+            </div>
+            
+            <div class="card">
+                <div class="card-header"><h3 class="card-title">Cluster Nodes</h3></div>
+                <table class="data-table">
+                    <thead><tr><th>Node ID</th><th>Address</th><th>Role</th><th>Status</th></tr></thead>
+                    <tbody>
+                        <tr><td>local-1</td><td>127.0.0.1:8080</td><td><span class="type-badge">LEADER</span></td><td style="color:var(--success)">Healthy</td></tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+
+        <!-- View: API Docs -->
+        <div id="view-api" class="content-area">
+            <div style="max-width: 800px; margin: 0 auto;">
+                <h2 style="margin-bottom: 8px;">REST API Reference</h2>
+                <p style="margin-bottom: 24px;">Interact with OmniKV over HTTP. All endpoints (except auth) require a Bearer token.</p>
+                
+                <div id="api-docs-list">
+                    <!-- Populated by JS -->
+                </div>
+            </div>
+        </div>
+    </main>
+
+    <!-- Modals -->
+    <div id="create-table-modal" class="modal-overlay">
+        <div class="modal">
+            <div class="modal-header">
+                <h3>Create Table</h3>
+                <button class="btn btn-secondary" style="padding:4px; border:none;" onclick="hideModal('create-table-modal')">✕</button>
+            </div>
+            <div class="modal-body">
+                <div class="form-group">
+                    <label class="form-label">Table Name</label>
+                    <input type="text" id="create-table-name" class="input" placeholder="users">
+                </div>
+                <div class="form-group">
+                    <div class="flex items-center justify-between" style="margin-bottom:8px;">
+                        <label class="form-label" style="margin:0;">Columns</label>
+                        <button class="btn btn-secondary" style="padding: 2px 8px; font-size:0.75rem;" onclick="addColumnRow()">+ Add</button>
+                    </div>
+                    <div id="columns-builder">
+                        <!-- Rows injected here -->
+                    </div>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-secondary" onclick="hideModal('create-table-modal')">Cancel</button>
+                <button class="btn btn-primary" onclick="submitCreateTable()">Create Table</button>
+            </div>
+        </div>
+    </div>
+    
+    <div id="insert-row-modal" class="modal-overlay">
+        <div class="modal">
+            <div class="modal-header">
+                <h3 id="insert-modal-title">Insert Row</h3>
+                <button class="btn btn-secondary" style="padding:4px; border:none;" onclick="hideModal('insert-row-modal')">✕</button>
+            </div>
+            <div class="modal-body" id="insert-form-builder">
+                <!-- Inputs injected dynamically -->
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-secondary" onclick="hideModal('insert-row-modal')">Cancel</button>
+                <button class="btn btn-primary" onclick="submitInsertRow()">Insert</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Toast Container -->
+    <div id="toast-container" class="toast-container"></div>
+
+    <script>
+        // --- State & Config ---
+        const API_BASE = ''; // Same origin
+        let authToken = localStorage.getItem('omnikv_token');
+        
+        let state = {
+            tables: [],
+            currentTable: null,
+            tablePage: 1,
+            tablePerPage: 50,
+            tableColumns: [],
+            systemTimer: null
+        };
+
+        // --- Init ---
+        document.addEventListener('DOMContentLoaded', () => {
+            if (!authToken) {
+                document.getElementById('auth-modal').classList.add('active');
+            } else {
+                initDashboard();
+            }
+            
+            setupNavigation();
+            setupSqlEditor();
+            addColumnRow(); // Init with one column in builder
+        });
+
+        function initDashboard() {
+            loadTables();
+            updateSystemStats();
+            renderApiDocs();
+            
+            // Auto refresh system stats if on system view
+            setInterval(() => {
+                const currentView = document.querySelector('.nav-item.active').dataset.view;
+                if (currentView === 'view-system') {
+                    updateSystemStats();
+                }
+            }, 5000);
+        }
+
+        // --- Navigation ---
+        function setupNavigation() {
+            document.querySelectorAll('.nav-item').forEach(item => {
+                item.addEventListener('click', (e) => {
+                    document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
+                    item.classList.add('active');
+                    
+                    const viewId = item.dataset.view;
+                    document.querySelectorAll('.content-area').forEach(v => v.classList.remove('active'));
+                    document.getElementById(viewId).classList.add('active');
+                    
+                    document.getElementById('topbar-title').textContent = item.textContent.trim();
+                    
+                    if (window.innerWidth <= 768) {
+                        document.getElementById('sidebar').classList.remove('open');
+                    }
+                    
+                    if (viewId === 'view-tables') loadTables();
+                    if (viewId === 'view-system') updateSystemStats();
+                });
+            });
+
+            document.getElementById('mobile-menu-btn').addEventListener('click', () => {
+                document.getElementById('sidebar').classList.toggle('open');
+            });
+            
+            document.getElementById('btn-logout').addEventListener('click', () => {
+                localStorage.removeItem('omnikv_token');
+                window.location.reload();
+            });
+        }
+
+        // --- Auth ---
+        document.getElementById('btn-login').addEventListener('click', async () => {
+            const key = document.getElementById('auth-key').value;
+            const errEl = document.getElementById('auth-error');
+            const btn = document.getElementById('btn-login');
+            
+            btn.disabled = true;
+            btn.textContent = 'Authenticating...';
+            
+            try {
+                const res = await fetch(API_BASE + '/auth/token', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ key })
+                });
+                
+                const data = await res.json();
+                if (res.ok && data.token) {
+                    authToken = data.token;
+                    localStorage.setItem('omnikv_token', authToken);
+                    document.getElementById('auth-modal').classList.remove('active');
+                    initDashboard();
+                    showToast('Authenticated successfully', 'success');
+                } else {
+                    errEl.textContent = data.error || 'Invalid bootstrap key';
+                    errEl.classList.remove('hidden');
+                }
+            } catch (e) {
+                errEl.textContent = 'Network error connecting to server';
+                errEl.classList.remove('hidden');
+            } finally {
+                btn.disabled = false;
+                btn.textContent = 'Authenticate';
+            }
+        });
+
+        // --- HTML Escape Helper (XSS prevention) ---
+        function esc(str) {
+            if (str === null || str === undefined) return '';
+            const div = document.createElement('div');
+            div.appendChild(document.createTextNode(String(str)));
+            return div.innerHTML;
+        }
+
+        // --- API Helper ---
+        async function apiCall(method, path, body = null) {
+            const headers = {
+                'Authorization': `Bearer ${authToken}`,
+                'Content-Type': 'application/json'
+            };
+            
+            const res = await fetch(API_BASE + path, {
+                method,
+                headers,
+                body: body ? JSON.stringify(body) : null
+            });
+            
+            if (!res.ok) {
+                if (res.status === 401 || res.status === 403) {
+                    localStorage.removeItem('omnikv_token');
+                    window.location.reload();
+                }
+                const text = await res.text();
+                throw new Error(text);
+            }
+            return await res.json();
+        }
+
+        // --- Tables View ---
+        async function loadTables() {
+            const listEl = document.getElementById('table-list');
+            try {
+                const res = await apiCall('GET', '/api/v1/tables');
+                state.tables = res.data || [];
+                
+                if (state.tables.length === 0) {
+                    listEl.innerHTML = `<div style="padding:40px; text-align:center; color:var(--text-muted);">No tables found. Create one to get started.</div>`;
+                    return;
+                }
+                
+                listEl.innerHTML = state.tables.map(t => `
+                    <div class="table-list-item" data-table="${esc(t.name)}">
+                        <div class="table-info">
+                            <div class="table-icon">
+                                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+                            </div>
+                            <div>
+                                <div style="font-weight: 500; color: white;">${esc(t.name)}</div>
+                                <div class="table-stats">
+                                    <span>${parseInt(t.columns) || 0} columns</span>
+                                    <span>${(parseInt(t.row_count) || 0).toLocaleString()} rows</span>
+                                </div>
+                            </div>
+                        </div>
+                        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="var(--text-muted)" stroke-width="2"><polyline points="9 18 15 12 9 6"></polyline></svg>
+                    </div>
+                `).join('');
+                // Attach click listeners safely (no inline onclick)
+                listEl.querySelectorAll('.table-list-item').forEach(el => {
+                    el.addEventListener('click', () => viewTable(el.dataset.table));
+                });
+                
+            } catch (e) {
+                listEl.innerHTML = `<div style="padding:40px; text-align:center; color:var(--danger);">Error loading tables. Check connection.</div>`;
+                showToast(e.message, 'error');
+            }
+        }
+
+        async function viewTable(name) {
+            state.currentTable = name;
+            state.tablePage = 1;
+            document.getElementById('current-table-name').textContent = name;
+            
+            document.getElementById('table-list-container').classList.add('hidden');
+            document.getElementById('table-data-container').classList.remove('hidden');
+            
+            await loadTableData();
+        }
+
+        function showTableList() {
+            state.currentTable = null;
+            document.getElementById('table-list-container').classList.remove('hidden');
+            document.getElementById('table-data-container').classList.add('hidden');
+            loadTables();
+        }
+
+        async function loadTableData() {
+            const head = document.getElementById('data-table-head');
+            const body = document.getElementById('data-table-body');
+            
+            head.innerHTML = `<th>Loading...</th>`;
+            body.innerHTML = `<tr><td></td></tr>`;
+            
+            try {
+                // Get schema
+                const schemaRes = await apiCall('GET', `/api/v1/tables/${state.currentTable}`);
+                state.tableColumns = schemaRes.data.columns;
+                
+                // Get data
+                const dataRes = await apiCall('GET', `/api/v1/data/${state.currentTable}?page=${state.tablePage}&per_page=${state.tablePerPage}`);
+                const data = dataRes.data;
+                
+                // Render headers
+                head.innerHTML = state.tableColumns.map(c => `
+                    <th>
+                        ${esc(c.name)} 
+                        <span class="type-badge">${esc(c.type)}</span>
+                        ${c.primary_key ? '<span style="color:var(--accent); margin-left:4px;" title="Primary Key">🔑</span>' : ''}
+                    </th>
+                `).join('') + `<th>Actions</th>`;
+                
+                // Render rows with XSS-safe escaping
+                const rows = data.rows || [];
+                if (rows.length > 0) {
+                    body.innerHTML = rows.map(row => {
+                        const rowHtml = row.map(cell => `<td class="copyable" data-value="${esc(String(cell))}" style="cursor:pointer;" title="Click to copy">${cell !== null ? esc(cell) : '<span class="text-muted">NULL</span>'}</td>`).join('');
+                        const pkIndex = state.tableColumns.findIndex(c => c.primary_key);
+                        const rowId = pkIndex >= 0 ? row[pkIndex] : null;
+                        const delBtn = rowId !== null ? `<button class="btn btn-danger del-row-btn" data-row-id="${esc(String(rowId))}" style="padding: 2px 6px; font-size:0.7rem;">Del</button>` : '';
+                        return `<tr>${rowHtml}<td>${delBtn}</td></tr>`;
+                    }).join('');
+                    // Attach listeners safely
+                    body.querySelectorAll('.copyable').forEach(td => {
+                        td.addEventListener('click', () => copyToClipboard(td.dataset.value));
+                    });
+                    body.querySelectorAll('.del-row-btn').forEach(btn => {
+                        btn.addEventListener('click', () => deleteRow(btn.dataset.rowId));
+                    });
+                } else {
+                    body.innerHTML = `<tr><td colspan="${state.tableColumns.length + 1}" style="text-align:center; padding: 20px; color: var(--text-muted);">No data in this table</td></tr>`;
+                }
+                
+                // Pagination (guard data.rows)
+                const total = data.total || 0;
+                const rowCount = rows.length;
+                document.getElementById('data-pagination-info').textContent = `Showing ${rowCount} rows (Total: ${total})`;
+                
+                document.getElementById('btn-prev-page').disabled = state.tablePage <= 1;
+                document.getElementById('btn-next-page').disabled = (state.tablePage * state.tablePerPage) >= total;
+                
+            } catch (e) {
+                showToast(e.message, 'error');
+            }
+        }
+        
+        document.getElementById('btn-prev-page').addEventListener('click', () => { state.tablePage--; loadTableData(); });
+        document.getElementById('btn-next-page').addEventListener('click', () => { state.tablePage++; loadTableData(); });
+
+        // --- Table Actions ---
+        function addColumnRow() {
+            const id = Date.now();
+            const html = `
+                <div class="col-builder-row" id="col-row-${id}">
+                    <input type="text" class="input col-name" placeholder="column_name" style="flex:2;">
+                    <select class="select col-type" style="flex:1.5;">
+                        <option value="TEXT">TEXT</option>
+                        <option value="INTEGER">INTEGER</option>
+                        <option value="FLOAT">FLOAT</option>
+                        <option value="BOOLEAN">BOOLEAN</option>
+                        <option value="TIMESTAMP">TIMESTAMP</option>
+                        <option value="JSON">JSON</option>
+                    </select>
+                    <label style="display:flex; align-items:center; gap:4px; font-size:0.75rem; color:var(--text-muted);">
+                        <input type="checkbox" class="col-pk"> PK
+                    </label>
+                    <label style="display:flex; align-items:center; gap:4px; font-size:0.75rem; color:var(--text-muted);">
+                        <input type="checkbox" class="col-null"> Null
+                    </label>
+                    <button class="btn btn-secondary" style="padding:4px 8px; color:var(--danger);" onclick="document.getElementById('col-row-${id}').remove()">✕</button>
+                </div>
+            `;
+            document.getElementById('columns-builder').insertAdjacentHTML('beforeend', html);
+        }
+
+        async function submitCreateTable() {
+            const name = document.getElementById('create-table-name').value;
+            if (!name) return showToast('Table name required', 'error');
+            
+            const rows = document.querySelectorAll('.col-builder-row');
+            if (rows.length === 0) return showToast('At least one column required', 'error');
+            
+            let defs = [];
+            rows.forEach(r => {
+                const cname = r.querySelector('.col-name').value;
+                const ctype = r.querySelector('.col-type').value;
+                const pk = r.querySelector('.col-pk').checked;
+                const nullable = r.querySelector('.col-null').checked;
+                
+                if (cname) {
+                    let def = `${cname} ${ctype}`;
+                    if (pk) def += ' PRIMARY KEY';
+                    if (!nullable && !pk) def += ' NOT NULL';
+                    defs.push(def);
+                }
+            });
+            
+            const sql = `CREATE TABLE ${name} (\n  ${defs.join(',\n  ')}\n);`;
+            
+            try {
+                await apiCall('POST', '/api/v1/sql', { query: sql });
+                showToast(`Table ${name} created`, 'success');
+                hideModal('create-table-modal');
+                loadTables();
+            } catch (e) {
+                showToast(e.message, 'error');
+            }
+        }
+
+        async function promptDropTable() {
+            if (confirm(`Are you absolutely sure you want to drop the table '${state.currentTable}'? All data will be lost.`)) {
+                try {
+                    await apiCall('POST', '/api/v1/sql', { query: `DROP TABLE ${state.currentTable};` });
+                    showToast(`Table dropped`, 'success');
+                    showTableList();
+                } catch (e) {
+                    showToast(e.message, 'error');
+                }
+            }
+        }
+
+        function showInsertRowModal() {
+            const builder = document.getElementById('insert-form-builder');
+            builder.innerHTML = '';
+            
+            state.tableColumns.forEach(c => {
+                const inputType = (c.type === 'INTEGER' || c.type === 'FLOAT') ? 'number' : 'text';
+                builder.innerHTML += `
+                    <div class="form-group">
+                        <label class="form-label">${c.name} <span class="type-badge">${c.type}</span> ${c.nullable?'':'*'}</label>
+                        <input type="${inputType}" class="input insert-col-val" data-col="${c.name}" data-type="${c.type}" placeholder="${c.nullable?'NULL':''}">
+                    </div>
+                `;
+            });
+            
+            showModal('insert-row-modal');
+        }
+
+        async function submitInsertRow() {
+            const inputs = document.querySelectorAll('.insert-col-val');
+            let row = {};
+            
+            inputs.forEach(inp => {
+                const col = inp.dataset.col;
+                const type = inp.dataset.type;
+                let val = inp.value;
+                
+                if (val === '') return; // Skip empty (let server handle nulls)
+                
+                if (type === 'INTEGER') val = parseInt(val, 10);
+                else if (type === 'FLOAT') val = parseFloat(val);
+                else if (type === 'BOOLEAN') val = (val.toLowerCase() === 'true' || val === '1');
+                else if (type === 'JSON') {
+                    try { val = JSON.parse(val); } catch(e) {}
+                }
+                
+                row[col] = val;
+            });
+            
+            try {
+                await apiCall('POST', `/api/v1/data/${state.currentTable}`, { row });
+                showToast('Row inserted', 'success');
+                hideModal('insert-row-modal');
+                loadTableData();
+            } catch (e) {
+                showToast(e.message, 'error');
+            }
+        }
+        
+        async function deleteRow(id) {
+            if(confirm('Delete this row?')) {
+                try {
+                    await apiCall('DELETE', `/api/v1/data/${state.currentTable}/${id}`);
+                    showToast('Row deleted', 'success');
+                    loadTableData();
+                } catch(e) {
+                    showToast(e.message, 'error');
+                }
+            }
+        }
+
+        // --- SQL Console ---
+        function setupSqlEditor() {
+            const input = document.getElementById('sql-input');
+            const runBtn = document.getElementById('btn-run-sql');
+            
+            input.addEventListener('keydown', (e) => {
+                if (e.ctrlKey && e.key === 'Enter') {
+                    e.preventDefault();
+                    executeSql();
+                }
+            });
+            
+            runBtn.addEventListener('click', executeSql);
+        }
+
+        async function executeSql() {
+            const query = document.getElementById('sql-input').value.trim();
+            if (!query) return;
+            
+            const btn = document.getElementById('btn-run-sql');
+            const resCont = document.getElementById('sql-result-container');
+            const errCont = document.getElementById('sql-error-container');
+            const wrapper = document.getElementById('sql-table-wrapper');
+            const timeEl = document.getElementById('sql-time');
+            
+            btn.disabled = true;
+            resCont.classList.add('hidden');
+            errCont.classList.add('hidden');
+            
+            const start = performance.now();
+            
+            try {
+                const res = await apiCall('POST', '/api/v1/sql', { query });
+                const ms = (performance.now() - start).toFixed(1);
+                timeEl.textContent = `${ms}ms`;
+                
+                if (res.data && res.data.columns && res.data.rows) {
+                    // It's a SELECT — escape all values
+                    const head = res.data.columns.map(c => `<th>${esc(c)}</th>`).join('');
+                    const body = res.data.rows.map(r => `<tr>${r.map(cell => `<td>${cell !== null ? esc(cell) : '<span class="text-muted">NULL</span>'}</td>`).join('')}</tr>`).join('');
+                    
+                    wrapper.innerHTML = `
+                        <table class="data-table">
+                            <thead><tr>${head}</tr></thead>
+                            <tbody>${body || '<tr><td colspan="100%" class="text-muted" style="text-align:center;">0 rows returned</td></tr>'}</tbody>
+                        </table>
+                    `;
+                } else if (res.data && res.data.count !== undefined) {
+                    // It's an INSERT/UPDATE/DELETE
+                    wrapper.innerHTML = `<div style="padding: 20px; font-family:var(--font-mono); color:var(--success);">Query OK, ${res.data.count} rows affected.</div>`;
+                }
+                
+                resCont.classList.remove('hidden');
+            } catch (e) {
+                errCont.textContent = e.message;
+                errCont.classList.remove('hidden');
+            } finally {
+                btn.disabled = false;
+            }
+        }
+
+        // --- System Monitor ---
+        async function updateSystemStats() {
+            try {
+                const res = await apiCall('GET', '/health');
+                const data = res; // Assuming health returns direct object, adjust if nested
+                
+                document.getElementById('sys-status').textContent = 'Healthy';
+                document.getElementById('sys-status').style.color = 'var(--success)';
+                
+                // format uptime
+                const secs = data.uptime_secs || 0;
+                let upStr = '';
+                if(secs > 86400) upStr = `${Math.floor(secs/86400)}d ${Math.floor((secs%86400)/3600)}h`;
+                else if(secs > 3600) upStr = `${Math.floor(secs/3600)}h ${Math.floor((secs%3600)/60)}m`;
+                else upStr = `${Math.floor(secs/60)}m ${secs%60}s`;
+                
+                document.getElementById('sys-uptime').innerHTML = upStr;
+                document.getElementById('sys-sstables').textContent = data.sstable_count || 0;
+                document.getElementById('sys-version').textContent = data.version || 'unknown';
+                document.getElementById('app-version').textContent = 'v' + (data.version || '1.0');
+                
+            } catch (e) {
+                document.getElementById('sys-status').textContent = 'Offline';
+                document.getElementById('sys-status').style.color = 'var(--danger)';
+            }
+        }
+
+        // --- API Docs ---
+        function renderApiDocs() {
+            const endpoints = [
+                { m: 'GET', p: '/health', d: 'Get node health status and metrics' },
+                { m: 'GET', p: '/api/v1/tables', d: 'List all tables and their stats' },
+                { m: 'GET', p: '/api/v1/tables/:name', d: 'Get table schema definition' },
+                { m: 'GET', p: '/api/v1/data/:table', d: 'Query rows from a table (supports ?page, ?per_page)' },
+                { m: 'POST', p: '/api/v1/data/:table', d: 'Insert a new row' },
+                { m: 'DELETE', p: '/api/v1/data/:table/:id', d: 'Delete a row by primary key' },
+                { m: 'POST', p: '/api/v1/sql', d: 'Execute raw SQL queries' }
+            ];
+            
+            const html = endpoints.map((ep, i) => `
+                <div class="api-endpoint" onclick="this.classList.toggle('open')">
+                    <div class="api-header">
+                        <span class="api-method method-${ep.m.toLowerCase()}">${ep.m}</span>
+                        <span class="api-path">${ep.p}</span>
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="var(--text-muted)" stroke-width="2"><polyline points="6 9 12 15 18 9"></polyline></svg>
+                    </div>
+                    <div class="api-details">
+                        <p class="api-desc">${ep.d}</p>
+                        ${ep.m === 'POST' ? `
+                        <div style="margin-top:12px;">
+                            <span class="text-muted text-sm">Example Body:</span>
+                            <div class="code-block">${ep.p.includes('sql') ? '{\n  "query": "SELECT * FROM users;"\n}' : '{\n  "row": {\n    "name": "value"\n  }\n}'}</div>
+                        </div>` : ''}
+                    </div>
+                </div>
+            `).join('');
+            
+            document.getElementById('api-docs-list').innerHTML = html;
+        }
+
+        // --- UI Utils ---
+        function showModal(id) { document.getElementById(id).classList.add('active'); }
+        function hideModal(id) { document.getElementById(id).classList.remove('active'); }
+        
+        function showToast(msg, type = 'success') {
+            const container = document.getElementById('toast-container');
+            const toast = document.createElement('div');
+            toast.className = `toast ${type}`;
+            toast.textContent = msg;
+            container.appendChild(toast);
+            
+            // Trigger animation
+            setTimeout(() => toast.classList.add('show'), 10);
+            
+            setTimeout(() => {
+                toast.classList.remove('show');
+                setTimeout(() => toast.remove(), 300);
+            }, 3000);
+        }
+        
+        function copyToClipboard(text) {
+            navigator.clipboard.writeText(text).then(() => {
+                showToast('Copied to clipboard');
+            });
+        }
+    </script>
+</body>
+</html>
