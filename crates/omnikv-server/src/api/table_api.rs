@@ -113,7 +113,7 @@ pub async fn execute_sql(
         Err(e) => return (StatusCode::BAD_REQUEST, ApiResponse::<()>::err(&e)).into_response(),
     };
 
-    let executor = SqlExecutor::new(state.db.clone(), state.catalog.clone());
+    let executor = SqlExecutor::new(state.db, state.catalog);
     let result = executor.execute(&stmt);
     let execution_time_ms = start.elapsed().as_secs_f64() * 1000.0;
 
@@ -208,7 +208,7 @@ pub async fn query_table(
         Err(e) => return (StatusCode::BAD_REQUEST, ApiResponse::<()>::err(&e)).into_response(),
     };
 
-    let executor = SqlExecutor::new(state.db.clone(), state.catalog.clone());
+    let executor = SqlExecutor::new(state.db, state.catalog);
     let total = match executor.execute(&count_stmt) {
         Ok(ExecResult::Rows { rows, .. }) => rows
             .first()
@@ -272,7 +272,7 @@ pub async fn get_row(
         Err(e) => return (StatusCode::BAD_REQUEST, ApiResponse::<()>::err(&e)).into_response(),
     };
 
-    let executor = SqlExecutor::new(state.db.clone(), state.catalog.clone());
+    let executor = SqlExecutor::new(state.db, state.catalog);
     match executor.execute(&stmt) {
         Ok(ExecResult::Rows { columns, mut rows }) => {
             if rows.is_empty() {
@@ -332,7 +332,7 @@ pub async fn insert_row(
         Err(e) => return (StatusCode::BAD_REQUEST, ApiResponse::<()>::err(&e)).into_response(),
     };
 
-    let executor = SqlExecutor::new(state.db.clone(), state.catalog.clone());
+    let executor = SqlExecutor::new(state.db, state.catalog);
     match executor.execute(&stmt) {
         Ok(ExecResult::Modified { count, command }) => (
             StatusCode::CREATED,
@@ -395,7 +395,7 @@ pub async fn update_row(
         Err(e) => return (StatusCode::BAD_REQUEST, ApiResponse::<()>::err(&e)).into_response(),
     };
 
-    let executor = SqlExecutor::new(state.db.clone(), state.catalog.clone());
+    let executor = SqlExecutor::new(state.db, state.catalog);
     match executor.execute(&stmt) {
         Ok(ExecResult::Modified { count, command }) => {
             if count == 0 {
@@ -453,7 +453,7 @@ pub async fn delete_row(
         Err(e) => return (StatusCode::BAD_REQUEST, ApiResponse::<()>::err(&e)).into_response(),
     };
 
-    let executor = SqlExecutor::new(state.db.clone(), state.catalog.clone());
+    let executor = SqlExecutor::new(state.db, state.catalog);
     match executor.execute(&stmt) {
         Ok(ExecResult::Modified { count, command }) => {
             if count == 0 {
