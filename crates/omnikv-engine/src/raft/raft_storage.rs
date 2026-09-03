@@ -171,6 +171,10 @@ impl OmniRaftStorage {
     }
 }
 
+#[expect(
+    clippy::unused_async_trait_impl,
+    reason = "openraft's storage/network traits declare async fns; the storage and network adapters are synchronous internally and async is required by the trait signatures."
+)]
 impl RaftLogReader<TypeConfig> for OmniRaftStorage {
     async fn try_get_log_entries<RB: RangeBounds<u64> + Clone + Debug + Send>(
         &mut self,
@@ -204,6 +208,10 @@ impl RaftLogReader<TypeConfig> for OmniRaftStorage {
     }
 }
 
+#[expect(
+    clippy::unused_async_trait_impl,
+    reason = "openraft's storage/network traits declare async fns; the storage and network adapters are synchronous internally and async is required by the trait signatures."
+)]
 impl RaftSnapshotBuilder<TypeConfig> for OmniRaftStorage {
     async fn build_snapshot(&mut self) -> Result<Snapshot<TypeConfig>, StorageError<u64>> {
         let mut entries = Vec::new();
@@ -283,6 +291,10 @@ fn storage_read_err(e: impl std::fmt::Display) -> openraft::StorageError<u64> {
     )
 }
 
+#[expect(
+    clippy::unused_async_trait_impl,
+    reason = "openraft's storage/network traits declare async fns; the storage and network adapters are synchronous internally and async is required by the trait signatures."
+)]
 impl RaftStorage<TypeConfig> for OmniRaftStorage {
     type LogReader = Self;
     type SnapshotBuilder = Self;

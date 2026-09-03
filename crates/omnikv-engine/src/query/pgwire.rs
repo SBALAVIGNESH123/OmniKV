@@ -89,6 +89,42 @@ impl ConnectionState {
     }
 }
 
+/// Cleartext-auth exposure policy for the PgWire listener.
+///
+/// Until the PgWire listener gains TLS (tracked separately), authentication is
+/// cleartext-password and must not be offered on externally reachable
+/// addresses. Production defaults fail closed: cleartext auth is only served
+/// on loopback or private (RFC 1918 / ULA) binds. Development mode allows any
+/// bind for local experiments.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PgWireSecurityPolicy {
+    /// Serve cleartext auth on any bind address (development default).
+    AllowCleartextAnywhere,
+    /// Serve cleartext auth only on loopback or private-network binds
+    /// (production default). Other binds fail closed at startup.
+    RequirePrivateBind,
+}
+
+/// Returns true when a bind address is safe for cleartext authentication:
+/// loopback (any family) or a private/unique-local network address.
+fn is_cleartext_safe_bind(bind_addr: &str) -> bool {
+    let Ok(addr) = bind_addr.parse::<std::net::SocketAddr>() else {
+        // Unparseable bind (e.g. a host name to be resolved later) cannot be
+        // proven private; treat as unsafe.
+        return false;
+    };
+    match addr.ip() {
+        std::net::IpAddr::V4(ip) => {
+            ip.is_loopback()
+                || ip.is_private() // RFC 1918: 10/8, 172.16/12, 192.168/16
+                || ip.is_link_local() // 169.254/16
+        }
+        std::net::IpAddr::V6(ip) => {
+            ip.is_loopback() || (ip.segments()[0] & 0xfe00) == 0xfc00 // fc00::/7 ULA
+        }
+    }
+}
+
 /// Represents a PostgreSQL wire protocol server with connection pooling.
 pub struct PgWireServer {
     db: Arc<OmniKV>,
@@ -99,11 +135,22 @@ pub struct PgWireServer {
     /// OMNI_PGWIRE_PASSWORD at construction time so tests can inject a
     /// deterministic value without mutating process-global environment.
     pgwire_password: String,
+    /// Whether cleartext auth may be served on non-private binds.
+    security_policy: PgWireSecurityPolicy,
 }
 
 /// Reads the PgWire cleartext password from OMNI_PGWIRE_PASSWORD.
 fn pgwire_password_from_env() -> String {
     std::env::var("OMNI_PGWIRE_PASSWORD").unwrap_or_default()
+}
+
+/// Production mode is env-driven because the engine crate does not own the
+/// server configuration pipeline; the server binary constructs the policy.
+fn default_security_policy() -> PgWireSecurityPolicy {
+    match std::env::var("OMNIKV_MODE").as_deref() {
+        Ok("production" | "prod") => PgWireSecurityPolicy::RequirePrivateBind,
+        _ => PgWireSecurityPolicy::AllowCleartextAnywhere,
+    }
 }
 
 impl PgWireServer {
@@ -114,6 +161,7 @@ impl PgWireServer {
             max_connections: 32,
             rate_limiter: default_pgwire_rate_limiter(),
             pgwire_password: pgwire_password_from_env(),
+            security_policy: default_security_policy(),
         }
     }
 
@@ -126,6 +174,25 @@ impl PgWireServer {
             max_connections: 32,
             rate_limiter: default_pgwire_rate_limiter(),
             pgwire_password: pgwire_password.to_string(),
+            security_policy: default_security_policy(),
+        }
+    }
+
+    /// Creates a PgWireServer with an explicit cleartext-auth exposure policy,
+    /// overriding the environment-derived default.
+    pub fn with_security_policy(
+        db: Arc<OmniKV>,
+        bind_addr: &str,
+        pgwire_password: &str,
+        security_policy: PgWireSecurityPolicy,
+    ) -> Self {
+        Self {
+            db,
+            bind_addr: bind_addr.to_string(),
+            max_connections: 32,
+            rate_limiter: default_pgwire_rate_limiter(),
+            pgwire_password: pgwire_password.to_string(),
+            security_policy,
         }
     }
 
@@ -137,6 +204,7 @@ impl PgWireServer {
             max_connections,
             rate_limiter: default_pgwire_rate_limiter(),
             pgwire_password: pgwire_password_from_env(),
+            security_policy: default_security_policy(),
         }
     }
 
@@ -152,6 +220,7 @@ impl PgWireServer {
             max_connections: 32,
             rate_limiter,
             pgwire_password: pgwire_password_from_env(),
+            security_policy: default_security_policy(),
         }
     }
 
@@ -160,15 +229,40 @@ impl PgWireServer {
         self.max_connections
     }
 
+    /// Returns the active cleartext-auth exposure policy.
+    pub fn security_policy(&self) -> PgWireSecurityPolicy {
+        self.security_policy
+    }
+
     /// Starts the PostgreSQL wire protocol server with connection pooling.
     /// Uses a bounded thread pool to prevent resource exhaustion.
     pub fn start(&self) -> std::io::Result<()> {
+        self.validate_security_policy()?;
         let listener = TcpListener::bind(&self.bind_addr)?;
         eprintln!(
             "[OmniKV] PostgreSQL wire protocol listening on {} (pool: {} max connections)",
             self.bind_addr, self.max_connections
         );
         self.serve(listener)
+    }
+
+    /// Checks the cleartext-auth exposure policy against the configured bind
+    /// without binding or entering the accept loop, so callers can validate
+    /// configuration before startup and tests can exercise the policy.
+    pub fn validate_security_policy(&self) -> std::io::Result<()> {
+        if self.security_policy == PgWireSecurityPolicy::RequirePrivateBind
+            && !is_cleartext_safe_bind(&self.bind_addr)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "PgWire cleartext authentication refused on non-private bind {}; \
+                     bind loopback/private or wait for PgWire TLS support",
+                    self.bind_addr
+                ),
+            ));
+        }
+        Ok(())
     }
 
     /// Accept loop over an already-bound listener.
@@ -315,6 +409,8 @@ const CANCEL_REQUEST_CODE: u32 = 80_877_102;
 /// Maximum number of negotiation packets (SSLRequest / GSSENCRequest) accepted
 /// before the StartupMessage. PostgreSQL treats repeated negotiation as a
 /// protocol violation; bounding it here prevents a trivial pre-auth spin loop.
+/// The bound applies only to negotiation packets — the StartupMessage itself
+/// is always readable after any number of negotiations within the bound.
 const MAX_STARTUP_NEGOTIATION_MESSAGES: usize = 8;
 
 /// Handle the startup handshake with password authentication.
@@ -333,8 +429,8 @@ fn handle_startup(
     stream: &mut std::net::TcpStream,
     expected_password: &str,
 ) -> std::io::Result<()> {
-    let mut negotiated_startup = false;
-    for _ in 0..MAX_STARTUP_NEGOTIATION_MESSAGES {
+    let mut negotiation_packets = 0usize;
+    loop {
         let mut len_buf = [0u8; 4];
         stream.read_exact(&mut len_buf)?;
         let len = u32::from_be_bytes(len_buf) as usize;
@@ -351,6 +447,18 @@ fn handle_startup(
 
         match protocol_code {
             SSL_REQUEST_CODE | GSS_ENC_REQUEST_CODE => {
+                negotiation_packets += 1;
+                if negotiation_packets > MAX_STARTUP_NEGOTIATION_MESSAGES {
+                    send_error_response(
+                        stream,
+                        "08P01",
+                        "too many negotiation requests before startup",
+                    )?;
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "too many negotiation requests before startup",
+                    ));
+                }
                 // Single-byte 'N': no TLS or GSS upgrade on this listener.
                 // The next message from the client is the real StartupMessage.
                 stream.write_all(b"N")?;
@@ -373,7 +481,6 @@ fn handle_startup(
                 // the remaining key/value parameters to stay framing-aligned.
                 let mut params = vec![0u8; body_len - 4];
                 stream.read_exact(&mut params)?;
-                negotiated_startup = true;
                 break;
             }
             _ => {
@@ -388,12 +495,6 @@ fn handle_startup(
                 ));
             }
         }
-    }
-    if !negotiated_startup {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "no StartupMessage received during negotiation",
-        ));
     }
 
     // Request cleartext password

@@ -42,8 +42,14 @@ loop.
 
 The PgWire listener therefore works with default client configurations
 (`sslmode=prefer` included) even though it does not offer TLS yet. Cleartext
-passwords still cross the wire, so the listener should only be exposed on
-trusted networks until PgWire TLS support lands.
+passwords still cross the wire, so the listener ships with a fail-closed
+exposure policy: in production mode (`OMNIKV_MODE=production`) the PgWire
+server refuses to start unless the bind address is loopback or a private
+network address (RFC 1918 / ULA). Development mode allows any bind for local
+experiments. Callers can check the policy without binding via
+`PgWireServer::validate_security_policy`. Until PgWire TLS support lands,
+production deployments that must expose PgWire off-host should terminate TLS
+in front of the listener (for example a local `stunnel`/`socat` hop).
 
 ## QUIC binary protocol
 

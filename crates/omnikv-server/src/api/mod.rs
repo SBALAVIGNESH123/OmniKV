@@ -302,6 +302,10 @@ pub fn build_router(state: AppState) -> Router {
         .with_state(state)
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Axum middleware convention returns Result<Response, Response>; boxing the error side would obscure the handler contract for no runtime benefit."
+)]
 async fn rest_rate_limit(
     State(state): State<AppState>,
     req: Request<Body>,
@@ -364,6 +368,10 @@ fn rate_limit_response(retry_after_ms: u64) -> Response {
     response
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Axum middleware convention returns Result<Response, Response>; boxing the error side would obscure the handler contract for no runtime benefit."
+)]
 async fn require_read(
     State(state): State<AppState>,
     req: Request<Body>,
@@ -372,6 +380,10 @@ async fn require_read(
     require_role(state, req, next, RequiredRole::Read).await
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Axum middleware convention returns Result<Response, Response>; boxing the error side would obscure the handler contract for no runtime benefit."
+)]
 async fn require_write(
     State(state): State<AppState>,
     req: Request<Body>,
@@ -380,6 +392,10 @@ async fn require_write(
     require_role(state, req, next, RequiredRole::Write).await
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Axum middleware convention returns Result<Response, Response>; boxing the error side would obscure the handler contract for no runtime benefit."
+)]
 async fn require_backup(
     State(state): State<AppState>,
     req: Request<Body>,
@@ -388,6 +404,10 @@ async fn require_backup(
     require_role(state, req, next, RequiredRole::Backup).await
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Axum middleware convention returns Result<Response, Response>; boxing the error side would obscure the handler contract for no runtime benefit."
+)]
 async fn require_admin(
     State(state): State<AppState>,
     req: Request<Body>,
@@ -396,6 +416,10 @@ async fn require_admin(
     require_role(state, req, next, RequiredRole::Admin).await
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Axum middleware convention returns Result<Response, Response>; boxing the error side would obscure the handler contract for no runtime benefit."
+)]
 async fn require_role(
     state: AppState,
     req: Request<Body>,
