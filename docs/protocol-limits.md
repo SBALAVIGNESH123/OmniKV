@@ -27,6 +27,24 @@ PGWire frame lengths below the protocol minimum or above the maximum are
 rejected before allocation. Oversized `SELECT` windows return a protocol error
 instead of streaming an unbounded result.
 
+### Connection negotiation
+
+Before the StartupMessage, libpq-based clients (psql, JDBC, psycopg2, pg8000,
+node-postgres) send an SSLRequest, and optionally a GSSENCRequest, negotiation
+packet. OmniKV answers each with a single byte `'N'` (no TLS/GSS upgrade on this
+listener) and then continues reading the StartupMessage on the same connection,
+matching PostgreSQL's plaintext fallback. Startup messages carrying any other
+protocol code are rejected with SQLSTATE `08P01` (protocol violation), and
+cancel-request connections for unknown backend keys are drained and closed. At
+most 8 negotiation packets are accepted before the StartupMessage; further
+negotiation attempts close the connection to prevent a pre-authentication spin
+loop.
+
+The PgWire listener therefore works with default client configurations
+(`sslmode=prefer` included) even though it does not offer TLS yet. Cleartext
+passwords still cross the wire, so the listener should only be exposed on
+trusted networks until PgWire TLS support lands.
+
 ## QUIC binary protocol
 
 The QUIC server currently reads at most one 64 KiB request frame per bidirectional

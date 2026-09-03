@@ -1,5 +1,38 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- PgWire connections now handle the PostgreSQL SSLRequest and GSSENCRequest
+  negotiation packets that libpq-based clients (psql, JDBC, psycopg2, pg8000,
+  node-postgres) send by default before the StartupMessage. The server
+  previously misparsed the 8-byte SSLRequest as a StartupMessage and
+  desynchronized the protocol, so every default-configured client failed at
+  connection time with `sslmode=prefer` (issue #108). The listener now answers
+  negotiation with a single-byte `'N'` and completes the handshake on the same
+  plaintext connection, matching PostgreSQL's fallback behavior.
+- Startup messages with unknown protocol codes are now rejected with SQLSTATE
+  `08P01` instead of producing a framing-dependent failure, and cancel-request
+  connections for unknown backend keys are drained and closed.
+- The pre-auth negotiation window is bounded (8 packets); hostile clients can
+  no longer spin the listener in an unbounded SSLRequest loop.
+
+### Added
+
+- `PgWireServer::serve(listener)` accept-loop API and
+  `PgWireServer::with_password(...)` constructor so protocol tests can drive
+  the production accept path on an OS-assigned port without mutating the
+  process environment.
+- `pgwire_compat` release-gate test suite: real-socket libpq handshake
+  conformance covering SSLRequest/GSSENCRequest refusal, plaintext fallback,
+  dual-negotiation sequences, protocol-violation rejection, wrong-password
+  rejection, and the negotiation loop bound. Registered in CI and in the test
+  suite taxonomy as a release gate.
+- Connection negotiation rules documented in `docs/protocol-limits.md`,
+  including the trusted-network guidance for cleartext passwords until PgWire
+  TLS support lands.
+
 ## OmniKV v0.4.0 - 2026-07-15
 
 OmniKV v0.4.0 is an evidence and integration release. It keeps OmniKV in beta,

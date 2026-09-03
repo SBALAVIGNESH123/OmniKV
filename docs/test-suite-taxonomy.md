@@ -21,6 +21,7 @@ These suites are expected to pass before a production-readiness PR is merged:
 | Transactions/concurrency | SSI, operations, and concurrent stress coverage | `cargo test -p omnikv-engine --test concurrent_stress -- --test-threads=1` |
 | SQL and operations | SQL layer, SQL v3 features, and ops maturity | `cargo test -p omnikv-engine --test sql_layer -- --test-threads=1` |
 | API contracts | REST, PgWire, and Rust client contract tests | `cargo test -p omnikv-server rest_contract -- --test-threads=1` |
+| PgWire compatibility | Real-socket libpq handshake conformance: SSLRequest/GSSENCRequest negotiation, plaintext fallback, protocol-violation rejection, password rejection, and the pre-auth negotiation loop bound | `cargo test -p omnikv-engine --test pgwire_compat -- --test-threads=1` |
 | Raft consensus | Single-process Raft cluster behavior, including partition-style scenarios, membership changes, and snapshot install catch-up | `cargo test -p omnikv-engine --test raft_cluster -- --test-threads=1` |
 | Security audit | Dependency vulnerability gate | `cargo audit --deny warnings` |
 | Docker build | Container image buildability | `docker build --pull --tag omnikv:ci .` |
