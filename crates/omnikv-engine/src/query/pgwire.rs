@@ -89,12 +89,68 @@ impl ConnectionState {
     }
 }
 
+/// Cleartext-auth exposure policy for the PgWire listener.
+///
+/// Until the PgWire listener gains TLS (tracked separately), authentication is
+/// cleartext-password and must not be offered on externally reachable
+/// addresses. Production defaults fail closed: cleartext auth is only served
+/// on loopback or private (RFC 1918 / ULA) binds. Development mode allows any
+/// bind for local experiments.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PgWireSecurityPolicy {
+    /// Serve cleartext auth on any bind address (development default).
+    AllowCleartextAnywhere,
+    /// Serve cleartext auth only on loopback or private-network binds
+    /// (production default). Other binds fail closed at startup.
+    RequirePrivateBind,
+}
+
+/// Returns true when a bind address is safe for cleartext authentication:
+/// loopback (any family) or a private/unique-local network address.
+fn is_cleartext_safe_bind(bind_addr: &str) -> bool {
+    let Ok(addr) = bind_addr.parse::<std::net::SocketAddr>() else {
+        // Unparseable bind (e.g. a host name to be resolved later) cannot be
+        // proven private; treat as unsafe.
+        return false;
+    };
+    match addr.ip() {
+        std::net::IpAddr::V4(ip) => {
+            ip.is_loopback()
+                || ip.is_private() // RFC 1918: 10/8, 172.16/12, 192.168/16
+                || ip.is_link_local() // 169.254/16
+        }
+        std::net::IpAddr::V6(ip) => {
+            ip.is_loopback() || (ip.segments()[0] & 0xfe00) == 0xfc00 // fc00::/7 ULA
+        }
+    }
+}
+
 /// Represents a PostgreSQL wire protocol server with connection pooling.
 pub struct PgWireServer {
     db: Arc<OmniKV>,
     bind_addr: String,
     max_connections: usize,
     rate_limiter: Arc<RateLimiter>,
+    /// Cleartext password required from PgWire clients. Read from
+    /// OMNI_PGWIRE_PASSWORD at construction time so tests can inject a
+    /// deterministic value without mutating process-global environment.
+    pgwire_password: String,
+    /// Whether cleartext auth may be served on non-private binds.
+    security_policy: PgWireSecurityPolicy,
+}
+
+/// Reads the PgWire cleartext password from OMNI_PGWIRE_PASSWORD.
+fn pgwire_password_from_env() -> String {
+    std::env::var("OMNI_PGWIRE_PASSWORD").unwrap_or_default()
+}
+
+/// Production mode is env-driven because the engine crate does not own the
+/// server configuration pipeline; the server binary constructs the policy.
+fn default_security_policy() -> PgWireSecurityPolicy {
+    match std::env::var("OMNIKV_MODE").as_deref() {
+        Ok("production" | "prod") => PgWireSecurityPolicy::RequirePrivateBind,
+        _ => PgWireSecurityPolicy::AllowCleartextAnywhere,
+    }
 }
 
 impl PgWireServer {
@@ -104,6 +160,39 @@ impl PgWireServer {
             bind_addr: bind_addr.to_string(),
             max_connections: 32,
             rate_limiter: default_pgwire_rate_limiter(),
+            pgwire_password: pgwire_password_from_env(),
+            security_policy: default_security_policy(),
+        }
+    }
+
+    /// Creates a PgWireServer with an explicit cleartext password, for callers
+    /// and tests that manage the credential outside the process environment.
+    pub fn with_password(db: Arc<OmniKV>, bind_addr: &str, pgwire_password: &str) -> Self {
+        Self {
+            db,
+            bind_addr: bind_addr.to_string(),
+            max_connections: 32,
+            rate_limiter: default_pgwire_rate_limiter(),
+            pgwire_password: pgwire_password.to_string(),
+            security_policy: default_security_policy(),
+        }
+    }
+
+    /// Creates a PgWireServer with an explicit cleartext-auth exposure policy,
+    /// overriding the environment-derived default.
+    pub fn with_security_policy(
+        db: Arc<OmniKV>,
+        bind_addr: &str,
+        pgwire_password: &str,
+        security_policy: PgWireSecurityPolicy,
+    ) -> Self {
+        Self {
+            db,
+            bind_addr: bind_addr.to_string(),
+            max_connections: 32,
+            rate_limiter: default_pgwire_rate_limiter(),
+            pgwire_password: pgwire_password.to_string(),
+            security_policy,
         }
     }
 
@@ -114,6 +203,8 @@ impl PgWireServer {
             bind_addr: bind_addr.to_string(),
             max_connections,
             rate_limiter: default_pgwire_rate_limiter(),
+            pgwire_password: pgwire_password_from_env(),
+            security_policy: default_security_policy(),
         }
     }
 
@@ -128,6 +219,8 @@ impl PgWireServer {
             bind_addr: bind_addr.to_string(),
             max_connections: 32,
             rate_limiter,
+            pgwire_password: pgwire_password_from_env(),
+            security_policy: default_security_policy(),
         }
     }
 
@@ -136,15 +229,48 @@ impl PgWireServer {
         self.max_connections
     }
 
+    /// Returns the active cleartext-auth exposure policy.
+    pub fn security_policy(&self) -> PgWireSecurityPolicy {
+        self.security_policy
+    }
+
     /// Starts the PostgreSQL wire protocol server with connection pooling.
     /// Uses a bounded thread pool to prevent resource exhaustion.
     pub fn start(&self) -> std::io::Result<()> {
+        self.validate_security_policy()?;
         let listener = TcpListener::bind(&self.bind_addr)?;
         eprintln!(
             "[OmniKV] PostgreSQL wire protocol listening on {} (pool: {} max connections)",
             self.bind_addr, self.max_connections
         );
+        self.serve(listener)
+    }
 
+    /// Checks the cleartext-auth exposure policy against the configured bind
+    /// without binding or entering the accept loop, so callers can validate
+    /// configuration before startup and tests can exercise the policy.
+    pub fn validate_security_policy(&self) -> std::io::Result<()> {
+        if self.security_policy == PgWireSecurityPolicy::RequirePrivateBind
+            && !is_cleartext_safe_bind(&self.bind_addr)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "PgWire cleartext authentication refused on non-private bind {}; \
+                     bind loopback/private or wait for PgWire TLS support",
+                    self.bind_addr
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Accept loop over an already-bound listener.
+    ///
+    /// Split from [`Self::start`] so tests can bind to an OS-assigned port
+    /// (`127.0.0.1:0`), learn it from [`TcpListener::local_addr`], and drive
+    /// real connections against the same accept path production uses.
+    pub fn serve(&self, listener: TcpListener) -> std::io::Result<()> {
         // Bounded connection semaphore using a channel
         let (permit_tx, permit_rx) = std::sync::mpsc::sync_channel::<()>(self.max_connections);
         // Pre-fill permits
@@ -162,9 +288,12 @@ impl PgWireServer {
                     }
                     let db = self.db.clone();
                     let rate_limiter = self.rate_limiter.clone();
+                    let pgwire_password = self.pgwire_password.clone();
                     let release_tx = permit_tx.clone();
                     std::thread::spawn(move || {
-                        if let Err(e) = handle_connection(db, stream, rate_limiter) {
+                        if let Err(e) =
+                            handle_connection(db, stream, rate_limiter, &pgwire_password)
+                        {
                             eprintln!("[OmniKV] Connection error: {}", e);
                         }
                         // Release permit back to pool
@@ -191,17 +320,17 @@ fn handle_connection(
     db: Arc<OmniKV>,
     mut stream: std::net::TcpStream,
     rate_limiter: Arc<RateLimiter>,
+    pgwire_password: &str,
 ) -> std::io::Result<()> {
     // Phase 1: Startup handshake
-    let pgwire_password = std::env::var("OMNI_PGWIRE_PASSWORD").unwrap_or_default();
     if pgwire_password.is_empty() {
-        tracing::error!("OMNI_PGWIRE_PASSWORD is not set — PGWire connections will be rejected");
+        tracing::error!("PgWire password is empty — PGWire connections will be rejected");
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
             "OMNI_PGWIRE_PASSWORD not configured",
         ));
     }
-    handle_startup(&mut stream, &pgwire_password)?;
+    handle_startup(&mut stream, pgwire_password)?;
 
     // Per-connection state: transaction manager and session state
     let tm = Arc::new(TransactionManager::new(db.clone()));
@@ -266,21 +395,107 @@ fn acquire_pgwire_query_permit(rate_limiter: &RateLimiter, client_id: &str) -> R
         })
 }
 
+/// PostgreSQL wire protocol negotiation codes sent as the first Int32 after
+/// the 4-byte length prefix.
+/// 196608 (0x00030000) is protocol version 3.0 (a StartupMessage).
+/// 80877103 (0x04D2162F) is the SSLRequest negotiation packet.
+/// 80877104 (0x04D21630) is the GSSENCRequest negotiation packet.
+/// 80877102 (0x04D2162E) is the CancelRequest packet (16 bytes total).
+const PROTOCOL_VERSION_3_0: u32 = 196_608;
+const SSL_REQUEST_CODE: u32 = 80_877_103;
+const GSS_ENC_REQUEST_CODE: u32 = 80_877_104;
+const CANCEL_REQUEST_CODE: u32 = 80_877_102;
+
+/// Maximum number of negotiation packets (SSLRequest / GSSENCRequest) accepted
+/// before the StartupMessage. PostgreSQL treats repeated negotiation as a
+/// protocol violation; bounding it here prevents a trivial pre-auth spin loop.
+/// The bound applies only to negotiation packets — the StartupMessage itself
+/// is always readable after any number of negotiations within the bound.
+const MAX_STARTUP_NEGOTIATION_MESSAGES: usize = 8;
+
 /// Handle the startup handshake with password authentication.
 ///
 /// Reads the startup message, sends AuthenticationCleartextPassword,
 /// reads the PasswordMessage, validates against OMNI_PGWIRE_PASSWORD,
 /// and only sends AuthenticationOk on success.
+///
+/// Clients running libpq defaults (psql, JDBC, psycopg2, pg8000, node-postgres)
+/// send an SSLRequest before the StartupMessage. Per the PostgreSQL protocol,
+/// the reply is a single byte: 'S' to upgrade to TLS, 'N' to stay on the
+/// current (plaintext) connection. OmniKV has no PgWire TLS yet, so the reply
+/// is always 'N', and the handshake then continues with the real
+/// StartupMessage on the same connection.
 fn handle_startup(
     stream: &mut std::net::TcpStream,
     expected_password: &str,
 ) -> std::io::Result<()> {
-    let mut len_buf = [0u8; 4];
-    stream.read_exact(&mut len_buf)?;
-    let len = u32::from_be_bytes(len_buf) as usize;
-    let body_len = validate_pgwire_body_len(len, "startup message")?;
-    let mut body = vec![0u8; body_len];
-    stream.read_exact(&mut body)?;
+    let mut negotiation_packets = 0usize;
+    loop {
+        let mut len_buf = [0u8; 4];
+        stream.read_exact(&mut len_buf)?;
+        let len = u32::from_be_bytes(len_buf) as usize;
+        let body_len = validate_pgwire_body_len(len, "startup message")?;
+        if body_len < 4 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "startup message too short for a protocol version",
+            ));
+        }
+        let mut code_buf = [0u8; 4];
+        stream.read_exact(&mut code_buf)?;
+        let protocol_code = u32::from_be_bytes(code_buf);
+
+        match protocol_code {
+            SSL_REQUEST_CODE | GSS_ENC_REQUEST_CODE => {
+                negotiation_packets += 1;
+                if negotiation_packets > MAX_STARTUP_NEGOTIATION_MESSAGES {
+                    send_error_response(
+                        stream,
+                        "08P01",
+                        "too many negotiation requests before startup",
+                    )?;
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "too many negotiation requests before startup",
+                    ));
+                }
+                // Single-byte 'N': no TLS or GSS upgrade on this listener.
+                // The next message from the client is the real StartupMessage.
+                stream.write_all(b"N")?;
+            }
+            CANCEL_REQUEST_CODE => {
+                // A dedicated connection carrying a query-cancel request
+                // (process ID + secret key follow the code). OmniKV does not
+                // issue backend keys, so a cancel can never match; drain the
+                // frame and close the connection, as PostgreSQL does for an
+                // unknown backend key.
+                let mut rest = vec![0u8; body_len - 4];
+                stream.read_exact(&mut rest)?;
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionAborted,
+                    "cancel request for unknown backend key",
+                ));
+            }
+            PROTOCOL_VERSION_3_0 => {
+                // Real StartupMessage: the protocol code is consumed, drain
+                // the remaining key/value parameters to stay framing-aligned.
+                let mut params = vec![0u8; body_len - 4];
+                stream.read_exact(&mut params)?;
+                break;
+            }
+            _ => {
+                send_error_response(
+                    stream,
+                    "08P01",
+                    &format!("unsupported protocol version {protocol_code}"),
+                )?;
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "unsupported startup protocol version",
+                ));
+            }
+        }
+    }
 
     // Request cleartext password
     // AuthenticationCleartextPassword: 'R' + int32(8) + int32(3)

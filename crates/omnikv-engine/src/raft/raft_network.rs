@@ -38,6 +38,10 @@ pub struct OmniNetworkConnection {
     target: OmniNode,
 }
 
+#[expect(
+    clippy::unused_async_trait_impl,
+    reason = "openraft's storage/network traits declare async fns; the storage and network adapters are synchronous internally and async is required by the trait signatures."
+)]
 impl RaftNetworkFactory<OmniTypeConfig> for OmniNetwork {
     type Network = OmniNetworkConnection;
 

@@ -142,6 +142,8 @@ jobs:
       run: cargo test -p omnikv-server rest_contract -- --test-threads=1
     - name: PgWire protocol frame contracts
       run: cargo test -p omnikv-engine pgwire_contract --lib -- --test-threads=1
+    - name: PgWire libpq compatibility (real sockets)
+      run: cargo test -p omnikv-engine --test pgwire_compat -- --test-threads=1
     - name: Rust client smoke contracts
       run: cargo test -p omni-client client_contract -- --test-threads=1
 
