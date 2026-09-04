@@ -8,7 +8,25 @@ use omni_engine::metrics_prometheus;
 use omni_engine::ops::{DiagnosticReport, LogFormat, OmniConfig};
 use omni_engine::{OmniKV, WriteBatch};
 use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::OnceLock;
 use std::time::Instant;
+
+/// Serializes every test that mutates process-global environment variables.
+///
+/// Rust's test harness runs tests on parallel threads, and `std::env` is
+/// process state: `test_config_from_env` setting `OMNI_RATE_LIMIT=500` can
+/// interleave with the invalid-value tests setting `OMNI_RATE_LIMIT=fast` or
+/// removing it mid-run, which made this suite flake between runs (issue
+/// #115). Every env-mutating test must hold this lock from its first
+/// `set_var` to its last `remove_var`.
+static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+    let lock = ENV_LOCK.get_or_init(|| Mutex::new(()));
+    lock.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 fn create_db() -> (Arc<OmniKV>, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
@@ -39,6 +57,7 @@ fn test_config_defaults() {
 
 #[test]
 fn test_config_from_env() {
+    let _guard = env_guard();
     // Set some env vars
     unsafe {
         std::env::set_var("OMNI_MEMTABLE_FLUSH", "5000");
@@ -70,6 +89,7 @@ fn test_config_from_env() {
 
 #[test]
 fn test_config_from_env_rejects_invalid_numeric_values() {
+    let _guard = env_guard();
     unsafe {
         std::env::set_var("OMNI_RATE_LIMIT", "fast");
     }
@@ -87,6 +107,7 @@ fn test_config_from_env_rejects_invalid_numeric_values() {
 
 #[test]
 fn test_config_from_env_rejects_invalid_log_format() {
+    let _guard = env_guard();
     unsafe {
         std::env::set_var("OMNI_LOG_FORMAT", "xml");
     }

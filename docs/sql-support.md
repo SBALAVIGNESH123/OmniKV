@@ -24,6 +24,26 @@ testing. It is not yet a complete PostgreSQL, MySQL, or SQLite replacement.
 | Explain | `EXPLAIN`, `EXPLAIN ANALYZE` | Used to inspect plan structure and estimated costs. |
 | Mutations | `UPDATE ... SET ... WHERE ...`, `DELETE FROM ... WHERE ...` | Common single-table mutation paths are covered by integration tests. |
 
+## Keyword case
+
+Per the SQL standard, keywords in OmniKV are case-insensitive, and whitespace
+between them does not change meaning: `select ... from ... where ...`,
+`SELECT ... FROM ... WHERE ...`, and `SeLeCt ... FrOm ... WhErE ...` all parse
+identically. Identifiers (table and column names) keep their case as written,
+matching PostgreSQL. Transaction statements over the PgWire protocol accept the
+full PostgreSQL variant set in any case and spacing combination — `BEGIN`,
+`BEGIN WORK`, `BEGIN TRANSACTION`, `START TRANSACTION`; `COMMIT`, `COMMIT
+WORK`, `COMMIT TRANSACTION`, `END`, `END WORK`, `END TRANSACTION`; `ROLLBACK`,
+`ROLLBACK WORK`, `ROLLBACK TRANSACTION`, `ABORT`, `ABORT WORK`, `ABORT
+TRANSACTION` — because DBAPI drivers implicitly send lowercase `begin
+transaction` when autocommit is off (issue #109). The `AND CHAIN` / `AND NO
+CHAIN` suffix is part of the termination commands' grammar (COMMIT, END,
+ROLLBACK, ABORT): `AND CHAIN` opens a new transaction immediately after the
+commit or rollback, and is a hard error (25P01) when no transaction is open,
+where the plain forms only warn. It is not valid on `BEGIN` / `START
+TRANSACTION`, which reject it as a syntax error (42601) like PostgreSQL.
+Client `SET` statements are accepted (and ignored) in any case.
+
 ## Prepared query support
 
 The embedded prepared-query engine intentionally supports a smaller,
@@ -70,7 +90,7 @@ silently producing an ambiguous plan.
 | --- | --- |
 | `ALTER TABLE` | Unsupported; parser returns an `Unsupported: ALTER` error. |
 | SQL `CREATE INDEX` / `DROP INDEX` | Use the secondary-index manager API; SQL DDL is not exposed yet. |
-| Transactions through SQL text | Storage transactions exist separately; SQL transaction grammar is not exposed yet. |
+| Transactions through SQL text | Over the PgWire protocol, `BEGIN`/`COMMIT`/`ROLLBACK` (with the full PostgreSQL variant set above) are handled by the connection dispatcher. The embedded SQL parser API itself does not expose transaction grammar — use the transaction manager API directly. |
 | Foreign keys and constraints beyond primary-key column metadata | Not part of the current SQL contract. |
 | Recursive CTEs, common table expressions, triggers, stored procedures | Not implemented. |
 | Full PostgreSQL dialect compatibility | Not a current goal. OmniKV exposes a focused embedded-database SQL subset. |

@@ -628,17 +628,60 @@ fn handle_query(
         return Ok(());
     }
 
-    let upper = sql_trimmed.to_uppercase();
+    // Uppercased whitespace-normalized form for multi-word transaction
+    // statements: DBAPI drivers (psycopg2, pg8000) send lowercase
+    // `begin transaction`, `commit`, `rollback work`, etc.
+    let normalized = sql_trimmed
+        .to_uppercase()
+        .split_whitespace()
+        .collect::<Vec<&str>>()
+        .join(" ");
+
+    // PostgreSQL's transaction-control grammar allows an optional
+    // `AND [NO] CHAIN` suffix on the termination commands only —
+    // COMMIT/ROLLBACK and their END/ABORT aliases. BEGIN/START
+    // TRANSACTION's synopsis has no chain suffix (`BEGIN AND CHAIN` is a
+    // 42601 syntax error there), and ordinary SQL may legally end in the
+    // word CHAIN as a column name (`WHERE admin AND chain`), so the
+    // suffix is stripped only for statements led by a termination
+    // keyword. `AND CHAIN` starts a new transaction with the same
+    // characteristics immediately after COMMIT/ROLLBACK; `AND NO CHAIN`
+    // (the default) does not.
+    let mut chain = false;
+    let normalized = if normalized
+        .split(' ')
+        .next()
+        .is_some_and(|first| matches!(first, "COMMIT" | "END" | "ROLLBACK" | "ABORT"))
+    {
+        if let Some(rest) = normalized.strip_suffix(" AND NO CHAIN") {
+            rest
+        } else if let Some(rest) = normalized.strip_suffix(" AND CHAIN") {
+            chain = true;
+            rest
+        } else {
+            normalized.as_str()
+        }
+    } else {
+        normalized.as_str()
+    };
 
     // ── SET — always accept silently ──
-    if upper.starts_with("SET ") {
+    if normalized == "SET" || normalized.starts_with("SET ") {
         send_command_complete(stream, "SET")?;
         send_ready_for_query_status(stream, conn.ready_status())?;
         return Ok(());
     }
 
     // ── BEGIN — start an explicit transaction block ──
-    if upper == "BEGIN" || upper == "START TRANSACTION" {
+    // PostgreSQL accepts BEGIN [WORK|TRANSACTION] and START TRANSACTION;
+    // a `AND CHAIN` suffix is a syntax error there (42601), which happens
+    // naturally because the suffix is only ever stripped for the
+    // termination commands: `BEGIN AND CHAIN` reaches the SQL parser
+    // unstripped and is rejected.
+    if matches!(
+        normalized,
+        "BEGIN" | "BEGIN WORK" | "BEGIN TRANSACTION" | "START TRANSACTION"
+    ) {
         if conn.txn.is_some() {
             // Already in a transaction — PostgreSQL sends a WARNING but doesn't fail
             send_error(
@@ -658,23 +701,51 @@ fn handle_query(
     }
 
     // ── COMMIT — commit the current transaction ──
-    if upper == "COMMIT" || upper == "END" {
+    // PostgreSQL accepts COMMIT [WORK|TRANSACTION] and END [WORK|TRANSACTION]
+    // (COMMIT TRANSACTION / END TRANSACTION are PostgreSQL extensions).
+    if matches!(
+        normalized,
+        "COMMIT" | "COMMIT WORK" | "COMMIT TRANSACTION" | "END" | "END WORK" | "END TRANSACTION"
+    ) {
         if let Some(mut txn) = conn.txn.take() {
             if conn.txn_failed {
                 // Failed transaction — COMMIT acts as ROLLBACK
                 db.unregister_snapshot(txn.read_seq);
                 conn.txn_failed = false;
                 send_command_complete(stream, "ROLLBACK")?;
+                if chain {
+                    let txn = tm.begin();
+                    conn.txn = Some(txn);
+                    conn.txn_failed = false;
+                }
             } else {
                 match tm.commit(&mut txn) {
                     Ok(_) => {
                         send_command_complete(stream, "COMMIT")?;
+                        // AND CHAIN: open a new transaction with the same
+                        // characteristics, exactly like PostgreSQL. There
+                        // is always a transaction to chain from here, so
+                        // this cannot fail.
+                        if chain {
+                            let txn = tm.begin();
+                            conn.txn = Some(txn);
+                            conn.txn_failed = false;
+                        }
                     }
                     Err(e) => {
                         send_error(stream, "ERROR", "40001", &format!("COMMIT failed: {}", e))?;
                     }
                 }
             }
+        } else if chain {
+            // `COMMIT AND CHAIN` outside a transaction block is an error in
+            // PostgreSQL, unlike plain COMMIT which only warns.
+            send_error(
+                stream,
+                "ERROR",
+                "25P01",
+                "there is no transaction in progress",
+            )?;
         } else {
             // No transaction — PostgreSQL sends a WARNING
             send_error(
@@ -690,11 +761,35 @@ fn handle_query(
     }
 
     // ── ROLLBACK — abort the current transaction ──
-    if upper == "ROLLBACK" || upper == "ABORT" {
+    // PostgreSQL accepts ROLLBACK [WORK|TRANSACTION] and ABORT [WORK|
+    // TRANSACTION] (the TRANSACTION spellings are PostgreSQL extensions).
+    if matches!(
+        normalized,
+        "ROLLBACK"
+            | "ROLLBACK WORK"
+            | "ROLLBACK TRANSACTION"
+            | "ABORT"
+            | "ABORT WORK"
+            | "ABORT TRANSACTION"
+    ) {
         if let Some(txn) = conn.txn.take() {
             db.unregister_snapshot(txn.read_seq);
             conn.txn_failed = false;
             send_command_complete(stream, "ROLLBACK")?;
+            if chain {
+                let txn = tm.begin();
+                conn.txn = Some(txn);
+                conn.txn_failed = false;
+            }
+        } else if chain {
+            // `ROLLBACK AND CHAIN` outside a transaction block is an error in
+            // PostgreSQL, unlike plain ROLLBACK which only warns.
+            send_error(
+                stream,
+                "ERROR",
+                "25P01",
+                "there is no transaction in progress",
+            )?;
         } else {
             send_error(
                 stream,
@@ -721,7 +816,9 @@ fn handle_query(
     }
 
     // ── SELECT 1 / SELECT VERSION — compatibility shortcuts ──
-    if upper == "SELECT 1" || upper.starts_with("SELECT VERSION") {
+    // #110 tracks real literal-SELECT support in the parser; until then these
+    // health-check shortcuts answer any case and spacing combination.
+    if normalized == "SELECT 1" || normalized.starts_with("SELECT VERSION") {
         send_row_description(stream, &[("version", 25)])?;
         send_data_row(stream, &["OmniKV 0.1.0 — Distributed KV Engine"])?;
         send_command_complete(stream, "SELECT 1")?;

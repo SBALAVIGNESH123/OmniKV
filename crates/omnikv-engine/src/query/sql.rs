@@ -1102,4 +1102,79 @@ mod tests {
             _ => panic!("Expected Select"),
         }
     }
+
+    #[test]
+    fn test_full_lowercase_statement_parses_identically() {
+        // Issue #109: SQL keywords are case-insensitive per the SQL standard.
+        let stmt = parse_sql(
+            "create table if not exists users (id integer primary key, name text not null)",
+        )
+        .expect("lowercase DDL must parse");
+        match stmt {
+            SqlStatement::CreateTable { name, columns, .. } => {
+                assert_eq!(name, "users");
+                assert!(columns[0].primary_key);
+                assert!(!columns[1].nullable);
+            }
+            _ => panic!("Expected CreateTable"),
+        }
+    }
+
+    #[test]
+    fn test_mixed_case_dml_parses_identically() {
+        let plain = parse_sql("Insert Into users (id, name) Values (1, 'Bala')")
+            .expect("mixed-case INSERT must parse");
+        match plain {
+            SqlStatement::Insert {
+                table,
+                columns,
+                values,
+            } => {
+                assert_eq!(table, "users");
+                assert_eq!(columns, vec!["id", "name"]);
+                assert_eq!(values.len(), 1);
+            }
+            _ => panic!("Expected Insert"),
+        }
+    }
+
+    #[test]
+    fn test_lowercase_select_with_join_group_order_limit() {
+        // Note: the parser does not support table aliases; the case matrix
+        // below uses fully qualified names like the existing join tests.
+        let stmt = parse_sql(
+            "select users.id, count(*) from users join orders on users.id = orders.user_id where users.id > 5 group by users.id having count(*) > 2 order by users.id desc limit 10 offset 2",
+        )
+        .expect("lowercase SELECT must parse");
+        match stmt {
+            SqlStatement::Select {
+                from,
+                where_clause,
+                group_by,
+                having,
+                order_by,
+                limit,
+                offset,
+                ..
+            } => {
+                assert!(matches!(from, FromClause::Join { .. }));
+                assert!(where_clause.is_some());
+                assert_eq!(group_by, vec!["users.id"]);
+                assert!(having.is_some());
+                assert_eq!(order_by.len(), 1);
+                assert!(order_by[0].desc);
+                assert_eq!(limit, Some(10));
+                assert_eq!(offset, Some(2));
+            }
+            _ => panic!("Expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_lowercase_update_delete_and_show_tables() {
+        parse_sql("update users set name = 'bala' where id = 1").expect("lowercase UPDATE");
+        parse_sql("delete from users where id = 1").expect("lowercase DELETE");
+        parse_sql("show tables").expect("lowercase SHOW TABLES");
+        parse_sql("Explain Select * From users").expect("mixed-case EXPLAIN");
+    }
 }

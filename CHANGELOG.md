@@ -4,6 +4,24 @@
 
 ### Fixed
 
+- SQL keywords and transaction statements now behave identically in any case
+  or spacing combination (issue #109). DBAPI drivers (psycopg2, pg8000) with
+  autocommit off implicitly send lowercase `begin transaction` at session
+  start, which previously failed with SQLSTATE `42601`; the PgWire command
+  dispatcher now accepts the full PostgreSQL variant set — `BEGIN
+  [WORK|TRANSACTION]`, `START TRANSACTION`, `COMMIT [WORK|TRANSACTION]`,
+  `END [WORK|TRANSACTION]`, `ROLLBACK [WORK|TRANSACTION]`,
+  `ABORT [WORK|TRANSACTION]`, with the optional `AND [NO] CHAIN` suffix
+  on the termination commands (COMMIT, END, ROLLBACK, ABORT) only, plus `SET` and the `SELECT 1` health shortcut, in any
+  case/spacing, via whitespace-normalized dispatch. `AND CHAIN` opens a new
+  transaction immediately after the commit or rollback and errors with
+  `25P01` when no transaction is open, matching PostgreSQL. The legacy KV
+  query parser's `key` filter column is also case-insensitive now, matching
+  the prepared-statement parser. Verified live end to end with pg8000 in
+  non-autocommit mode: implicit `begin transaction`, lowercase DML, and
+  mixed-case statements all work. (Extended-protocol `commit()` is a
+  separate gap, tracked in #119.)
+
 - PgWire connections now handle the PostgreSQL SSLRequest and GSSENCRequest
   negotiation packets that libpq-based clients (psql, JDBC, psycopg2, pg8000,
   node-postgres) send by default before the StartupMessage. The server
