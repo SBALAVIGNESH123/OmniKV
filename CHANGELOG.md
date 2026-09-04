@@ -11,8 +11,8 @@
   dispatcher now accepts the full PostgreSQL variant set — `BEGIN
   [WORK|TRANSACTION]`, `START TRANSACTION`, `COMMIT [WORK|TRANSACTION]`,
   `END [WORK|TRANSACTION]`, `ROLLBACK [WORK|TRANSACTION]`,
-  `ABORT [WORK|TRANSACTION]`, each with the optional `AND [NO] CHAIN`
-  suffix — plus `SET` and the `SELECT 1` health shortcut, in any
+  `ABORT [WORK|TRANSACTION]`, with the optional `AND [NO] CHAIN` suffix
+  on the termination commands (COMMIT, END, ROLLBACK, ABORT) only, plus `SET` and the `SELECT 1` health shortcut, in any
   case/spacing, via whitespace-normalized dispatch. `AND CHAIN` opens a new
   transaction immediately after the commit or rollback and errors with
   `25P01` when no transaction is open, matching PostgreSQL. The legacy KV

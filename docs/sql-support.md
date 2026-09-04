@@ -90,7 +90,7 @@ silently producing an ambiguous plan.
 | --- | --- |
 | `ALTER TABLE` | Unsupported; parser returns an `Unsupported: ALTER` error. |
 | SQL `CREATE INDEX` / `DROP INDEX` | Use the secondary-index manager API; SQL DDL is not exposed yet. |
-| Transactions through SQL text | Storage transactions exist separately; SQL transaction grammar is not exposed yet. |
+| Transactions through SQL text | Over the PgWire protocol, `BEGIN`/`COMMIT`/`ROLLBACK` (with the full PostgreSQL variant set above) are handled by the connection dispatcher. The embedded SQL parser API itself does not expose transaction grammar — use the transaction manager API directly. |
 | Foreign keys and constraints beyond primary-key column metadata | Not part of the current SQL contract. |
 | Recursive CTEs, common table expressions, triggers, stored procedures | Not implemented. |
 | Full PostgreSQL dialect compatibility | Not a current goal. OmniKV exposes a focused embedded-database SQL subset. |
