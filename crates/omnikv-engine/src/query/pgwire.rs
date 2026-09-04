@@ -638,22 +638,31 @@ fn handle_query(
         .join(" ");
 
     // PostgreSQL's transaction-control grammar allows an optional
-    // `AND [NO] CHAIN` suffix on BEGIN/COMMIT/ROLLBACK. Split it off so the
-    // statement matchers below stay exhaustive, and carry the chain flag
-    // into the semantics. `AND CHAIN` starts a new transaction with the
-    // same characteristics immediately after COMMIT/ROLLBACK; `AND NO
-    // CHAIN` (the default) does not.
+    // `AND [NO] CHAIN` suffix on the termination commands only —
+    // COMMIT/ROLLBACK and their END/ABORT aliases. BEGIN/START
+    // TRANSACTION's synopsis has no chain suffix (`BEGIN AND CHAIN` is a
+    // 42601 syntax error there), and ordinary SQL may legally end in the
+    // word CHAIN as a column name (`WHERE admin AND chain`), so the
+    // suffix is stripped only for statements led by a termination
+    // keyword. `AND CHAIN` starts a new transaction with the same
+    // characteristics immediately after COMMIT/ROLLBACK; `AND NO CHAIN`
+    // (the default) does not.
     let mut chain = false;
-    let normalized = match normalized.strip_suffix(" AND NO CHAIN") {
-        Some(rest) => rest,
-        None => {
-            if normalized.ends_with(" AND CHAIN") {
-                chain = true;
-                &normalized[..normalized.len() - " AND CHAIN".len()]
-            } else {
-                &normalized
-            }
+    let normalized = if normalized
+        .split(' ')
+        .next()
+        .is_some_and(|first| matches!(first, "COMMIT" | "END" | "ROLLBACK" | "ABORT"))
+    {
+        if let Some(rest) = normalized.strip_suffix(" AND NO CHAIN") {
+            rest
+        } else if let Some(rest) = normalized.strip_suffix(" AND CHAIN") {
+            chain = true;
+            rest
+        } else {
+            normalized.as_str()
         }
+    } else {
+        normalized.as_str()
     };
 
     // ── SET — always accept silently ──
@@ -664,7 +673,11 @@ fn handle_query(
     }
 
     // ── BEGIN — start an explicit transaction block ──
-    // PostgreSQL accepts BEGIN [WORK|TRANSACTION] and START TRANSACTION.
+    // PostgreSQL accepts BEGIN [WORK|TRANSACTION] and START TRANSACTION;
+    // a `AND CHAIN` suffix is a syntax error there (42601), which happens
+    // naturally because the suffix is only ever stripped for the
+    // termination commands: `BEGIN AND CHAIN` reaches the SQL parser
+    // unstripped and is rejected.
     if matches!(
         normalized,
         "BEGIN" | "BEGIN WORK" | "BEGIN TRANSACTION" | "START TRANSACTION"

@@ -37,10 +37,12 @@ WORK`, `COMMIT TRANSACTION`, `END`, `END WORK`, `END TRANSACTION`; `ROLLBACK`,
 `ROLLBACK WORK`, `ROLLBACK TRANSACTION`, `ABORT`, `ABORT WORK`, `ABORT
 TRANSACTION` — because DBAPI drivers implicitly send lowercase `begin
 transaction` when autocommit is off (issue #109). The `AND CHAIN` / `AND NO
-CHAIN` suffix follows PostgreSQL semantics: `AND CHAIN` opens a new
-transaction immediately after the commit or rollback, and is a hard error
-(25P01) when no transaction is open, where the plain forms only warn. Client
-`SET` statements are accepted (and ignored) in any case.
+CHAIN` suffix is part of the termination commands' grammar (COMMIT, END,
+ROLLBACK, ABORT): `AND CHAIN` opens a new transaction immediately after the
+commit or rollback, and is a hard error (25P01) when no transaction is open,
+where the plain forms only warn. It is not valid on `BEGIN` / `START
+TRANSACTION`, which reject it as a syntax error (42601) like PostgreSQL.
+Client `SET` statements are accepted (and ignored) in any case.
 
 ## Prepared query support
 

@@ -339,10 +339,34 @@ fn pgwire_commit_and_rollback_and_chain_behaves_like_postgresql() {
     // `AND CHAIN` (a PostgreSQL/SQL-standard suffix on COMMIT and ROLLBACK)
     // must start a new transaction immediately, and `AND NO CHAIN` must not.
     // With no open transaction, CHAIN is a hard error 25P01 while the plain
-    // forms only warn.
+    // forms only warn. BEGIN/START TRANSACTION take no chain suffix in
+    // PostgreSQL's grammar, so a chained BEGIN must be a 42601 syntax error
+    // that opens nothing.
     let addr = spawn_pgwire_server().expect("spawn server");
     let mut stream = TcpStream::connect(&addr).expect("connect");
     complete_handshake(&mut stream).expect("handshake");
+
+    // BEGIN AND CHAIN / BEGIN AND NO CHAIN / START TRANSACTION AND CHAIN:
+    // syntax errors, and no transaction may be opened by a rejected statement.
+    for malformed in [
+        "begin and chain",
+        "BEGIN AND NO CHAIN",
+        "start transaction and chain",
+    ] {
+        send_query(&mut stream, malformed).expect("send malformed begin");
+        let (msg_type, body) = read_message(&mut stream).expect("error frame");
+        assert_eq!(msg_type, b'E', "{malformed:?} must be a syntax error");
+        let text = String::from_utf8_lossy(&body);
+        assert!(
+            text.starts_with("SERROR") && text.contains("42601"),
+            "expected ERROR severity with 42601, got {text:?}"
+        );
+        assert_eq!(
+            read_ready_status(&mut stream),
+            b'I',
+            "{malformed:?} must not open a transaction"
+        );
+    }
 
     // COMMIT AND CHAIN with no open transaction: ERROR 25P01, session stays idle.
     send_query(&mut stream, "commit and chain").expect("send commit and chain");
