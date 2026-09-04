@@ -637,6 +637,25 @@ fn handle_query(
         .collect::<Vec<&str>>()
         .join(" ");
 
+    // PostgreSQL's transaction-control grammar allows an optional
+    // `AND [NO] CHAIN` suffix on BEGIN/COMMIT/ROLLBACK. Split it off so the
+    // statement matchers below stay exhaustive, and carry the chain flag
+    // into the semantics. `AND CHAIN` starts a new transaction with the
+    // same characteristics immediately after COMMIT/ROLLBACK; `AND NO
+    // CHAIN` (the default) does not.
+    let mut chain = false;
+    let normalized = match normalized.strip_suffix(" AND NO CHAIN") {
+        Some(rest) => rest,
+        None => {
+            if normalized.ends_with(" AND CHAIN") {
+                chain = true;
+                &normalized[..normalized.len() - " AND CHAIN".len()]
+            } else {
+                &normalized
+            }
+        }
+    };
+
     // ── SET — always accept silently ──
     if normalized == "SET" || normalized.starts_with("SET ") {
         send_command_complete(stream, "SET")?;
@@ -646,11 +665,10 @@ fn handle_query(
 
     // ── BEGIN — start an explicit transaction block ──
     // PostgreSQL accepts BEGIN [WORK|TRANSACTION] and START TRANSACTION.
-    if normalized == "BEGIN"
-        || normalized == "BEGIN WORK"
-        || normalized == "BEGIN TRANSACTION"
-        || normalized == "START TRANSACTION"
-    {
+    if matches!(
+        normalized,
+        "BEGIN" | "BEGIN WORK" | "BEGIN TRANSACTION" | "START TRANSACTION"
+    ) {
         if conn.txn.is_some() {
             // Already in a transaction — PostgreSQL sends a WARNING but doesn't fail
             send_error(
@@ -670,28 +688,51 @@ fn handle_query(
     }
 
     // ── COMMIT — commit the current transaction ──
-    // PostgreSQL accepts COMMIT [WORK] and END [WORK].
-    if normalized == "COMMIT"
-        || normalized == "COMMIT WORK"
-        || normalized == "END"
-        || normalized == "END WORK"
-    {
+    // PostgreSQL accepts COMMIT [WORK|TRANSACTION] and END [WORK|TRANSACTION]
+    // (COMMIT TRANSACTION / END TRANSACTION are PostgreSQL extensions).
+    if matches!(
+        normalized,
+        "COMMIT" | "COMMIT WORK" | "COMMIT TRANSACTION" | "END" | "END WORK" | "END TRANSACTION"
+    ) {
         if let Some(mut txn) = conn.txn.take() {
             if conn.txn_failed {
                 // Failed transaction — COMMIT acts as ROLLBACK
                 db.unregister_snapshot(txn.read_seq);
                 conn.txn_failed = false;
                 send_command_complete(stream, "ROLLBACK")?;
+                if chain {
+                    let txn = tm.begin();
+                    conn.txn = Some(txn);
+                    conn.txn_failed = false;
+                }
             } else {
                 match tm.commit(&mut txn) {
                     Ok(_) => {
                         send_command_complete(stream, "COMMIT")?;
+                        // AND CHAIN: open a new transaction with the same
+                        // characteristics, exactly like PostgreSQL. There
+                        // is always a transaction to chain from here, so
+                        // this cannot fail.
+                        if chain {
+                            let txn = tm.begin();
+                            conn.txn = Some(txn);
+                            conn.txn_failed = false;
+                        }
                     }
                     Err(e) => {
                         send_error(stream, "ERROR", "40001", &format!("COMMIT failed: {}", e))?;
                     }
                 }
             }
+        } else if chain {
+            // `COMMIT AND CHAIN` outside a transaction block is an error in
+            // PostgreSQL, unlike plain COMMIT which only warns.
+            send_error(
+                stream,
+                "ERROR",
+                "25P01",
+                "there is no transaction in progress",
+            )?;
         } else {
             // No transaction — PostgreSQL sends a WARNING
             send_error(
@@ -707,16 +748,35 @@ fn handle_query(
     }
 
     // ── ROLLBACK — abort the current transaction ──
-    // PostgreSQL accepts ROLLBACK [WORK] and ABORT [WORK].
-    if normalized == "ROLLBACK"
-        || normalized == "ROLLBACK WORK"
-        || normalized == "ABORT"
-        || normalized == "ABORT WORK"
-    {
+    // PostgreSQL accepts ROLLBACK [WORK|TRANSACTION] and ABORT [WORK|
+    // TRANSACTION] (the TRANSACTION spellings are PostgreSQL extensions).
+    if matches!(
+        normalized,
+        "ROLLBACK"
+            | "ROLLBACK WORK"
+            | "ROLLBACK TRANSACTION"
+            | "ABORT"
+            | "ABORT WORK"
+            | "ABORT TRANSACTION"
+    ) {
         if let Some(txn) = conn.txn.take() {
             db.unregister_snapshot(txn.read_seq);
             conn.txn_failed = false;
             send_command_complete(stream, "ROLLBACK")?;
+            if chain {
+                let txn = tm.begin();
+                conn.txn = Some(txn);
+                conn.txn_failed = false;
+            }
+        } else if chain {
+            // `ROLLBACK AND CHAIN` outside a transaction block is an error in
+            // PostgreSQL, unlike plain ROLLBACK which only warns.
+            send_error(
+                stream,
+                "ERROR",
+                "25P01",
+                "there is no transaction in progress",
+            )?;
         } else {
             send_error(
                 stream,

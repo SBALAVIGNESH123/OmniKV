@@ -32,10 +32,15 @@ between them does not change meaning: `select ... from ... where ...`,
 identically. Identifiers (table and column names) keep their case as written,
 matching PostgreSQL. Transaction statements over the PgWire protocol accept the
 full PostgreSQL variant set in any case and spacing combination — `BEGIN`,
-`BEGIN WORK`, `BEGIN TRANSACTION`, `START TRANSACTION`, `COMMIT`/`COMMIT
-WORK`/`END`/`END WORK`, and `ROLLBACK`/`ROLLBACK WORK`/`ABORT` — because DBAPI
-drivers implicitly send lowercase `begin transaction` when autocommit is off
-(issue #109). Client `SET` statements are accepted (and ignored) in any case.
+`BEGIN WORK`, `BEGIN TRANSACTION`, `START TRANSACTION`; `COMMIT`, `COMMIT
+WORK`, `COMMIT TRANSACTION`, `END`, `END WORK`, `END TRANSACTION`; `ROLLBACK`,
+`ROLLBACK WORK`, `ROLLBACK TRANSACTION`, `ABORT`, `ABORT WORK`, `ABORT
+TRANSACTION` — because DBAPI drivers implicitly send lowercase `begin
+transaction` when autocommit is off (issue #109). The `AND CHAIN` / `AND NO
+CHAIN` suffix follows PostgreSQL semantics: `AND CHAIN` opens a new
+transaction immediately after the commit or rollback, and is a hard error
+(25P01) when no transaction is open, where the plain forms only warn. Client
+`SET` statements are accepted (and ignored) in any case.
 
 ## Prepared query support
 

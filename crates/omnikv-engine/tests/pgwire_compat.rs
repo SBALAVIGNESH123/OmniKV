@@ -296,10 +296,30 @@ fn pgwire_transaction_statement_keywords_accept_any_case_and_variant() {
         "session must report in-transaction ('T') after begin"
     );
 
-    // Close with every COMMIT/END variant. The first is a real commit; the
-    // rest run with no open transaction and get a WARNING first, exactly
-    // like PostgreSQL — then CommandComplete and idle status.
-    for variant in ["commit", "Commit  Work", "end", "END WORK"] {
+    // COMMIT TRANSACTION is a documented PostgreSQL extension and must work
+    // like plain COMMIT.
+    send_query(&mut stream, "commit transaction").expect("send commit transaction");
+    assert_eq!(
+        read_command_complete(&mut stream).as_str(),
+        "COMMIT",
+        "commit transaction must return CommandComplete COMMIT"
+    );
+    assert_eq!(
+        read_ready_status(&mut stream),
+        b'I',
+        "transaction must be closed after commit transaction"
+    );
+
+    // Close with every remaining COMMIT/END variant. These run with no open
+    // transaction and get a WARNING first, exactly like PostgreSQL — then
+    // CommandComplete and idle status.
+    for variant in [
+        "commit",
+        "Commit  Work",
+        "end",
+        "END WORK",
+        "End Transaction",
+    ] {
         send_query(&mut stream, variant).expect("send commit variant");
         assert_eq!(
             read_command_complete(&mut stream).as_str(),
@@ -312,6 +332,80 @@ fn pgwire_transaction_statement_keywords_accept_any_case_and_variant() {
             "transaction must be closed after {variant:?}"
         );
     }
+}
+
+#[test]
+fn pgwire_commit_and_rollback_and_chain_behaves_like_postgresql() {
+    // `AND CHAIN` (a PostgreSQL/SQL-standard suffix on COMMIT and ROLLBACK)
+    // must start a new transaction immediately, and `AND NO CHAIN` must not.
+    // With no open transaction, CHAIN is a hard error 25P01 while the plain
+    // forms only warn.
+    let addr = spawn_pgwire_server().expect("spawn server");
+    let mut stream = TcpStream::connect(&addr).expect("connect");
+    complete_handshake(&mut stream).expect("handshake");
+
+    // COMMIT AND CHAIN with no open transaction: ERROR 25P01, session stays idle.
+    send_query(&mut stream, "commit and chain").expect("send commit and chain");
+    let (msg_type, body) = read_message(&mut stream).expect("error frame");
+    assert_eq!(msg_type, b'E', "COMMIT AND CHAIN outside a txn must error");
+    let text = String::from_utf8_lossy(&body);
+    assert!(
+        text.starts_with("SERROR") && text.contains("25P01"),
+        "expected ERROR severity with 25P01, got {text:?}"
+    );
+    assert_eq!(read_ready_status(&mut stream), b'I');
+
+    // COMMIT AND NO CHAIN outside a transaction is the plain form: WARNING,
+    // then CommandComplete, still idle.
+    send_query(&mut stream, "commit and no chain").expect("send commit and no chain");
+    assert_eq!(
+        read_command_complete(&mut stream).as_str(),
+        "COMMIT",
+        "COMMIT AND NO CHAIN must complete like plain COMMIT"
+    );
+    assert_eq!(read_ready_status(&mut stream), b'I');
+
+    // begin → COMMIT AND CHAIN: commits, then a NEW transaction is open ('T').
+    send_query(&mut stream, "begin").expect("send begin");
+    assert_eq!(read_command_complete(&mut stream).as_str(), "BEGIN");
+    assert_eq!(read_ready_status(&mut stream), b'T');
+    send_query(&mut stream, "commit and chain").expect("send commit and chain");
+    assert_eq!(
+        read_command_complete(&mut stream).as_str(),
+        "COMMIT",
+        "COMMIT AND CHAIN must commit the open transaction"
+    );
+    assert_eq!(
+        read_ready_status(&mut stream),
+        b'T',
+        "AND CHAIN must immediately open a new transaction"
+    );
+
+    // ROLLBACK TRANSACTION AND CHAIN rolls back and re-opens ('T' again).
+    send_query(&mut stream, "rollback transaction and chain").expect("send rollback and chain");
+    assert_eq!(
+        read_command_complete(&mut stream).as_str(),
+        "ROLLBACK",
+        "ROLLBACK TRANSACTION AND CHAIN must roll back"
+    );
+    assert_eq!(
+        read_ready_status(&mut stream),
+        b'T',
+        "rollback AND CHAIN must immediately open a new transaction"
+    );
+
+    // ROLLBACK WORK AND NO CHAIN closes the transaction and stays idle.
+    send_query(&mut stream, "rollback work and no chain").expect("send rollback no chain");
+    assert_eq!(
+        read_command_complete(&mut stream).as_str(),
+        "ROLLBACK",
+        "ROLLBACK WORK AND NO CHAIN must roll back without chaining"
+    );
+    assert_eq!(
+        read_ready_status(&mut stream),
+        b'I',
+        "AND NO CHAIN must leave the session idle"
+    );
 }
 
 #[test]
@@ -333,7 +427,12 @@ fn pgwire_begin_work_and_rollback_work_variants_any_case() {
             "must be in a transaction after {begin_variant:?}"
         );
 
-        for rollback_variant in ["rollback", "Rollback  Work", "abort"] {
+        for rollback_variant in [
+            "rollback",
+            "Rollback  Work",
+            "abort",
+            "Rollback Transaction",
+        ] {
             send_query(&mut stream, rollback_variant).expect("send rollback variant");
             assert_eq!(
                 read_command_complete(&mut stream).as_str(),
