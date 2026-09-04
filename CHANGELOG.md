@@ -2,6 +2,29 @@
 
 ## Unreleased
 
+### Added
+
+- PgWire now implements the extended query protocol (issue #119): `Parse`,
+  `Bind`, `Describe`, `Execute`, `Close`, `Flush`, and `Sync` are answered
+  per the PostgreSQL v3 wire contract. DBAPI drivers drive `commit()` and
+  `rollback()` and parameterized statements through these frames —
+  previously every one failed with `XX000 Unsupported message type` — and
+  now work end to end: live-verified with pg8000 in non-autocommit mode
+  (implicit `begin transaction`, INSERT with `$1`/`$2` bindings,
+  `conn.commit()`, `conn.rollback()`, committed data visible on a fresh
+  connection). The implementation stores named and unnamed statements and
+  portals with PostgreSQL's replacement semantics, binds parameters as
+  text (binary format is rejected with `08P01`), derives `Describe` row
+  shapes side-effect-free from the parsed statement, and follows the
+  skip-until-`Sync` error rule: an extended-protocol error sends the
+  ErrorResponse, fails the open transaction, and skips every message until
+  the next `Sync` answers `ReadyForQuery`. Benign warnings now travel as
+  `NoticeResponse` ('N') frames instead of `ErrorResponse` — drivers raise
+  on any ErrorResponse, so a COMMIT-outside-transaction warning must never
+  be one. Both wire protocols run one shared execution core, so transaction
+  semantics cannot drift between the simple and extended paths. (Write
+  buffering inside explicit transactions remains a separate gap, #121.)
+
 ### Fixed
 
 - SQL keywords and transaction statements now behave identically in any case

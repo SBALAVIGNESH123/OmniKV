@@ -18,6 +18,7 @@
 //!   |--- Terminate ---------------->|
 //! ```
 
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::sync::Arc;
@@ -50,10 +51,24 @@ const DATA_ROW: u8 = b'D';
 const COMMAND_COMPLETE: u8 = b'C';
 const ERROR_RESPONSE: u8 = b'E';
 const PARAMETER_STATUS: u8 = b'S';
+const NOTICE_RESPONSE: u8 = b'N';
 
 /// PostgreSQL wire protocol message types (client -> server)
 const QUERY_MSG: u8 = b'Q';
 const TERMINATE_MSG: u8 = b'X';
+const PARSE_MSG: u8 = b'P';
+const BIND_MSG: u8 = b'B';
+const DESCRIBE_MSG: u8 = b'D';
+const EXECUTE_MSG: u8 = b'E';
+const CLOSE_MSG: u8 = b'C';
+const FLUSH_MSG: u8 = b'H';
+const SYNC_MSG: u8 = b'S';
+
+/// PostgreSQL wire protocol message types (server -> client, extended only)
+const PARSE_COMPLETE: u8 = b'1';
+const BIND_COMPLETE: u8 = b'2';
+const CLOSE_COMPLETE: u8 = b'3';
+const NO_DATA: u8 = b'n';
 
 /// Per-connection transaction state for PgWire sessions.
 /// Tracks whether the client is in an explicit transaction block.
@@ -64,6 +79,27 @@ struct ConnectionState {
     /// All subsequent commands (except ROLLBACK) return error until
     /// the client issues ROLLBACK.
     txn_failed: bool,
+    /// Named prepared statements from the extended protocol's Parse
+    /// message. The unnamed statement is stored under the empty name and,
+    /// per PostgreSQL semantics, is overwritten by every Parse with an
+    /// empty name and lasts only until the next Parse of any kind.
+    named_statements: HashMap<String, String>,
+    /// Bound portals awaiting Execute. The unnamed portal is stored under
+    /// the empty name and is destroyed by any Bind (not only an unnamed
+    /// one), matching PostgreSQL.
+    portals: HashMap<String, Portal>,
+    /// After an extended-protocol error, the pipeline is aborted: every
+    /// message except Sync (and Terminate) is skipped without execution
+    /// until the next Sync, exactly like PostgreSQL's error rule.
+    extended_error_pending: bool,
+}
+
+/// A bound portal: a parsed statement with its Bind-parameter values,
+/// ready to Execute. Values are already resolved to text (format code 0)
+/// or rejected at Bind time.
+struct Portal {
+    sql: String,
+    params: Vec<Option<String>>,
 }
 
 impl ConnectionState {
@@ -71,6 +107,9 @@ impl ConnectionState {
         Self {
             txn: None,
             txn_failed: false,
+            named_statements: HashMap::new(),
+            portals: HashMap::new(),
+            extended_error_pending: false,
         }
     }
 
@@ -85,6 +124,48 @@ impl ConnectionState {
             b'T'
         } else {
             b'I'
+        }
+    }
+}
+
+/// The structured outcome of executing one statement, produced by the
+/// protocol-neutral execution core and rendered differently by the simple
+/// ('Q') and extended (Parse/Bind/Execute) protocol writers.
+#[derive(Debug, Clone, PartialEq)]
+enum StepOutcome {
+    /// Statement executed; the tag is the CommandComplete tag (e.g.
+    /// "BEGIN", "COMMIT", "SELECT 3", "INSERT 0 1").
+    Complete(String),
+    /// Statement produced a row set: (columns, rows) with the final
+    /// CommandComplete tag appended by the writer.
+    Rows {
+        columns: Vec<(String, i32)>,
+        rows: Vec<Vec<String>>,
+        tag: String,
+    },
+    /// Benign warning (e.g. COMMIT with no open transaction) — the frame is
+    /// WARNING-severity, followed by the completion tag, matching
+    /// PostgreSQL's notice-then-complete sequence.
+    Warning {
+        code: String,
+        message: String,
+        tag: String,
+    },
+    /// Hard error (SQLSTATE + message). In the simple protocol the writer
+    /// sends an ErrorResponse; in the extended protocol the pipeline is
+    /// aborted and the connection skips messages until Sync.
+    Error { code: String, message: String },
+}
+
+impl StepOutcome {
+    fn complete(tag: impl Into<String>) -> Self {
+        StepOutcome::Complete(tag.into())
+    }
+
+    fn error(code: &str, message: impl Into<String>) -> Self {
+        StepOutcome::Error {
+            code: code.to_string(),
+            message: message.into(),
         }
     }
 }
@@ -366,7 +447,46 @@ fn handle_connection(
                     send_ready_for_query_status(&mut stream, conn.ready_status())?;
                     continue;
                 }
+                conn.extended_error_pending = false;
                 handle_query(&db, &tm, &mut conn, &mut stream, &sql)?;
+            }
+            PARSE_MSG => {
+                let body = read_message_body(&mut stream)?;
+                handle_parse(
+                    &db,
+                    &tm,
+                    &mut conn,
+                    &mut stream,
+                    &body,
+                    &rate_limiter,
+                    &client_id,
+                )?;
+            }
+            BIND_MSG => {
+                let body = read_message_body(&mut stream)?;
+                handle_bind(&mut conn, &mut stream, &body)?;
+            }
+            DESCRIBE_MSG => {
+                let body = read_message_body(&mut stream)?;
+                handle_describe(&mut conn, &mut stream, &body)?;
+            }
+            EXECUTE_MSG => {
+                let body = read_message_body(&mut stream)?;
+                handle_execute(&db, &tm, &mut conn, &mut stream, &body)?;
+            }
+            CLOSE_MSG => {
+                let body = read_message_body(&mut stream)?;
+                handle_close(&mut conn, &mut stream, &body)?;
+            }
+            FLUSH_MSG => {
+                let _ = read_message_body(&mut stream)?;
+                // Flush has no body beyond the length; just drain the socket.
+                let _ = stream.flush();
+            }
+            SYNC_MSG => {
+                let _ = read_message_body(&mut stream)?;
+                conn.extended_error_pending = false;
+                send_ready_for_query_status(&mut stream, conn.ready_status())?;
             }
             TERMINATE_MSG => {
                 let _ = read_message_body(&mut stream)?;
@@ -612,7 +732,514 @@ fn validate_pgwire_body_len(len: usize, context: &str) -> std::io::Result<usize>
     Ok(body_len)
 }
 
-/// Handle a SQL query and send results back.
+// =====================================================================
+// Extended Query Protocol (Parse / Bind / Describe / Execute / Sync)
+// =====================================================================
+
+/// Reads a null-terminated string from the front of `buf`, returning the
+/// string and the rest of the buffer. Errors are protocol violations.
+fn take_cstr<'a>(buf: &'a [u8], what: &str) -> Result<(&'a str, &'a [u8]), String> {
+    let end = buf
+        .iter()
+        .position(|&b| b == 0)
+        .ok_or_else(|| format!("{what} is missing its null terminator"))?;
+    let s = std::str::from_utf8(&buf[..end]).map_err(|e| format!("{what} is not UTF-8: {e}"))?;
+    Ok((s, &buf[end + 1..]))
+}
+
+/// Handles a Parse ('P') message: parse-check the statement, store it under
+/// its name (the unnamed statement lives under ""), and reply ParseComplete.
+/// Per PostgreSQL, the unnamed statement is destroyed by any Parse; named
+/// statements are replaced on name collision. Parameter type OIDs sent by
+/// the client are accepted but not enforced (parameters bind as text).
+fn handle_parse(
+    db: &Arc<OmniKV>,
+    tm: &Arc<TransactionManager>,
+    conn: &mut ConnectionState,
+    stream: &mut std::net::TcpStream,
+    body: &[u8],
+    rate_limiter: &RateLimiter,
+    client_id: &str,
+) -> std::io::Result<()> {
+    if conn.extended_error_pending {
+        return Ok(());
+    }
+    if let Err(retry_after_ms) = acquire_pgwire_query_permit(rate_limiter, client_id) {
+        conn.extended_error_pending = true;
+        send_error(
+            stream,
+            "ERROR",
+            "53300",
+            &format!("rate limit exceeded; retry after {retry_after_ms}ms"),
+        )?;
+        return Ok(());
+    }
+
+    let (name, rest) = match take_cstr(body, "statement name") {
+        Ok(v) => v,
+        Err(e) => return extended_protocol_error(stream, conn, "08P01", &e),
+    };
+    let (sql, rest) = match take_cstr(rest, "query text") {
+        Ok(v) => v,
+        Err(e) => return extended_protocol_error(stream, conn, "08P01", &e),
+    };
+    // rest is: int16 parameter-type count, then that many int32 OIDs.
+    if rest.len() < 2 {
+        return extended_protocol_error(
+            stream,
+            conn,
+            "08P01",
+            "Parse message is missing the parameter type count",
+        );
+    }
+    let param_count = u16::from_be_bytes([rest[0], rest[1]]) as usize;
+    if rest.len() < 2 + param_count * 4 {
+        return extended_protocol_error(
+            stream,
+            conn,
+            "08P01",
+            "Parse message parameter type list is truncated",
+        );
+    }
+
+    // Store the raw text; the shared execution core parses at Execute time,
+    // which keeps transaction semantics identical between protocols. The
+    // unnamed statement is destroyed by ANY Parse, including a named one.
+    if name.is_empty() {
+        conn.named_statements.remove("");
+    }
+    conn.named_statements
+        .insert(name.to_string(), sql.to_string());
+
+    // Reply ParseComplete: '1' + int32(4).
+    let msg = [PARSE_COMPLETE, 0, 0, 0, 4];
+    stream.write_all(&msg)
+}
+
+/// Handles a Bind ('B') message: resolve the statement (by name or the
+/// unnamed statement), bind the parameter values into a portal, and reply
+/// BindComplete. Per PostgreSQL, the unnamed portal is destroyed by ANY
+/// Bind, and a Bind of an unknown statement is a 26000 error that aborts
+/// the pipeline until Sync.
+fn handle_bind(
+    conn: &mut ConnectionState,
+    stream: &mut std::net::TcpStream,
+    body: &[u8],
+) -> std::io::Result<()> {
+    if conn.extended_error_pending {
+        return Ok(());
+    }
+
+    let (portal_name, rest) = match take_cstr(body, "portal name") {
+        Ok(v) => v,
+        Err(e) => return extended_protocol_error(stream, conn, "08P01", &e),
+    };
+    let (stmt_name, rest) = match take_cstr(rest, "statement name") {
+        Ok(v) => v,
+        Err(e) => return extended_protocol_error(stream, conn, "08P01", &e),
+    };
+
+    let sql = match conn.named_statements.get(stmt_name) {
+        Some(sql) => sql.clone(),
+        None => {
+            let msg = format!("prepared statement \"{stmt_name}\" does not exist");
+            return extended_protocol_error(stream, conn, "26000", &msg);
+        }
+    };
+
+    // The three Bind lists are each: int16 count, then entries. Format
+    // codes are int16 each (0 = text, 1 = binary); values are int32 length
+    // + bytes with -1 meaning NULL. A format-code count of 0 means "all
+    // text", and a count of 1 means "applies to all parameters".
+    let (format_codes, rest) = match read_bind_list(rest, "parameter format codes", true) {
+        Ok(v) => v,
+        Err(e) => return extended_protocol_error(stream, conn, "08P01", &e),
+    };
+    let (raw_values, rest) = match read_bind_list(rest, "parameter values", false) {
+        Ok(v) => v,
+        Err(e) => return extended_protocol_error(stream, conn, "08P01", &e),
+    };
+    let (_result_formats, _rest) = match read_bind_list(rest, "result format codes", true) {
+        Ok(v) => v,
+        Err(e) => return extended_protocol_error(stream, conn, "08P01", &e),
+    };
+
+    if format_codes.len() > 1 && format_codes.len() != raw_values.len() {
+        return extended_protocol_error(
+            stream,
+            conn,
+            "08P01",
+            "parameter format code count does not match parameter count",
+        );
+    }
+    if format_codes.iter().any(Option::is_some) {
+        return extended_protocol_error(
+            stream,
+            conn,
+            "08P01",
+            "binary parameter format is not supported; use text format (0)",
+        );
+    }
+
+    let params: Vec<Option<String>> = raw_values
+        .into_iter()
+        .map(|v| v.map(|bytes| String::from_utf8_lossy(bytes.as_slice()).into_owned()))
+        .collect();
+
+    // Any Bind destroys the unnamed portal (PostgreSQL semantics).
+    conn.portals.remove("");
+    conn.portals
+        .insert(portal_name.to_string(), Portal { sql, params });
+
+    // Reply BindComplete: '2' + int32(4).
+    let msg = [BIND_COMPLETE, 0, 0, 0, 4];
+    stream.write_all(&msg)
+}
+
+/// One decoded Bind list entry: `None` is a NULL value (or the "all text"
+/// format-code slot), `Some(bytes)` is a raw value (or a non-text format).
+type BindList = Vec<Option<Vec<u8>>>;
+
+/// Reads one of Bind's int16-count-prefixed lists. When `is_format` is set,
+/// entries are int16 format codes (0 text, 1 binary) and are returned as
+/// Some(code) / None for "all text"; value entries are int32 length + bytes
+/// with -1 as NULL.
+fn read_bind_list<'a>(
+    buf: &'a [u8],
+    what: &str,
+    is_format: bool,
+) -> Result<(BindList, &'a [u8]), String> {
+    if buf.len() < 2 {
+        return Err(format!("{what} is missing its count"));
+    }
+    let count = u16::from_be_bytes([buf[0], buf[1]]) as usize;
+    let mut rest = &buf[2..];
+    let mut out = Vec::with_capacity(count);
+    for _ in 0..count {
+        if is_format {
+            if rest.len() < 2 {
+                return Err(format!("{what} entry is truncated"));
+            }
+            let code = i16::from_be_bytes([rest[0], rest[1]]);
+            rest = &rest[2..];
+            out.push(if code == 0 { None } else { Some(vec![1]) });
+        } else {
+            if rest.len() < 4 {
+                return Err(format!("{what} entry is truncated"));
+            }
+            let len = i32::from_be_bytes([rest[0], rest[1], rest[2], rest[3]]);
+            rest = &rest[4..];
+            if len < 0 {
+                out.push(None);
+            } else {
+                let n = usize::try_from(len).map_err(|_| format!("{what} length is huge"))?;
+                if rest.len() < n {
+                    return Err(format!("{what} entry is truncated"));
+                }
+                out.push(Some(rest[..n].to_vec()));
+                rest = &rest[n..];
+            }
+        }
+    }
+    Ok((out, rest))
+}
+
+/// Derives a display label for a SELECT column for RowDescription, the
+/// way PostgreSQL names result columns. `Star` and aggregates get their
+/// canonical function labels; named columns keep their name.
+fn select_column_label(col: &crate::sql::SelectColumn) -> String {
+    use crate::sql::{AggFunc, SelectColumn, WindowFuncType};
+    let func_name = |agg: &AggFunc| match agg {
+        AggFunc::Count => "count",
+        AggFunc::Sum => "sum",
+        AggFunc::Avg => "avg",
+        AggFunc::Min => "min",
+        AggFunc::Max => "max",
+    };
+    let window_name = |w: &WindowFuncType| match w {
+        WindowFuncType::RowNumber => "row_number",
+        WindowFuncType::Rank => "rank",
+        WindowFuncType::DenseRank => "dense_rank",
+    };
+    match col {
+        SelectColumn::Star => "?column?".to_string(),
+        SelectColumn::Named(name) => name.clone(),
+        SelectColumn::Qualified(table, column) => format!("{table}.{column}"),
+        SelectColumn::Aggregate(func, arg) => format!("{}({arg})", func_name(func)),
+        SelectColumn::WindowFunc { func, .. } => window_name(func).to_string(),
+    }
+}
+
+/// Handles Describe ('D'): 'S' describes a statement, 'P' a portal. Both
+/// reply the statement's row shape - RowDescription for row-returning
+/// statements, NoData otherwise. Describe is side-effect-free, exactly
+/// like PostgreSQL's plan-based Describe: pg8000's execute_unnamed sends
+/// Parse/Describe/Sync before every unnamed statement, so executing the
+/// statement here would double-run every query (committing at Describe
+/// time and failing at Execute time). Instead the shape is derived from
+/// the parsed statement alone.
+fn handle_describe(
+    conn: &mut ConnectionState,
+    stream: &mut std::net::TcpStream,
+    body: &[u8],
+) -> std::io::Result<()> {
+    if conn.extended_error_pending {
+        return Ok(());
+    }
+    if body.len() < 2 {
+        return extended_protocol_error(
+            stream,
+            conn,
+            "08P01",
+            "Describe message is missing its kind byte",
+        );
+    }
+    let kind = body[0];
+    let (name, _rest) = match take_cstr(&body[1..], "describe target name") {
+        Ok(v) => v,
+        Err(e) => return extended_protocol_error(stream, conn, "08P01", &e),
+    };
+
+    let sql: String = match kind {
+        b'S' => match conn.named_statements.get(name) {
+            Some(sql) => sql.clone(),
+            None => {
+                let msg = format!("prepared statement \"{name}\" does not exist");
+                return extended_protocol_error(stream, conn, "26000", &msg);
+            }
+        },
+        b'P' => match conn.portals.get(name) {
+            Some(portal) => portal.sql.clone(),
+            None => {
+                let msg = format!("portal \"{name}\" does not exist");
+                return extended_protocol_error(stream, conn, "34000", &msg);
+            }
+        },
+        other => {
+            let msg = format!("unknown Describe kind {other:#x}");
+            return extended_protocol_error(stream, conn, "08P01", &msg);
+        }
+    };
+
+    // Derive the row shape from the statement text without executing it.
+    // Only SELECT-shaped statements (SQL SELECT, the SELECT 1/VERSION
+    // shortcuts, and legacy KV SELECT forms) produce rows; a column name
+    // cannot be derived without executing for arbitrary expressions, so
+    // row statements reply a single text column like the simple path's
+    // shortcuts do. Everything else replies NoData.
+    let sql_trimmed = sql.trim().trim_end_matches(';');
+    let normalized = sql_trimmed
+        .to_uppercase()
+        .split_whitespace()
+        .collect::<Vec<&str>>()
+        .join(" ");
+
+    let row_columns: Option<Vec<(String, i32)>> =
+        if normalized == "SELECT 1" || normalized.starts_with("SELECT VERSION") {
+            Some(vec![("version".to_string(), 25)])
+        } else if normalized.starts_with("SELECT") || normalized.starts_with("SHOW") {
+            // Row-returning statements: derive column names from the parse when
+            // possible; fall back to a placeholder text column. Parameters are
+            // irrelevant to shape (they bind as text).
+            match crate::sql::parse_sql(sql_trimmed) {
+                Ok(crate::sql::SqlStatement::Select { columns, .. }) => Some(
+                    columns
+                        .iter()
+                        .map(|c| (select_column_label(c), 25))
+                        .collect(),
+                ),
+                _ => Some(vec![("column".to_string(), 25)]),
+            }
+        } else {
+            // Legacy KV SELECT forms (SELECT * WHERE key = ...) also return rows.
+            match query::parse_query(sql_trimmed) {
+                Ok(parsed) => match parsed.action {
+                    query::Action::SelectAll => {
+                        Some(vec![("key".to_string(), 25), ("value".to_string(), 25)])
+                    }
+                    query::Action::SelectCount => Some(vec![("count".to_string(), 20)]),
+                    _ => None,
+                },
+                Err(_) => None,
+            }
+        };
+
+    match row_columns {
+        Some(cols) => {
+            let refs: Vec<(&str, i32)> = cols
+                .iter()
+                .map(|(name, oid)| (name.as_str(), *oid))
+                .collect();
+            send_row_description(stream, &refs)
+        }
+        None => {
+            // Reply NoData: 'n' + int32(4).
+            let msg = [NO_DATA, 0, 0, 0, 4];
+            stream.write_all(&msg)
+        }
+    }
+}
+
+/// Handles Execute ('E'): run the portal's statement with its bound
+/// parameters and stream the result frames. Unlike the simple protocol,
+/// Execute errors abort the pipeline: the ErrorResponse is sent and the
+/// connection skips every message until Sync (PostgreSQL's error rule).
+fn handle_execute(
+    db: &Arc<OmniKV>,
+    tm: &Arc<TransactionManager>,
+    conn: &mut ConnectionState,
+    stream: &mut std::net::TcpStream,
+    body: &[u8],
+) -> std::io::Result<()> {
+    if conn.extended_error_pending {
+        return Ok(());
+    }
+    let (portal_name, rest) = match take_cstr(body, "portal name") {
+        Ok(v) => v,
+        Err(e) => return extended_protocol_error(stream, conn, "08P01", &e),
+    };
+    // int32 max rows (0 = unlimited); the row cap is enforced by the
+    // statement-level limits, so the value is accepted but not applied.
+    if rest.len() < 4 {
+        return extended_protocol_error(
+            stream,
+            conn,
+            "08P01",
+            "Execute message is missing its row-count field",
+        );
+    }
+
+    let portal = match conn.portals.get(portal_name) {
+        Some(p) => p,
+        None => {
+            let msg = format!("portal \"{portal_name}\" does not exist");
+            return extended_protocol_error(stream, conn, "34000", &msg);
+        }
+    };
+    let sql = portal.sql.clone();
+    let params = portal.params.clone();
+
+    let bound = substitute_params(&sql, &params);
+    let outcome = execute_statement_core(db, tm, conn, &bound);
+    match outcome {
+        StepOutcome::Complete(tag) => send_command_complete(stream, &tag),
+        StepOutcome::Rows { columns, rows, tag } => {
+            let col_defs: Vec<(&str, i32)> =
+                columns.iter().map(|(c, oid)| (c.as_str(), *oid)).collect();
+            send_row_description(stream, &col_defs)?;
+            for row in &rows {
+                let refs: Vec<&str> = row.iter().map(String::as_str).collect();
+                send_data_row(stream, &refs)?;
+            }
+            send_command_complete(stream, &tag)
+        }
+        // Warnings are benign (COMMIT outside a txn); the NOTICE precedes
+        // the completion tag and the pipeline continues, like PostgreSQL.
+        StepOutcome::Warning { code, message, tag } => {
+            send_error(stream, "WARNING", &code, &message)?;
+            send_command_complete(stream, &tag)
+        }
+        StepOutcome::Error { code, message } => {
+            extended_protocol_error(stream, conn, &code, &message)
+        }
+    }
+}
+
+/// Handles Close ('C'): destroy a named statement or portal and reply
+/// CloseComplete. Closing a nonexistent name is NOT an error in PostgreSQL.
+fn handle_close(
+    conn: &mut ConnectionState,
+    stream: &mut std::net::TcpStream,
+    body: &[u8],
+) -> std::io::Result<()> {
+    if conn.extended_error_pending {
+        return Ok(());
+    }
+    if body.len() < 2 {
+        return extended_protocol_error(
+            stream,
+            conn,
+            "08P01",
+            "Close message is missing its kind byte",
+        );
+    }
+    let kind = body[0];
+    let (name, _rest) = match take_cstr(&body[1..], "close target name") {
+        Ok(v) => v,
+        Err(e) => return extended_protocol_error(stream, conn, "08P01", &e),
+    };
+    match kind {
+        b'S' => {
+            conn.named_statements.remove(name);
+        }
+        b'P' => {
+            conn.portals.remove(name);
+        }
+        other => {
+            let msg = format!("unknown Close kind {other:#x}");
+            return extended_protocol_error(stream, conn, "08P01", &msg);
+        }
+    }
+    // Reply CloseComplete: '3' + int32(4).
+    let msg = [CLOSE_COMPLETE, 0, 0, 0, 4];
+    stream.write_all(&msg)
+}
+
+/// Sends an ERROR-severity ErrorResponse and marks the extended-protocol
+/// pipeline as aborted: subsequent Parse/Bind/Describe/Execute/Close are
+/// skipped until the next Sync, which clears the flag and sends
+/// ReadyForQuery. This is PostgreSQL's skip-until-Sync error rule. Errors
+/// inside a transaction block also fail the transaction, matching the
+/// simple-protocol behavior.
+fn extended_protocol_error(
+    stream: &mut std::net::TcpStream,
+    conn: &mut ConnectionState,
+    code: &str,
+    message: &str,
+) -> std::io::Result<()> {
+    conn.extended_error_pending = true;
+    if conn.txn.is_some() {
+        conn.txn_failed = true;
+    }
+    send_error(stream, "ERROR", code, message)
+}
+
+/// Substitutes `$1`, `$2`, ... parameter placeholders in a statement with
+/// the bound values (text format). An unbound or NULL parameter becomes
+/// the literal NULL, which the statement parsers reject with a syntax
+/// error; real NULL literal support is tracked by #111.
+fn substitute_params(sql: &str, params: &[Option<String>]) -> String {
+    let mut out = String::with_capacity(sql.len());
+    let bytes = sql.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'$' {
+            let mut j = i + 1;
+            while j < bytes.len() && bytes[j].is_ascii_digit() {
+                j += 1;
+            }
+            if j > i + 1 {
+                let index = &sql[i + 1..j];
+                let position = index.parse::<usize>().ok().and_then(|n| n.checked_sub(1));
+                let value = position.and_then(|idx| params.get(idx)).cloned().flatten();
+                let replacement = match value {
+                    Some(v) => v,
+                    None => "NULL".to_string(),
+                };
+                out.push_str(&replacement);
+                i = j;
+                continue;
+            }
+        }
+        let ch = sql[i..].chars().next().expect("in-bounds char");
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+/// Handle a simple-protocol ('Q') Query: run the shared execution core and
+/// render its outcome as simple-protocol frames.
 fn handle_query(
     db: &Arc<OmniKV>,
     tm: &Arc<TransactionManager>,
@@ -620,12 +1247,54 @@ fn handle_query(
     stream: &mut std::net::TcpStream,
     sql: &str,
 ) -> std::io::Result<()> {
+    write_step_outcome_simple(stream, execute_statement_core(db, tm, conn, sql))?;
+    send_ready_for_query_status(stream, conn.ready_status())
+}
+
+/// Render one core outcome as simple-protocol frames. A WARNING-severity
+/// ErrorResponse is followed by the completion tag, matching PostgreSQL.
+fn write_step_outcome_simple(
+    stream: &mut std::net::TcpStream,
+    outcome: StepOutcome,
+) -> std::io::Result<()> {
+    match outcome {
+        StepOutcome::Complete(tag) => send_command_complete(stream, &tag)?,
+        StepOutcome::Rows { columns, rows, tag } => {
+            let col_defs: Vec<(&str, i32)> =
+                columns.iter().map(|(c, oid)| (c.as_str(), *oid)).collect();
+            send_row_description(stream, &col_defs)?;
+            for row in &rows {
+                let refs: Vec<&str> = row.iter().map(String::as_str).collect();
+                send_data_row(stream, &refs)?;
+            }
+            send_command_complete(stream, &tag)?;
+        }
+        StepOutcome::Warning { code, message, tag } => {
+            send_error(stream, "WARNING", &code, &message)?;
+            send_command_complete(stream, &tag)?;
+        }
+        StepOutcome::Error { code, message } => {
+            send_error(stream, "ERROR", &code, &message)?;
+        }
+    }
+    Ok(())
+}
+
+/// Protocol-neutral statement execution: runs one SQL string against the
+/// engine, mutating connection transaction state, and returns the
+/// structured outcome for the protocol writer to render. Both the simple
+/// ('Q') and extended (Parse/Bind/Execute) protocols run this core so
+/// transaction semantics can never drift between them.
+fn execute_statement_core(
+    db: &Arc<OmniKV>,
+    tm: &Arc<TransactionManager>,
+    conn: &mut ConnectionState,
+    sql: &str,
+) -> StepOutcome {
     let sql_trimmed = sql.trim().trim_end_matches(';');
 
     if sql_trimmed.is_empty() {
-        send_command_complete(stream, "EMPTY")?;
-        send_ready_for_query_status(stream, conn.ready_status())?;
-        return Ok(());
+        return StepOutcome::complete("EMPTY");
     }
 
     // Uppercased whitespace-normalized form for multi-word transaction
@@ -667,9 +1336,7 @@ fn handle_query(
 
     // ── SET — always accept silently ──
     if normalized == "SET" || normalized.starts_with("SET ") {
-        send_command_complete(stream, "SET")?;
-        send_ready_for_query_status(stream, conn.ready_status())?;
-        return Ok(());
+        return StepOutcome::complete("SET");
     }
 
     // ── BEGIN — start an explicit transaction block ──
@@ -684,20 +1351,16 @@ fn handle_query(
     ) {
         if conn.txn.is_some() {
             // Already in a transaction — PostgreSQL sends a WARNING but doesn't fail
-            send_error(
-                stream,
-                "WARNING",
-                "25001",
-                "there is already a transaction in progress",
-            )?;
-        } else {
-            let txn = tm.begin();
-            conn.txn = Some(txn);
-            conn.txn_failed = false;
+            return StepOutcome::Warning {
+                code: "25001".into(),
+                message: "there is already a transaction in progress".into(),
+                tag: "BEGIN".into(),
+            };
         }
-        send_command_complete(stream, "BEGIN")?;
-        send_ready_for_query_status(stream, conn.ready_status())?;
-        return Ok(());
+        let txn = tm.begin();
+        conn.txn = Some(txn);
+        conn.txn_failed = false;
+        return StepOutcome::complete("BEGIN");
     }
 
     // ── COMMIT — commit the current transaction ──
@@ -712,58 +1375,41 @@ fn handle_query(
                 // Failed transaction — COMMIT acts as ROLLBACK
                 db.unregister_snapshot(txn.read_seq);
                 conn.txn_failed = false;
-                send_command_complete(stream, "ROLLBACK")?;
                 if chain {
                     let txn = tm.begin();
                     conn.txn = Some(txn);
                     conn.txn_failed = false;
                 }
-            } else {
-                match tm.commit(&mut txn) {
-                    Ok(_) => {
-                        send_command_complete(stream, "COMMIT")?;
-                        // AND CHAIN: open a new transaction with the same
-                        // characteristics, exactly like PostgreSQL. There
-                        // is always a transaction to chain from here, so
-                        // this cannot fail.
-                        if chain {
-                            let txn = tm.begin();
-                            conn.txn = Some(txn);
-                            conn.txn_failed = false;
-                        }
+                return StepOutcome::complete("ROLLBACK");
+            }
+            match tm.commit(&mut txn) {
+                Ok(_) => {
+                    // AND CHAIN: open a new transaction with the same
+                    // characteristics, exactly like PostgreSQL. There
+                    // is always a transaction to chain from here, so
+                    // this cannot fail.
+                    if chain {
+                        let txn = tm.begin();
+                        conn.txn = Some(txn);
+                        conn.txn_failed = false;
                     }
-                    Err(e) => {
-                        send_error(stream, "ERROR", "40001", &format!("COMMIT failed: {}", e))?;
-                    }
+                    StepOutcome::complete("COMMIT")
                 }
+                Err(e) => StepOutcome::error("40001", format!("COMMIT failed: {e}")),
             }
         } else if chain {
             // `COMMIT AND CHAIN` outside a transaction block is an error in
             // PostgreSQL, unlike plain COMMIT which only warns.
-            send_error(
-                stream,
-                "ERROR",
-                "25P01",
-                "there is no transaction in progress",
-            )?;
+            StepOutcome::error("25P01", "there is no transaction in progress")
         } else {
-            // No transaction — PostgreSQL sends a WARNING
-            send_error(
-                stream,
-                "WARNING",
-                "25P01",
-                "there is no transaction in progress",
-            )?;
-            send_command_complete(stream, "COMMIT")?;
+            // No transaction — PostgreSQL sends a WARNING then completes.
+            StepOutcome::Warning {
+                code: "25P01".into(),
+                message: "there is no transaction in progress".into(),
+                tag: "COMMIT".into(),
+            }
         }
-        send_ready_for_query_status(stream, conn.ready_status())?;
-        return Ok(());
-    }
-
-    // ── ROLLBACK — abort the current transaction ──
-    // PostgreSQL accepts ROLLBACK [WORK|TRANSACTION] and ABORT [WORK|
-    // TRANSACTION] (the TRANSACTION spellings are PostgreSQL extensions).
-    if matches!(
+    } else if matches!(
         normalized,
         "ROLLBACK"
             | "ROLLBACK WORK"
@@ -772,61 +1418,63 @@ fn handle_query(
             | "ABORT WORK"
             | "ABORT TRANSACTION"
     ) {
+        // ── ROLLBACK — abort the current transaction ──
+        // PostgreSQL accepts ROLLBACK [WORK|TRANSACTION] and ABORT [WORK|
+        // TRANSACTION] (the TRANSACTION spellings are PostgreSQL extensions).
         if let Some(txn) = conn.txn.take() {
             db.unregister_snapshot(txn.read_seq);
             conn.txn_failed = false;
-            send_command_complete(stream, "ROLLBACK")?;
             if chain {
                 let txn = tm.begin();
                 conn.txn = Some(txn);
                 conn.txn_failed = false;
             }
+            StepOutcome::complete("ROLLBACK")
         } else if chain {
             // `ROLLBACK AND CHAIN` outside a transaction block is an error in
             // PostgreSQL, unlike plain ROLLBACK which only warns.
-            send_error(
-                stream,
-                "ERROR",
-                "25P01",
-                "there is no transaction in progress",
-            )?;
+            StepOutcome::error("25P01", "there is no transaction in progress")
         } else {
-            send_error(
-                stream,
-                "WARNING",
-                "25P01",
-                "there is no transaction in progress",
-            )?;
-            send_command_complete(stream, "ROLLBACK")?;
+            StepOutcome::Warning {
+                code: "25P01".into(),
+                message: "there is no transaction in progress".into(),
+                tag: "ROLLBACK".into(),
+            }
         }
-        send_ready_for_query_status(stream, conn.ready_status())?;
-        return Ok(());
+    } else {
+        execute_non_transactional_statement(db, conn, sql_trimmed, normalized)
     }
+}
 
+/// Executes everything that is not a transaction-control statement: the
+/// failed-transaction guard, health-check shortcuts, the SQL path, and the
+/// legacy KV fallback. Shares the connection's transaction snapshot when a
+/// BEGIN block is open.
+fn execute_non_transactional_statement(
+    db: &Arc<OmniKV>,
+    conn: &mut ConnectionState,
+    sql_trimmed: &str,
+    normalized: &str,
+) -> StepOutcome {
     // ── If in a failed transaction, reject all commands until ROLLBACK ──
     if conn.txn_failed {
-        send_error(
-            stream,
-            "ERROR",
+        return StepOutcome::error(
             "25P02",
             "current transaction is aborted, commands ignored until end of transaction block",
-        )?;
-        send_ready_for_query_status(stream, conn.ready_status())?;
-        return Ok(());
+        );
     }
 
     // ── SELECT 1 / SELECT VERSION — compatibility shortcuts ──
     // #110 tracks real literal-SELECT support in the parser; until then these
     // health-check shortcuts answer any case and spacing combination.
     if normalized == "SELECT 1" || normalized.starts_with("SELECT VERSION") {
-        send_row_description(stream, &[("version", 25)])?;
-        send_data_row(stream, &["OmniKV 0.1.0 — Distributed KV Engine"])?;
-        send_command_complete(stream, "SELECT 1")?;
-        send_ready_for_query_status(stream, conn.ready_status())?;
-        return Ok(());
+        return StepOutcome::Rows {
+            columns: vec![("version".into(), 25)],
+            rows: vec![vec!["OmniKV 0.1.0 — Distributed KV Engine".into()]],
+            tag: "SELECT 1".into(),
+        };
     }
 
-    // ── Execute SQL (with transaction context if inside BEGIN block) ──
     match crate::sql::parse_sql(sql_trimmed) {
         Ok(stmt) => {
             let stmt = match enforce_pgwire_statement_limits(stmt) {
@@ -835,16 +1483,14 @@ fn handle_query(
                     if conn.txn.is_some() {
                         conn.txn_failed = true;
                     }
-                    send_error(stream, "ERROR", "54000", &msg)?;
-                    send_ready_for_query_status(stream, conn.ready_status())?;
-                    return Ok(());
+                    return StepOutcome::error("54000", msg);
                 }
             };
             let catalog = std::sync::Arc::new(crate::catalog::Catalog::new(db.clone()));
 
             // If inside an explicit transaction, use the transaction's read_seq
             // for snapshot isolation. Otherwise use autocommit (current seq).
-            let executor = if let Some(ref mut txn) = conn.txn {
+            let executor = if let Some(ref txn) = conn.txn {
                 crate::sql_exec::SqlExecutor::with_snapshot(db.clone(), catalog, txn.read_seq)
             } else {
                 crate::sql_exec::SqlExecutor::new(db.clone(), catalog)
@@ -852,62 +1498,44 @@ fn handle_query(
 
             match executor.execute(&stmt) {
                 Ok(crate::sql_exec::ExecResult::Rows { columns, rows }) => {
-                    let col_defs: Vec<(&str, i32)> =
-                        columns.iter().map(|c| (c.as_str(), 25i32)).collect();
-                    send_row_description(stream, &col_defs)?;
-                    for row in &rows {
-                        let refs: Vec<&str> = row.iter().map(|s| s.as_str()).collect();
-                        send_data_row(stream, &refs)?;
+                    let tag = format!("SELECT {}", rows.len());
+                    StepOutcome::Rows {
+                        columns: columns.into_iter().map(|c| (c, 25)).collect(),
+                        rows,
+                        tag,
                     }
-                    send_command_complete(stream, &format!("SELECT {}", rows.len()))?;
                 }
                 Ok(crate::sql_exec::ExecResult::Modified { count, command }) => {
-                    // Track writes in the transaction if inside BEGIN block
-                    if let Some(ref mut txn) = conn.txn {
-                        // For DML inside a transaction, buffer through the txn manager.
-                        // Note: full write buffering requires deeper SqlExecutor integration.
-                        // For now, we track that the transaction has performed writes.
-                        let _ = count; // Writes are committed directly for now
-                    }
-                    send_command_complete(stream, &command)?;
+                    let _ = count; // Writes are committed directly for now (see txn note above)
+                    StepOutcome::complete(command)
                 }
-                Ok(crate::sql_exec::ExecResult::Ok(msg)) => {
-                    send_command_complete(stream, &msg)?;
-                }
+                Ok(crate::sql_exec::ExecResult::Ok(msg)) => StepOutcome::complete(msg),
                 Err(e) => {
                     if conn.txn.is_some() {
                         conn.txn_failed = true;
                     }
-                    send_error(stream, "ERROR", "XX000", &format!("Exec error: {}", e))?;
+                    StepOutcome::error("XX000", format!("Exec error: {e}"))
                 }
             }
         }
         Err(_) => {
             // Fall back to legacy KV query parser
             match query::parse_query(sql_trimmed) {
-                Ok(parsed) => {
-                    execute_query(db, stream, &parsed)?;
-                }
+                Ok(parsed) => execute_parsed_kv_query(db, &parsed),
                 Err(e) => {
                     if conn.txn.is_some() {
                         conn.txn_failed = true;
                     }
-                    send_error(stream, "ERROR", "42601", &format!("Parse error: {}", e))?;
+                    StepOutcome::error("42601", format!("Parse error: {e}"))
                 }
             }
         }
     }
-
-    send_ready_for_query_status(stream, conn.ready_status())?;
-    Ok(())
 }
 
-/// Execute a parsed query and stream results.
-fn execute_query(
-    db: &Arc<OmniKV>,
-    stream: &mut std::net::TcpStream,
-    parsed: &query::Query,
-) -> std::io::Result<()> {
+/// Execute a parsed legacy-KV query and build its outcome. Used by both
+/// wire protocols after the SQL parser declines a statement.
+fn execute_parsed_kv_query(db: &Arc<OmniKV>, parsed: &query::Query) -> StepOutcome {
     let seq = db.get_seq();
 
     match &parsed.action {
@@ -917,16 +1545,11 @@ fn execute_query(
 
             let results = db.scan(&start_key, &end_key, seq).unwrap_or_default();
 
-            send_row_description(stream, &[("key", 25), ("value", 25)])?;
-
             let limit = match bounded_pgwire_query_limit(parsed.limit) {
                 Ok(limit) => limit,
-                Err(msg) => {
-                    send_error(stream, "ERROR", "54000", &msg)?;
-                    return Ok(());
-                }
+                Err(msg) => return StepOutcome::error("54000", msg),
             };
-            let mut count = 0;
+            let mut rows = Vec::new();
 
             let iter: Box<dyn Iterator<Item = &(String, String)>> = if parsed.order_desc {
                 Box::new(results.iter().rev())
@@ -935,48 +1558,50 @@ fn execute_query(
             };
 
             for (key, value) in iter {
-                if count >= limit {
+                if rows.len() >= limit {
                     break;
                 }
-                send_data_row(stream, &[key, value])?;
-                count += 1;
+                rows.push(vec![key.clone(), value.clone()]);
             }
 
-            send_command_complete(stream, &format!("SELECT {}", count))?;
+            let count = rows.len();
+            StepOutcome::Rows {
+                columns: vec![("key".into(), 25), ("value".into(), 25)],
+                rows,
+                tag: format!("SELECT {count}"),
+            }
         }
 
         query::Action::SelectCount => {
             let (start_key, end_key) = build_scan_range(&parsed.conditions);
             let results = db.scan(&start_key, &end_key, seq).unwrap_or_default();
 
-            send_row_description(stream, &[("count", 20)])?;
-            send_data_row(stream, &[&results.len().to_string()])?;
-            send_command_complete(stream, "SELECT 1")?;
+            StepOutcome::Rows {
+                columns: vec![("count".into(), 20)],
+                rows: vec![vec![results.len().to_string()]],
+                tag: "SELECT 1".into(),
+            }
         }
 
         query::Action::Insert(key, value) => {
             let mut batch = WriteBatch::new();
             match batch.set(key, value.clone()) {
-                Ok(_) => match db.commit_batch(&batch) {
-                    Ok(_) => send_command_complete(stream, "INSERT 0 1")?,
-                    Err(e) => {
-                        send_error(stream, "ERROR", "XX000", &format!("Insert failed: {}", e))?
-                    }
+                Ok(()) => match db.commit_batch(&batch) {
+                    Ok(_) => StepOutcome::complete("INSERT 0 1"),
+                    Err(e) => StepOutcome::error("XX000", format!("Insert failed: {e}")),
                 },
-                Err(e) => send_error(stream, "ERROR", "XX000", &format!("Batch error: {}", e))?,
+                Err(e) => StepOutcome::error("XX000", format!("Batch error: {e}")),
             }
         }
 
         query::Action::Update(key, value) => {
             let mut batch = WriteBatch::new();
             match batch.set(key, value.clone()) {
-                Ok(_) => match db.commit_batch(&batch) {
-                    Ok(_) => send_command_complete(stream, "UPDATE 1")?,
-                    Err(e) => {
-                        send_error(stream, "ERROR", "XX000", &format!("Update failed: {}", e))?
-                    }
+                Ok(()) => match db.commit_batch(&batch) {
+                    Ok(_) => StepOutcome::complete("UPDATE 1"),
+                    Err(e) => StepOutcome::error("XX000", format!("Update failed: {e}")),
                 },
-                Err(e) => send_error(stream, "ERROR", "XX000", &format!("Batch error: {}", e))?,
+                Err(e) => StepOutcome::error("XX000", format!("Batch error: {e}")),
             }
         }
 
@@ -996,11 +1621,9 @@ fn execute_query(
                 let _ = db.commit_batch(&batch);
             }
 
-            send_command_complete(stream, &format!("DELETE {}", deleted))?;
+            StepOutcome::complete(format!("DELETE {deleted}"))
         }
     }
-
-    Ok(())
 }
 
 fn bounded_pgwire_query_limit(limit: Option<usize>) -> Result<usize, String> {
@@ -1210,6 +1833,30 @@ fn send_error(
     message: &str,
 ) -> std::io::Result<()> {
     stream.write_all(&error_response_bytes(severity, code, message))
+}
+
+/// Sends a WARNING/NOTICE as a NoticeResponse ('N') frame, the frame real
+/// drivers (psql prints it, pg8000 ignores it) expect for benign warnings.
+/// ErrorResponse ('E') is reserved for errors: DBAPI drivers raise on any
+/// ErrorResponse, so a benign COMMIT-outside-transaction warning must never
+/// travel as 'E'.
+fn send_notice(stream: &mut std::net::TcpStream, code: &str, message: &str) -> std::io::Result<()> {
+    let mut payload = Vec::new();
+    payload.push(b'S');
+    payload.extend_from_slice(b"WARNING ");
+    payload.push(b'C');
+    payload.extend_from_slice(code.as_bytes());
+    payload.push(0);
+    payload.push(b'M');
+    payload.extend_from_slice(message.as_bytes());
+    payload.push(0);
+    payload.push(0);
+    let total_len = u32::try_from(payload.len() + 4).expect("notice length fits u32");
+    let mut msg = Vec::with_capacity(1 + 4 + payload.len());
+    msg.push(NOTICE_RESPONSE);
+    msg.extend_from_slice(&total_len.to_be_bytes());
+    msg.extend_from_slice(&payload);
+    stream.write_all(&msg)
 }
 
 fn error_response_bytes(severity: &str, code: &str, message: &str) -> Vec<u8> {

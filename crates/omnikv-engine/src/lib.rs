@@ -21,7 +21,6 @@
     clippy::format_collect,
     clippy::format_push_string,
     clippy::if_not_else,
-    clippy::ignored_unit_patterns,
     clippy::items_after_statements,
     clippy::manual_let_else,
     clippy::manual_string_new,

@@ -51,6 +51,36 @@ experiments. Callers can check the policy without binding via
 production deployments that must expose PgWire off-host should terminate TLS
 in front of the listener (for example a local `stunnel`/`socat` hop).
 
+### Extended query protocol
+
+OmniKV implements the extended query protocol alongside the simple one, so
+DBAPI drivers (psycopg2, pg8000, JDBC, Npgsql) — whose `commit()`/`rollback()`
+and parameterized statements drive Parse/Bind/Execute frames — work without
+configuration:
+
+| Message | Reply | Behavior |
+| --- | --- | --- |
+| `Parse` ('P') | `ParseComplete` ('1') | Statement stored under its name; the unnamed statement is destroyed by any Parse, per PostgreSQL |
+| `Bind` ('B') | `BindComplete` ('2') | `$1..$n` parameter values resolve into a portal (text format only; binary format is rejected with `08P01`); any Bind destroys the unnamed portal |
+| `Describe` ('D') | `RowDescription` ('T') or `NoData` ('n') | Side-effect-free: the row shape derives from the statement text, never by executing it |
+| `Execute` ('E') | rows + `CommandComplete` | Runs the portal's statement through the same execution core as the simple protocol — transaction semantics cannot drift between the two paths |
+| `Close` ('C') | `CloseComplete` ('3') | Destroys a named statement or portal; closing an unknown name is not an error |
+| `Sync` ('S') | `ReadyForQuery` | Ends the pipeline; clears any pending error state |
+| `Flush` ('H') | — | Drains the socket |
+
+Errors inside an extended-protocol pipeline follow PostgreSQL's
+skip-until-Sync rule: the ErrorResponse is sent, the transaction (if any) is
+marked failed, and every subsequent Parse/Bind/Describe/Execute/Close is
+skipped without execution until the next `Sync`, which answers
+`ReadyForQuery` and restores normal processing. Benign warnings (COMMIT with
+no open transaction, BEGIN inside one) travel as `NoticeResponse` ('N')
+frames — never `ErrorResponse` — because DBAPI drivers raise on any
+ErrorResponse.
+
+Parameters bind as text; an unbound or NULL parameter becomes the `NULL`
+literal, which the statement parsers reject (full NULL support is tracked by
+#111). Write buffering inside explicit transactions is tracked by #121.
+
 ## QUIC binary protocol
 
 The QUIC server currently reads at most one 64 KiB request frame per bidirectional

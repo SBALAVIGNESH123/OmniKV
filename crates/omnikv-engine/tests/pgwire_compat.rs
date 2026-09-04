@@ -177,6 +177,309 @@ fn complete_handshake(stream: &mut TcpStream) -> std::io::Result<()> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------
+// Extended query protocol (issue #119): Parse / Bind / Describe / Execute /
+// Close / Sync over raw sockets, exactly as DBAPI drivers drive them.
+// ---------------------------------------------------------------------
+
+/// Sends one extended-protocol frame: type byte + body (length is added).
+fn send_extended(stream: &mut TcpStream, msg_type: u8, body: &[u8]) -> std::io::Result<()> {
+    let frame_len = u32::try_from(body.len() + 4).expect("frame length fits u32");
+    let mut frame = Vec::with_capacity(1 + 4 + body.len());
+    frame.push(msg_type);
+    frame.extend_from_slice(&frame_len.to_be_bytes());
+    frame.extend_from_slice(body);
+    stream.write_all(&frame)?;
+    stream.flush()
+}
+
+/// Builds a Parse body: statement name, query, parameter type OIDs.
+fn parse_body(name: &str, sql: &str, oids: &[u32]) -> Vec<u8> {
+    let mut body = Vec::new();
+    body.extend_from_slice(name.as_bytes());
+    body.push(0);
+    body.extend_from_slice(sql.as_bytes());
+    body.push(0);
+    let oid_count = i16::try_from(oids.len()).expect("oid count fits i16");
+    body.extend_from_slice(&oid_count.to_be_bytes());
+    for oid in oids {
+        body.extend_from_slice(&oid.to_be_bytes());
+    }
+    body
+}
+
+/// Builds a Bind body: portal name, statement name, one text param.
+fn bind_body_text_params(portal: &str, stmt: &str, params: &[&str]) -> Vec<u8> {
+    let mut body = Vec::new();
+    body.extend_from_slice(portal.as_bytes());
+    body.push(0);
+    body.extend_from_slice(stmt.as_bytes());
+    body.push(0);
+    // Zero format codes: all parameters are text.
+    body.extend_from_slice(&0i16.to_be_bytes());
+    let param_count = i16::try_from(params.len()).expect("param count fits i16");
+    body.extend_from_slice(&param_count.to_be_bytes());
+    for p in params {
+        let param_len = i32::try_from(p.len()).expect("param length fits i32");
+        body.extend_from_slice(&param_len.to_be_bytes());
+        body.extend_from_slice(p.as_bytes());
+    }
+    // Zero result format codes: all results are text.
+    body.extend_from_slice(&0i16.to_be_bytes());
+    body
+}
+
+/// Builds an Execute body: portal name + max rows (0 = unlimited).
+fn execute_body(portal: &str) -> Vec<u8> {
+    let mut body = Vec::new();
+    body.extend_from_slice(portal.as_bytes());
+    body.push(0);
+    body.extend_from_slice(&0i32.to_be_bytes());
+    body
+}
+
+/// Builds a Describe/Close body: kind byte ('S' statement, 'P' portal).
+fn kind_body(kind: u8, name: &str) -> Vec<u8> {
+    let mut body = Vec::new();
+    body.push(kind);
+    body.extend_from_slice(name.as_bytes());
+    body.push(0);
+    body
+}
+
+/// Reads frames, skipping benign `NoticeResponse` ('N') frames, until the
+/// wanted type arrives. Returns its body.
+fn read_until_type(stream: &mut TcpStream, wanted: u8) -> Vec<u8> {
+    loop {
+        let (msg_type, body) = read_message(stream).expect("read frame");
+        match msg_type {
+            t if t == wanted => return body,
+            b'N' => { /* benign notice; skip */ }
+            b'T' if wanted == b'D' => { /* row description precedes rows */ }
+            other => panic!("expected frame {wanted:#x}, got {other:#x}"),
+        }
+    }
+}
+
+#[test]
+fn pgwire_extended_protocol_prepare_bind_execute_sync_round_trip() {
+    // The canonical extended-protocol sequence every DBAPI driver uses:
+    // Parse(unnamed) -> Bind(unnamed portal) -> Execute -> Sync, expecting
+    // ParseComplete, BindComplete, CommandComplete, ReadyForQuery.
+    let addr = spawn_pgwire_server().expect("spawn server");
+    let mut stream = TcpStream::connect(&addr).expect("connect");
+    complete_handshake(&mut stream).expect("handshake");
+
+    send_extended(&mut stream, b'P', &parse_body("", "SELECT 1", &[])).expect("send Parse");
+    send_extended(&mut stream, b'S', &[]).expect("send Sync");
+
+    // ParseComplete: '1' + int32(4) — empty body.
+    let body = read_until_type(&mut stream, b'1');
+    assert_eq!(body, Vec::<u8>::new());
+    // ReadyForQuery after Sync.
+    assert_eq!(read_ready_status(&mut stream), b'I');
+
+    // pg8000's actual sequence for every unnamed statement:
+    // Parse -> Describe(S, "") -> Sync, then Bind -> Execute -> Sync.
+    send_extended(&mut stream, b'P', &parse_body("", "SELECT 1", &[])).expect("send Parse");
+    send_extended(&mut stream, b'D', &kind_body(b'S', "")).expect("send Describe stmt");
+    send_extended(&mut stream, b'S', &[]).expect("send Sync");
+    read_until_type(&mut stream, b'1'); // ParseComplete
+    let desc = read_until_type(&mut stream, b'T'); // RowDescription
+    assert!(
+        String::from_utf8_lossy(&desc).contains("version"),
+        "SELECT 1 describe must expose the version column"
+    );
+    assert_eq!(read_ready_status(&mut stream), b'I');
+
+    send_extended(&mut stream, b'B', &bind_body_text_params("", "", &[])).expect("send Bind");
+    send_extended(&mut stream, b'E', &execute_body("")).expect("send Execute");
+    send_extended(&mut stream, b'S', &[]).expect("send Sync");
+    read_until_type(&mut stream, b'2'); // BindComplete
+    let rows = read_until_type(&mut stream, b'D'); // DataRow
+    assert!(
+        String::from_utf8_lossy(&rows).contains("OmniKV"),
+        "SELECT 1 must return the version banner row"
+    );
+    let tag = read_command_complete(&mut stream);
+    assert_eq!(tag, "SELECT 1");
+    assert_eq!(read_ready_status(&mut stream), b'I');
+}
+
+#[test]
+fn pgwire_extended_protocol_transaction_commit_and_rollback() {
+    // The exact #119 scenario: DBAPI commit()/rollback() drive COMMIT /
+    // ROLLBACK through the extended protocol. Sync after the unnamed
+    // statement must keep the session's transaction state coherent.
+    let addr = spawn_pgwire_server().expect("spawn server");
+    let mut stream = TcpStream::connect(&addr).expect("connect");
+    complete_handshake(&mut stream).expect("handshake");
+
+    // Open the transaction with simple 'Q' (pg8000 sends begin that way),
+    // then commit via extended protocol — the #119 failure path.
+    send_query(&mut stream, "begin transaction").expect("send begin");
+    assert_eq!(read_command_complete(&mut stream), "BEGIN");
+    assert_eq!(read_ready_status(&mut stream), b'T');
+
+    // commit via Parse/Bind/Execute/Sync (pg8000 execute_unnamed).
+    send_extended(&mut stream, b'P', &parse_body("", "commit", &[])).expect("Parse commit");
+    send_extended(&mut stream, b'B', &bind_body_text_params("", "", &[])).expect("Bind");
+    send_extended(&mut stream, b'E', &execute_body("")).expect("Execute");
+    send_extended(&mut stream, b'S', &[]).expect("Sync");
+    read_until_type(&mut stream, b'1'); // ParseComplete
+    read_until_type(&mut stream, b'2'); // BindComplete
+    assert_eq!(read_command_complete(&mut stream), "COMMIT");
+    // ReadyForQuery after Sync must report idle: the extended-path commit
+    // closed the same transaction the simple path opened.
+    assert_eq!(read_ready_status(&mut stream), b'I');
+
+    // Now begin again and rollback through the extended protocol.
+    send_extended(&mut stream, b'P', &parse_body("", "begin", &[])).expect("Parse begin");
+    send_extended(&mut stream, b'B', &bind_body_text_params("", "", &[])).expect("Bind");
+    send_extended(&mut stream, b'E', &execute_body("")).expect("Execute");
+    send_extended(&mut stream, b'S', &[]).expect("Sync");
+    read_until_type(&mut stream, b'1');
+    read_until_type(&mut stream, b'2');
+    assert_eq!(read_command_complete(&mut stream), "BEGIN");
+    assert_eq!(read_ready_status(&mut stream), b'T');
+
+    send_extended(&mut stream, b'P', &parse_body("", "rollback", &[])).expect("Parse rollback");
+    send_extended(&mut stream, b'B', &bind_body_text_params("", "", &[])).expect("Bind");
+    send_extended(&mut stream, b'E', &execute_body("")).expect("Execute");
+    send_extended(&mut stream, b'S', &[]).expect("Sync");
+    read_until_type(&mut stream, b'1');
+    read_until_type(&mut stream, b'2');
+    assert_eq!(read_command_complete(&mut stream), "ROLLBACK");
+    assert_eq!(read_ready_status(&mut stream), b'I');
+}
+
+#[test]
+fn pgwire_extended_protocol_bind_error_aborts_pipeline_until_sync() {
+    // PostgreSQL's error rule: after an extended-protocol error, the
+    // connection skips every message until the next Sync, which answers
+    // ReadyForQuery. A Bind against a nonexistent statement is 26000.
+    let addr = spawn_pgwire_server().expect("spawn server");
+    let mut stream = TcpStream::connect(&addr).expect("connect");
+    complete_handshake(&mut stream).expect("handshake");
+
+    // Bind of an unknown statement: error + skip-until-Sync.
+    send_extended(
+        &mut stream,
+        b'B',
+        &bind_body_text_params("", "no-such-stmt", &[]),
+    )
+    .expect("Bind unknown");
+    send_extended(&mut stream, b'E', &execute_body("")).expect("Execute (must be skipped)");
+    send_extended(&mut stream, b'S', &[]).expect("Sync");
+
+    let (msg_type, body) = read_message(&mut stream).expect("error frame");
+    assert_eq!(msg_type, b'E');
+    let text = String::from_utf8_lossy(&body);
+    assert!(
+        text.starts_with("SERROR") && text.contains("26000"),
+        "expected ERROR 26000 for unknown statement, got {text:?}"
+    );
+    // The Execute between the Bind error and Sync must be skipped: the
+    // next frame is ReadyForQuery, not another error.
+    assert_eq!(read_ready_status(&mut stream), b'I');
+
+    // And the pipeline recovers: a fresh statement works afterwards.
+    send_query(&mut stream, "SELECT 1").expect("post-error query");
+    let (msg_type, _) = read_message(&mut stream).expect("reply");
+    assert_eq!(msg_type, b'T', "pipeline must recover after Sync");
+}
+
+#[test]
+fn pgwire_extended_protocol_named_statement_close_and_describe_portal() {
+    // Named statements + portals: Parse(named), Bind, Describe(portal),
+    // Execute (named portal), Close(statement), Sync — the JDBC-style
+    // lifecycle.
+    let addr = spawn_pgwire_server().expect("spawn server");
+    let mut stream = TcpStream::connect(&addr).expect("connect");
+    complete_handshake(&mut stream).expect("handshake");
+
+    send_extended(&mut stream, b'P', &parse_body("health", "SELECT 1", &[])).expect("Parse named");
+    send_extended(
+        &mut stream,
+        b'B',
+        &bind_body_text_params("p1", "health", &[]),
+    )
+    .expect("Bind to named portal");
+    send_extended(&mut stream, b'D', &kind_body(b'P', "p1")).expect("Describe portal");
+    send_extended(&mut stream, b'E', &execute_body("p1")).expect("Execute named portal");
+    send_extended(&mut stream, b'C', &kind_body(b'S', "health")).expect("Close statement");
+    send_extended(&mut stream, b'S', &[]).expect("Sync");
+
+    read_until_type(&mut stream, b'1'); // ParseComplete
+    read_until_type(&mut stream, b'2'); // BindComplete
+    let desc = read_until_type(&mut stream, b'T'); // portal Describe
+    assert!(
+        String::from_utf8_lossy(&desc).contains("version"),
+        "portal describe must expose the row shape"
+    );
+    read_until_type(&mut stream, b'D'); // DataRow
+    assert_eq!(read_command_complete(&mut stream), "SELECT 1");
+    read_until_type(&mut stream, b'3'); // CloseComplete
+    assert_eq!(read_ready_status(&mut stream), b'I');
+
+    // After Close, the named statement is gone: a Bind to it is 26000.
+    send_extended(&mut stream, b'B', &bind_body_text_params("", "health", &[]))
+        .expect("Bind closed statement");
+    send_extended(&mut stream, b'S', &[]).expect("Sync");
+    let (msg_type, body) = read_message(&mut stream).expect("error frame");
+    assert_eq!(msg_type, b'E');
+    let text = String::from_utf8_lossy(&body);
+    assert!(
+        text.contains("26000"),
+        "closed statement must be gone, got {text:?}"
+    );
+    assert_eq!(read_ready_status(&mut stream), b'I');
+}
+
+#[test]
+fn pgwire_extended_protocol_parameter_binding_substitutes_values() {
+    // $1/$2 placeholders must be substituted with the Bind values before
+    // execution — the legacy KV path accepts INSERT key value with any text.
+    let addr = spawn_pgwire_server().expect("spawn server");
+    let mut stream = TcpStream::connect(&addr).expect("connect");
+    complete_handshake(&mut stream).expect("handshake");
+
+    send_extended(&mut stream, b'P', &parse_body("", "INSERT 42 $1", &[25]))
+        .expect("Parse with param");
+    send_extended(
+        &mut stream,
+        b'B',
+        &bind_body_text_params("", "", &["'hello'"]),
+    )
+    .expect("Bind param value");
+    send_extended(&mut stream, b'E', &execute_body("")).expect("Execute");
+    send_extended(&mut stream, b'S', &[]).expect("Sync");
+
+    read_until_type(&mut stream, b'1'); // ParseComplete
+    read_until_type(&mut stream, b'2'); // BindComplete
+    assert_eq!(read_command_complete(&mut stream), "INSERT 0 1");
+    assert_eq!(read_ready_status(&mut stream), b'I');
+
+    // Read it back through the same protocol with a bound parameter.
+    send_extended(
+        &mut stream,
+        b'P',
+        &parse_body("", "SELECT * WHERE key = $1", &[25]),
+    )
+    .expect("Parse select");
+    send_extended(&mut stream, b'B', &bind_body_text_params("", "", &["42"])).expect("Bind key");
+    send_extended(&mut stream, b'E', &execute_body("")).expect("Execute");
+    send_extended(&mut stream, b'S', &[]).expect("Sync");
+    read_until_type(&mut stream, b'1');
+    read_until_type(&mut stream, b'2');
+    let row = read_until_type(&mut stream, b'D');
+    let text = String::from_utf8_lossy(&row);
+    assert!(
+        text.contains("hello"),
+        "bound parameter must reach the executor, got {text:?}"
+    );
+}
+
 #[test]
 fn pgwire_ssl_request_receives_single_byte_no_and_handshake_continues() {
     let addr = spawn_pgwire_server().expect("spawn server");
