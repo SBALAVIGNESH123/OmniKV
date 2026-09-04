@@ -72,7 +72,7 @@ fn parse_select(tokens: &[&str]) -> Result<Query, String> {
             if upper == "LIMIT" || upper == "ORDER" {
                 break;
             }
-            if tokens[i] != "key" {
+            if tokens[i].to_lowercase() != "key" {
                 return Err("Can only filter on 'key'".into());
             }
 
@@ -146,7 +146,7 @@ fn parse_delete(tokens: &[&str]) -> Result<Query, String> {
             i += 1;
             continue;
         }
-        if tokens[i] != "key" {
+        if tokens[i].to_lowercase() != "key" {
             return Err("Can only filter on 'key'".into());
         }
         if i + 2 >= tokens.len() {
@@ -241,6 +241,44 @@ mod tests {
         assert_eq!(q.conditions.len(), 2);
         assert_eq!(q.limit, None);
         assert!(!q.order_desc);
+    }
+
+    #[test]
+    fn test_select_all_lowercase_keywords_and_key() {
+        // Issue #109: keywords and the 'key' filter column must be
+        // case-insensitive, matching PostgreSQL behavior.
+        let q = parse_query("select * where key >= 100 and key <= 200").expect("unwrap failed");
+        assert_eq!(q.action, Action::SelectAll);
+        assert_eq!(q.conditions.len(), 2);
+    }
+
+    #[test]
+    fn test_select_all_mixed_case_key_column() {
+        let q = parse_query("SELECT * WHERE KEY >= 100 AND Key <= 200").expect("unwrap failed");
+        assert_eq!(q.conditions.len(), 2);
+    }
+
+    #[test]
+    fn test_select_count_lowercase() {
+        let q = parse_query("select count where key = 42").expect("unwrap failed");
+        assert_eq!(q.action, Action::SelectCount);
+        assert_eq!(q.conditions.len(), 1);
+    }
+
+    #[test]
+    fn test_delete_lowercase_key_filter() {
+        let q = parse_query("delete where KEY = 100").expect("unwrap failed");
+        assert!(matches!(q.action, Action::Delete));
+        assert_eq!(q.conditions.len(), 1);
+    }
+
+    #[test]
+    fn test_update_lowercase() {
+        // The legacy UPDATE parser stores the filter key inside
+        // Action::Update(key, value) and keeps conditions empty.
+        let q = parse_query("update set value = 'x' where key = 5").expect("unwrap failed");
+        assert!(matches!(q.action, Action::Update(k, v) if k == "5" && v == "'x'"));
+        assert!(q.conditions.is_empty());
     }
 
     #[test]

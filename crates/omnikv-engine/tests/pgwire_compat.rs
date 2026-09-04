@@ -237,6 +237,153 @@ fn pgwire_ssl_then_gss_negotiation_then_startup_is_accepted() {
     complete_handshake(&mut stream).expect("handshake after dual negotiation");
 }
 
+/// Reads frames until `CommandComplete` and returns the command tag.
+///
+/// Tolerates WARNING-severity `ErrorResponse` frames, which the server emits
+/// before `CommandComplete` for benign cases exactly like PostgreSQL (COMMIT
+/// without a transaction, BEGIN inside a transaction). Any ERROR-severity
+/// frame fails the test.
+fn read_command_complete(stream: &mut TcpStream) -> String {
+    loop {
+        let (msg_type, body) = read_message(stream).expect("read frame");
+        match msg_type {
+            b'C' => {
+                let tag = &body[..body.len().saturating_sub(1)];
+                return String::from_utf8_lossy(tag).to_string();
+            }
+            b'Z' => panic!("ReadyForQuery before CommandComplete"),
+            b'E' => {
+                let text = String::from_utf8_lossy(&body);
+                assert!(
+                    text.starts_with("SWARNING"),
+                    "unexpected error frame: {text:?}"
+                );
+            }
+            other => panic!("unexpected frame {other:#x} while waiting for CommandComplete"),
+        }
+    }
+}
+
+/// Reads one `ReadyForQuery` frame and returns its transaction status byte.
+fn read_ready_status(stream: &mut TcpStream) -> u8 {
+    let (msg_type, body) = read_message(stream).expect("read ReadyForQuery");
+    assert_eq!(msg_type, b'Z', "expected ReadyForQuery");
+    assert_eq!(body.len(), 1);
+    body[0]
+}
+
+#[test]
+fn pgwire_transaction_statement_keywords_accept_any_case_and_variant() {
+    // Issue #109: DBAPI drivers (psycopg2, pg8000 in non-autocommit mode)
+    // implicitly send lowercase `begin transaction` at session start, and
+    // clients use the full PostgreSQL variant set: BEGIN [WORK|TRANSACTION],
+    // COMMIT [WORK], END [WORK], ROLLBACK [WORK], START TRANSACTION, ABORT.
+    // All of them must behave identically in any case/spacing combination.
+    let addr = spawn_pgwire_server().expect("spawn server");
+    let mut stream = TcpStream::connect(&addr).expect("connect");
+    complete_handshake(&mut stream).expect("handshake");
+
+    // The exact DBAPI sequence: lowercase begin transaction.
+    send_query(&mut stream, "begin transaction").expect("send begin transaction");
+    assert_eq!(
+        read_command_complete(&mut stream).as_str(),
+        "BEGIN",
+        "lowercase begin transaction must start a transaction block"
+    );
+    assert_eq!(
+        read_ready_status(&mut stream),
+        b'T',
+        "session must report in-transaction ('T') after begin"
+    );
+
+    // Close with every COMMIT/END variant. The first is a real commit; the
+    // rest run with no open transaction and get a WARNING first, exactly
+    // like PostgreSQL — then CommandComplete and idle status.
+    for variant in ["commit", "Commit  Work", "end", "END WORK"] {
+        send_query(&mut stream, variant).expect("send commit variant");
+        assert_eq!(
+            read_command_complete(&mut stream).as_str(),
+            "COMMIT",
+            "commit variant {variant:?} must return CommandComplete COMMIT"
+        );
+        assert_eq!(
+            read_ready_status(&mut stream),
+            b'I',
+            "transaction must be closed after {variant:?}"
+        );
+    }
+}
+
+#[test]
+fn pgwire_begin_work_and_rollback_work_variants_any_case() {
+    let addr = spawn_pgwire_server().expect("spawn server");
+    let mut stream = TcpStream::connect(&addr).expect("connect");
+    complete_handshake(&mut stream).expect("handshake");
+
+    for begin_variant in ["begin work", "Begin  Transaction", "START transaction"] {
+        send_query(&mut stream, begin_variant).expect("send begin variant");
+        assert_eq!(
+            read_command_complete(&mut stream).as_str(),
+            "BEGIN",
+            "begin variant {begin_variant:?} must return CommandComplete BEGIN"
+        );
+        assert_eq!(
+            read_ready_status(&mut stream),
+            b'T',
+            "must be in a transaction after {begin_variant:?}"
+        );
+
+        for rollback_variant in ["rollback", "Rollback  Work", "abort"] {
+            send_query(&mut stream, rollback_variant).expect("send rollback variant");
+            assert_eq!(
+                read_command_complete(&mut stream).as_str(),
+                "ROLLBACK",
+                "rollback variant {rollback_variant:?} must return CommandComplete ROLLBACK"
+            );
+            assert_eq!(
+                read_ready_status(&mut stream),
+                b'I',
+                "transaction must be closed after {rollback_variant:?}"
+            );
+            // Re-open a transaction for the next rollback variant; on the
+            // second pass the previous re-open may still hold, which yields
+            // a benign WARNING like PostgreSQL.
+            send_query(&mut stream, begin_variant).expect("re-send begin variant");
+            assert_eq!(
+                read_command_complete(&mut stream).as_str(),
+                "BEGIN",
+                "re-open via {begin_variant:?} must return CommandComplete BEGIN"
+            );
+            let _ = read_ready_status(&mut stream);
+        }
+    }
+}
+
+#[test]
+fn pgwire_set_statement_is_accepted_in_any_case_and_spacing() {
+    let addr = spawn_pgwire_server().expect("spawn server");
+    let mut stream = TcpStream::connect(&addr).expect("connect");
+    complete_handshake(&mut stream).expect("handshake");
+
+    // Drivers issue SET statements at session start (e.g. psycopg2's
+    // `SET datestyle`); they must never depend on keyword case.
+    for variant in [
+        "SET client_encoding = 'UTF8'",
+        "set  datestyle = 'ISO'",
+        "Set Timezone To 'UTC'",
+    ] {
+        send_query(&mut stream, variant).expect("send set variant");
+        let (msg_type, body) = read_message(&mut stream).expect("set reply");
+        assert_eq!(
+            msg_type, b'C',
+            "SET variant {variant:?} must return CommandComplete"
+        );
+        assert_eq!(body, b"SET\0".to_vec());
+        let (msg_type, _) = read_message(&mut stream).expect("ready after set");
+        assert_eq!(msg_type, b'Z');
+    }
+}
+
 #[test]
 fn pgwire_plain_startup_without_negotiation_still_works() {
     // Clients configured with sslmode=disable skip negotiation entirely; the

@@ -24,6 +24,19 @@ testing. It is not yet a complete PostgreSQL, MySQL, or SQLite replacement.
 | Explain | `EXPLAIN`, `EXPLAIN ANALYZE` | Used to inspect plan structure and estimated costs. |
 | Mutations | `UPDATE ... SET ... WHERE ...`, `DELETE FROM ... WHERE ...` | Common single-table mutation paths are covered by integration tests. |
 
+## Keyword case
+
+Per the SQL standard, keywords in OmniKV are case-insensitive, and whitespace
+between them does not change meaning: `select ... from ... where ...`,
+`SELECT ... FROM ... WHERE ...`, and `SeLeCt ... FrOm ... WhErE ...` all parse
+identically. Identifiers (table and column names) keep their case as written,
+matching PostgreSQL. Transaction statements over the PgWire protocol accept the
+full PostgreSQL variant set in any case and spacing combination — `BEGIN`,
+`BEGIN WORK`, `BEGIN TRANSACTION`, `START TRANSACTION`, `COMMIT`/`COMMIT
+WORK`/`END`/`END WORK`, and `ROLLBACK`/`ROLLBACK WORK`/`ABORT` — because DBAPI
+drivers implicitly send lowercase `begin transaction` when autocommit is off
+(issue #109). Client `SET` statements are accepted (and ignored) in any case.
+
 ## Prepared query support
 
 The embedded prepared-query engine intentionally supports a smaller,

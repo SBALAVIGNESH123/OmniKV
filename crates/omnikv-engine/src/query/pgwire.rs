@@ -628,17 +628,29 @@ fn handle_query(
         return Ok(());
     }
 
-    let upper = sql_trimmed.to_uppercase();
+    // Uppercased whitespace-normalized form for multi-word transaction
+    // statements: DBAPI drivers (psycopg2, pg8000) send lowercase
+    // `begin transaction`, `commit`, `rollback work`, etc.
+    let normalized = sql_trimmed
+        .to_uppercase()
+        .split_whitespace()
+        .collect::<Vec<&str>>()
+        .join(" ");
 
     // ── SET — always accept silently ──
-    if upper.starts_with("SET ") {
+    if normalized == "SET" || normalized.starts_with("SET ") {
         send_command_complete(stream, "SET")?;
         send_ready_for_query_status(stream, conn.ready_status())?;
         return Ok(());
     }
 
     // ── BEGIN — start an explicit transaction block ──
-    if upper == "BEGIN" || upper == "START TRANSACTION" {
+    // PostgreSQL accepts BEGIN [WORK|TRANSACTION] and START TRANSACTION.
+    if normalized == "BEGIN"
+        || normalized == "BEGIN WORK"
+        || normalized == "BEGIN TRANSACTION"
+        || normalized == "START TRANSACTION"
+    {
         if conn.txn.is_some() {
             // Already in a transaction — PostgreSQL sends a WARNING but doesn't fail
             send_error(
@@ -658,7 +670,12 @@ fn handle_query(
     }
 
     // ── COMMIT — commit the current transaction ──
-    if upper == "COMMIT" || upper == "END" {
+    // PostgreSQL accepts COMMIT [WORK] and END [WORK].
+    if normalized == "COMMIT"
+        || normalized == "COMMIT WORK"
+        || normalized == "END"
+        || normalized == "END WORK"
+    {
         if let Some(mut txn) = conn.txn.take() {
             if conn.txn_failed {
                 // Failed transaction — COMMIT acts as ROLLBACK
@@ -690,7 +707,12 @@ fn handle_query(
     }
 
     // ── ROLLBACK — abort the current transaction ──
-    if upper == "ROLLBACK" || upper == "ABORT" {
+    // PostgreSQL accepts ROLLBACK [WORK] and ABORT [WORK].
+    if normalized == "ROLLBACK"
+        || normalized == "ROLLBACK WORK"
+        || normalized == "ABORT"
+        || normalized == "ABORT WORK"
+    {
         if let Some(txn) = conn.txn.take() {
             db.unregister_snapshot(txn.read_seq);
             conn.txn_failed = false;
@@ -721,7 +743,9 @@ fn handle_query(
     }
 
     // ── SELECT 1 / SELECT VERSION — compatibility shortcuts ──
-    if upper == "SELECT 1" || upper.starts_with("SELECT VERSION") {
+    // #110 tracks real literal-SELECT support in the parser; until then these
+    // health-check shortcuts answer any case and spacing combination.
+    if normalized == "SELECT 1" || normalized.starts_with("SELECT VERSION") {
         send_row_description(stream, &[("version", 25)])?;
         send_data_row(stream, &["OmniKV 0.1.0 — Distributed KV Engine"])?;
         send_command_complete(stream, "SELECT 1")?;
