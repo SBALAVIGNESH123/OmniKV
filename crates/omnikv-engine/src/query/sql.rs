@@ -156,6 +156,11 @@ pub enum SqlValue {
     Float(f64),
     Boolean(bool),
     Null,
+    /// Extended-protocol Bind parameter reference, resolved AFTER parsing
+    /// so parameter data can never be re-parsed as SQL text. `$1` becomes
+    /// this marker in the AST; the bound bytes are substituted as data at
+    /// execution time (injection-proof by construction).
+    Placeholder(usize),
 }
 
 impl SqlValue {
@@ -166,6 +171,10 @@ impl SqlValue {
             Self::Float(f) => f.to_string(),
             Self::Boolean(b) => b.to_string(),
             Self::Null => "NULL".to_string(),
+            // An unresolved placeholder reaching string conversion means a
+            // statement was executed without its parameters bound; surface
+            // it as the marker rather than empty data.
+            Self::Placeholder(n) => format!("${n}"),
         }
     }
 }
@@ -174,6 +183,194 @@ impl SqlValue {
 pub struct OrderByItem {
     pub column: String,
     pub desc: bool,
+}
+
+/// Substitutes extended-protocol Bind values into a parsed statement's
+/// `Placeholder(n)` nodes, by position. Values are injected as AST data -
+/// they are never re-parsed as SQL, so a bound value containing operators
+/// or keywords (`x OR 1=1`) cannot alter the statement structure: it is a
+/// value comparing against a column, exactly as the client intended.
+/// Returns Err naming the first unbound parameter, mirroring PostgreSQL's
+/// "there is no parameter $n" error.
+pub fn bind_statement_params(
+    stmt: SqlStatement,
+    params: &[Option<String>],
+) -> Result<SqlStatement, String> {
+    let resolve = |n: usize| -> Result<SqlValue, String> {
+        match params.get(n.checked_sub(1).expect("n >= 1")) {
+            Some(Some(v)) => Ok(SqlValue::Text(v.clone())),
+            Some(None) => Ok(SqlValue::Null),
+            None => Err(format!("no value specified for parameter ${n}")),
+        }
+    };
+    bind_walk(stmt, &resolve)
+}
+
+/// The highest `$n` position a statement references — its Bind
+/// parameter count, which Describe(statement) reports in
+/// ParameterDescription. Walks exactly the AST positions
+/// `bind_statement_params` walks (with a dummy resolver that just
+/// records the maximum), so the reported count can never disagree with
+/// what the binder demands. Statements the SQL grammar cannot parse
+/// (legacy KV grammar, transaction keywords) declare zero parameters —
+/// the SQL grammar is the only path that accepts parameters at all.
+pub fn count_statement_params(sql: &str) -> usize {
+    let trimmed = sql.trim().trim_end_matches(';');
+    let Ok(stmt) = parse_sql(trimmed) else {
+        return 0;
+    };
+    let max_seen = std::cell::Cell::new(0usize);
+    let resolve = |n: usize| {
+        max_seen.set(max_seen.get().max(n));
+        Ok(SqlValue::Null)
+    };
+    // The resolver never errors, so the walk always succeeds; only the
+    // recorded maximum matters.
+    let _ = bind_walk(stmt, &resolve);
+    max_seen.get()
+}
+
+/// The recursive AST walk behind `bind_statement_params`: every position
+/// that holds a `SqlValue` (INSERT rows, WHERE comparisons, IN lists,
+/// UPDATE assignments, nested SetOp branches) gets its placeholders
+/// resolved to bound data.
+fn bind_walk(
+    stmt: SqlStatement,
+    resolve: &dyn Fn(usize) -> Result<SqlValue, String>,
+) -> Result<SqlStatement, String> {
+    let bind_val = |v: SqlValue| -> Result<SqlValue, String> {
+        match v {
+            SqlValue::Placeholder(n) => resolve(n),
+            other => Ok(other),
+        }
+    };
+    let bind_expr = |e: Option<WhereExpr>| -> Result<Option<WhereExpr>, String> {
+        match e {
+            None => Ok(None),
+            Some(expr) => Ok(Some(bind_where(expr, resolve)?)),
+        }
+    };
+
+    Ok(match stmt {
+        SqlStatement::Insert {
+            table,
+            columns,
+            values,
+        } => {
+            let mut bound_rows = Vec::with_capacity(values.len());
+            for row in values {
+                let mut bound_row = Vec::with_capacity(row.len());
+                for v in row {
+                    bound_row.push(bind_val(v)?);
+                }
+                bound_rows.push(bound_row);
+            }
+            SqlStatement::Insert {
+                table,
+                columns,
+                values: bound_rows,
+            }
+        }
+        SqlStatement::Select {
+            columns,
+            from,
+            where_clause,
+            group_by,
+            having,
+            order_by,
+            limit,
+            offset,
+        } => SqlStatement::Select {
+            columns,
+            from,
+            where_clause: bind_expr(where_clause)?,
+            group_by,
+            having: bind_expr(having)?,
+            order_by,
+            limit,
+            offset,
+        },
+        SqlStatement::Update {
+            table,
+            assignments,
+            where_clause,
+        } => {
+            let mut bound_assignments = Vec::with_capacity(assignments.len());
+            for (col, v) in assignments {
+                bound_assignments.push((col, bind_val(v)?));
+            }
+            SqlStatement::Update {
+                table,
+                assignments: bound_assignments,
+                where_clause: bind_expr(where_clause)?,
+            }
+        }
+        SqlStatement::Delete {
+            table,
+            where_clause,
+        } => SqlStatement::Delete {
+            table,
+            where_clause: bind_expr(where_clause)?,
+        },
+        SqlStatement::SetOp {
+            op,
+            left,
+            right,
+            all,
+        } => SqlStatement::SetOp {
+            op,
+            left: Box::new(bind_walk(*left, resolve)?),
+            right: Box::new(bind_walk(*right, resolve)?),
+            all,
+        },
+        // EXPLAIN wraps an inner statement that CAN carry value positions.
+        SqlStatement::Explain(inner) => {
+            SqlStatement::Explain(Box::new(bind_walk(*inner, resolve)?))
+        }
+        SqlStatement::ExplainAnalyze(inner) => {
+            SqlStatement::ExplainAnalyze(Box::new(bind_walk(*inner, resolve)?))
+        }
+        // SHOW TABLES, CREATE, and DROP never carry value positions.
+        other => other,
+    })
+}
+
+fn bind_where(
+    expr: WhereExpr,
+    resolve: &dyn Fn(usize) -> Result<SqlValue, String>,
+) -> Result<WhereExpr, String> {
+    Ok(match expr {
+        WhereExpr::Comparison { column, op, value } => {
+            let value = match value {
+                SqlValue::Placeholder(n) => resolve(n)?,
+                other => other,
+            };
+            WhereExpr::Comparison { column, op, value }
+        }
+        WhereExpr::And(l, r) => WhereExpr::And(
+            Box::new(bind_where(*l, resolve)?),
+            Box::new(bind_where(*r, resolve)?),
+        ),
+        WhereExpr::Or(l, r) => WhereExpr::Or(
+            Box::new(bind_where(*l, resolve)?),
+            Box::new(bind_where(*r, resolve)?),
+        ),
+        WhereExpr::Not(inner) => WhereExpr::Not(Box::new(bind_where(*inner, resolve)?)),
+        WhereExpr::In(column, values) => {
+            let mut bound = Vec::with_capacity(values.len());
+            for v in values {
+                bound.push(match v {
+                    SqlValue::Placeholder(n) => resolve(n)?,
+                    other => other,
+                });
+            }
+            WhereExpr::In(column, bound)
+        }
+        WhereExpr::InSubquery(column, inner) => {
+            WhereExpr::InSubquery(column, Box::new(bind_walk(*inner, resolve)?))
+        }
+        other => other,
+    })
 }
 
 /// Parse a SQL string into a structured statement.
@@ -325,6 +522,16 @@ fn tokenize(input: &str) -> Vec<String> {
 }
 
 fn parse_value(token: &str) -> SqlValue {
+    // `$n` positional parameter: a value-position marker, never data. A
+    // quoted string is one opaque token to the tokenizer, so parameter
+    // bytes arriving in a Bind value cannot forge this marker.
+    if let Some(rest) = token.strip_prefix('$')
+        && let Ok(n) = rest.parse::<usize>()
+        && n >= 1
+    {
+        return SqlValue::Placeholder(n);
+    }
+
     if token.starts_with('\'') && token.ends_with('\'') {
         return SqlValue::Text(token[1..token.len() - 1].to_string());
     }

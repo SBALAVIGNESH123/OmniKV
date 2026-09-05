@@ -66,6 +66,19 @@ The prepared-query plan cache is explicit. `clear_cache()` invalidates all
 cached prepared plans and resets cache statistics. DDL-driven automatic
 invalidation is not yet part of the public contract.
 
+### Parameter binding over PgWire
+
+DBAPI drivers and other PostgreSQL clients bind parameters through the
+extended query protocol (Parse/Bind/Execute/Sync), which the PgWire server
+implements with the same positional `$1`..`$n` placeholders. Bound values are
+substituted into the parsed statement AS DATA — never re-parsed as SQL — so
+parameter bytes cannot alter statement structure. An explicitly NULL Bind
+value binds as `NULL`; a placeholder with no bound value is a `08P01` error
+— missing is not NULL (full NULL comparison support is tracked by #111).
+See [protocol-limits.md](protocol-limits.md) for the full extended-protocol
+contract, including named statements, portals, `ParameterDescription`,
+`PortalSuspended` row capping, and the skip-until-Sync error rule.
+
 ## Planner contract
 
 The optimizer turns SQL ASTs into physical plan nodes. Current single-table

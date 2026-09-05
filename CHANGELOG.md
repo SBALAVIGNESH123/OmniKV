@@ -2,6 +2,47 @@
 
 ## Unreleased
 
+### Added
+
+- PgWire now implements the extended query protocol (issue #119): `Parse`,
+  `Bind`, `Describe`, `Execute`, `Close`, `Flush`, and `Sync` are answered
+  per the PostgreSQL v3 wire contract. DBAPI drivers drive `commit()` and
+  `rollback()` and parameterized statements through these frames —
+  previously every one failed with `XX000 Unsupported message type` — and
+  now work end to end: live-verified with pg8000 in non-autocommit mode
+  (implicit `begin transaction`, INSERT with `$1`/`$2` bindings,
+  `conn.commit()`, `conn.rollback()`, committed data visible on a fresh
+  connection). The implementation stores named and unnamed statements and
+  portals with PostgreSQL's replacement semantics, binds parameters as
+  text (binary format is rejected with `08P01`), derives `Describe` row
+  shapes side-effect-free from the parsed statement, reports statement
+  syntax errors at Parse time (42601, like PostgreSQL), answers
+  Describe(statement) with a `ParameterDescription` frame reporting the
+  parameters the statement needs, and follows the
+  skip-until-`Sync` error rule: an extended-protocol error sends the
+  ErrorResponse, fails the open transaction, and skips every message until
+  the next `Sync` answers `ReadyForQuery`. Bound parameters are substituted
+  into the parsed statement AS DATA (a `SqlValue::Placeholder` AST node),
+  never re-parsed as SQL text — a value like `x OR 1=1` binds as one inert
+  text value and cannot alter statement structure. A nonzero Execute
+  max-rows bound streams at most that many rows, ends the round with
+  `PortalSuspended`, and resumes from retained rows on the next Execute
+  without re-running the statement (the JDBC fetch-size /
+  server-side-cursor contract). Execute itself never sends
+  `RowDescription` (clients Describe first, per PostgreSQL), and a fresh
+  execution consumes a rate-limit permit like a simple-protocol Query
+  while resuming a suspended portal is free. Closing a prepared statement
+  implicitly closes the portals constructed from it, and named statements
+  and portals are capped per connection (1,000 distinct names each,
+  `54000` on breach). Binary Bind result formats are rejected with
+  `08P01` at Bind time instead of being accepted and answered with
+  text frames. Benign warnings travel as `NoticeResponse` ('N') frames on
+  both protocols — never `ErrorResponse`, which DBAPI drivers treat as a
+  hard failure. Both wire protocols run one shared execution core, so
+  transaction semantics cannot drift between the simple and extended
+  paths. (Write buffering inside explicit transactions remains a separate
+  gap, #121.)
+
 ### Fixed
 
 - SQL keywords and transaction statements now behave identically in any case
