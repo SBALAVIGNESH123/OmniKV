@@ -355,11 +355,17 @@ fn pgwire_extended_protocol_execute_max_rows_suspends_and_resumes() {
     assert_eq!(read_ready_status(&mut stream), b'I');
 
     // Resume: the remaining one row, then CommandComplete "SELECT 3" —
-    // the tag counts the whole statement's rows, like PostgreSQL.
+    // the tag counts the whole statement's rows, like PostgreSQL. The
+    // resumed round continues the ROW stream: DataRows arrive directly,
+    // with NO second RowDescription (the columns were already described
+    // by the first round; re-sending them desyncs drivers).
     send_extended(&mut stream, b'E', &execute_body("p")).expect("Execute resume");
     send_extended(&mut stream, b'S', &[]).expect("Sync");
-    let _ = read_until_type(&mut stream, b'T');
-    let _ = read_until_type(&mut stream, b'D'); // row 3
+    let (msg_type, _) = read_message(&mut stream).expect("first resume frame");
+    assert_eq!(
+        msg_type, b'D',
+        "resumed Execute must start with a DataRow, not RowDescription"
+    );
     assert_eq!(
         read_command_complete(&mut stream),
         "SELECT 3",
@@ -381,6 +387,45 @@ fn pgwire_extended_protocol_execute_max_rows_suspends_and_resumes() {
     }
     assert_eq!(read_command_complete(&mut stream), "SELECT 3");
     let _ = read_ready_status(&mut stream);
+}
+
+#[test]
+fn pgwire_extended_protocol_unbound_parameter_is_an_error_not_data() {
+    // A statement carrying $n executed through a Bind with NO values must
+    // fail with a missing-parameter error — never fall through and reach
+    // the executor with a raw `$1` string as literal data. This was the
+    // review regression: the empty-params shortcut skipped binding
+    // entirely, so `WHERE id = $1` compared against the literal "$1".
+    let addr = spawn_pgwire_server().expect("spawn server");
+    let mut stream = TcpStream::connect(&addr).expect("connect");
+    complete_handshake(&mut stream).expect("handshake");
+
+    send_query(&mut stream, "CREATE TABLE t (id INT PRIMARY KEY)").expect("create");
+    read_command_complete(&mut stream);
+    let _ = read_ready_status(&mut stream);
+
+    // Parse a parameterized statement, Bind with ZERO values, Execute.
+    send_extended(
+        &mut stream,
+        b'P',
+        &parse_body("", "SELECT id FROM t WHERE id = $1", &[23]),
+    )
+    .expect("Parse with $1");
+    send_extended(&mut stream, b'B', &bind_body_text_params("", "", &[]))
+        .expect("Bind with no values");
+    send_extended(&mut stream, b'E', &execute_body("")).expect("Execute");
+    send_extended(&mut stream, b'S', &[]).expect("Sync");
+
+    read_until_type(&mut stream, b'1'); // ParseComplete
+    read_until_type(&mut stream, b'2'); // BindComplete
+    let (msg_type, body) = read_message(&mut stream).expect("error frame");
+    assert_eq!(msg_type, b'E', "unbound $1 must be an error, not data");
+    let text = String::from_utf8_lossy(&body);
+    assert!(
+        text.contains("no value specified for parameter $1"),
+        "expected the missing-parameter error, got {text:?}"
+    );
+    assert_eq!(read_ready_status(&mut stream), b'I');
 }
 
 #[test]

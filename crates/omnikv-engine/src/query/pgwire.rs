@@ -1204,8 +1204,14 @@ fn handle_execute(
     };
     let suspended_now = end < rows.len();
 
-    let col_defs: Vec<(&str, i32)> = columns.iter().map(|(c, oid)| (c.as_str(), *oid)).collect();
-    send_row_description(stream, &col_defs)?;
+    // The RowDescription goes out only on the portal's FIRST round; a
+    // resumed Execute continues the row stream with DataRows directly
+    // (re-sending it desyncs drivers that expect rows).
+    if start == 0 {
+        let col_defs: Vec<(&str, i32)> =
+            columns.iter().map(|(c, oid)| (c.as_str(), *oid)).collect();
+        send_row_description(stream, &col_defs)?;
+    }
     for row in &rows[start..end] {
         let refs: Vec<&str> = row.iter().map(String::as_str).collect();
         send_data_row(stream, &refs)?;
@@ -1542,13 +1548,24 @@ fn execute_non_transactional_statement(
         };
     }
 
-    match crate::sql::parse_sql(sql_trimmed).and_then(|stmt| {
-        if params.is_empty() {
-            return Ok(stmt);
-        }
-        crate::sql::bind_statement_params(stmt, params)
-    }) {
-        Ok(stmt) => {
+    // Binding ALWAYS runs: a statement carrying $n with an empty Bind
+    // value list must fail with the missing-parameter error here, never
+    // reach the executor with raw placeholder markers. Bind errors are
+    // distinct from parse errors: a parse failure falls back to the
+    // legacy KV grammar below, but a bind failure is a hard error about
+    // the caller's parameters and must not be re-interpreted by another
+    // parser.
+    match crate::sql::parse_sql(sql_trimmed) {
+        Ok(parsed) => {
+            let stmt = match crate::sql::bind_statement_params(parsed, params) {
+                Ok(bound) => bound,
+                Err(msg) => {
+                    if conn.txn.is_some() {
+                        conn.txn_failed = true;
+                    }
+                    return StepOutcome::error("08P01", msg);
+                }
+            };
             let stmt = match enforce_pgwire_statement_limits(stmt) {
                 Ok(stmt) => stmt,
                 Err(msg) => {
