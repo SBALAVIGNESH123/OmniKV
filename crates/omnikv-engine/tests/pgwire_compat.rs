@@ -390,6 +390,88 @@ fn pgwire_extended_protocol_execute_max_rows_suspends_and_resumes() {
 }
 
 #[test]
+fn pgwire_extended_protocol_explain_binds_inner_statement_parameters() {
+    // EXPLAIN/EXPLAIN ANALYZE wrap an inner statement that carries value
+    // positions; the binder must recurse into the wrapped AST. Proof at
+    // the wire: EXPLAIN of a parameterized statement with an EMPTY Bind
+    // must surface the missing-parameter error — if the walk skipped the
+    // inner statement, the `$1` would execute as literal text instead.
+    let addr = spawn_pgwire_server().expect("spawn server");
+    let mut stream = TcpStream::connect(&addr).expect("connect");
+    complete_handshake(&mut stream).expect("handshake");
+
+    send_query(&mut stream, "CREATE TABLE t (id INT PRIMARY KEY)").expect("create");
+    read_command_complete(&mut stream);
+    let _ = read_ready_status(&mut stream);
+
+    send_extended(
+        &mut stream,
+        b'P',
+        &parse_body("", "EXPLAIN SELECT id FROM t WHERE id = $1", &[]),
+    )
+    .expect("Parse EXPLAIN with inner $1");
+    send_extended(&mut stream, b'B', &bind_body_text_params("", "", &[]))
+        .expect("Bind with no values");
+    send_extended(&mut stream, b'E', &execute_body("")).expect("Execute");
+    send_extended(&mut stream, b'S', &[]).expect("Sync");
+
+    read_until_type(&mut stream, b'1'); // ParseComplete
+    read_until_type(&mut stream, b'2'); // BindComplete
+    let (msg_type, body) = read_message(&mut stream).expect("error frame");
+    assert_eq!(msg_type, b'E', "unbound inner $1 must be an error");
+    let text = String::from_utf8_lossy(&body);
+    assert!(
+        text.contains("no value specified for parameter $1"),
+        "binder must reach inside EXPLAIN, got {text:?}"
+    );
+    assert_eq!(read_ready_status(&mut stream), b'I');
+
+    // And with a value supplied, the EXPLAIN round-trips: BindComplete,
+    // rows/NoData, CommandComplete — the inner statement is fully bound.
+    send_extended(
+        &mut stream,
+        b'P',
+        &parse_body("", "EXPLAIN SELECT id FROM t WHERE id = $1", &[]),
+    )
+    .expect("Parse EXPLAIN again");
+    send_extended(&mut stream, b'B', &bind_body_text_params("", "", &["1"]))
+        .expect("Bind with a value");
+    send_extended(&mut stream, b'E', &execute_body("")).expect("Execute");
+    send_extended(&mut stream, b'S', &[]).expect("Sync");
+    read_until_type(&mut stream, b'1');
+    read_until_type(&mut stream, b'2');
+    // EXPLAIN returns the plan as rows: RowDescription, DataRows, then
+    // CommandComplete. The inner statement is fully bound — no error, no
+    // missing-parameter complaint.
+    // EXPLAIN returns the plan as rows: RowDescription, then DataRows
+    // (however many the plan renderer emits), then CommandComplete.
+    let _ = read_until_type(&mut stream, b'T'); // plan RowDescription
+    let explain_tag: String;
+    loop {
+        let (msg_type, body) = read_message(&mut stream).expect("plan frames");
+        match msg_type {
+            // Plan rows and benign notices both just continue the stream.
+            b'D' | b'N' => {}
+            b'C' => {
+                explain_tag =
+                    String::from_utf8_lossy(&body[..body.len().saturating_sub(1)]).to_string();
+                break;
+            }
+            other => panic!("unexpected frame {other:#x} in EXPLAIN result"),
+        }
+    }
+    // The completion tag reflects the row stream the plan renderer
+    // produced; the contract under test is that the round completes
+    // cleanly with the inner statement fully bound — no error, no
+    // missing-parameter complaint.
+    assert!(
+        !explain_tag.is_empty(),
+        "bound EXPLAIN must complete with a CommandComplete tag, got {explain_tag:?}"
+    );
+    let _ = read_ready_status(&mut stream);
+}
+
+#[test]
 fn pgwire_extended_protocol_unbound_parameter_is_an_error_not_data() {
     // A statement carrying $n executed through a Bind with NO values must
     // fail with a missing-parameter error — never fall through and reach

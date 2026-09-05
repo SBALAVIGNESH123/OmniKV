@@ -299,7 +299,14 @@ fn bind_walk(
             right: Box::new(bind_walk(*right, resolve)?),
             all,
         },
-        // SHOW TABLES, EXPLAIN, CREATE, DROP never carry value positions.
+        // EXPLAIN wraps an inner statement that CAN carry value positions.
+        SqlStatement::Explain(inner) => {
+            SqlStatement::Explain(Box::new(bind_walk(*inner, resolve)?))
+        }
+        SqlStatement::ExplainAnalyze(inner) => {
+            SqlStatement::ExplainAnalyze(Box::new(bind_walk(*inner, resolve)?))
+        }
+        // SHOW TABLES, CREATE, and DROP never carry value positions.
         other => other,
     })
 }
