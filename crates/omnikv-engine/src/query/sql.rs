@@ -206,6 +206,30 @@ pub fn bind_statement_params(
     bind_walk(stmt, &resolve)
 }
 
+/// The highest `$n` position a statement references — its Bind
+/// parameter count, which Describe(statement) reports in
+/// ParameterDescription. Walks exactly the AST positions
+/// `bind_statement_params` walks (with a dummy resolver that just
+/// records the maximum), so the reported count can never disagree with
+/// what the binder demands. Statements the SQL grammar cannot parse
+/// (legacy KV grammar, transaction keywords) declare zero parameters —
+/// the SQL grammar is the only path that accepts parameters at all.
+pub fn count_statement_params(sql: &str) -> usize {
+    let trimmed = sql.trim().trim_end_matches(';');
+    let Ok(stmt) = parse_sql(trimmed) else {
+        return 0;
+    };
+    let max_seen = std::cell::Cell::new(0usize);
+    let resolve = |n: usize| {
+        max_seen.set(max_seen.get().max(n));
+        Ok(SqlValue::Null)
+    };
+    // The resolver never errors, so the walk always succeeds; only the
+    // recorded maximum matters.
+    let _ = bind_walk(stmt, &resolve);
+    max_seen.get()
+}
+
 /// The recursive AST walk behind `bind_statement_params`: every position
 /// that holds a `SqlValue` (INSERT rows, WHERE comparisons, IN lists,
 /// UPDATE assignments, nested SetOp branches) gets its placeholders

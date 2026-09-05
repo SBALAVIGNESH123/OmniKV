@@ -43,6 +43,18 @@ const DEFAULT_PGWIRE_RATE_LIMIT_PER_SEC: f64 = 1000.0;
 const DEFAULT_PGWIRE_RATE_LIMIT_BURST: u32 = 100;
 const DEFAULT_PGWIRE_RATE_LIMIT_MAX_USERS: usize = 10_000;
 
+/// Maximum number of named prepared statements a single connection may
+/// retain. Distinct names accumulate until disconnect and each pins its
+/// SQL text, so without a cap one authenticated client can grow session
+/// memory without bound; exceeding the cap is a `54000` protocol error.
+/// Replacing an existing name (and the unnamed statement slot) is free.
+const MAX_PGWIRE_PREPARED_STATEMENTS: usize = 1_000;
+
+/// Maximum number of named portals a single connection may retain. A
+/// suspended portal additionally retains its full result set, so this
+/// bounds retained rows too; exceeding it is a `54000` protocol error.
+const MAX_PGWIRE_PORTALS: usize = 1_000;
+
 /// PostgreSQL wire protocol message types (server -> client)
 const AUTH_OK: u8 = b'R';
 const READY_FOR_QUERY: u8 = b'Z';
@@ -69,7 +81,17 @@ const PARSE_COMPLETE: u8 = b'1';
 const BIND_COMPLETE: u8 = b'2';
 const CLOSE_COMPLETE: u8 = b'3';
 const NO_DATA: u8 = b'n';
+const PARAMETER_DESCRIPTION: u8 = b't';
 const PORTAL_SUSPENDED: u8 = b's';
+
+/// A Parse-created prepared statement: the query text plus the
+/// parameter type OIDs the client declared, which Describe(statement)
+/// echoes back in ParameterDescription (the true `$n` count is derived
+/// from the statement text itself at Describe time).
+struct PreparedStatement {
+    sql: String,
+    param_oids: Vec<u32>,
+}
 
 /// Per-connection transaction state for PgWire sessions.
 /// Tracks whether the client is in an explicit transaction block.
@@ -84,7 +106,9 @@ struct ConnectionState {
     /// message. The unnamed statement is stored under the empty name and,
     /// per PostgreSQL semantics, is overwritten by every Parse with an
     /// empty name and lasts only until the next Parse of any kind.
-    named_statements: HashMap<String, String>,
+    /// Each entry retains the parameter type OIDs the Parse carried, so
+    /// Describe(statement) can echo them in ParameterDescription.
+    named_statements: HashMap<String, PreparedStatement>,
     /// Bound portals awaiting Execute. The unnamed portal is stored under
     /// the empty name and is destroyed by any Bind (not only an unnamed
     /// one), matching PostgreSQL.
@@ -100,6 +124,11 @@ struct ConnectionState {
 /// or rejected at Bind time.
 struct Portal {
     sql: String,
+    /// Name of the prepared statement this portal was bound from, so
+    /// Close(statement) can implicitly destroy it — PostgreSQL: "closing
+    /// a prepared statement implicitly closes any open portals that were
+    /// constructed from that statement."
+    source_statement: String,
     params: Vec<Option<String>>,
     /// Rows retained from a suspended execution, awaiting further Execute
     /// rounds. PostgreSQL's portal holds the executor's output the same
@@ -320,6 +349,25 @@ impl PgWireServer {
         }
     }
 
+    /// Creates a PgWireServer with caller-supplied password and rate
+    /// limiter state — for tests that need a deterministic limiter budget
+    /// and production setups that provision their own limiter.
+    pub fn with_password_and_rate_limiter(
+        db: Arc<OmniKV>,
+        bind_addr: &str,
+        pgwire_password: &str,
+        rate_limiter: Arc<RateLimiter>,
+    ) -> Self {
+        Self {
+            db,
+            bind_addr: bind_addr.to_string(),
+            max_connections: 32,
+            rate_limiter,
+            pgwire_password: pgwire_password.to_string(),
+            security_policy: default_security_policy(),
+        }
+    }
+
     /// Returns the configured max connections.
     pub fn max_connections(&self) -> usize {
         self.max_connections
@@ -467,15 +515,7 @@ fn handle_connection(
             }
             PARSE_MSG => {
                 let body = read_message_body(&mut stream)?;
-                handle_parse(
-                    &db,
-                    &tm,
-                    &mut conn,
-                    &mut stream,
-                    &body,
-                    &rate_limiter,
-                    &client_id,
-                )?;
+                handle_parse(&mut conn, &mut stream, &body, &rate_limiter, &client_id)?;
             }
             BIND_MSG => {
                 let body = read_message_body(&mut stream)?;
@@ -487,7 +527,15 @@ fn handle_connection(
             }
             EXECUTE_MSG => {
                 let body = read_message_body(&mut stream)?;
-                handle_execute(&db, &tm, &mut conn, &mut stream, &body)?;
+                handle_execute(
+                    &db,
+                    &tm,
+                    &mut conn,
+                    &mut stream,
+                    &body,
+                    &rate_limiter,
+                    &client_id,
+                )?;
             }
             CLOSE_MSG => {
                 let body = read_message_body(&mut stream)?;
@@ -762,14 +810,75 @@ fn take_cstr<'a>(buf: &'a [u8], what: &str) -> Result<(&'a str, &'a [u8]), Strin
     Ok((s, &buf[end + 1..]))
 }
 
-/// Handles a Parse ('P') message: parse-check the statement, store it under
-/// its name (the unnamed statement lives under ""), and reply ParseComplete.
-/// Per PostgreSQL, the unnamed statement is destroyed by any Parse; named
-/// statements are replaced on name collision. Parameter type OIDs sent by
-/// the client are accepted but not enforced (parameters bind as text).
+/// Whether the shared execution core accepts `sql_trimmed` — mirrors
+/// its acceptance order exactly: empty statements, the whitespace-
+/// normalized transaction keywords (with the `AND [NO] CHAIN` suffix
+/// stripped only for the termination commands, as the core does), `SET`,
+/// the `SELECT 1` / `SELECT VERSION` shortcuts, the SQL grammar, and
+/// finally the legacy KV grammar. Parse rejects anything this returns
+/// false for, at Parse time — the same text the core would reject with
+/// `42601` at first Execute, which is how PostgreSQL reports it.
+fn statement_is_accepted_by_core(sql_trimmed: &str) -> bool {
+    let normalized = sql_trimmed
+        .to_uppercase()
+        .split_whitespace()
+        .collect::<Vec<&str>>()
+        .join(" ");
+    if normalized.is_empty() {
+        return true;
+    }
+    // Termination commands accept the chain suffix; nothing else does —
+    // ordinary SQL may end in the word CHAIN as a column name.
+    let mut stripped = normalized.as_str();
+    if normalized
+        .split(' ')
+        .next()
+        .is_some_and(|first| matches!(first, "COMMIT" | "END" | "ROLLBACK" | "ABORT"))
+    {
+        if let Some(rest) = normalized.strip_suffix(" AND NO CHAIN") {
+            stripped = rest;
+        } else if let Some(rest) = normalized.strip_suffix(" AND CHAIN") {
+            stripped = rest;
+        }
+    }
+    if matches!(
+        stripped,
+        "BEGIN"
+            | "BEGIN WORK"
+            | "BEGIN TRANSACTION"
+            | "START TRANSACTION"
+            | "COMMIT"
+            | "COMMIT WORK"
+            | "COMMIT TRANSACTION"
+            | "END"
+            | "END WORK"
+            | "END TRANSACTION"
+            | "ROLLBACK"
+            | "ROLLBACK WORK"
+            | "ROLLBACK TRANSACTION"
+            | "ABORT"
+            | "ABORT WORK"
+            | "ABORT TRANSACTION"
+    ) {
+        return true;
+    }
+    if normalized == "SET" || normalized.starts_with("SET ") {
+        return true;
+    }
+    if normalized == "SELECT 1" || normalized.starts_with("SELECT VERSION") {
+        return true;
+    }
+    crate::sql::parse_sql(sql_trimmed).is_ok() || query::parse_query(sql_trimmed).is_ok()
+}
+
+/// Handles a Parse ('P') message: parse-check the statement (syntax
+/// errors are reported HERE, at Parse time, like PostgreSQL), store it
+/// under its name (the unnamed statement lives under ""), and reply
+/// ParseComplete. Per PostgreSQL, the unnamed statement is destroyed by
+/// any Parse; named statements are replaced on name collision and capped
+/// per connection. Parameter type OIDs sent by the client are accepted
+/// but not enforced (parameters bind as text); Describe echoes them.
 fn handle_parse(
-    db: &Arc<OmniKV>,
-    tm: &Arc<TransactionManager>,
     conn: &mut ConnectionState,
     stream: &mut std::net::TcpStream,
     body: &[u8],
@@ -816,15 +925,53 @@ fn handle_parse(
             "Parse message parameter type list is truncated",
         );
     }
+    let mut param_oids = Vec::with_capacity(param_count);
+    for i in 0..param_count {
+        let at = 2 + i * 4;
+        param_oids.push(u32::from_be_bytes([
+            rest[at],
+            rest[at + 1],
+            rest[at + 2],
+            rest[at + 3],
+        ]));
+    }
 
-    // Store the raw text; the shared execution core parses at Execute time,
-    // which keeps transaction semantics identical between protocols. The
-    // unnamed statement is destroyed by ANY Parse, including a named one.
+    // Parse-check NOW: PostgreSQL reports statement syntax errors at
+    // Parse time, not at first Execute. Acceptance mirrors the shared
+    // execution core exactly (see statement_is_accepted_by_core), so
+    // nothing Parse accepts here fails there, and anything rejected
+    // here is the exact text the core would reject with 42601.
+    let sql_trimmed = sql.trim().trim_end_matches(';');
+    if !statement_is_accepted_by_core(sql_trimmed) {
+        let near = sql_trimmed.split_whitespace().next().unwrap_or_default();
+        let msg = format!("syntax error at or near \"{near}\"");
+        return extended_protocol_error(stream, conn, "42601", &msg);
+    }
+
+    // The execution core parses again at Execute time, which keeps
+    // transaction semantics identical between protocols. The unnamed
+    // statement is destroyed by ANY Parse, including a named one. The
+    // cap counts DISTINCT names only — replacing an existing name or
+    // the unnamed slot never grows the session's retained state.
     if name.is_empty() {
         conn.named_statements.remove("");
     }
-    conn.named_statements
-        .insert(name.to_string(), sql.to_string());
+    if !name.is_empty()
+        && !conn.named_statements.contains_key(name)
+        && conn.named_statements.len() >= MAX_PGWIRE_PREPARED_STATEMENTS
+    {
+        let msg = format!(
+            "too many prepared statements (max {MAX_PGWIRE_PREPARED_STATEMENTS}); close some first"
+        );
+        return extended_protocol_error(stream, conn, "54000", &msg);
+    }
+    conn.named_statements.insert(
+        name.to_string(),
+        PreparedStatement {
+            sql: sql.to_string(),
+            param_oids,
+        },
+    );
 
     // Reply ParseComplete: '1' + int32(4).
     let msg = [PARSE_COMPLETE, 0, 0, 0, 4];
@@ -855,7 +1002,7 @@ fn handle_bind(
     };
 
     let sql = match conn.named_statements.get(stmt_name) {
-        Some(sql) => sql.clone(),
+        Some(stmt) => stmt.sql.clone(),
         None => {
             let msg = format!("prepared statement \"{stmt_name}\" does not exist");
             return extended_protocol_error(stream, conn, "26000", &msg);
@@ -915,11 +1062,21 @@ fn handle_bind(
         .collect();
 
     // Any Bind destroys the unnamed portal (PostgreSQL semantics).
+    // The cap counts DISTINCT names only — re-Binding an existing portal
+    // (the unnamed round-trip pattern drivers use) never grows state.
     conn.portals.remove("");
+    if !portal_name.is_empty()
+        && !conn.portals.contains_key(portal_name)
+        && conn.portals.len() >= MAX_PGWIRE_PORTALS
+    {
+        let msg = format!("too many portals (max {MAX_PGWIRE_PORTALS}); close some first");
+        return extended_protocol_error(stream, conn, "54000", &msg);
+    }
     conn.portals.insert(
         portal_name.to_string(),
         Portal {
             sql,
+            source_statement: stmt_name.to_string(),
             params,
             suspended_rows: None,
         },
@@ -1004,9 +1161,10 @@ fn select_column_label(col: &crate::sql::SelectColumn) -> String {
     }
 }
 
-/// Handles Describe ('D'): 'S' describes a statement, 'P' a portal. Both
-/// reply the statement's row shape - RowDescription for row-returning
-/// statements, NoData otherwise. Describe is side-effect-free, exactly
+/// Handles Describe ('D'): 'S' describes a statement (ParameterDescription,
+/// then the row shape), 'P' a portal (row shape only). Both reply
+/// RowDescription for row-returning statements, NoData otherwise.
+/// Describe is side-effect-free, exactly
 /// like PostgreSQL's plan-based Describe: pg8000's execute_unnamed sends
 /// Parse/Describe/Sync before every unnamed statement, so executing the
 /// statement here would double-run every query (committing at Describe
@@ -1034,16 +1192,16 @@ fn handle_describe(
         Err(e) => return extended_protocol_error(stream, conn, "08P01", &e),
     };
 
-    let sql: String = match kind {
+    let (sql, stmt_param_oids): (String, Vec<u32>) = match kind {
         b'S' => match conn.named_statements.get(name) {
-            Some(sql) => sql.clone(),
+            Some(stmt) => (stmt.sql.clone(), stmt.param_oids.clone()),
             None => {
                 let msg = format!("prepared statement \"{name}\" does not exist");
                 return extended_protocol_error(stream, conn, "26000", &msg);
             }
         },
         b'P' => match conn.portals.get(name) {
-            Some(portal) => portal.sql.clone(),
+            Some(portal) => (portal.sql.clone(), Vec::new()),
             None => {
                 let msg = format!("portal \"{name}\" does not exist");
                 return extended_protocol_error(stream, conn, "34000", &msg);
@@ -1098,6 +1256,21 @@ fn handle_describe(
             }
         };
 
+    // Describe(statement) replies ParameterDescription first — even for
+    // zero parameters — exactly like PostgreSQL: "The response is a
+    // ParameterDescription message describing the parameters needed by
+    // the statement, followed by a RowDescription ... (or NoData)".
+    // The count is what the STATEMENT needs: the highest `$n` its text
+    // references. Client-declared Parse OIDs are echoed where provided;
+    // the rest stay 0 (unspecified — parameters bind as text).
+    if kind == b'S' {
+        let n_params = crate::sql::count_statement_params(&sql);
+        let oids: Vec<u32> = (1..=n_params)
+            .map(|i| stmt_param_oids.get(i - 1).copied().unwrap_or(0))
+            .collect();
+        send_parameter_description(stream, &oids)?;
+    }
+
     match row_columns {
         Some(cols) => {
             let refs: Vec<(&str, i32)> = cols
@@ -1115,8 +1288,11 @@ fn handle_describe(
 }
 
 /// Handles Execute ('E'): run the portal's statement with its bound
-/// parameters and stream the result frames. Unlike the simple protocol,
-/// Execute errors abort the pipeline: the ErrorResponse is sent and the
+/// parameters and stream DataRows + CommandComplete (or PortalSuspended) —
+/// never RowDescription, which only Describe sends. A fresh execution
+/// consumes a rate-limit permit like a simple-protocol Query; a resume
+/// of retained rows does not. Unlike the simple protocol, Execute
+/// errors abort the pipeline: the ErrorResponse is sent and the
 /// connection skips every message until Sync (PostgreSQL's error rule).
 fn handle_execute(
     db: &Arc<OmniKV>,
@@ -1124,6 +1300,8 @@ fn handle_execute(
     conn: &mut ConnectionState,
     stream: &mut std::net::TcpStream,
     body: &[u8],
+    rate_limiter: &RateLimiter,
+    client_id: &str,
 ) -> std::io::Result<()> {
     if conn.extended_error_pending {
         return Ok(());
@@ -1172,6 +1350,18 @@ fn handle_execute(
             streamed,
         }) => (columns, rows, tag, streamed),
         None => {
+            // A fresh execution consumes a rate-limit permit, exactly like
+            // a simple-protocol Query — otherwise a client could re-Execute
+            // a bound portal in a tight loop and bypass throttling. A
+            // resume streams retained rows only and consumes nothing.
+            if let Err(retry_after_ms) = acquire_pgwire_query_permit(rate_limiter, client_id) {
+                return extended_protocol_error(
+                    stream,
+                    conn,
+                    "53300",
+                    &format!("rate limit exceeded; retry after {retry_after_ms}ms"),
+                );
+            }
             let portal_sql = conn
                 .portals
                 .get(portal_name)
@@ -1204,14 +1394,10 @@ fn handle_execute(
     };
     let suspended_now = end < rows.len();
 
-    // The RowDescription goes out only on the portal's FIRST round; a
-    // resumed Execute continues the row stream with DataRows directly
-    // (re-sending it desyncs drivers that expect rows).
-    if start == 0 {
-        let col_defs: Vec<(&str, i32)> =
-            columns.iter().map(|(c, oid)| (c.as_str(), *oid)).collect();
-        send_row_description(stream, &col_defs)?;
-    }
+    // Execute NEVER sends RowDescription — PostgreSQL: "Execute doesn't
+    // cause ReadyForQuery or RowDescription to be issued". The row shape
+    // came from Describe(portal) or Describe(statement)+Bind; Execute
+    // streams DataRows only, on every round.
     for row in &rows[start..end] {
         let refs: Vec<&str> = row.iter().map(String::as_str).collect();
         send_data_row(stream, &refs)?;
@@ -1236,7 +1422,9 @@ fn handle_execute(
 }
 
 /// Handles Close ('C'): destroy a named statement or portal and reply
-/// CloseComplete. Closing a nonexistent name is NOT an error in PostgreSQL.
+/// CloseComplete. Closing a statement implicitly closes the portals
+/// constructed from it. Closing a nonexistent name is NOT an error in
+/// PostgreSQL.
 fn handle_close(
     conn: &mut ConnectionState,
     stream: &mut std::net::TcpStream,
@@ -1260,7 +1448,16 @@ fn handle_close(
     };
     match kind {
         b'S' => {
-            conn.named_statements.remove(name);
+            // Closing a prepared statement implicitly closes every open
+            // portal constructed from it — PostgreSQL's documented
+            // behavior. Portals remember their source statement name, so
+            // only this statement's portals disappear; portals of other
+            // statements (even ones with identical SQL text) survive.
+            // Closing a nonexistent name stays a silent no-op.
+            if conn.named_statements.remove(name).is_some() {
+                conn.portals
+                    .retain(|_, portal| portal.source_statement != name);
+            }
         }
         b'P' => {
             conn.portals.remove(name);
@@ -1887,6 +2084,25 @@ fn send_row_description(
 
     let mut buf = Vec::new();
     buf.push(ROW_DESCRIPTION);
+    buf.extend_from_slice(&((body.len() + 4) as i32).to_be_bytes());
+    buf.extend_from_slice(&body);
+    stream.write_all(&buf)
+}
+
+/// Sends a ParameterDescription ('t') frame: int16 parameter count,
+/// then one int32 type OID per parameter.
+fn send_parameter_description(
+    stream: &mut std::net::TcpStream,
+    oids: &[u32],
+) -> std::io::Result<()> {
+    let count = i16::try_from(oids.len()).expect("parameter count fits i16");
+    let mut body = Vec::with_capacity(2 + oids.len() * 4);
+    body.extend_from_slice(&count.to_be_bytes());
+    for oid in oids {
+        body.extend_from_slice(&oid.to_be_bytes());
+    }
+    let mut buf = Vec::with_capacity(1 + 4 + body.len());
+    buf.push(PARAMETER_DESCRIPTION);
     buf.extend_from_slice(&((body.len() + 4) as i32).to_be_bytes());
     buf.extend_from_slice(&body);
     stream.write_all(&buf)
