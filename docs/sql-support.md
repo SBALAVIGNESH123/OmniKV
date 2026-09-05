@@ -70,12 +70,13 @@ invalidation is not yet part of the public contract.
 
 DBAPI drivers and other PostgreSQL clients bind parameters through the
 extended query protocol (Parse/Bind/Execute/Sync), which the PgWire server
-implements with the same positional `$1`..`$n` placeholders. Parameters bind
-as text; an unbound or NULL parameter becomes the `NULL` literal, which the
-statement parsers reject (full NULL support is tracked by #111). See
-[protocol-limits.md](protocol-limits.md) for the full extended-protocol
-contract, including named statements, portals, and the skip-until-Sync error
-rule.
+implements with the same positional `$1`..`$n` placeholders. Bound values are
+substituted into the parsed statement AS DATA — never re-parsed as SQL — so
+parameter bytes cannot alter statement structure. An unbound or NULL
+parameter binds as `NULL` (full NULL comparison support is tracked by #111).
+See [protocol-limits.md](protocol-limits.md) for the full extended-protocol
+contract, including named statements, portals, `PortalSuspended` row
+capping, and the skip-until-Sync error rule.
 
 ## Planner contract
 

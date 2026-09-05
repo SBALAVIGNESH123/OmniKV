@@ -307,6 +307,152 @@ fn pgwire_extended_protocol_prepare_bind_execute_sync_round_trip() {
 }
 
 #[test]
+fn pgwire_extended_protocol_execute_max_rows_suspends_and_resumes() {
+    // A nonzero Execute max-rows bound must stream at most that many rows
+    // and end the round with PortalSuspended ('s'), NOT CommandComplete.
+    // The next Execute of the same portal resumes from the retained rows —
+    // the statement is never re-run — and the final round closes with
+    // CommandComplete. This is the frame contract JDBC fetch sizes and
+    // psycopg2 server-side cursors depend on.
+    let addr = spawn_pgwire_server().expect("spawn server");
+    let mut stream = TcpStream::connect(&addr).expect("connect");
+    complete_handshake(&mut stream).expect("handshake");
+
+    // Seed three rows through the simple protocol.
+    send_query(&mut stream, "CREATE TABLE t (id INT PRIMARY KEY)").expect("create");
+    read_command_complete(&mut stream);
+    let _ = read_ready_status(&mut stream);
+    for id in 1..=3 {
+        send_query(&mut stream, &format!("INSERT INTO t VALUES ({id})")).expect("insert");
+        read_command_complete(&mut stream);
+        let _ = read_ready_status(&mut stream);
+    }
+
+    // Bind a full-range SELECT into a portal.
+    send_extended(&mut stream, b'P', &parse_body("", "SELECT id FROM t", &[])).expect("Parse");
+    send_extended(&mut stream, b'B', &bind_body_text_params("p", "", &[])).expect("Bind");
+    send_extended(&mut stream, b'S', &[]).expect("Sync");
+    read_until_type(&mut stream, b'1');
+    read_until_type(&mut stream, b'2');
+    let _ = read_ready_status(&mut stream);
+
+    // Execute with max_rows = 2: exactly two DataRows, then PortalSuspended.
+    let mut exec = execute_body("p");
+    // Overwrite the trailing row-count field with 2.
+    let n = exec.len();
+    exec[n - 4..n].copy_from_slice(&2u32.to_be_bytes());
+    send_extended(&mut stream, b'E', &exec).expect("Execute capped");
+    send_extended(&mut stream, b'S', &[]).expect("Sync");
+    let _ = read_until_type(&mut stream, b'T'); // RowDescription
+    let _ = read_until_type(&mut stream, b'D'); // row 1
+    let _ = read_until_type(&mut stream, b'D'); // row 2
+    let suspended = read_message(&mut stream).expect("suspended frame");
+    assert_eq!(
+        suspended.0, b's',
+        "capped Execute must end with PortalSuspended, got {:#x}",
+        suspended.0
+    );
+    assert_eq!(read_ready_status(&mut stream), b'I');
+
+    // Resume: the remaining one row, then CommandComplete "SELECT 3" —
+    // the tag counts the whole statement's rows, like PostgreSQL.
+    send_extended(&mut stream, b'E', &execute_body("p")).expect("Execute resume");
+    send_extended(&mut stream, b'S', &[]).expect("Sync");
+    let _ = read_until_type(&mut stream, b'T');
+    let _ = read_until_type(&mut stream, b'D'); // row 3
+    assert_eq!(
+        read_command_complete(&mut stream),
+        "SELECT 3",
+        "resumed round must close the statement with the full row count"
+    );
+    let _ = read_ready_status(&mut stream);
+
+    // The JDBC pattern: a new round re-Binds the statement (destroying the
+    // unnamed portal's prior state; here the named portal is re-created by
+    // Bind) and a full Execute streams every row with CommandComplete —
+    // no PortalSuspended.
+    send_extended(&mut stream, b'B', &bind_body_text_params("p", "", &[])).expect("re-Bind");
+    send_extended(&mut stream, b'E', &execute_body("p")).expect("Execute full");
+    send_extended(&mut stream, b'S', &[]).expect("Sync");
+    read_until_type(&mut stream, b'2'); // BindComplete
+    let _ = read_until_type(&mut stream, b'T');
+    for _ in 0..3 {
+        let _ = read_until_type(&mut stream, b'D');
+    }
+    assert_eq!(read_command_complete(&mut stream), "SELECT 3");
+    let _ = read_ready_status(&mut stream);
+}
+
+#[test]
+fn pgwire_extended_protocol_binary_result_format_is_rejected_at_bind() {
+    // Bind requesting binary result format must be rejected with 08P01 at
+    // Bind time — accepting it and emitting text frames would make
+    // clients decode garbage.
+    let addr = spawn_pgwire_server().expect("spawn server");
+    let mut stream = TcpStream::connect(&addr).expect("connect");
+    complete_handshake(&mut stream).expect("handshake");
+
+    send_extended(&mut stream, b'P', &parse_body("", "SELECT 1", &[])).expect("Parse");
+    send_extended(&mut stream, b'S', &[]).expect("Sync");
+    read_until_type(&mut stream, b'1');
+    let _ = read_ready_status(&mut stream);
+
+    // Bind with result format code = 1 (binary) for the single column.
+    let mut body = Vec::new();
+    body.extend_from_slice(b" "); // portal: unnamed
+    body.extend_from_slice(b" "); // statement: unnamed
+    body.extend_from_slice(&0i16.to_be_bytes()); // param format codes: all text
+    body.extend_from_slice(&0i16.to_be_bytes()); // zero param values
+    body.extend_from_slice(&1i16.to_be_bytes()); // one result format code
+    body.extend_from_slice(&1i16.to_be_bytes()); // ...and it is binary
+    send_extended(&mut stream, b'B', &body).expect("Bind binary result");
+    send_extended(&mut stream, b'S', &[]).expect("Sync");
+
+    let (msg_type, resp) = read_message(&mut stream).expect("error frame");
+    assert_eq!(msg_type, b'E', "binary result format must be rejected");
+    let text = String::from_utf8_lossy(&resp);
+    assert!(
+        text.contains("08P01") && text.contains("binary result format"),
+        "expected 08P01 naming the binary result format gap, got {text:?}"
+    );
+    assert_eq!(read_ready_status(&mut stream), b'I');
+}
+
+#[test]
+fn pgwire_extended_protocol_warnings_travel_as_notice_response() {
+    // The benign COMMIT-without-transaction warning over the extended
+    // protocol must arrive as a NoticeResponse ('N') frame followed by
+    // CommandComplete — never an ErrorResponse ('E'), because DBAPI
+    // drivers raise on any 'E' and would break a benign autocommit-adjacent
+    // commit. This was the review regression: both renderers called
+    // send_error("WARNING", ...), which always emits 'E'.
+    let addr = spawn_pgwire_server().expect("spawn server");
+    let mut stream = TcpStream::connect(&addr).expect("connect");
+    complete_handshake(&mut stream).expect("handshake");
+
+    send_extended(&mut stream, b'P', &parse_body("", "commit", &[])).expect("Parse commit");
+    send_extended(&mut stream, b'B', &bind_body_text_params("", "", &[])).expect("Bind");
+    send_extended(&mut stream, b'E', &execute_body("")).expect("Execute");
+    send_extended(&mut stream, b'S', &[]).expect("Sync");
+
+    read_until_type(&mut stream, b'1'); // ParseComplete
+    read_until_type(&mut stream, b'2'); // BindComplete
+    // THE CONTRACT: the warning frame must be 'N', not 'E'.
+    let (warn_type, warn_body) = read_message(&mut stream).expect("warning frame");
+    assert_eq!(
+        warn_type, b'N',
+        "benign warning must be a NoticeResponse, got {warn_type:#x}"
+    );
+    let warn = String::from_utf8_lossy(&warn_body);
+    assert!(
+        warn.contains("25P01") && warn.contains("WARNING"),
+        "expected WARNING 25P01 notice, got {warn:?}"
+    );
+    assert_eq!(read_command_complete(&mut stream), "COMMIT");
+    assert_eq!(read_ready_status(&mut stream), b'I');
+}
+
+#[test]
 fn pgwire_extended_protocol_transaction_commit_and_rollback() {
     // The exact #119 scenario: DBAPI commit()/rollback() drive COMMIT /
     // ROLLBACK through the extended protocol. Sync after the unnamed
@@ -438,20 +584,42 @@ fn pgwire_extended_protocol_named_statement_close_and_describe_portal() {
 
 #[test]
 fn pgwire_extended_protocol_parameter_binding_substitutes_values() {
-    // $1/$2 placeholders must be substituted with the Bind values before
-    // execution — the legacy KV path accepts INSERT key value with any text.
+    // Bound `$1` values must flow to the executor AS DATA, never as SQL
+    // text: the statement is parsed with the placeholders intact and the
+    // values are substituted into the parsed AST. The proof is the
+    // injection attempt below — a value full of SQL operators binds as a
+    // plain text value and finds nothing, instead of restructuring the
+    // statement.
     let addr = spawn_pgwire_server().expect("spawn server");
     let mut stream = TcpStream::connect(&addr).expect("connect");
     complete_handshake(&mut stream).expect("handshake");
 
-    send_extended(&mut stream, b'P', &parse_body("", "INSERT 42 $1", &[25]))
-        .expect("Parse with param");
+    // Set up a table with one row via the simple protocol.
+    send_query(
+        &mut stream,
+        "CREATE TABLE users (id INT PRIMARY KEY, name TEXT)",
+    )
+    .expect("create table");
+    read_command_complete(&mut stream);
+    let _ = read_ready_status(&mut stream);
+    send_query(&mut stream, "INSERT INTO users VALUES (1, 'bala')").expect("seed row");
+    read_command_complete(&mut stream);
+    let _ = read_ready_status(&mut stream);
+
+    // Parameterized INSERT through Parse/Bind/Execute/Sync, with the RAW
+    // value (no pre-quotes — quoting is the executor's business now).
+    send_extended(
+        &mut stream,
+        b'P',
+        &parse_body("", "INSERT INTO users VALUES ($1, $2)", &[23, 25]),
+    )
+    .expect("Parse with params");
     send_extended(
         &mut stream,
         b'B',
-        &bind_body_text_params("", "", &["'hello'"]),
+        &bind_body_text_params("", "", &["2", "vignesh"]),
     )
-    .expect("Bind param value");
+    .expect("Bind raw values");
     send_extended(&mut stream, b'E', &execute_body("")).expect("Execute");
     send_extended(&mut stream, b'S', &[]).expect("Sync");
 
@@ -460,14 +628,15 @@ fn pgwire_extended_protocol_parameter_binding_substitutes_values() {
     assert_eq!(read_command_complete(&mut stream), "INSERT 0 1");
     assert_eq!(read_ready_status(&mut stream), b'I');
 
-    // Read it back through the same protocol with a bound parameter.
+    // Read the row back through a bound parameter: `WHERE id = $1` with
+    // the value `2` must find exactly the row the parameter inserted.
     send_extended(
         &mut stream,
         b'P',
-        &parse_body("", "SELECT * WHERE key = $1", &[25]),
+        &parse_body("", "SELECT id, name FROM users WHERE id = $1", &[23]),
     )
     .expect("Parse select");
-    send_extended(&mut stream, b'B', &bind_body_text_params("", "", &["42"])).expect("Bind key");
+    send_extended(&mut stream, b'B', &bind_body_text_params("", "", &["2"])).expect("Bind key");
     send_extended(&mut stream, b'E', &execute_body("")).expect("Execute");
     send_extended(&mut stream, b'S', &[]).expect("Sync");
     read_until_type(&mut stream, b'1');
@@ -475,9 +644,41 @@ fn pgwire_extended_protocol_parameter_binding_substitutes_values() {
     let row = read_until_type(&mut stream, b'D');
     let text = String::from_utf8_lossy(&row);
     assert!(
-        text.contains("hello"),
-        "bound parameter must reach the executor, got {text:?}"
+        text.contains("vignesh"),
+        "bound parameter must reach the executor as data, got {text:?}"
     );
+    assert_eq!(read_command_complete(&mut stream), "SELECT 1");
+    let _ = read_ready_status(&mut stream);
+
+    // THE INJECTION ATTEMPT: a value containing SQL operators must bind as
+    // a plain text value. Under text substitution, `1 OR id > 0` would
+    // restructure the WHERE clause and return every row; under AST
+    // binding it compares a single text value against id and matches
+    // nothing.
+    send_extended(
+        &mut stream,
+        b'P',
+        &parse_body("", "SELECT id FROM users WHERE id = $1", &[23]),
+    )
+    .expect("Parse injection probe");
+    send_extended(
+        &mut stream,
+        b'B',
+        &bind_body_text_params("", "", &["1 OR id > 0"]),
+    )
+    .expect("Bind injection payload");
+    send_extended(&mut stream, b'E', &execute_body("")).expect("Execute");
+    send_extended(&mut stream, b'S', &[]).expect("Sync");
+    read_until_type(&mut stream, b'1');
+    read_until_type(&mut stream, b'2');
+    let _ = read_until_type(&mut stream, b'T'); // RowDescription (still sent for 0 rows)
+    // No DataRows may arrive: the payload is one text value, not SQL.
+    assert_eq!(
+        read_command_complete(&mut stream),
+        "SELECT 0",
+        "injection payload must bind as inert data and match nothing"
+    );
+    let _ = read_ready_status(&mut stream);
 }
 
 #[test]
@@ -542,10 +743,11 @@ fn pgwire_ssl_then_gss_negotiation_then_startup_is_accepted() {
 
 /// Reads frames until `CommandComplete` and returns the command tag.
 ///
-/// Tolerates WARNING-severity `ErrorResponse` frames, which the server emits
-/// before `CommandComplete` for benign cases exactly like PostgreSQL (COMMIT
-/// without a transaction, BEGIN inside a transaction). Any ERROR-severity
-/// frame fails the test.
+/// Tolerates `NoticeResponse` ('N') frames, which the server emits before
+/// `CommandComplete` for benign cases exactly like PostgreSQL (COMMIT
+/// without a transaction, BEGIN inside a transaction). An `ErrorResponse`
+/// ('E') here is a contract violation — DBAPI drivers raise on any 'E'
+/// frame — so it fails the test rather than being tolerated.
 fn read_command_complete(stream: &mut TcpStream) -> String {
     loop {
         let (msg_type, body) = read_message(stream).expect("read frame");
@@ -555,13 +757,7 @@ fn read_command_complete(stream: &mut TcpStream) -> String {
                 return String::from_utf8_lossy(tag).to_string();
             }
             b'Z' => panic!("ReadyForQuery before CommandComplete"),
-            b'E' => {
-                let text = String::from_utf8_lossy(&body);
-                assert!(
-                    text.starts_with("SWARNING"),
-                    "unexpected error frame: {text:?}"
-                );
-            }
+            b'N' => { /* benign notice; PostgreSQL sends these as 'N' */ }
             other => panic!("unexpected frame {other:#x} while waiting for CommandComplete"),
         }
     }

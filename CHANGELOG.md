@@ -18,12 +18,21 @@
   shapes side-effect-free from the parsed statement, and follows the
   skip-until-`Sync` error rule: an extended-protocol error sends the
   ErrorResponse, fails the open transaction, and skips every message until
-  the next `Sync` answers `ReadyForQuery`. Benign warnings now travel as
-  `NoticeResponse` ('N') frames instead of `ErrorResponse` — drivers raise
-  on any ErrorResponse, so a COMMIT-outside-transaction warning must never
-  be one. Both wire protocols run one shared execution core, so transaction
-  semantics cannot drift between the simple and extended paths. (Write
-  buffering inside explicit transactions remains a separate gap, #121.)
+  the next `Sync` answers `ReadyForQuery`. Bound parameters are substituted
+  into the parsed statement AS DATA (a `SqlValue::Placeholder` AST node),
+  never re-parsed as SQL text — a value like `x OR 1=1` binds as one inert
+  text value and cannot alter statement structure. A nonzero Execute
+  max-rows bound streams at most that many rows, ends the round with
+  `PortalSuspended`, and resumes from retained rows on the next Execute
+  without re-running the statement (the JDBC fetch-size /
+  server-side-cursor contract). Binary Bind result formats are rejected
+  with `08P01` at Bind time instead of being accepted and answered with
+  text frames. Benign warnings travel as `NoticeResponse` ('N') frames on
+  both protocols — never `ErrorResponse`, which DBAPI drivers treat as a
+  hard failure. Both wire protocols run one shared execution core, so
+  transaction semantics cannot drift between the simple and extended
+  paths. (Write buffering inside explicit transactions remains a separate
+  gap, #121.)
 
 ### Fixed
 

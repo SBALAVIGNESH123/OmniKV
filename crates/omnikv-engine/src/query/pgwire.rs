@@ -69,6 +69,7 @@ const PARSE_COMPLETE: u8 = b'1';
 const BIND_COMPLETE: u8 = b'2';
 const CLOSE_COMPLETE: u8 = b'3';
 const NO_DATA: u8 = b'n';
+const PORTAL_SUSPENDED: u8 = b's';
 
 /// Per-connection transaction state for PgWire sessions.
 /// Tracks whether the client is in an explicit transaction block.
@@ -100,6 +101,20 @@ struct ConnectionState {
 struct Portal {
     sql: String,
     params: Vec<Option<String>>,
+    /// Rows retained from a suspended execution, awaiting further Execute
+    /// rounds. PostgreSQL's portal holds the executor's output the same
+    /// way: a suspended portal resumes by streaming retained rows, never
+    /// by re-running the statement (which could re-apply DML or read a
+    /// different snapshot).
+    suspended_rows: Option<SuspendedRows>,
+}
+
+/// The retained result of a partially-consumed portal.
+struct SuspendedRows {
+    columns: Vec<(String, i32)>,
+    rows: Vec<Vec<String>>,
+    tag: String,
+    streamed: usize,
 }
 
 impl ConnectionState {
@@ -859,10 +874,23 @@ fn handle_bind(
         Ok(v) => v,
         Err(e) => return extended_protocol_error(stream, conn, "08P01", &e),
     };
-    let (_result_formats, _rest) = match read_bind_list(rest, "result format codes", true) {
+    let (result_formats, _rest) = match read_bind_list(rest, "result format codes", true) {
         Ok(v) => v,
         Err(e) => return extended_protocol_error(stream, conn, "08P01", &e),
     };
+    // Only text result format (0) is implemented. Accepting a binary
+    // request and then emitting text frames would make clients decode
+    // garbage; reject at Bind with a protocol error naming the gap,
+    // which is exactly the failure PostgreSQL gives for an unsupported
+    // format rather than a silent mismatch.
+    if result_formats.iter().any(Option::is_some) {
+        return extended_protocol_error(
+            stream,
+            conn,
+            "08P01",
+            "binary result format is not supported; request text format (0)",
+        );
+    }
 
     if format_codes.len() > 1 && format_codes.len() != raw_values.len() {
         return extended_protocol_error(
@@ -888,8 +916,14 @@ fn handle_bind(
 
     // Any Bind destroys the unnamed portal (PostgreSQL semantics).
     conn.portals.remove("");
-    conn.portals
-        .insert(portal_name.to_string(), Portal { sql, params });
+    conn.portals.insert(
+        portal_name.to_string(),
+        Portal {
+            sql,
+            params,
+            suspended_rows: None,
+        },
+    );
 
     // Reply BindComplete: '2' + int32(4).
     let msg = [BIND_COMPLETE, 0, 0, 0, 4];
@@ -1098,8 +1132,12 @@ fn handle_execute(
         Ok(v) => v,
         Err(e) => return extended_protocol_error(stream, conn, "08P01", &e),
     };
-    // int32 max rows (0 = unlimited); the row cap is enforced by the
-    // statement-level limits, so the value is accepted but not applied.
+    // int32 max rows: 0 = unlimited (all rows, then CommandComplete);
+    // a nonzero bound streams at most that many rows, and if the portal
+    // has more, the round ends with PortalSuspended instead of
+    // CommandComplete — the client resumes with another Execute of the
+    // same portal. This is the frame contract cursor/fetch-size clients
+    // (JDBC fetch size, psycopg2 server-side cursors) rely on.
     if rest.len() < 4 {
         return extended_protocol_error(
             stream,
@@ -1108,40 +1146,86 @@ fn handle_execute(
             "Execute message is missing its row-count field",
         );
     }
+    let max_rows = u32::from_be_bytes([rest[0], rest[1], rest[2], rest[3]]) as usize;
 
-    let portal = match conn.portals.get(portal_name) {
-        Some(p) => p,
+    // A suspended portal resumes from its RETAINED rows — the statement
+    // is never re-run (re-running DML would double-apply it, and a read
+    // could see a snapshot that no longer exists).
+    let suspended = {
+        let portal = match conn.portals.get_mut(portal_name) {
+            Some(p) => p,
+            None => {
+                let msg = format!("portal \"{portal_name}\" does not exist");
+                return extended_protocol_error(stream, conn, "34000", &msg);
+            }
+        };
+        portal.suspended_rows.take()
+    };
+
+    // Either the retained rows of a suspended portal, or a fresh run.
+    // (columns, rows, tag, resume_offset)
+    let (columns, rows, tag, resume_at) = match suspended {
+        Some(SuspendedRows {
+            columns,
+            rows,
+            tag,
+            streamed,
+        }) => (columns, rows, tag, streamed),
         None => {
-            let msg = format!("portal \"{portal_name}\" does not exist");
-            return extended_protocol_error(stream, conn, "34000", &msg);
+            let portal_sql = conn
+                .portals
+                .get(portal_name)
+                .map(|p| (p.sql.clone(), p.params.clone()))
+                .expect("portal exists (checked above)");
+            let (sql, params) = portal_sql;
+            match execute_statement_with_params(db, tm, conn, &sql, &params) {
+                StepOutcome::Rows { columns, rows, tag } => (columns, rows, tag, 0),
+                StepOutcome::Complete(tag) => {
+                    return send_command_complete(stream, &tag);
+                }
+                StepOutcome::Warning { code, message, tag } => {
+                    send_notice(stream, &code, &message)?;
+                    return send_command_complete(stream, &tag);
+                }
+                StepOutcome::Error { code, message } => {
+                    return extended_protocol_error(stream, conn, &code, &message);
+                }
+            }
         }
     };
-    let sql = portal.sql.clone();
-    let params = portal.params.clone();
 
-    let bound = substitute_params(&sql, &params);
-    let outcome = execute_statement_core(db, tm, conn, &bound);
-    match outcome {
-        StepOutcome::Complete(tag) => send_command_complete(stream, &tag),
-        StepOutcome::Rows { columns, rows, tag } => {
-            let col_defs: Vec<(&str, i32)> =
-                columns.iter().map(|(c, oid)| (c.as_str(), *oid)).collect();
-            send_row_description(stream, &col_defs)?;
-            for row in &rows {
-                let refs: Vec<&str> = row.iter().map(String::as_str).collect();
-                send_data_row(stream, &refs)?;
-            }
-            send_command_complete(stream, &tag)
+    // Apply the max-rows bound on top of the statement's rows, starting
+    // at the offset a suspended round reached.
+    let start = resume_at.min(rows.len());
+    let end = if max_rows == 0 {
+        rows.len()
+    } else {
+        (start + max_rows).min(rows.len())
+    };
+    let suspended_now = end < rows.len();
+
+    let col_defs: Vec<(&str, i32)> = columns.iter().map(|(c, oid)| (c.as_str(), *oid)).collect();
+    send_row_description(stream, &col_defs)?;
+    for row in &rows[start..end] {
+        let refs: Vec<&str> = row.iter().map(String::as_str).collect();
+        send_data_row(stream, &refs)?;
+    }
+    if suspended_now {
+        let portal = conn.portals.get_mut(portal_name);
+        if let Some(p) = portal {
+            p.suspended_rows = Some(SuspendedRows {
+                columns,
+                rows,
+                tag,
+                streamed: end,
+            });
         }
-        // Warnings are benign (COMMIT outside a txn); the NOTICE precedes
-        // the completion tag and the pipeline continues, like PostgreSQL.
-        StepOutcome::Warning { code, message, tag } => {
-            send_error(stream, "WARNING", &code, &message)?;
-            send_command_complete(stream, &tag)
-        }
-        StepOutcome::Error { code, message } => {
-            extended_protocol_error(stream, conn, &code, &message)
-        }
+        // PortalSuspended: 's' + int32(4). No CommandComplete this round —
+        // the client continues with another Execute of the same portal.
+        let msg = [PORTAL_SUSPENDED, 0, 0, 0, 4];
+        stream.write_all(&msg)
+    } else {
+        send_command_complete(stream, &tag)
     }
 }
 
@@ -1204,40 +1288,6 @@ fn extended_protocol_error(
     send_error(stream, "ERROR", code, message)
 }
 
-/// Substitutes `$1`, `$2`, ... parameter placeholders in a statement with
-/// the bound values (text format). An unbound or NULL parameter becomes
-/// the literal NULL, which the statement parsers reject with a syntax
-/// error; real NULL literal support is tracked by #111.
-fn substitute_params(sql: &str, params: &[Option<String>]) -> String {
-    let mut out = String::with_capacity(sql.len());
-    let bytes = sql.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'$' {
-            let mut j = i + 1;
-            while j < bytes.len() && bytes[j].is_ascii_digit() {
-                j += 1;
-            }
-            if j > i + 1 {
-                let index = &sql[i + 1..j];
-                let position = index.parse::<usize>().ok().and_then(|n| n.checked_sub(1));
-                let value = position.and_then(|idx| params.get(idx)).cloned().flatten();
-                let replacement = match value {
-                    Some(v) => v,
-                    None => "NULL".to_string(),
-                };
-                out.push_str(&replacement);
-                i = j;
-                continue;
-            }
-        }
-        let ch = sql[i..].chars().next().expect("in-bounds char");
-        out.push(ch);
-        i += ch.len_utf8();
-    }
-    out
-}
-
 /// Handle a simple-protocol ('Q') Query: run the shared execution core and
 /// render its outcome as simple-protocol frames.
 fn handle_query(
@@ -1269,8 +1319,9 @@ fn write_step_outcome_simple(
             }
             send_command_complete(stream, &tag)?;
         }
+        // NoticeResponse, never ErrorResponse — drivers raise on 'E' frames.
         StepOutcome::Warning { code, message, tag } => {
-            send_error(stream, "WARNING", &code, &message)?;
+            send_notice(stream, &code, &message)?;
             send_command_complete(stream, &tag)?;
         }
         StepOutcome::Error { code, message } => {
@@ -1290,6 +1341,21 @@ fn execute_statement_core(
     tm: &Arc<TransactionManager>,
     conn: &mut ConnectionState,
     sql: &str,
+) -> StepOutcome {
+    execute_statement_with_params(db, tm, conn, sql, &[])
+}
+
+/// Params-aware execution core: the extended protocol's Execute path.
+/// `$n` placeholders are parsed into the AST as marker nodes and the bound
+/// values are substituted AS DATA after parsing - parameter bytes are never
+/// re-parsed as SQL, so a bound value like `x OR 1=1` compares as a plain
+/// text value and cannot alter the statement structure.
+fn execute_statement_with_params(
+    db: &Arc<OmniKV>,
+    tm: &Arc<TransactionManager>,
+    conn: &mut ConnectionState,
+    sql: &str,
+    params: &[Option<String>],
 ) -> StepOutcome {
     let sql_trimmed = sql.trim().trim_end_matches(';');
 
@@ -1442,7 +1508,7 @@ fn execute_statement_core(
             }
         }
     } else {
-        execute_non_transactional_statement(db, conn, sql_trimmed, normalized)
+        execute_non_transactional_statement(db, conn, sql_trimmed, normalized, params)
     }
 }
 
@@ -1455,6 +1521,7 @@ fn execute_non_transactional_statement(
     conn: &mut ConnectionState,
     sql_trimmed: &str,
     normalized: &str,
+    params: &[Option<String>],
 ) -> StepOutcome {
     // ── If in a failed transaction, reject all commands until ROLLBACK ──
     if conn.txn_failed {
@@ -1475,7 +1542,12 @@ fn execute_non_transactional_statement(
         };
     }
 
-    match crate::sql::parse_sql(sql_trimmed) {
+    match crate::sql::parse_sql(sql_trimmed).and_then(|stmt| {
+        if params.is_empty() {
+            return Ok(stmt);
+        }
+        crate::sql::bind_statement_params(stmt, params)
+    }) {
         Ok(stmt) => {
             let stmt = match enforce_pgwire_statement_limits(stmt) {
                 Ok(stmt) => stmt,
@@ -1519,7 +1591,17 @@ fn execute_non_transactional_statement(
             }
         }
         Err(_) => {
-            // Fall back to legacy KV query parser
+            // Fall back to legacy KV query parser. Parameterized
+            // statements never take this path: a bound value with
+            // whitespace would split into multiple tokens here, so params
+            // + legacy grammar is rejected as unsupported instead of
+            // silently mis-parsed.
+            if !params.is_empty() {
+                return StepOutcome::error(
+                    "0A000",
+                    "parameterized statements require the SQL grammar; the legacy KV grammar does not support parameters",
+                );
+            }
             match query::parse_query(sql_trimmed) {
                 Ok(parsed) => execute_parsed_kv_query(db, &parsed),
                 Err(e) => {

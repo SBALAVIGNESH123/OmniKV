@@ -61,9 +61,9 @@ configuration:
 | Message | Reply | Behavior |
 | --- | --- | --- |
 | `Parse` ('P') | `ParseComplete` ('1') | Statement stored under its name; the unnamed statement is destroyed by any Parse, per PostgreSQL |
-| `Bind` ('B') | `BindComplete` ('2') | `$1..$n` parameter values resolve into a portal (text format only; binary format is rejected with `08P01`); any Bind destroys the unnamed portal |
+| `Bind` ('B') | `BindComplete` ('2') | `$1..$n` parameter values resolve into a portal (text format only; binary parameter OR result format is rejected with `08P01` at Bind time); any Bind destroys the unnamed portal |
 | `Describe` ('D') | `RowDescription` ('T') or `NoData` ('n') | Side-effect-free: the row shape derives from the statement text, never by executing it |
-| `Execute` ('E') | rows + `CommandComplete` | Runs the portal's statement through the same execution core as the simple protocol — transaction semantics cannot drift between the two paths |
+| `Execute` ('E') | rows + `CommandComplete`, or `PortalSuspended` ('s') | Runs the portal's statement through the same execution core as the simple protocol — transaction semantics cannot drift between the two paths. A nonzero max-rows bound streams at most that many rows and ends with `PortalSuspended`; the next Execute resumes from retained rows (the statement is never re-run) and the final round closes with `CommandComplete` |
 | `Close` ('C') | `CloseComplete` ('3') | Destroys a named statement or portal; closing an unknown name is not an error |
 | `Sync` ('S') | `ReadyForQuery` | Ends the pipeline; clears any pending error state |
 | `Flush` ('H') | — | Drains the socket |
@@ -77,9 +77,14 @@ no open transaction, BEGIN inside one) travel as `NoticeResponse` ('N')
 frames — never `ErrorResponse` — because DBAPI drivers raise on any
 ErrorResponse.
 
-Parameters bind as text; an unbound or NULL parameter becomes the `NULL`
-literal, which the statement parsers reject (full NULL support is tracked by
-#111). Write buffering inside explicit transactions is tracked by #121.
+Parameters bind as text **as AST data, not SQL text**: `$n` placeholders are
+parsed into marker nodes and the bound bytes are substituted into the parsed
+statement after parsing — a value like `x OR 1=1` compares as one plain text
+value and cannot alter the statement structure. An unbound or NULL parameter
+binds as `NULL` (full NULL literal support in comparisons is tracked by #111).
+Parameterized statements require the SQL grammar; the legacy KV grammar
+rejects them with `0A000`. Write buffering inside explicit transactions is
+tracked by #121.
 
 ## QUIC binary protocol
 
