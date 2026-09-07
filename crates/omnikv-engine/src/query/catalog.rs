@@ -190,6 +190,71 @@ impl Catalog {
         Ok(())
     }
 
+    /// The storage key and serialized TableDef a CREATE TABLE writes —
+    /// the transactional executor stages exactly this pair so the SSI
+    /// engine applies it at COMMIT and a ROLLBACK discards it.
+    pub fn staged_create_entry(table: &TableDef) -> Result<(String, String), String> {
+        let key = format!("{}{}", CATALOG_PREFIX, table.name.to_lowercase());
+        let value = serde_json::to_string(table).map_err(|e| format!("Serialize: {}", e))?;
+        Ok((key, value))
+    }
+
+    /// The storage key a DROP TABLE deletes from the catalog.
+    pub fn staged_drop_key(name: &str) -> String {
+        format!("{}{}", CATALOG_PREFIX, name.to_lowercase())
+    }
+
+    /// Applies a transaction's staged catalog writes over the loaded
+    /// cache, so this statement sees the block's own uncommitted CREATEs
+    /// and DROPs (read-your-own-writes for DDL). The cache instance is
+    /// per-statement, so no other connection is affected; the staged
+    /// writes themselves only become durable at COMMIT.
+    pub fn apply_txn_overlay(
+        &self,
+        staged: &std::collections::HashMap<String, (Option<String>, u64)>,
+    ) {
+        let mut cache = self
+            .cache
+            .write()
+            .expect("catalog cache RwLock poisoned: fatal invariant");
+        for (key, (value, _ttl)) in staged {
+            let Some(name) = key.strip_prefix(CATALOG_PREFIX) else {
+                continue;
+            };
+            match value {
+                Some(serialized) => {
+                    if let Ok(table) = serde_json::from_str::<TableDef>(serialized) {
+                        cache.insert(table.name.to_lowercase(), table);
+                    }
+                }
+                None => {
+                    cache.remove(name);
+                }
+            }
+        }
+    }
+
+    /// Inserts a staged CREATE's table into this statement's cache so the
+    /// very statement that created it (and later statements in the same
+    /// block, via the overlay) can use it.
+    pub fn insert_staged(&self, table: TableDef) {
+        let mut cache = self
+            .cache
+            .write()
+            .expect("catalog cache RwLock poisoned: fatal invariant");
+        cache.insert(table.name.to_lowercase(), table);
+    }
+
+    /// Removes a staged DROP's table from this statement's cache, mirroring
+    /// the staged delete for the block's own later statements.
+    pub fn remove_staged(&self, name: &str) {
+        let mut cache = self
+            .cache
+            .write()
+            .expect("catalog cache RwLock poisoned: fatal invariant");
+        cache.remove(&name.to_lowercase());
+    }
+
     pub fn get_table(&self, name: &str) -> Option<TableDef> {
         let cache = self
             .cache

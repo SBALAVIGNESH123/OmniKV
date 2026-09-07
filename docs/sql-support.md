@@ -79,6 +79,16 @@ See [protocol-limits.md](protocol-limits.md) for the full extended-protocol
 contract, including named statements, portals, `ParameterDescription`,
 `PortalSuspended` row capping, and the skip-until-Sync error rule.
 
+### DML inside explicit transactions
+
+`INSERT`/`UPDATE`/`DELETE` inside a `BEGIN ... COMMIT|ROLLBACK` block are
+transactional: staged in the open transaction, visible to the block's own
+later statements (read-your-own-writes), invisible to other connections
+until `COMMIT`, and fully discarded by `ROLLBACK`. Both wire protocols
+share this path. DDL is transactional too — `CREATE`/`DROP TABLE`
+inside a block stage with the rows and commit or roll back with the
+transaction, exactly like PostgreSQL's transactional DDL.
+
 ## Planner contract
 
 The optimizer turns SQL ASTs into physical plan nodes. Current single-table

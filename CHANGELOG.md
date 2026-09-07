@@ -45,6 +45,24 @@
 
 ### Fixed
 
+- DML inside a `BEGIN` block is now transactional (issue #121):
+  `INSERT`/`UPDATE`/`DELETE` (and legacy KV writes) previously committed
+  immediately even inside an explicit transaction, so `ROLLBACK` could
+  never undo them — phantom-committed rows, a correctness violation for
+  every DBAPI client in the default non-autocommit mode. Writes are now
+  staged in the open transaction's write set and applied atomically by the
+  SSI transaction engine at `COMMIT` (after conflict validation),
+  discarded untouched by `ROLLBACK`. Later statements in the block see
+  earlier statements' uncommitted writes — read-your-own-writes now holds
+  through the optimizer plan path too, whose scans read at the
+  transaction's snapshot with staged writes overlaid — and other
+  connections see nothing until `COMMIT`. DDL is transactional too:
+  `CREATE`/`DROP TABLE` inside a block stage their catalog entry (and the
+  dropped table's row deletes) in the same write set, so they commit and
+  roll back with the transaction like PostgreSQL's transactional DDL —
+  no more silent autocommit through the block. Both wire protocols share
+  the one execution core, so the semantics are identical on each.
+
 - SQL keywords and transaction statements now behave identically in any case
   or spacing combination (issue #109). DBAPI drivers (psycopg2, pg8000) with
   autocommit off implicitly send lowercase `begin transaction` at session

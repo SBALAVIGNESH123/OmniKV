@@ -1715,6 +1715,28 @@ fn execute_statement_with_params(
     }
 }
 
+/// Merges a transactional executor's staged writes into the open
+/// transaction's write set, so `TransactionManager::commit` applies them
+/// atomically after SSI validation and a ROLLBACK discards them
+/// untouched. Later statements in the same transaction saw these rows
+/// through the executor's read overlay (read-your-own-writes); COMMIT
+/// makes that view real for everyone.
+fn merge_staged_writes_into_txn(
+    executor: &mut crate::sql_exec::SqlExecutor,
+    conn: &mut ConnectionState,
+) {
+    if let (Some(txn), Some(batch)) = (conn.txn.as_mut(), executor.flush_batch()) {
+        for (key, value, ttl) in batch.buffered_writes {
+            let key = String::from_utf8_lossy(&key).into_owned();
+            txn.write_set.insert(key, (Some(value), ttl));
+        }
+        for key in batch.buffered_deletes {
+            let key = String::from_utf8_lossy(&key).into_owned();
+            txn.write_set.insert(key, (None, 0));
+        }
+    }
+}
+
 /// Executes everything that is not a transaction-control statement: the
 /// failed-transaction guard, health-check shortcuts, the SQL path, and the
 /// legacy KV fallback. Shares the connection's transaction snapshot when a
@@ -1774,16 +1796,26 @@ fn execute_non_transactional_statement(
             };
             let catalog = std::sync::Arc::new(crate::catalog::Catalog::new(db.clone()));
 
-            // If inside an explicit transaction, use the transaction's read_seq
-            // for snapshot isolation. Otherwise use autocommit (current seq).
-            let executor = if let Some(ref txn) = conn.txn {
-                crate::sql_exec::SqlExecutor::with_snapshot(db.clone(), catalog, txn.read_seq)
+            // Inside an explicit transaction the executor stages DML into
+            // its pending batch (visible to this transaction's later reads,
+            // invisible to everyone else) — the SSI engine applies it
+            // atomically at COMMIT. Outside one, autocommit as before.
+            let mut executor = if let Some(ref txn) = conn.txn {
+                crate::sql_exec::SqlExecutor::with_transaction(
+                    db.clone(),
+                    catalog,
+                    txn.read_seq,
+                    &txn.write_set,
+                )
             } else {
                 crate::sql_exec::SqlExecutor::new(db.clone(), catalog)
             };
 
             match executor.execute(&stmt) {
                 Ok(crate::sql_exec::ExecResult::Rows { columns, rows }) => {
+                    // A read-only statement never stages writes; flush
+                    // anyway for the invariant (a no-op here).
+                    merge_staged_writes_into_txn(&mut executor, conn);
                     let tag = format!("SELECT {}", rows.len());
                     StepOutcome::Rows {
                         columns: columns.into_iter().map(|c| (c, 25)).collect(),
@@ -1792,15 +1824,39 @@ fn execute_non_transactional_statement(
                     }
                 }
                 Ok(crate::sql_exec::ExecResult::Modified { count, command }) => {
-                    let _ = count; // Writes are committed directly for now (see txn note above)
+                    let _ = count;
+                    // DML staged by the transactional executor moves into
+                    // the transaction's write set here; COMMIT applies it
+                    // atomically, ROLLBACK discards it. Autocommit
+                    // executors already committed inside execute().
+                    merge_staged_writes_into_txn(&mut executor, conn);
                     StepOutcome::complete(command)
                 }
-                Ok(crate::sql_exec::ExecResult::Ok(msg)) => StepOutcome::complete(msg),
+                Ok(crate::sql_exec::ExecResult::Ok(msg)) => {
+                    // Transactional DDL (CREATE/DROP TABLE) stages its
+                    // catalog write exactly like DML stages rows; the
+                    // merge moves it into the transaction's write set so
+                    // COMMIT applies it and ROLLBACK discards it.
+                    merge_staged_writes_into_txn(&mut executor, conn);
+                    StepOutcome::complete(msg)
+                }
                 Err(e) => {
                     if conn.txn.is_some() {
                         conn.txn_failed = true;
                     }
-                    StepOutcome::error("XX000", format!("Exec error: {e}"))
+                    // The two catalog errors carry their PostgreSQL
+                    // SQLSTATEs instead of the generic internal-error
+                    // one: clients branch on these (42P01 undefined
+                    // table, 42P07 duplicate table) the same way they
+                    // branch on 23505 for duplicate keys.
+                    let code = if e.contains("does not exist") {
+                        "42P01"
+                    } else if e.contains("already exists") {
+                        "42P07"
+                    } else {
+                        "XX000"
+                    };
+                    StepOutcome::error(code, format!("Exec error: {e}"))
                 }
             }
         }
@@ -1817,7 +1873,7 @@ fn execute_non_transactional_statement(
                 );
             }
             match query::parse_query(sql_trimmed) {
-                Ok(parsed) => execute_parsed_kv_query(db, &parsed),
+                Ok(parsed) => execute_parsed_kv_query(db, conn, &parsed),
                 Err(e) => {
                     if conn.txn.is_some() {
                         conn.txn_failed = true;
@@ -1831,15 +1887,25 @@ fn execute_non_transactional_statement(
 
 /// Execute a parsed legacy-KV query and build its outcome. Used by both
 /// wire protocols after the SQL parser declines a statement.
-fn execute_parsed_kv_query(db: &Arc<OmniKV>, parsed: &query::Query) -> StepOutcome {
-    let seq = db.get_seq();
+fn execute_parsed_kv_query(
+    db: &Arc<OmniKV>,
+    conn: &mut ConnectionState,
+    parsed: &query::Query,
+) -> StepOutcome {
+    // Reads use the transaction snapshot when a BEGIN block is open;
+    // the write overlay below gives read-your-own-writes.
+    let seq = conn
+        .txn
+        .as_ref()
+        .map(|txn| txn.read_seq)
+        .unwrap_or_else(|| db.get_seq());
 
     match &parsed.action {
         query::Action::SelectAll => {
             // Build scan range from conditions
             let (start_key, end_key) = build_scan_range(&parsed.conditions);
 
-            let results = db.scan(&start_key, &end_key, seq).unwrap_or_default();
+            let results = overlay_kv_scan(db, conn, &start_key, &end_key, seq);
 
             let limit = match bounded_pgwire_query_limit(parsed.limit) {
                 Ok(limit) => limit,
@@ -1870,7 +1936,7 @@ fn execute_parsed_kv_query(db: &Arc<OmniKV>, parsed: &query::Query) -> StepOutco
 
         query::Action::SelectCount => {
             let (start_key, end_key) = build_scan_range(&parsed.conditions);
-            let results = db.scan(&start_key, &end_key, seq).unwrap_or_default();
+            let results = overlay_kv_scan(db, conn, &start_key, &end_key, seq);
 
             StepOutcome::Rows {
                 columns: vec![("count".into(), 20)],
@@ -1882,8 +1948,8 @@ fn execute_parsed_kv_query(db: &Arc<OmniKV>, parsed: &query::Query) -> StepOutco
         query::Action::Insert(key, value) => {
             let mut batch = WriteBatch::new();
             match batch.set(key, value.clone()) {
-                Ok(()) => match db.commit_batch(&batch) {
-                    Ok(_) => StepOutcome::complete("INSERT 0 1"),
+                Ok(()) => match stage_kv_write(db, conn, batch) {
+                    Ok(()) => StepOutcome::complete("INSERT 0 1"),
                     Err(e) => StepOutcome::error("XX000", format!("Insert failed: {e}")),
                 },
                 Err(e) => StepOutcome::error("XX000", format!("Batch error: {e}")),
@@ -1893,8 +1959,8 @@ fn execute_parsed_kv_query(db: &Arc<OmniKV>, parsed: &query::Query) -> StepOutco
         query::Action::Update(key, value) => {
             let mut batch = WriteBatch::new();
             match batch.set(key, value.clone()) {
-                Ok(()) => match db.commit_batch(&batch) {
-                    Ok(_) => StepOutcome::complete("UPDATE 1"),
+                Ok(()) => match stage_kv_write(db, conn, batch) {
+                    Ok(()) => StepOutcome::complete("UPDATE 1"),
                     Err(e) => StepOutcome::error("XX000", format!("Update failed: {e}")),
                 },
                 Err(e) => StepOutcome::error("XX000", format!("Batch error: {e}")),
@@ -1903,7 +1969,7 @@ fn execute_parsed_kv_query(db: &Arc<OmniKV>, parsed: &query::Query) -> StepOutco
 
         query::Action::Delete => {
             let (start_key, end_key) = build_scan_range(&parsed.conditions);
-            let results = db.scan(&start_key, &end_key, seq).unwrap_or_default();
+            let results = overlay_kv_scan(db, conn, &start_key, &end_key, seq);
 
             let mut batch = WriteBatch::new();
             let mut deleted = 0;
@@ -1913,13 +1979,70 @@ fn execute_parsed_kv_query(db: &Arc<OmniKV>, parsed: &query::Query) -> StepOutco
                 }
             }
 
-            if deleted > 0 {
-                let _ = db.commit_batch(&batch);
+            if deleted > 0
+                && let Err(e) = stage_kv_write(db, conn, batch)
+            {
+                return StepOutcome::error("XX000", format!("Delete failed: {e}"));
             }
 
             StepOutcome::complete(format!("DELETE {deleted}"))
         }
     }
+}
+
+/// Stages or commits a legacy-KV write batch: inside a transaction the
+/// writes land in the transaction's write set — applied atomically by
+/// the SSI engine at COMMIT, discarded untouched by ROLLBACK — and this
+/// transaction's own later reads see them via the scan overlay. Outside
+/// a transaction they commit immediately, exactly as before.
+fn stage_kv_write(
+    db: &Arc<OmniKV>,
+    conn: &mut ConnectionState,
+    batch: WriteBatch,
+) -> Result<(), String> {
+    match conn.txn.as_mut() {
+        Some(txn) => {
+            for (key, value, ttl) in batch.buffered_writes {
+                let key = String::from_utf8_lossy(&key).into_owned();
+                txn.write_set.insert(key, (Some(value), ttl));
+            }
+            for key in batch.buffered_deletes {
+                let key = String::from_utf8_lossy(&key).into_owned();
+                txn.write_set.insert(key, (None, 0));
+            }
+            Ok(())
+        }
+        None => db
+            .commit_batch(&batch)
+            .map(|_| ())
+            .map_err(|e| format!("{e:?}")),
+    }
+}
+
+/// A range scan with the transaction's staged writes overlaid — the
+/// legacy-KV read-your-own-writes: keys this transaction wrote replace
+/// stored copies, keys it deleted vanish, uncommitted writes are visible
+/// only to this scan. Outside a transaction this is a plain scan.
+fn overlay_kv_scan(
+    db: &Arc<OmniKV>,
+    conn: &ConnectionState,
+    start_key: &str,
+    end_key: &str,
+    seq: u64,
+) -> Vec<(String, String)> {
+    let mut results = db.scan(start_key, end_key, seq).unwrap_or_default();
+    if let Some(txn) = conn.txn.as_ref() {
+        results.retain(|(key, _)| !txn.write_set.contains_key(key));
+        for (key, (value, _ttl)) in &txn.write_set {
+            if key.as_str() >= start_key
+                && key.as_str() < end_key
+                && let Some(value) = value
+            {
+                results.push((key.clone(), value.clone()));
+            }
+        }
+    }
+    results
 }
 
 fn bounded_pgwire_query_limit(limit: Option<usize>) -> Result<usize, String> {
