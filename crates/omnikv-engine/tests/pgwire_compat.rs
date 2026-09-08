@@ -1207,6 +1207,60 @@ fn pgwire_transaction_update_delete_also_roll_back() {
     let _ = read_ready_status(&mut stream);
 }
 #[test]
+fn pgwire_transaction_kv_select_desc_with_staged_writes_stays_sorted() {
+    // Regression (CodeRabbit, PR #123 round 2): a legacy-KV
+    // SELECT * ORDER BY DESC inside a transaction must return rows in
+    // key order even when the transaction staged writes — the overlay
+    // merge used to append staged keys in HashMap order, so the
+    // reversed/truncated view was shuffled.
+    let addr = spawn_pgwire_server().expect("spawn server");
+    let mut stream = TcpStream::connect(&addr).expect("connect");
+    complete_handshake(&mut stream).expect("handshake");
+
+    // Seed keys in ascending order outside the transaction.
+    for k in ["alpha", "delta", "kilo"] {
+        send_query(&mut stream, &format!("INSERT {k} v-{k}")).expect("seed");
+        read_command_complete(&mut stream);
+        let _ = read_ready_status(&mut stream);
+    }
+
+    // Stage a key that sorts between the stored ones.
+    send_query(&mut stream, "BEGIN").expect("begin");
+    read_command_complete(&mut stream);
+    let _ = read_ready_status(&mut stream);
+    send_query(&mut stream, "INSERT bravo v-bravo").expect("staged write");
+    read_command_complete(&mut stream);
+    let _ = read_ready_status(&mut stream);
+
+    // DESC over stored+staged: strictly descending keys.
+    send_query(&mut stream, "SELECT * ORDER BY DESC LIMIT 2").expect("desc select");
+    let _ = read_until_type(&mut stream, b'T');
+    let mut keys = Vec::new();
+    while let Ok((t, body)) = read_message(&mut stream) {
+        if t == b'D' {
+            // DataRow: int16 field count, then per field int32 length
+            // + raw bytes. The first field is the key.
+            let count = i16::from_be_bytes([body[0], body[1]]);
+            assert_eq!(count, 2, "kv SELECT rows have two fields");
+            let len = u32::from_be_bytes([body[2], body[3], body[4], body[5]]) as usize;
+            keys.push(String::from_utf8_lossy(&body[6..6 + len]).into_owned());
+        } else if t == b'C' {
+            break;
+        }
+    }
+    assert_eq!(
+        keys,
+        vec!["kilo".to_string(), "delta".to_string()],
+        "DESC with staged writes must return strictly descending keys, got {keys:?}"
+    );
+    let _ = read_ready_status(&mut stream);
+
+    send_query(&mut stream, "ROLLBACK").expect("rollback");
+    read_command_complete(&mut stream);
+    let _ = read_ready_status(&mut stream);
+}
+
+#[test]
 fn pgwire_transaction_read_write_conflict_aborts_committer() {
     // SSI on the SQL path (Greptile P1 #1 on PR #123): two transactions
     // read the same table; one then writes a row the other's reads

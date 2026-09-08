@@ -663,6 +663,7 @@ impl TransactionManager {
         txn.state = TxnState::Aborted;
         txn.write_set.clear();
         txn.read_set.clear();
+        txn.read_ranges.clear();
         txn.savepoints.clear();
         self.cleanup_txn(txn.id, txn.read_seq);
         self.metrics.txns_aborted.fetch_add(1, Ordering::Relaxed);

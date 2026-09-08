@@ -513,10 +513,12 @@ fn handle_connection(
     loop {
         let mut msg_type = [0u8; 1];
         if stream.read_exact(&mut msg_type).is_err() {
-            // Client disconnected — clean up any open transaction
-            if let Some(txn) = conn.txn.take() {
-                // Implicit rollback: unregister the snapshot
-                db.unregister_snapshot(txn.read_seq);
+            // Client disconnected — clean up any open transaction.
+            // tm.abort unregisters the snapshot AND removes the txn
+            // from the shared manager's active set — a bare unregister
+            // would pin history pruning at this txn's read_seq forever.
+            if let Some(mut txn) = conn.txn.take() {
+                tm.abort(&mut txn);
             }
             break;
         }
@@ -578,9 +580,10 @@ fn handle_connection(
             }
             TERMINATE_MSG => {
                 let _ = read_message_body(&mut stream)?;
-                // Clean up any open transaction
-                if let Some(txn) = conn.txn.take() {
-                    db.unregister_snapshot(txn.read_seq);
+                // Clean up any open transaction through the shared
+                // manager so active-txn tracking and metrics stay true.
+                if let Some(mut txn) = conn.txn.take() {
+                    tm.abort(&mut txn);
                 }
                 break;
             }
@@ -1667,7 +1670,7 @@ fn execute_statement_with_params(
         if let Some(mut txn) = conn.txn.take() {
             if conn.txn_failed {
                 // Failed transaction — COMMIT acts as ROLLBACK
-                db.unregister_snapshot(txn.read_seq);
+                tm.abort(&mut txn);
                 conn.txn_failed = false;
                 if chain {
                     let txn = tm.begin();
@@ -1715,8 +1718,8 @@ fn execute_statement_with_params(
         // ── ROLLBACK — abort the current transaction ──
         // PostgreSQL accepts ROLLBACK [WORK|TRANSACTION] and ABORT [WORK|
         // TRANSACTION] (the TRANSACTION spellings are PostgreSQL extensions).
-        if let Some(txn) = conn.txn.take() {
-            db.unregister_snapshot(txn.read_seq);
+        if let Some(mut txn) = conn.txn.take() {
+            tm.abort(&mut txn);
             conn.txn_failed = false;
             if chain {
                 let txn = tm.begin();
@@ -2082,6 +2085,11 @@ fn overlay_kv_scan(
             }
         }
     }
+    // The stored scan is key-ordered; the staged writes above were
+    // appended in HashMap iteration order. Callers depend on key order
+    // (reverse iteration for ORDER BY ... DESC, prefix truncation for
+    // LIMIT), so the merged view must be re-sorted.
+    results.sort_by(|(a, _), (b, _)| a.cmp(b));
     results
 }
 
