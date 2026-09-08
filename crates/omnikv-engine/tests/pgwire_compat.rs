@@ -1206,6 +1206,125 @@ fn pgwire_transaction_update_delete_also_roll_back() {
     );
     let _ = read_ready_status(&mut stream);
 }
+#[test]
+fn pgwire_transaction_read_write_conflict_aborts_committer() {
+    // SSI on the SQL path (Greptile P1 #1 on PR #123): two transactions
+    // read the same table; one then writes a row the other's reads
+    // covered. The second COMMIT must abort with 40001 — before the
+    // read-dependency recording, both committed and the first
+    // transaction's later reads were silently stale (write skew).
+    let addr = spawn_pgwire_server().expect("spawn server");
+    let mut a = TcpStream::connect(&addr).expect("connect A");
+    complete_handshake(&mut a).expect("handshake A");
+    let mut b = TcpStream::connect(&addr).expect("connect B");
+    complete_handshake(&mut b).expect("handshake B");
+
+    send_query(&mut a, "CREATE TABLE t (id INT PRIMARY KEY, v TEXT)").expect("create");
+    read_command_complete(&mut a);
+    let _ = read_ready_status(&mut a);
+    send_query(&mut a, "INSERT INTO t VALUES (1, 'one')").expect("seed");
+    read_command_complete(&mut a);
+    let _ = read_ready_status(&mut a);
+
+    // Both open transactions and read the table (B commits first).
+    send_query(&mut a, "BEGIN").expect("begin A");
+    read_command_complete(&mut a);
+    let _ = read_ready_status(&mut a);
+    send_query(&mut b, "BEGIN").expect("begin B");
+    read_command_complete(&mut b);
+    let _ = read_ready_status(&mut b);
+
+    send_query(&mut a, "SELECT id FROM t").expect("A reads");
+    assert_eq!(read_select_result(&mut a), "SELECT 1");
+    let _ = read_ready_status(&mut a);
+    send_query(&mut b, "SELECT id FROM t").expect("B reads");
+    assert_eq!(read_select_result(&mut b), "SELECT 1");
+    let _ = read_ready_status(&mut b);
+
+    // B writes the row A's scan covered, then commits — fine so far.
+    send_query(&mut b, "UPDATE t SET v = 'by-b' WHERE id = 1").expect("B writes");
+    read_command_complete(&mut b);
+    let _ = read_ready_status(&mut b);
+    send_query(&mut b, "COMMIT").expect("B commits");
+    read_command_complete(&mut b);
+    let _ = read_ready_status(&mut b);
+
+    // A also writes the same row — its read (the scan that covered id 1)
+    // was invalidated by B's committed write, so A's COMMIT must abort
+    // with 40001, not silently overwrite.
+    send_query(&mut a, "UPDATE t SET v = 'by-a' WHERE id = 1").expect("A writes");
+    read_command_complete(&mut a);
+    let _ = read_ready_status(&mut a);
+    send_query(&mut a, "COMMIT").expect("A commits");
+    let (msg_type, body) = read_message(&mut a).expect("error frame");
+    assert_eq!(msg_type, b'E', "A's COMMIT must abort with 40001");
+    let text = String::from_utf8_lossy(&body);
+    assert!(
+        text.contains("40001"),
+        "A's COMMIT must fail with serialization error 40001, got {text:?}"
+    );
+    let _ = read_ready_status(&mut a);
+
+    // B's value survived.
+    send_query(&mut b, "SELECT v FROM t WHERE id = 1").expect("check winner");
+    assert_eq!(read_select_result(&mut b), "SELECT 1");
+    let _ = read_ready_status(&mut b);
+}
+
+#[test]
+fn pgwire_transaction_drop_table_beats_concurrent_insert() {
+    // SSI range protection for DROP TABLE (Greptile P1 #2 on PR #123):
+    // a transaction drops a table after scanning its rows; a concurrent
+    // transaction inserts into the same table and commits. The DROP's
+    // COMMIT must abort — before range/predicate locks, the catalog
+    // delete committed while the concurrently inserted row survived,
+    // and recreating the table resurrected the stale row.
+    let addr = spawn_pgwire_server().expect("spawn server");
+    let mut a = TcpStream::connect(&addr).expect("connect A");
+    complete_handshake(&mut a).expect("handshake A");
+    let mut b = TcpStream::connect(&addr).expect("connect B");
+    complete_handshake(&mut b).expect("handshake B");
+
+    send_query(&mut a, "CREATE TABLE t (id INT PRIMARY KEY)").expect("create");
+    read_command_complete(&mut a);
+    let _ = read_ready_status(&mut a);
+
+    send_query(&mut a, "BEGIN").expect("begin A");
+    read_command_complete(&mut a);
+    let _ = read_ready_status(&mut a);
+    send_query(&mut b, "BEGIN").expect("begin B");
+    read_command_complete(&mut b);
+    let _ = read_ready_status(&mut b);
+
+    // A drops (its row scan records the table's prefix range).
+    send_query(&mut a, "DROP TABLE t").expect("A drops");
+    read_command_complete(&mut a);
+    let _ = read_ready_status(&mut a);
+
+    // B inserts into the same range and commits first — allowed.
+    send_query(&mut b, "INSERT INTO t VALUES (99)").expect("B inserts");
+    read_command_complete(&mut b);
+    let _ = read_ready_status(&mut b);
+    send_query(&mut b, "COMMIT").expect("B commits");
+    read_command_complete(&mut b);
+    let _ = read_ready_status(&mut b);
+
+    // A's COMMIT must abort: B's insert landed inside A's scanned range.
+    send_query(&mut a, "COMMIT").expect("A commits");
+    let (msg_type, body) = read_message(&mut a).expect("error frame");
+    assert_eq!(msg_type, b'E', "A's COMMIT must abort with 40001");
+    let text = String::from_utf8_lossy(&body);
+    assert!(
+        text.contains("40001"),
+        "DROP-vs-INSERT must abort the DROP with 40001, got {text:?}"
+    );
+    let _ = read_ready_status(&mut a);
+
+    // The table and B's row survived — no phantom catalog delete.
+    send_query(&mut b, "SELECT id FROM t").expect("table survives");
+    assert_eq!(read_select_result(&mut b), "SELECT 1");
+    let _ = read_ready_status(&mut b);
+}
 
 #[test]
 fn pgwire_extended_protocol_bind_error_aborts_pipeline_until_sync() {

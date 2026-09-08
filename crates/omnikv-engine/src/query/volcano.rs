@@ -111,7 +111,7 @@ pub type TxnOverlay = std::collections::HashMap<String, Option<String>>;
 
 impl SeqScanIter {
     pub fn new(db: &Arc<OmniKV>, table: &TableDef) -> Self {
-        Self::with_scan(db, table, db.get_seq(), None)
+        Self::with_scan(db, table, db.get_seq(), None, None)
     }
 
     /// Create with column pruning — only deserialize needed columns.
@@ -142,8 +142,14 @@ impl SeqScanIter {
         table: &TableDef,
         scan_seq: u64,
         overlay: Option<&TxnOverlay>,
+        reads: Option<&std::sync::Arc<std::sync::Mutex<ReadCollector>>>,
     ) -> Self {
         let prefix = table.row_prefix();
+        if let Some(reads) = reads
+            && let Ok(mut collector) = reads.lock()
+        {
+            collector.record_range(&prefix, &format!("{}\x7F", prefix));
+        }
         let mut rows: Vec<Row> = db
             .scan(&prefix, &format!("{}\x7F", prefix), scan_seq)
             .unwrap_or_default()
@@ -211,7 +217,7 @@ pub struct PkLookupIter {
 
 impl PkLookupIter {
     pub fn new(db: &Arc<OmniKV>, table: &TableDef, key_value: &str) -> Self {
-        Self::with_scan(db, table, key_value, db.get_seq(), None)
+        Self::with_scan(db, table, key_value, db.get_seq(), None, None)
     }
 
     /// Transaction-aware lookup: the transaction's overlay wins over
@@ -223,6 +229,7 @@ impl PkLookupIter {
         key_value: &str,
         scan_seq: u64,
         overlay: Option<&TxnOverlay>,
+        reads: Option<&std::sync::Arc<std::sync::Mutex<ReadCollector>>>,
     ) -> Self {
         let key = format!("{}{}", table.row_prefix(), key_value);
         let end = format!("{}{}\x7F", table.row_prefix(), key_value);
@@ -244,6 +251,11 @@ impl PkLookupIter {
                 }
                 None => {}
             }
+        }
+        if let Some(reads) = reads
+            && let Ok(mut collector) = reads.lock()
+        {
+            collector.record_point(&key);
         }
         let row = db
             .scan(&key, &end, scan_seq)
@@ -727,9 +739,32 @@ impl RowIterator for AggregateIter {
 /// sequence reads must use, and the transaction's own uncommitted writes
 /// overlaid on storage (read-your-own-writes). `None` scans read at
 /// `db.get_seq()` with no overlay — the autocommit behavior.
+/// Where a transactional plan's scans record their SSI read
+/// dependencies: point reads land in `keys`, range scans in `ranges`.
+/// The wire core merges both into the transaction alongside its staged
+/// writes, so any committed write that invalidates these reads aborts
+/// the COMMIT.
+#[derive(Default)]
+pub struct ReadCollector {
+    pub keys: std::collections::HashSet<String>,
+    pub ranges: Vec<(String, String)>,
+}
+
+impl ReadCollector {
+    fn record_point(&mut self, key: &str) {
+        self.keys.insert(key.to_string());
+    }
+
+    fn record_range(&mut self, start: &str, end: &str) {
+        self.ranges.push((start.to_string(), end.to_string()));
+    }
+}
+
 pub struct ScanContext {
     pub scan_seq: u64,
     pub overlay: TxnOverlay,
+    /// SSI read-dependency collector — `None` on autocommit plans.
+    pub reads: Option<std::sync::Arc<std::sync::Mutex<ReadCollector>>>,
 }
 
 /// Compiles a PlanNode tree into a volcano iterator pipeline.
@@ -768,6 +803,7 @@ pub fn compile_plan_with_scan(
                         key_value,
                         ctx.scan_seq,
                         Some(&ctx.overlay),
+                        ctx.reads.as_ref(),
                     )),
                     None => Box::new(PkLookupIter::new(db, &table_def, key_value)),
                 },
@@ -777,6 +813,7 @@ pub fn compile_plan_with_scan(
                         &table_def,
                         ctx.scan_seq,
                         Some(&ctx.overlay),
+                        ctx.reads.as_ref(),
                     )),
                     None => Box::new(SeqScanIter::new(db, &table_def)),
                 },

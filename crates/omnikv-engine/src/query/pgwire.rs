@@ -256,6 +256,12 @@ pub struct PgWireServer {
     bind_addr: String,
     max_connections: usize,
     rate_limiter: Arc<RateLimiter>,
+    /// The server-wide SSI transaction engine, shared by every
+    /// connection. Committed-transaction history is how
+    /// cross-connection conflicts are detected; a per-connection manager
+    /// would make each connection's transactions invisible to every
+    /// other connection's conflict checks.
+    txn_manager: Arc<TransactionManager>,
     /// Cleartext password required from PgWire clients. Read from
     /// OMNI_PGWIRE_PASSWORD at construction time so tests can inject a
     /// deterministic value without mutating process-global environment.
@@ -280,6 +286,7 @@ fn default_security_policy() -> PgWireSecurityPolicy {
 
 impl PgWireServer {
     pub fn new(db: Arc<OmniKV>, bind_addr: &str) -> Self {
+        let txn_manager = Arc::new(TransactionManager::new(db.clone()));
         Self {
             db,
             bind_addr: bind_addr.to_string(),
@@ -287,12 +294,14 @@ impl PgWireServer {
             rate_limiter: default_pgwire_rate_limiter(),
             pgwire_password: pgwire_password_from_env(),
             security_policy: default_security_policy(),
+            txn_manager,
         }
     }
 
     /// Creates a PgWireServer with an explicit cleartext password, for callers
     /// and tests that manage the credential outside the process environment.
     pub fn with_password(db: Arc<OmniKV>, bind_addr: &str, pgwire_password: &str) -> Self {
+        let txn_manager = Arc::new(TransactionManager::new(db.clone()));
         Self {
             db,
             bind_addr: bind_addr.to_string(),
@@ -300,6 +309,7 @@ impl PgWireServer {
             rate_limiter: default_pgwire_rate_limiter(),
             pgwire_password: pgwire_password.to_string(),
             security_policy: default_security_policy(),
+            txn_manager,
         }
     }
 
@@ -311,6 +321,7 @@ impl PgWireServer {
         pgwire_password: &str,
         security_policy: PgWireSecurityPolicy,
     ) -> Self {
+        let txn_manager = Arc::new(TransactionManager::new(db.clone()));
         Self {
             db,
             bind_addr: bind_addr.to_string(),
@@ -318,11 +329,13 @@ impl PgWireServer {
             rate_limiter: default_pgwire_rate_limiter(),
             pgwire_password: pgwire_password.to_string(),
             security_policy,
+            txn_manager,
         }
     }
 
     /// Creates a PgWireServer with a custom connection pool size.
     pub fn with_pool_size(db: Arc<OmniKV>, bind_addr: &str, max_connections: usize) -> Self {
+        let txn_manager = Arc::new(TransactionManager::new(db.clone()));
         Self {
             db,
             bind_addr: bind_addr.to_string(),
@@ -330,6 +343,7 @@ impl PgWireServer {
             rate_limiter: default_pgwire_rate_limiter(),
             pgwire_password: pgwire_password_from_env(),
             security_policy: default_security_policy(),
+            txn_manager,
         }
     }
 
@@ -339,6 +353,7 @@ impl PgWireServer {
         bind_addr: &str,
         rate_limiter: Arc<RateLimiter>,
     ) -> Self {
+        let txn_manager = Arc::new(TransactionManager::new(db.clone()));
         Self {
             db,
             bind_addr: bind_addr.to_string(),
@@ -346,6 +361,7 @@ impl PgWireServer {
             rate_limiter,
             pgwire_password: pgwire_password_from_env(),
             security_policy: default_security_policy(),
+            txn_manager,
         }
     }
 
@@ -358,6 +374,7 @@ impl PgWireServer {
         pgwire_password: &str,
         rate_limiter: Arc<RateLimiter>,
     ) -> Self {
+        let txn_manager = Arc::new(TransactionManager::new(db.clone()));
         Self {
             db,
             bind_addr: bind_addr.to_string(),
@@ -365,6 +382,7 @@ impl PgWireServer {
             rate_limiter,
             pgwire_password: pgwire_password.to_string(),
             security_policy: default_security_policy(),
+            txn_manager,
         }
     }
 
@@ -433,11 +451,16 @@ impl PgWireServer {
                     let db = self.db.clone();
                     let rate_limiter = self.rate_limiter.clone();
                     let pgwire_password = self.pgwire_password.clone();
+                    let txn_manager = self.txn_manager.clone();
                     let release_tx = permit_tx.clone();
                     std::thread::spawn(move || {
-                        if let Err(e) =
-                            handle_connection(db, stream, rate_limiter, &pgwire_password)
-                        {
+                        if let Err(e) = handle_connection(
+                            db,
+                            stream,
+                            rate_limiter,
+                            &pgwire_password,
+                            txn_manager,
+                        ) {
                             eprintln!("[OmniKV] Connection error: {}", e);
                         }
                         // Release permit back to pool
@@ -465,6 +488,7 @@ fn handle_connection(
     mut stream: std::net::TcpStream,
     rate_limiter: Arc<RateLimiter>,
     pgwire_password: &str,
+    txn_manager: Arc<TransactionManager>,
 ) -> std::io::Result<()> {
     // Phase 1: Startup handshake
     if pgwire_password.is_empty() {
@@ -476,8 +500,9 @@ fn handle_connection(
     }
     handle_startup(&mut stream, pgwire_password)?;
 
-    // Per-connection state: transaction manager and session state
-    let tm = Arc::new(TransactionManager::new(db.clone()));
+    // Per-connection session state; the transaction manager is the
+    // server-wide shared one (cross-connection SSI history).
+    let tm = txn_manager;
     let mut conn = ConnectionState::new();
     let client_id = stream
         .peer_addr()
@@ -1725,6 +1750,14 @@ fn merge_staged_writes_into_txn(
     executor: &mut crate::sql_exec::SqlExecutor,
     conn: &mut ConnectionState,
 ) {
+    // Read dependencies first: they describe what the statement's
+    // scans saw and must land in the transaction even when the
+    // statement staged no writes (a pure SELECT still builds SSI
+    // anti-dependencies from its reads).
+    if let (Some(txn), Some(reads)) = (conn.txn.as_mut(), executor.drain_reads()) {
+        txn.read_set.extend(reads.keys);
+        txn.read_ranges.extend(reads.ranges);
+    }
     if let (Some(txn), Some(batch)) = (conn.txn.as_mut(), executor.flush_batch()) {
         for (key, value, ttl) in batch.buffered_writes {
             let key = String::from_utf8_lossy(&key).into_owned();
@@ -2025,11 +2058,18 @@ fn stage_kv_write(
 /// only to this scan. Outside a transaction this is a plain scan.
 fn overlay_kv_scan(
     db: &Arc<OmniKV>,
-    conn: &ConnectionState,
+    conn: &mut ConnectionState,
     start_key: &str,
     end_key: &str,
     seq: u64,
 ) -> Vec<(String, String)> {
+    // The range scan itself is an SSI read dependency — a committed
+    // write inside [start, end) after this transaction's snapshot
+    // aborts its COMMIT.
+    if let Some(txn) = conn.txn.as_mut() {
+        txn.read_ranges
+            .push((start_key.to_string(), end_key.to_string()));
+    }
     let mut results = db.scan(start_key, end_key, seq).unwrap_or_default();
     if let Some(txn) = conn.txn.as_ref() {
         results.retain(|(key, _)| !txn.write_set.contains_key(key));

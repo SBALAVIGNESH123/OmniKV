@@ -62,6 +62,13 @@
   roll back with the transaction like PostgreSQL's transactional DDL —
   no more silent autocommit through the block. Both wire protocols share
   the one execution core, so the semantics are identical on each.
+  Conflict detection is serializable across connections: every
+  statement's reads (point lookups, scans, catalog lookups, KV ranges)
+  become SSI read dependencies with range reads acting as predicate
+  locks, a shared server-wide transaction manager records the committed
+  history all connections validate against, and a `COMMIT` whose reads
+  were invalidated by a concurrent commit aborts with `40001` — closing
+  the write-skew and DROP-vs-INSERT phantom races.
 
 - SQL keywords and transaction statements now behave identically in any case
   or spacing combination (issue #109). DBAPI drivers (psycopg2, pg8000) with

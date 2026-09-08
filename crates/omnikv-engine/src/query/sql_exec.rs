@@ -34,6 +34,13 @@ pub struct SqlExecutor {
     /// If set, all reads use this MVCC snapshot instead of the current seq.
     /// Used by PgWire transaction blocks for snapshot isolation.
     snapshot_seq: Option<u64>,
+    /// SSI read dependencies collected by this statement's scans — the
+    /// read counterpart of `pending_batch`. The wire core drains them
+    /// into the open transaction alongside the staged writes, so any
+    /// committed write that invalidates a read this statement made
+    /// aborts the COMMIT (write-skew prevention). `None` on autocommit
+    /// executors.
+    pending_reads: std::cell::RefCell<Option<crate::volcano::ReadCollector>>,
     /// Uncommitted writes staged inside an explicit transaction. DML
     /// buffers here instead of hitting `commit_batch`, so ROLLBACK
     /// discards it and COMMIT applies it atomically through the SSI
@@ -56,6 +63,7 @@ impl SqlExecutor {
             db,
             catalog,
             snapshot_seq: None,
+            pending_reads: std::cell::RefCell::new(None),
             pending_batch: std::cell::RefCell::new(None),
             query_timeout: Some(std::time::Duration::from_secs(30)),
             slow_query_threshold: std::time::Duration::from_millis(100),
@@ -69,6 +77,7 @@ impl SqlExecutor {
             db,
             catalog,
             snapshot_seq: Some(seq),
+            pending_reads: std::cell::RefCell::new(None),
             pending_batch: std::cell::RefCell::new(None),
             query_timeout: Some(std::time::Duration::from_secs(30)),
             slow_query_threshold: std::time::Duration::from_millis(100),
@@ -112,10 +121,41 @@ impl SqlExecutor {
             db,
             catalog,
             snapshot_seq: Some(read_seq),
+            pending_reads: std::cell::RefCell::new(Some(crate::volcano::ReadCollector::default())),
             pending_batch: std::cell::RefCell::new(Some(pending)),
             query_timeout: Some(std::time::Duration::from_secs(30)),
             slow_query_threshold: std::time::Duration::from_millis(100),
         }
+    }
+
+    /// Drains this statement's collected read dependencies. The wire
+    /// core merges them into the open transaction's read set and read
+    /// ranges — the read counterpart of [`Self::flush_batch`].
+    pub fn drain_reads(&mut self) -> Option<crate::volcano::ReadCollector> {
+        self.pending_reads.get_mut().take()
+    }
+
+    /// Records a point read dependency (storage key).
+    fn record_point_read(&self, key: &str) {
+        let mut slot = self.pending_reads.borrow_mut();
+        if let Some(collector) = slot.as_mut() {
+            collector.keys.insert(key.to_string());
+        }
+    }
+
+    /// Records a range read dependency ([start, end)) — a predicate
+    /// lock over every key in the range.
+    fn record_range_read(&self, start: &str, end: &str) {
+        let mut slot = self.pending_reads.borrow_mut();
+        if let Some(collector) = slot.as_mut() {
+            collector.ranges.push((start.to_string(), end.to_string()));
+        }
+    }
+
+    /// Records the catalog key of a table this statement depends on, so
+    /// a concurrent CREATE/DROP of the same name aborts this COMMIT.
+    fn record_catalog_read(&self, table_name: &str) {
+        self.record_point_read(&Catalog::staged_drop_key(table_name));
     }
 
     /// Whether this executor stages writes into a pending batch (created
@@ -471,6 +511,7 @@ impl SqlExecutor {
             if self.catalog.get_table(name).is_some() {
                 return Err(format!("Table '{}' already exists", name));
             }
+            self.record_catalog_read(name);
             let (cat_key, cat_value) = Catalog::staged_create_entry(&table)?;
             let mut batch = WriteBatch::new();
             batch
@@ -500,6 +541,7 @@ impl SqlExecutor {
                 .catalog
                 .get_table(name)
                 .ok_or_else(|| format!("Table '{}' does not exist", name))?;
+            self.record_catalog_read(name);
             // The table's own rows go through the normal DML staging: the
             // row reads use this statement's snapshot+overlay, so only
             // rows that exist for this transaction are deleted.
@@ -530,6 +572,7 @@ impl SqlExecutor {
             .catalog
             .get_table(table_name)
             .ok_or_else(|| format!("Table '{}' does not exist", table_name))?;
+        self.record_catalog_read(table_name);
 
         let columns = if col_names.is_empty() {
             table
@@ -582,6 +625,12 @@ impl SqlExecutor {
 
     fn load_table_rows(&self, table: &TableDef) -> Vec<Row> {
         let prefix = table.row_prefix();
+        // Every read of a table's rows is a range read of its prefix —
+        // recorded for SSI so a concurrent write inside the prefix
+        // aborts this transaction's COMMIT (phantom/write-skew
+        // protection). Autocommit executors collect nothing (their
+        // collector is None — nothing to abort).
+        self.record_range_read(&prefix, &format!("{}\x7F", prefix));
         // Use transaction snapshot if available, otherwise current seq (autocommit)
         let seq = self.snapshot_seq.unwrap_or_else(|| self.db.get_seq());
         let mut results = self
@@ -681,13 +730,33 @@ impl SqlExecutor {
                     .map(|overlay| crate::volcano::ScanContext {
                         scan_seq: self.snapshot_seq.unwrap_or_else(|| self.db.get_seq()),
                         overlay,
+                        reads: self.pending_reads.borrow().as_ref().map(|_| {
+                            std::sync::Arc::new(std::sync::Mutex::new(
+                                crate::volcano::ReadCollector::default(),
+                            ))
+                        }),
                     });
+                let iter_reads = scan_ctx.as_ref().map(|ctx| ctx.reads.clone());
                 let mut iter =
                     compile_plan_with_scan(&plan, &self.db, &self.catalog, scan_ctx.as_ref());
 
                 let mut rows: Vec<Row> = Vec::new();
                 while let Some(row) = iter.next_row() {
                     rows.push(row);
+                }
+
+                // The plan's scans recorded their read dependencies into
+                // the shared collector; fold them into the executor's
+                // pending reads so the wire core drains one set.
+                if let Some(reads) = iter_reads
+                    && let Some(reads) = reads
+                    && let Ok(collected) = reads.lock()
+                {
+                    let mut slot = self.pending_reads.borrow_mut();
+                    if let Some(collector) = slot.as_mut() {
+                        collector.keys.extend(collected.keys.iter().cloned());
+                        collector.ranges.extend(collected.ranges.iter().cloned());
+                    }
                 }
 
                 // HAVING: post-aggregate filter
@@ -833,6 +902,7 @@ impl SqlExecutor {
                 if self.catalog.get_table(name).is_none() {
                     return Err(format!("Table '{}' does not exist", name));
                 }
+                self.record_catalog_read(name);
                 Ok(())
             }
             FromClause::Join { left, right, .. } => {
@@ -840,6 +910,7 @@ impl SqlExecutor {
                     if self.catalog.get_table(side).is_none() {
                         return Err(format!("Table '{}' does not exist", side));
                     }
+                    self.record_catalog_read(side);
                 }
                 Ok(())
             }
@@ -861,6 +932,7 @@ impl SqlExecutor {
                     .catalog
                     .get_table(name)
                     .ok_or_else(|| format!("Table '{}' not found", name))?;
+                self.record_catalog_read(name);
                 self.load_table_rows(&table)
             }
             FromClause::Join {
@@ -870,6 +942,8 @@ impl SqlExecutor {
                 on_left,
                 on_right,
             } => {
+                self.record_catalog_read(left);
+                self.record_catalog_read(right);
                 let lt = self
                     .catalog
                     .get_table(left)
@@ -1145,6 +1219,7 @@ impl SqlExecutor {
             .catalog
             .get_table(table_name)
             .ok_or_else(|| format!("Table '{}' not found", table_name))?;
+        self.record_catalog_read(table_name);
         let mut rows = self.load_table_rows(&table);
 
         if let Some(expr) = where_clause {
@@ -1181,6 +1256,7 @@ impl SqlExecutor {
             .catalog
             .get_table(table_name)
             .ok_or_else(|| format!("Table '{}' not found", table_name))?;
+        self.record_catalog_read(table_name);
         let mut rows = self.load_table_rows(&table);
 
         if let Some(expr) = where_clause {

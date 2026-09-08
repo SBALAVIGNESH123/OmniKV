@@ -116,6 +116,16 @@ not re-created) fails later statements with `42P01`
 (`undefined_table`), and a duplicate `CREATE TABLE` fails with `42P07`,
 both the same states PostgreSQL reports.
 
+Conflict detection is serializable (SSI) across connections: every
+statement's reads — point lookups, table scans, the catalog lookups
+behind table resolution, and the legacy KV range selects — become read
+dependencies of the open transaction, and range reads act as predicate
+locks. A `COMMIT` whose reads were invalidated by a concurrently
+committed write aborts with `40001` (`serialization_failure`), which is
+also what stops a phantom insert from surviving a concurrent
+`DROP TABLE`. One transaction manager is shared by all connections, so
+conflicts are detected between connections, not just within one.
+
 ## QUIC binary protocol
 
 The QUIC server currently reads at most one 64 KiB request frame per bidirectional
