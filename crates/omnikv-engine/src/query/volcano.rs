@@ -91,44 +91,91 @@ pub const DEFAULT_ROW_CHUNK_SIZE: usize = 1024;
 // ─── Sequential Scan Iterator ───────────────────────────────────────────────
 
 /// Streams rows from a table one at a time.
+///
+/// The scan reads at a caller-provided MVCC sequence and overlays the
+/// transaction's own buffered writes: rows the transaction has written or
+/// deleted (but not yet committed) appear exactly as the transaction's
+/// later statements will see them — PostgreSQL's read-your-own-writes.
+/// A delete in the overlay removes the row; a write replaces it.
 pub struct SeqScanIter {
     rows: Vec<Row>,
     pos: usize,
 }
 
+/// A transaction's uncommitted writes as seen by scans inside that
+/// transaction: full storage key → serialized row (Some) for a write,
+/// tombstone (None) for a delete. Tombstones shadow (hide) storage rows
+/// and writes replace them. Owned keys: an overlay is built per statement
+/// from the transaction's staged batch and dropped with the plan.
+pub type TxnOverlay = std::collections::HashMap<String, Option<String>>;
+
 impl SeqScanIter {
     pub fn new(db: &Arc<OmniKV>, table: &TableDef) -> Self {
-        let prefix = table.row_prefix();
-        let seq = db.get_seq();
-        let rows = db
-            .scan(&prefix, &format!("{}\x7F", prefix), seq)
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|(_, value)| serde_json::from_str::<Row>(&value).ok())
-            .collect();
-        Self { rows, pos: 0 }
+        Self::with_scan(db, table, db.get_seq(), None, None)
     }
 
     /// Create with column pruning — only deserialize needed columns.
     pub fn new_pruned(db: &Arc<OmniKV>, table: &TableDef, needed: &[String]) -> Self {
+        let mut iter = Self::new(db, table);
+        if !needed.is_empty() {
+            let pruned_rows = std::mem::take(&mut iter.rows)
+                .into_iter()
+                .map(|full| {
+                    full.into_iter()
+                        .filter(|(k, _)| needed.iter().any(|c| c.eq_ignore_ascii_case(k)))
+                        .collect::<Row>()
+                })
+                .collect::<Vec<_>>();
+            iter.rows = pruned_rows;
+        }
+        iter
+    }
+
+    /// Transaction-aware scan: reads at `scan_seq` (the transaction's
+    /// snapshot) and applies `overlay` on top — the transaction's own
+    /// buffered writes. Overlay keys are full storage row keys
+    /// (`table.row_prefix() + pk`); a `Some` value replaces the stored
+    /// row, `None` deletes it. Rows the overlay covers are skipped from
+    /// the storage scan so exactly one copy survives.
+    pub fn with_scan(
+        db: &Arc<OmniKV>,
+        table: &TableDef,
+        scan_seq: u64,
+        overlay: Option<&TxnOverlay>,
+        reads: Option<&std::sync::Arc<std::sync::Mutex<ReadCollector>>>,
+    ) -> Self {
         let prefix = table.row_prefix();
-        let seq = db.get_seq();
-        let rows = db
-            .scan(&prefix, &format!("{}\x7F", prefix), seq)
+        if let Some(reads) = reads
+            && let Ok(mut collector) = reads.lock()
+        {
+            collector.record_range(&prefix, &format!("{}\x7F", prefix));
+        }
+        let mut rows: Vec<Row> = db
+            .scan(&prefix, &format!("{}\x7F", prefix), scan_seq)
             .unwrap_or_default()
             .into_iter()
-            .filter_map(|(_, value)| {
-                let full: Row = serde_json::from_str(&value).ok()?;
-                if needed.is_empty() {
-                    return Some(full);
+            .filter_map(|(key, value)| {
+                if let Some(ov) = overlay {
+                    // The overlay owns this key — written or deleted by
+                    // this transaction. Skip the stored copy; the overlay
+                    // copy is applied below.
+                    if ov.contains_key(key.as_str()) {
+                        return None;
+                    }
                 }
-                let pruned: Row = full
-                    .into_iter()
-                    .filter(|(k, _)| needed.iter().any(|c| c.eq_ignore_ascii_case(k)))
-                    .collect();
-                Some(pruned)
+                serde_json::from_str::<Row>(&value).ok()
             })
             .collect();
+        if let Some(ov) = overlay {
+            for (key, value) in ov {
+                let in_table = key.starts_with(prefix.as_str()) && key.len() > prefix.len();
+                if let (true, Some(serialized)) = (in_table, value)
+                    && let Ok(row) = serde_json::from_str::<Row>(serialized)
+                {
+                    rows.push(row);
+                }
+            }
+        }
         Self { rows, pos: 0 }
     }
 }
@@ -170,11 +217,48 @@ pub struct PkLookupIter {
 
 impl PkLookupIter {
     pub fn new(db: &Arc<OmniKV>, table: &TableDef, key_value: &str) -> Self {
+        Self::with_scan(db, table, key_value, db.get_seq(), None, None)
+    }
+
+    /// Transaction-aware lookup: the transaction's overlay wins over
+    /// storage — a buffered write for this key is visible even though it
+    /// is not committed, and a buffered delete hides the stored row.
+    pub fn with_scan(
+        db: &Arc<OmniKV>,
+        table: &TableDef,
+        key_value: &str,
+        scan_seq: u64,
+        overlay: Option<&TxnOverlay>,
+        reads: Option<&std::sync::Arc<std::sync::Mutex<ReadCollector>>>,
+    ) -> Self {
         let key = format!("{}{}", table.row_prefix(), key_value);
         let end = format!("{}{}\x7F", table.row_prefix(), key_value);
-        let seq = db.get_seq();
+        if let Some(ov) = overlay {
+            match ov.get(key.as_str()) {
+                // Buffered write: read our own uncommitted row.
+                Some(Some(serialized)) => {
+                    return Self {
+                        row: serde_json::from_str::<Row>(serialized).ok(),
+                        consumed: false,
+                    };
+                }
+                // Buffered delete: the row is gone for this transaction.
+                Some(None) => {
+                    return Self {
+                        row: None,
+                        consumed: false,
+                    };
+                }
+                None => {}
+            }
+        }
+        if let Some(reads) = reads
+            && let Ok(mut collector) = reads.lock()
+        {
+            collector.record_point(&key);
+        }
         let row = db
-            .scan(&key, &end, seq)
+            .scan(&key, &end, scan_seq)
             .unwrap_or_default()
             .into_iter()
             .next()
@@ -651,11 +735,55 @@ impl RowIterator for AggregateIter {
 
 // ─── Plan-to-Iterator Compiler ──────────────────────────────────────────────
 
+/// The read context for scans inside a transaction: the MVCC snapshot
+/// sequence reads must use, and the transaction's own uncommitted writes
+/// overlaid on storage (read-your-own-writes). `None` scans read at
+/// `db.get_seq()` with no overlay — the autocommit behavior.
+/// Where a transactional plan's scans record their SSI read
+/// dependencies: point reads land in `keys`, range scans in `ranges`.
+/// The wire core merges both into the transaction alongside its staged
+/// writes, so any committed write that invalidates these reads aborts
+/// the COMMIT.
+#[derive(Default)]
+pub struct ReadCollector {
+    pub keys: std::collections::HashSet<String>,
+    pub ranges: Vec<(String, String)>,
+}
+
+impl ReadCollector {
+    fn record_point(&mut self, key: &str) {
+        self.keys.insert(key.to_string());
+    }
+
+    fn record_range(&mut self, start: &str, end: &str) {
+        self.ranges.push((start.to_string(), end.to_string()));
+    }
+}
+
+pub struct ScanContext {
+    pub scan_seq: u64,
+    pub overlay: TxnOverlay,
+    /// SSI read-dependency collector — `None` on autocommit plans.
+    pub reads: Option<std::sync::Arc<std::sync::Mutex<ReadCollector>>>,
+}
+
 /// Compiles a PlanNode tree into a volcano iterator pipeline.
 pub fn compile_plan(
     plan: &PlanNode,
     db: &Arc<OmniKV>,
     catalog: &Arc<Catalog>,
+) -> Box<dyn RowIterator> {
+    compile_plan_with_scan(plan, db, catalog, None)
+}
+
+/// `compile_plan` with a transaction's [`ScanContext`]: every scan in the
+/// plan reads at the transaction's snapshot and sees its own buffered
+/// writes. Unchanged behavior for plans compiled without one.
+pub fn compile_plan_with_scan(
+    plan: &PlanNode,
+    db: &Arc<OmniKV>,
+    catalog: &Arc<Catalog>,
+    scan: Option<&ScanContext>,
 ) -> Box<dyn RowIterator> {
     match plan {
         PlanNode::Scan {
@@ -668,12 +796,27 @@ pub fn compile_plan(
                 .get_table(table)
                 .expect("Table not found in catalog");
             let base: Box<dyn RowIterator> = match access {
-                AccessMethod::PkLookup { key_value } => {
-                    Box::new(PkLookupIter::new(db, &table_def, key_value))
-                }
-                AccessMethod::SeqScan | AccessMethod::IndexScan { .. } => {
-                    Box::new(SeqScanIter::new(db, &table_def))
-                }
+                AccessMethod::PkLookup { key_value } => match scan {
+                    Some(ctx) => Box::new(PkLookupIter::with_scan(
+                        db,
+                        &table_def,
+                        key_value,
+                        ctx.scan_seq,
+                        Some(&ctx.overlay),
+                        ctx.reads.as_ref(),
+                    )),
+                    None => Box::new(PkLookupIter::new(db, &table_def, key_value)),
+                },
+                AccessMethod::SeqScan | AccessMethod::IndexScan { .. } => match scan {
+                    Some(ctx) => Box::new(SeqScanIter::with_scan(
+                        db,
+                        &table_def,
+                        ctx.scan_seq,
+                        Some(&ctx.overlay),
+                        ctx.reads.as_ref(),
+                    )),
+                    None => Box::new(SeqScanIter::new(db, &table_def)),
+                },
             };
             match filter {
                 Some(pred) => Box::new(FilterIter::new(base, pred.clone())),
@@ -688,8 +831,8 @@ pub fn compile_plan(
             on_right_col,
             ..
         } => {
-            let left_iter = compile_plan(left, db, catalog);
-            let right_iter = compile_plan(right, db, catalog);
+            let left_iter = compile_plan_with_scan(left, db, catalog, scan);
+            let right_iter = compile_plan_with_scan(right, db, catalog, scan);
             Box::new(HashJoinIter::new(
                 left_iter,
                 right_iter,
@@ -701,21 +844,21 @@ pub fn compile_plan(
         PlanNode::Filter {
             child, predicate, ..
         } => {
-            let child_iter = compile_plan(child, db, catalog);
+            let child_iter = compile_plan_with_scan(child, db, catalog, scan);
             Box::new(FilterIter::new(child_iter, predicate.clone()))
         }
         PlanNode::Project { child, columns } => {
-            let child_iter = compile_plan(child, db, catalog);
+            let child_iter = compile_plan_with_scan(child, db, catalog, scan);
             Box::new(ProjectIter::new(child_iter, columns.clone()))
         }
         PlanNode::Sort {
             child, order_by, ..
         } => {
-            let child_iter = compile_plan(child, db, catalog);
+            let child_iter = compile_plan_with_scan(child, db, catalog, scan);
             Box::new(SortIter::new(child_iter, order_by.clone()))
         }
         PlanNode::Limit { child, count } => {
-            let child_iter = compile_plan(child, db, catalog);
+            let child_iter = compile_plan_with_scan(child, db, catalog, scan);
             Box::new(LimitIter::new(child_iter, *count))
         }
         PlanNode::Aggregate {
@@ -724,7 +867,7 @@ pub fn compile_plan(
             aggregates,
             ..
         } => {
-            let child_iter = compile_plan(child, db, catalog);
+            let child_iter = compile_plan_with_scan(child, db, catalog, scan);
             Box::new(AggregateIter::new(
                 child_iter,
                 group_by.clone(),

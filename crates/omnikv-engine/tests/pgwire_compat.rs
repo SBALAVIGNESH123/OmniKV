@@ -888,6 +888,499 @@ fn pgwire_extended_protocol_transaction_commit_and_rollback() {
 }
 
 #[test]
+fn pgwire_transaction_dml_rollback_discards_writes() {
+    // THE #121 ACCEPTANCE CRITERION: begin; INSERT; rollback; SELECT ->
+    // row absent. The write must be staged in the transaction and only
+    // applied by COMMIT — previously INSERT committed immediately and
+    // the row survived the rollback as a phantom commit.
+    let addr = spawn_pgwire_server().expect("spawn server");
+    let mut stream = TcpStream::connect(&addr).expect("connect");
+    complete_handshake(&mut stream).expect("handshake");
+
+    send_query(
+        &mut stream,
+        "CREATE TABLE t (id INT PRIMARY KEY, name TEXT)",
+    )
+    .expect("create");
+    read_command_complete(&mut stream);
+    let _ = read_ready_status(&mut stream);
+
+    send_query(&mut stream, "BEGIN").expect("begin");
+    read_command_complete(&mut stream);
+    let _ = read_ready_status(&mut stream);
+
+    send_query(&mut stream, "INSERT INTO t VALUES (9, 'rb')").expect("insert in txn");
+    assert_eq!(read_command_complete(&mut stream), "INSERT 0 1");
+    let _ = read_ready_status(&mut stream);
+
+    // Read-your-own-writes: the inserting transaction sees its staged row.
+    send_query(&mut stream, "SELECT id FROM t WHERE id = 9").expect("select own write");
+    let own = read_until_type(&mut stream, b'D'); // DataRow after RowDescription
+    assert!(
+        String::from_utf8_lossy(&own).contains('9'),
+        "transaction must see its own staged write, got {own:?}"
+    );
+    assert_eq!(read_command_complete(&mut stream), "SELECT 1");
+    let _ = read_ready_status(&mut stream);
+
+    send_query(&mut stream, "ROLLBACK").expect("rollback");
+    read_command_complete(&mut stream);
+    let _ = read_ready_status(&mut stream);
+
+    send_query(&mut stream, "SELECT id FROM t WHERE id = 9").expect("select after rollback");
+    assert_eq!(
+        read_select_result(&mut stream),
+        "SELECT 0",
+        "staged write must be discarded by ROLLBACK (issue #121)"
+    );
+    let _ = read_ready_status(&mut stream);
+}
+
+#[test]
+fn pgwire_transaction_dml_commit_persists_writes() {
+    // The other half of #121: begin; INSERT; commit; SELECT -> row
+    // present. Staged writes apply atomically at COMMIT.
+    let addr = spawn_pgwire_server().expect("spawn server");
+    let mut stream = TcpStream::connect(&addr).expect("connect");
+    complete_handshake(&mut stream).expect("handshake");
+
+    send_query(
+        &mut stream,
+        "CREATE TABLE t (id INT PRIMARY KEY, name TEXT)",
+    )
+    .expect("create");
+    read_command_complete(&mut stream);
+    let _ = read_ready_status(&mut stream);
+
+    send_query(&mut stream, "BEGIN").expect("begin");
+    read_command_complete(&mut stream);
+    let _ = read_ready_status(&mut stream);
+
+    send_query(&mut stream, "INSERT INTO t VALUES (10, 'kept')").expect("insert in txn");
+    assert_eq!(read_command_complete(&mut stream), "INSERT 0 1");
+    let _ = read_ready_status(&mut stream);
+
+    send_query(&mut stream, "COMMIT").expect("commit");
+    read_command_complete(&mut stream);
+    let _ = read_ready_status(&mut stream);
+
+    send_query(&mut stream, "SELECT id FROM t WHERE id = 10").expect("select after commit");
+    assert_eq!(
+        read_select_result(&mut stream),
+        "SELECT 1",
+        "committed write must be visible after COMMIT"
+    );
+    let _ = read_ready_status(&mut stream);
+}
+
+#[test]
+fn pgwire_transaction_staged_writes_invisible_to_other_connections() {
+    // Isolation: a staged (uncommitted) write must be visible ONLY to the
+    // transaction that staged it — a second connection sees nothing until
+    // COMMIT, exactly like PostgreSQL's MVCC.
+    let addr = spawn_pgwire_server().expect("spawn server");
+    let mut a = TcpStream::connect(&addr).expect("connect A");
+    complete_handshake(&mut a).expect("handshake A");
+    let mut b = TcpStream::connect(&addr).expect("connect B");
+    complete_handshake(&mut b).expect("handshake B");
+
+    send_query(&mut a, "CREATE TABLE t (id INT PRIMARY KEY)").expect("create");
+    read_command_complete(&mut a);
+    let _ = read_ready_status(&mut a);
+
+    send_query(&mut a, "BEGIN").expect("begin A");
+    read_command_complete(&mut a);
+    let _ = read_ready_status(&mut a);
+
+    send_query(&mut a, "INSERT INTO t VALUES (42)").expect("stage insert");
+    assert_eq!(read_command_complete(&mut a), "INSERT 0 1");
+    let _ = read_ready_status(&mut a);
+
+    // Connection A sees its own staged row.
+    send_query(&mut a, "SELECT id FROM t WHERE id = 42").expect("own view");
+    assert_eq!(read_select_result(&mut a), "SELECT 1");
+    let _ = read_ready_status(&mut a);
+
+    // Connection B must not — the write is not committed.
+    send_query(&mut b, "SELECT id FROM t WHERE id = 42").expect("other view");
+    assert_eq!(
+        read_select_result(&mut b),
+        "SELECT 0",
+        "uncommitted write leaked across connections (issue #121 isolation)"
+    );
+    let _ = read_ready_status(&mut b);
+
+    send_query(&mut a, "COMMIT").expect("commit A");
+    read_command_complete(&mut a);
+    let _ = read_ready_status(&mut a);
+
+    // After COMMIT, connection B sees it.
+    send_query(&mut b, "SELECT id FROM t WHERE id = 42").expect("post-commit view");
+    assert_eq!(read_select_result(&mut b), "SELECT 1");
+    let _ = read_ready_status(&mut b);
+}
+
+#[test]
+fn pgwire_extended_protocol_transaction_dml_rolls_back() {
+    // #121 through the EXTENDED protocol — the exact DBAPI flow:
+    // pg8000 in non-autocommit mode stages INSERT via Parse/Bind/Execute
+    // and the driver's conn.rollback() must discard it.
+    let addr = spawn_pgwire_server().expect("spawn server");
+    let mut stream = TcpStream::connect(&addr).expect("connect");
+    complete_handshake(&mut stream).expect("handshake");
+
+    send_query(&mut stream, "CREATE TABLE t (id INT PRIMARY KEY)").expect("create");
+    read_command_complete(&mut stream);
+    let _ = read_ready_status(&mut stream);
+
+    // BEGIN via the extended protocol.
+    send_extended(&mut stream, b'P', &parse_body("", "BEGIN", &[])).expect("Parse begin");
+    send_extended(&mut stream, b'B', &bind_body_text_params("", "", &[])).expect("Bind begin");
+    send_extended(&mut stream, b'E', &execute_body("")).expect("Execute begin");
+    send_extended(&mut stream, b'S', &[]).expect("Sync");
+    read_until_type(&mut stream, b'1');
+    read_until_type(&mut stream, b'2');
+    assert_eq!(read_command_complete(&mut stream), "BEGIN");
+    let _ = read_ready_status(&mut stream);
+
+    // Parameterized INSERT staged inside the transaction.
+    send_extended(
+        &mut stream,
+        b'P',
+        &parse_body("", "INSERT INTO t VALUES ($1)", &[23]),
+    )
+    .expect("Parse insert");
+    send_extended(&mut stream, b'B', &bind_body_text_params("", "", &["99"])).expect("Bind insert");
+    send_extended(&mut stream, b'E', &execute_body("")).expect("Execute insert");
+    send_extended(&mut stream, b'S', &[]).expect("Sync");
+    read_until_type(&mut stream, b'1');
+    read_until_type(&mut stream, b'2');
+    assert_eq!(read_command_complete(&mut stream), "INSERT 0 1");
+    let _ = read_ready_status(&mut stream);
+
+    // Driver rollback: ROLLBACK via the extended protocol.
+    send_extended(&mut stream, b'P', &parse_body("", "ROLLBACK", &[])).expect("Parse rollback");
+    send_extended(&mut stream, b'B', &bind_body_text_params("", "", &[])).expect("Bind rollback");
+    send_extended(&mut stream, b'E', &execute_body("")).expect("Execute rollback");
+    send_extended(&mut stream, b'S', &[]).expect("Sync");
+    read_until_type(&mut stream, b'1');
+    read_until_type(&mut stream, b'2');
+    assert_eq!(read_command_complete(&mut stream), "ROLLBACK");
+    let _ = read_ready_status(&mut stream);
+
+    // The staged row must be gone.
+    send_extended(
+        &mut stream,
+        b'P',
+        &parse_body("", "SELECT id FROM t WHERE id = $1", &[23]),
+    )
+    .expect("Parse select");
+    send_extended(&mut stream, b'B', &bind_body_text_params("", "", &["99"])).expect("Bind select");
+    send_extended(&mut stream, b'E', &execute_body("")).expect("Execute select");
+    send_extended(&mut stream, b'S', &[]).expect("Sync");
+    read_until_type(&mut stream, b'1');
+    read_until_type(&mut stream, b'2');
+    assert_eq!(
+        read_command_complete(&mut stream),
+        "SELECT 0",
+        "extended-protocol rollback must discard staged writes (issue #121)"
+    );
+    let _ = read_ready_status(&mut stream);
+}
+
+#[test]
+fn pgwire_transaction_ddl_rolls_back_with_transaction() {
+    // DDL inside BEGIN/ROLLBACK is undone and DDL inside BEGIN/COMMIT
+    // persists — CREATE/DROP TABLE stage in the same write set as row
+    // DML instead of autocommitting past the transaction (the catalog
+    // side of issue #121). A missing table after rollback reports
+    // PostgreSQL's undefined_table (42P01), not an internal error.
+    let addr = spawn_pgwire_server().expect("spawn server");
+    let mut stream = TcpStream::connect(&addr).expect("connect");
+    complete_handshake(&mut stream).expect("handshake");
+
+    // Rolled-back CREATE leaves no table behind.
+    send_query(&mut stream, "BEGIN").expect("begin");
+    read_command_complete(&mut stream);
+    let _ = read_ready_status(&mut stream);
+    send_query(&mut stream, "CREATE TABLE rolled (id INT PRIMARY KEY)").expect("staged create");
+    assert_eq!(read_command_complete(&mut stream), "CREATE TABLE rolled");
+    let _ = read_ready_status(&mut stream);
+    // The creating transaction sees its own table.
+    send_query(&mut stream, "SELECT id FROM rolled").expect("read own DDL");
+    assert_eq!(read_select_result(&mut stream), "SELECT 0");
+    let _ = read_ready_status(&mut stream);
+    send_query(&mut stream, "ROLLBACK").expect("rollback");
+    read_command_complete(&mut stream);
+    let _ = read_ready_status(&mut stream);
+    send_query(&mut stream, "SELECT id FROM rolled").expect("table must be gone");
+    let (msg_type, body) = read_message(&mut stream).expect("error frame");
+    assert_eq!(msg_type, b'E', "SELECT on rolled-back table must fail");
+    let text = String::from_utf8_lossy(&body);
+    assert!(
+        text.contains("42P01"),
+        "missing table must report 42P01, got {text:?}"
+    );
+    let _ = read_ready_status(&mut stream);
+
+    // Committed CREATE persists.
+    send_query(&mut stream, "BEGIN").expect("begin");
+    read_command_complete(&mut stream);
+    let _ = read_ready_status(&mut stream);
+    send_query(&mut stream, "CREATE TABLE kept (id INT PRIMARY KEY)").expect("staged create");
+    assert_eq!(read_command_complete(&mut stream), "CREATE TABLE kept");
+    let _ = read_ready_status(&mut stream);
+    send_query(&mut stream, "COMMIT").expect("commit");
+    read_command_complete(&mut stream);
+    let _ = read_ready_status(&mut stream);
+    send_query(&mut stream, "SELECT id FROM kept").expect("table must exist");
+    assert_eq!(read_select_result(&mut stream), "SELECT 0");
+    let _ = read_ready_status(&mut stream);
+
+    // Rolled-back DROP keeps the table (and its rows).
+    send_query(&mut stream, "INSERT INTO kept VALUES (7)").expect("seed kept");
+    read_command_complete(&mut stream);
+    let _ = read_ready_status(&mut stream);
+    send_query(&mut stream, "BEGIN").expect("begin");
+    read_command_complete(&mut stream);
+    let _ = read_ready_status(&mut stream);
+    send_query(&mut stream, "DROP TABLE kept").expect("staged drop");
+    assert_eq!(read_command_complete(&mut stream), "DROP TABLE kept");
+    let _ = read_ready_status(&mut stream);
+    send_query(&mut stream, "ROLLBACK").expect("rollback");
+    read_command_complete(&mut stream);
+    let _ = read_ready_status(&mut stream);
+    send_query(&mut stream, "SELECT id FROM kept").expect("table must survive");
+    assert_eq!(read_select_result(&mut stream), "SELECT 1");
+    let _ = read_ready_status(&mut stream);
+}
+
+#[test]
+fn pgwire_transaction_update_delete_also_roll_back() {
+    // #121 generalized: UPDATE and DELETE staged inside a transaction
+    // roll back too — every DML verb, not just INSERT.
+    let addr = spawn_pgwire_server().expect("spawn server");
+    let mut stream = TcpStream::connect(&addr).expect("connect");
+    complete_handshake(&mut stream).expect("handshake");
+
+    send_query(&mut stream, "CREATE TABLE t (id INT PRIMARY KEY, v TEXT)").expect("create");
+    read_command_complete(&mut stream);
+    let _ = read_ready_status(&mut stream);
+    send_query(&mut stream, "INSERT INTO t VALUES (1, 'one')").expect("seed");
+    read_command_complete(&mut stream);
+    let _ = read_ready_status(&mut stream);
+    send_query(&mut stream, "INSERT INTO t VALUES (2, 'two')").expect("seed");
+    read_command_complete(&mut stream);
+    let _ = read_ready_status(&mut stream);
+
+    send_query(&mut stream, "BEGIN").expect("begin");
+    read_command_complete(&mut stream);
+    let _ = read_ready_status(&mut stream);
+
+    send_query(&mut stream, "UPDATE t SET v = 'changed' WHERE id = 1").expect("update");
+    read_command_complete(&mut stream);
+    let _ = read_ready_status(&mut stream);
+    send_query(&mut stream, "DELETE FROM t WHERE id = 2").expect("delete");
+    read_command_complete(&mut stream);
+    let _ = read_ready_status(&mut stream);
+
+    send_query(&mut stream, "ROLLBACK").expect("rollback");
+    read_command_complete(&mut stream);
+    let _ = read_ready_status(&mut stream);
+
+    // Both rows unchanged after rollback.
+    send_query(&mut stream, "SELECT id, v FROM t").expect("select");
+    let _ = read_until_type(&mut stream, b'T');
+    let r1 = read_until_type(&mut stream, b'D');
+    let r2 = read_until_type(&mut stream, b'D');
+    assert_eq!(
+        read_command_complete(&mut stream),
+        "SELECT 2",
+        "UPDATE and DELETE must roll back with INSERT (issue #121)"
+    );
+    let r1s = String::from_utf8_lossy(&r1);
+    let r2s = String::from_utf8_lossy(&r2);
+    assert!(
+        r1s.contains("one") && r2s.contains("two"),
+        "rows must be back to pre-transaction values, got {r1s:?} {r2s:?}"
+    );
+    let _ = read_ready_status(&mut stream);
+}
+#[test]
+fn pgwire_transaction_kv_select_desc_with_staged_writes_stays_sorted() {
+    // Regression (CodeRabbit, PR #123 round 2): a legacy-KV
+    // SELECT * ORDER BY DESC inside a transaction must return rows in
+    // key order even when the transaction staged writes — the overlay
+    // merge used to append staged keys in HashMap order, so the
+    // reversed/truncated view was shuffled.
+    let addr = spawn_pgwire_server().expect("spawn server");
+    let mut stream = TcpStream::connect(&addr).expect("connect");
+    complete_handshake(&mut stream).expect("handshake");
+
+    // Seed keys in ascending order outside the transaction.
+    for k in ["alpha", "delta", "kilo"] {
+        send_query(&mut stream, &format!("INSERT {k} v-{k}")).expect("seed");
+        read_command_complete(&mut stream);
+        let _ = read_ready_status(&mut stream);
+    }
+
+    // Stage a key that sorts between the stored ones.
+    send_query(&mut stream, "BEGIN").expect("begin");
+    read_command_complete(&mut stream);
+    let _ = read_ready_status(&mut stream);
+    send_query(&mut stream, "INSERT bravo v-bravo").expect("staged write");
+    read_command_complete(&mut stream);
+    let _ = read_ready_status(&mut stream);
+
+    // DESC over stored+staged: strictly descending keys.
+    send_query(&mut stream, "SELECT * ORDER BY DESC LIMIT 2").expect("desc select");
+    let _ = read_until_type(&mut stream, b'T');
+    let mut keys = Vec::new();
+    while let Ok((t, body)) = read_message(&mut stream) {
+        if t == b'D' {
+            // DataRow: int16 field count, then per field int32 length
+            // + raw bytes. The first field is the key.
+            let count = i16::from_be_bytes([body[0], body[1]]);
+            assert_eq!(count, 2, "kv SELECT rows have two fields");
+            let len = u32::from_be_bytes([body[2], body[3], body[4], body[5]]) as usize;
+            keys.push(String::from_utf8_lossy(&body[6..6 + len]).into_owned());
+        } else if t == b'C' {
+            break;
+        }
+    }
+    assert_eq!(
+        keys,
+        vec!["kilo".to_string(), "delta".to_string()],
+        "DESC with staged writes must return strictly descending keys, got {keys:?}"
+    );
+    let _ = read_ready_status(&mut stream);
+
+    send_query(&mut stream, "ROLLBACK").expect("rollback");
+    read_command_complete(&mut stream);
+    let _ = read_ready_status(&mut stream);
+}
+
+#[test]
+fn pgwire_transaction_read_write_conflict_aborts_committer() {
+    // SSI on the SQL path (Greptile P1 #1 on PR #123): two transactions
+    // read the same table; one then writes a row the other's reads
+    // covered. The second COMMIT must abort with 40001 — before the
+    // read-dependency recording, both committed and the first
+    // transaction's later reads were silently stale (write skew).
+    let addr = spawn_pgwire_server().expect("spawn server");
+    let mut a = TcpStream::connect(&addr).expect("connect A");
+    complete_handshake(&mut a).expect("handshake A");
+    let mut b = TcpStream::connect(&addr).expect("connect B");
+    complete_handshake(&mut b).expect("handshake B");
+
+    send_query(&mut a, "CREATE TABLE t (id INT PRIMARY KEY, v TEXT)").expect("create");
+    read_command_complete(&mut a);
+    let _ = read_ready_status(&mut a);
+    send_query(&mut a, "INSERT INTO t VALUES (1, 'one')").expect("seed");
+    read_command_complete(&mut a);
+    let _ = read_ready_status(&mut a);
+
+    // Both open transactions and read the table (B commits first).
+    send_query(&mut a, "BEGIN").expect("begin A");
+    read_command_complete(&mut a);
+    let _ = read_ready_status(&mut a);
+    send_query(&mut b, "BEGIN").expect("begin B");
+    read_command_complete(&mut b);
+    let _ = read_ready_status(&mut b);
+
+    send_query(&mut a, "SELECT id FROM t").expect("A reads");
+    assert_eq!(read_select_result(&mut a), "SELECT 1");
+    let _ = read_ready_status(&mut a);
+    send_query(&mut b, "SELECT id FROM t").expect("B reads");
+    assert_eq!(read_select_result(&mut b), "SELECT 1");
+    let _ = read_ready_status(&mut b);
+
+    // B writes the row A's scan covered, then commits — fine so far.
+    send_query(&mut b, "UPDATE t SET v = 'by-b' WHERE id = 1").expect("B writes");
+    read_command_complete(&mut b);
+    let _ = read_ready_status(&mut b);
+    send_query(&mut b, "COMMIT").expect("B commits");
+    read_command_complete(&mut b);
+    let _ = read_ready_status(&mut b);
+
+    // A also writes the same row — its read (the scan that covered id 1)
+    // was invalidated by B's committed write, so A's COMMIT must abort
+    // with 40001, not silently overwrite.
+    send_query(&mut a, "UPDATE t SET v = 'by-a' WHERE id = 1").expect("A writes");
+    read_command_complete(&mut a);
+    let _ = read_ready_status(&mut a);
+    send_query(&mut a, "COMMIT").expect("A commits");
+    let (msg_type, body) = read_message(&mut a).expect("error frame");
+    assert_eq!(msg_type, b'E', "A's COMMIT must abort with 40001");
+    let text = String::from_utf8_lossy(&body);
+    assert!(
+        text.contains("40001"),
+        "A's COMMIT must fail with serialization error 40001, got {text:?}"
+    );
+    let _ = read_ready_status(&mut a);
+
+    // B's value survived.
+    send_query(&mut b, "SELECT v FROM t WHERE id = 1").expect("check winner");
+    assert_eq!(read_select_result(&mut b), "SELECT 1");
+    let _ = read_ready_status(&mut b);
+}
+
+#[test]
+fn pgwire_transaction_drop_table_beats_concurrent_insert() {
+    // SSI range protection for DROP TABLE (Greptile P1 #2 on PR #123):
+    // a transaction drops a table after scanning its rows; a concurrent
+    // transaction inserts into the same table and commits. The DROP's
+    // COMMIT must abort — before range/predicate locks, the catalog
+    // delete committed while the concurrently inserted row survived,
+    // and recreating the table resurrected the stale row.
+    let addr = spawn_pgwire_server().expect("spawn server");
+    let mut a = TcpStream::connect(&addr).expect("connect A");
+    complete_handshake(&mut a).expect("handshake A");
+    let mut b = TcpStream::connect(&addr).expect("connect B");
+    complete_handshake(&mut b).expect("handshake B");
+
+    send_query(&mut a, "CREATE TABLE t (id INT PRIMARY KEY)").expect("create");
+    read_command_complete(&mut a);
+    let _ = read_ready_status(&mut a);
+
+    send_query(&mut a, "BEGIN").expect("begin A");
+    read_command_complete(&mut a);
+    let _ = read_ready_status(&mut a);
+    send_query(&mut b, "BEGIN").expect("begin B");
+    read_command_complete(&mut b);
+    let _ = read_ready_status(&mut b);
+
+    // A drops (its row scan records the table's prefix range).
+    send_query(&mut a, "DROP TABLE t").expect("A drops");
+    read_command_complete(&mut a);
+    let _ = read_ready_status(&mut a);
+
+    // B inserts into the same range and commits first — allowed.
+    send_query(&mut b, "INSERT INTO t VALUES (99)").expect("B inserts");
+    read_command_complete(&mut b);
+    let _ = read_ready_status(&mut b);
+    send_query(&mut b, "COMMIT").expect("B commits");
+    read_command_complete(&mut b);
+    let _ = read_ready_status(&mut b);
+
+    // A's COMMIT must abort: B's insert landed inside A's scanned range.
+    send_query(&mut a, "COMMIT").expect("A commits");
+    let (msg_type, body) = read_message(&mut a).expect("error frame");
+    assert_eq!(msg_type, b'E', "A's COMMIT must abort with 40001");
+    let text = String::from_utf8_lossy(&body);
+    assert!(
+        text.contains("40001"),
+        "DROP-vs-INSERT must abort the DROP with 40001, got {text:?}"
+    );
+    let _ = read_ready_status(&mut a);
+
+    // The table and B's row survived — no phantom catalog delete.
+    send_query(&mut b, "SELECT id FROM t").expect("table survives");
+    assert_eq!(read_select_result(&mut b), "SELECT 1");
+    let _ = read_ready_status(&mut b);
+}
+
+#[test]
 fn pgwire_extended_protocol_bind_error_aborts_pipeline_until_sync() {
     // PostgreSQL's error rule: after an extended-protocol error, the
     // connection skips every message until the next Sync, which answers
@@ -1150,6 +1643,26 @@ fn read_command_complete(stream: &mut TcpStream) -> String {
             b'Z' => panic!("ReadyForQuery before CommandComplete"),
             b'N' => { /* benign notice; PostgreSQL sends these as 'N' */ }
             other => panic!("unexpected frame {other:#x} while waiting for CommandComplete"),
+        }
+    }
+}
+
+/// Drives one row-returning SELECT to completion over the simple
+/// protocol: `RowDescription`, then `DataRow` frames, then the
+/// `CommandComplete` tag. Returns the tag.
+fn read_select_result(stream: &mut TcpStream) -> String {
+    let _ = read_until_type(stream, b'T'); // RowDescription
+    loop {
+        let (msg_type, body) = read_message(stream).expect("read frame");
+        match msg_type {
+            // DataRows stream until the completion tag; benign notices
+            // interleave on both protocols.
+            b'D' | b'N' => {}
+            b'C' => {
+                let tag = &body[..body.len().saturating_sub(1)];
+                return String::from_utf8_lossy(tag).to_string();
+            }
+            other => panic!("unexpected frame {other:#x} in SELECT result"),
         }
     }
 }

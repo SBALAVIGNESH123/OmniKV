@@ -34,6 +34,23 @@ pub struct SqlExecutor {
     /// If set, all reads use this MVCC snapshot instead of the current seq.
     /// Used by PgWire transaction blocks for snapshot isolation.
     snapshot_seq: Option<u64>,
+    /// SSI read dependencies collected by this statement's scans — the
+    /// read counterpart of `pending_batch`. The wire core drains them
+    /// into the open transaction alongside the staged writes, so any
+    /// committed write that invalidates a read this statement made
+    /// aborts the COMMIT (write-skew prevention). `None` on autocommit
+    /// executors.
+    pending_reads: std::cell::RefCell<Option<crate::volcano::ReadCollector>>,
+    /// Uncommitted writes staged inside an explicit transaction. DML
+    /// buffers here instead of hitting `commit_batch`, so ROLLBACK
+    /// discards it and COMMIT applies it atomically through the SSI
+    /// transaction engine; later statements in the same transaction read
+    /// the staged rows back (read-your-own-writes). `None` (or a `None`
+    /// inside the RefCell) on autocommit executors, which keep committing
+    /// each statement directly. Interior mutability keeps `execute(&self)`
+    /// while a transaction is open — only this executor's own thread
+    /// touches the batch.
+    pending_batch: std::cell::RefCell<Option<WriteBatch>>,
     /// Query timeout duration. None = no timeout.
     query_timeout: Option<std::time::Duration>,
     /// Slow query log threshold. Queries exceeding this are logged.
@@ -46,6 +63,8 @@ impl SqlExecutor {
             db,
             catalog,
             snapshot_seq: None,
+            pending_reads: std::cell::RefCell::new(None),
+            pending_batch: std::cell::RefCell::new(None),
             query_timeout: Some(std::time::Duration::from_secs(30)),
             slow_query_threshold: std::time::Duration::from_millis(100),
         }
@@ -58,9 +77,158 @@ impl SqlExecutor {
             db,
             catalog,
             snapshot_seq: Some(seq),
+            pending_reads: std::cell::RefCell::new(None),
+            pending_batch: std::cell::RefCell::new(None),
             query_timeout: Some(std::time::Duration::from_secs(30)),
             slow_query_threshold: std::time::Duration::from_millis(100),
         }
+    }
+
+    /// Creates a transaction-aware executor: reads at the transaction's
+    /// snapshot, DML staged into an internal pending batch instead of
+    /// committed, and later statements in the same transaction see the
+    /// staged rows (read-your-own-writes). `staged_writes` is the
+    /// transaction's write set so far — seeded into the batch so this
+    /// statement reads earlier statements' writes too. Durability is the
+    /// caller's: [`Self::flush_batch`] hands the accumulated writes to the
+    /// SSI transaction engine — `TransactionManager::commit` applies them
+    /// atomically, a ROLLBACK discards them untouched.
+    pub fn with_transaction(
+        db: Arc<OmniKV>,
+        catalog: Arc<Catalog>,
+        read_seq: u64,
+        staged_writes: &HashMap<String, (Option<String>, u64)>,
+    ) -> Self {
+        // Seed the pending batch with everything the transaction has
+        // staged so far, so this statement's reads see earlier
+        // statements' uncommitted writes (read-your-own-writes across
+        // statements — each statement runs on its own executor).
+        let mut pending = WriteBatch::new();
+        for (key, (value, ttl)) in staged_writes {
+            match value {
+                Some(value) if *ttl > 0 => {
+                    let _ = pending.set_with_ttl(key, value.clone(), *ttl);
+                }
+                Some(value) => {
+                    let _ = pending.set(key, value.clone());
+                }
+                None => {
+                    let _ = pending.delete(key);
+                }
+            }
+        }
+        Self {
+            db,
+            catalog,
+            snapshot_seq: Some(read_seq),
+            pending_reads: std::cell::RefCell::new(Some(crate::volcano::ReadCollector::default())),
+            pending_batch: std::cell::RefCell::new(Some(pending)),
+            query_timeout: Some(std::time::Duration::from_secs(30)),
+            slow_query_threshold: std::time::Duration::from_millis(100),
+        }
+    }
+
+    /// Drains this statement's collected read dependencies. The wire
+    /// core merges them into the open transaction's read set and read
+    /// ranges — the read counterpart of [`Self::flush_batch`].
+    pub fn drain_reads(&mut self) -> Option<crate::volcano::ReadCollector> {
+        self.pending_reads.get_mut().take()
+    }
+
+    /// Records a point read dependency (storage key).
+    fn record_point_read(&self, key: &str) {
+        let mut slot = self.pending_reads.borrow_mut();
+        if let Some(collector) = slot.as_mut() {
+            collector.keys.insert(key.to_string());
+        }
+    }
+
+    /// Records a range read dependency ([start, end)) — a predicate
+    /// lock over every key in the range.
+    fn record_range_read(&self, start: &str, end: &str) {
+        let mut slot = self.pending_reads.borrow_mut();
+        if let Some(collector) = slot.as_mut() {
+            collector.ranges.push((start.to_string(), end.to_string()));
+        }
+    }
+
+    /// Records the catalog key of a table this statement depends on, so
+    /// a concurrent CREATE/DROP of the same name aborts this COMMIT.
+    fn record_catalog_read(&self, table_name: &str) {
+        self.record_point_read(&Catalog::staged_drop_key(table_name));
+    }
+
+    /// Whether this executor stages writes into a pending batch (created
+    /// via [`Self::with_transaction`]) instead of committing directly.
+    pub fn is_transactional(&self) -> bool {
+        self.pending_batch.borrow().is_some()
+    }
+
+    /// Drains the staged writes of a transactional executor. The wire
+    /// protocol core merges them into the open transaction's write set;
+    /// the SSI engine then applies them atomically at COMMIT and
+    /// discards them on ROLLBACK. Returns `None` for autocommit
+    /// executors and after an earlier flush.
+    pub fn flush_batch(&mut self) -> Option<WriteBatch> {
+        self.pending_batch.get_mut().take()
+    }
+
+    /// Stages one DML `batch` into the pending batch: a later write of
+    /// the same key replaces an earlier one, a delete removes an earlier
+    /// write — the merged batch is exactly what COMMIT must apply and
+    /// what reads-in-transaction must see. Autocommit executors commit
+    /// immediately, exactly as before this transaction support existed.
+    fn stage_or_commit(&self, batch: WriteBatch) -> Result<(), String> {
+        let mut pending_slot = self.pending_batch.borrow_mut();
+        match pending_slot.as_mut() {
+            Some(pending) => {
+                for (key, value, ttl) in batch.buffered_writes {
+                    pending.buffered_writes.retain(|(k, _, _)| *k != key);
+                    pending.buffered_deletes.retain(|k| *k != key);
+                    let key_str = String::from_utf8_lossy(&key).into_owned();
+                    if ttl > 0 {
+                        pending
+                            .set_with_ttl(&key_str, value, ttl)
+                            .map_err(|e| format!("{:?}", e))?;
+                    } else {
+                        pending
+                            .set(&key_str, value)
+                            .map_err(|e| format!("{:?}", e))?;
+                    }
+                }
+                for key in batch.buffered_deletes {
+                    pending.buffered_writes.retain(|(k, _, _)| *k != key);
+                    let key_str = String::from_utf8_lossy(&key).into_owned();
+                    pending.delete(&key_str).map_err(|e| format!("{:?}", e))?;
+                }
+                Ok(())
+            }
+            None => self
+                .db
+                .commit_batch(&batch)
+                .map(|_| ())
+                .map_err(|e| format!("{:?}", e)),
+        }
+    }
+
+    /// The staged writes of this transaction as an overlay storage key →
+    /// serialized row (Some) or tombstone (None), consumed by reads.
+    fn pending_overlay(&self) -> Option<std::collections::HashMap<String, Option<String>>> {
+        let pending = self.pending_batch.borrow();
+        let pending = pending.as_ref()?;
+        let mut ov = std::collections::HashMap::new();
+        for (key, value, _ttl) in &pending.buffered_writes {
+            // Later writes of the same key already replaced earlier ones
+            // in the staged batch, so insertion cannot lose data.
+            ov.insert(
+                String::from_utf8_lossy(key).into_owned(),
+                Some(value.clone()),
+            );
+        }
+        for key in &pending.buffered_deletes {
+            ov.insert(String::from_utf8_lossy(key).into_owned(), None);
+        }
+        Some(ov)
     }
 
     /// Set query timeout. None = no timeout.
@@ -75,6 +243,19 @@ impl SqlExecutor {
 
     pub fn execute(&self, stmt: &SqlStatement) -> Result<ExecResult, String> {
         let start = std::time::Instant::now();
+
+        // A transactional executor's catalog overlay: staged DDL from
+        // earlier statements in the block becomes visible to this
+        // statement's catalog lookups. The overlay is rebuilt from the
+        // pending batch (seeded from the transaction's write set), so
+        // CREATEs and DROPs from earlier statements appear here.
+        if self.is_transactional()
+            && let Some(overlay) = self.pending_overlay()
+        {
+            let staged: HashMap<String, (Option<String>, u64)> =
+                overlay.into_iter().map(|(k, v)| (k, (v, 0))).collect();
+            self.catalog.apply_txn_overlay(&staged);
+        }
 
         // Check timeout before execution
         if let Some(timeout) = self.query_timeout
@@ -316,6 +497,31 @@ impl SqlExecutor {
                 .as_secs(),
         };
 
+        // Inside a transaction the CREATE stages in the pending batch —
+        // the SSI engine applies it at COMMIT, a ROLLBACK discards it —
+        // and the statement's own catalog cache learns the table so
+        // later statements in the block see it. Outside one, the
+        // catalog's own autocommit path (which also updates its cache)
+        // handles it exactly as before.
+        if self.is_transactional() {
+            // The staging path must reject a duplicate exactly like the
+            // autocommit path (Catalog::create_table checks the cache):
+            // staging would silently overwrite the existing definition
+            // at COMMIT instead of failing the statement.
+            if self.catalog.get_table(name).is_some() {
+                return Err(format!("Table '{}' already exists", name));
+            }
+            self.record_catalog_read(name);
+            let (cat_key, cat_value) = Catalog::staged_create_entry(&table)?;
+            let mut batch = WriteBatch::new();
+            batch
+                .set(&cat_key, cat_value)
+                .map_err(|e| format!("{:?}", e))?;
+            self.stage_or_commit(batch)?;
+            self.catalog.insert_staged(table);
+            return Ok(ExecResult::Ok(format!("CREATE TABLE {}", name)));
+        }
+
         self.catalog.create_table(table)?;
         Ok(ExecResult::Ok(format!("CREATE TABLE {}", name)))
     }
@@ -323,6 +529,34 @@ impl SqlExecutor {
     fn exec_drop_table(&self, name: &str, if_exists: bool) -> Result<ExecResult, String> {
         if if_exists && self.catalog.get_table(name).is_none() {
             return Ok(ExecResult::Ok("Table does not exist".into()));
+        }
+        // Inside a transaction the DROP stages: the catalog entry's
+        // delete and the row deletes all land in the pending batch —
+        // applied atomically at COMMIT, discarded by ROLLBACK — and the
+        // statement's own cache forgets the table for this block's later
+        // statements. Outside one, the catalog's autocommit path handles
+        // rows + entry + cache exactly as before.
+        if self.is_transactional() {
+            let table = self
+                .catalog
+                .get_table(name)
+                .ok_or_else(|| format!("Table '{}' does not exist", name))?;
+            self.record_catalog_read(name);
+            // The table's own rows go through the normal DML staging: the
+            // row reads use this statement's snapshot+overlay, so only
+            // rows that exist for this transaction are deleted.
+            let rows = self.load_table_rows(&table);
+            let mut batch = WriteBatch::new();
+            for row in &rows {
+                let pk = row.get(&table.primary_key).cloned().unwrap_or_default();
+                let key = format!("{}{}", table.row_prefix(), pk);
+                batch.delete(&key).map_err(|e| format!("{:?}", e))?;
+            }
+            let cat_key = Catalog::staged_drop_key(name);
+            batch.delete(&cat_key).map_err(|e| format!("{:?}", e))?;
+            self.stage_or_commit(batch)?;
+            self.catalog.remove_staged(name);
+            return Ok(ExecResult::Ok(format!("DROP TABLE {}", name)));
         }
         self.catalog.drop_table(name)?;
         Ok(ExecResult::Ok(format!("DROP TABLE {}", name)))
@@ -338,6 +572,7 @@ impl SqlExecutor {
             .catalog
             .get_table(table_name)
             .ok_or_else(|| format!("Table '{}' does not exist", table_name))?;
+        self.record_catalog_read(table_name);
 
         let columns = if col_names.is_empty() {
             table
@@ -381,9 +616,7 @@ impl SqlExecutor {
             count += 1;
         }
 
-        self.db
-            .commit_batch(&batch)
-            .map_err(|e| format!("{:?}", e))?;
+        self.stage_or_commit(batch)?;
         Ok(ExecResult::Modified {
             count,
             command: format!("INSERT 0 {}", count),
@@ -392,12 +625,36 @@ impl SqlExecutor {
 
     fn load_table_rows(&self, table: &TableDef) -> Vec<Row> {
         let prefix = table.row_prefix();
+        // Every read of a table's rows is a range read of its prefix —
+        // recorded for SSI so a concurrent write inside the prefix
+        // aborts this transaction's COMMIT (phantom/write-skew
+        // protection). Autocommit executors collect nothing (their
+        // collector is None — nothing to abort).
+        self.record_range_read(&prefix, &format!("{}\x7F", prefix));
         // Use transaction snapshot if available, otherwise current seq (autocommit)
         let seq = self.snapshot_seq.unwrap_or_else(|| self.db.get_seq());
-        let results = self
+        let mut results = self
             .db
             .scan(&prefix, &format!("{}\x7F", prefix), seq)
             .unwrap_or_default();
+
+        // Read-your-own-writes: staged rows replace their stored copies,
+        // staged deletes hide stored rows. Only this table's key range is
+        // overlaid — the pending batch may span tables.
+        if let Some(overlay) = self.pending_overlay() {
+            results.retain(|(key, _)| !overlay.contains_key(key.as_str()));
+            for (key, value) in &overlay {
+                let in_table = key.starts_with(prefix.as_str()) && key.len() > prefix.len();
+                if let (true, Some(serialized)) = (in_table, value) {
+                    // Validate the staged row still deserializes; invalid
+                    // staged data is skipped (it could never have been
+                    // produced by a successful DML statement).
+                    if serde_json::from_str::<Row>(serialized).is_ok() {
+                        results.push((key.clone(), serialized.clone()));
+                    }
+                }
+            }
+        }
 
         results
             .into_iter()
@@ -428,10 +685,18 @@ impl SqlExecutor {
         };
         let where_clause = resolved_where.as_ref();
 
-        // ═══ Production path: Optimizer → Volcano iterators ═══
+        // ═══ Production path: Optimizer → Volcano iterators ╀══
         let has_window = columns
             .iter()
             .any(|c| matches!(c, SelectColumn::WindowFunc { .. }));
+
+        // Every table referenced by the statement must resolve before the
+        // plan is built: the optimizer estimates rows for unknown tables
+        // with a default, so a missing table only surfaces as a panic deep
+        // inside plan compilation. Fail here with the catalog's error
+        // instead — including tables that were dropped (and not re-created)
+        // earlier in this transaction.
+        self.validate_from_tables(from)?;
 
         // When OFFSET is present, fetch limit+offset rows from the pipeline,
         // then skip offset rows in post-processing.
@@ -456,12 +721,42 @@ impl SqlExecutor {
 
         match optimizer.optimize(&stmt) {
             Ok(plan) => {
-                use crate::volcano::{RowIterator, compile_plan, eval_where};
-                let mut iter = compile_plan(&plan, &self.db, &self.catalog);
+                use crate::volcano::{RowIterator, compile_plan_with_scan, eval_where};
+                // Inside a transaction, scans read at the snapshot and
+                // overlay this transaction's staged writes (read-your-
+                // own-writes); outside one, plain autocommit scans.
+                let scan_ctx = self
+                    .pending_overlay()
+                    .map(|overlay| crate::volcano::ScanContext {
+                        scan_seq: self.snapshot_seq.unwrap_or_else(|| self.db.get_seq()),
+                        overlay,
+                        reads: self.pending_reads.borrow().as_ref().map(|_| {
+                            std::sync::Arc::new(std::sync::Mutex::new(
+                                crate::volcano::ReadCollector::default(),
+                            ))
+                        }),
+                    });
+                let iter_reads = scan_ctx.as_ref().map(|ctx| ctx.reads.clone());
+                let mut iter =
+                    compile_plan_with_scan(&plan, &self.db, &self.catalog, scan_ctx.as_ref());
 
                 let mut rows: Vec<Row> = Vec::new();
                 while let Some(row) = iter.next_row() {
                     rows.push(row);
+                }
+
+                // The plan's scans recorded their read dependencies into
+                // the shared collector; fold them into the executor's
+                // pending reads so the wire core drains one set.
+                if let Some(reads) = iter_reads
+                    && let Some(reads) = reads
+                    && let Ok(collected) = reads.lock()
+                {
+                    let mut slot = self.pending_reads.borrow_mut();
+                    if let Some(collector) = slot.as_mut() {
+                        collector.keys.extend(collected.keys.iter().cloned());
+                        collector.ranges.extend(collected.ranges.iter().cloned());
+                    }
                 }
 
                 // HAVING: post-aggregate filter
@@ -597,6 +892,31 @@ impl SqlExecutor {
     }
 
     /// Legacy execution path — fallback for queries the optimizer can't handle.
+    /// Fails with the catalog's error when any table in the FROM clause
+    /// (or a join's side) is unknown to this statement's catalog view.
+    /// The optimizer would happily plan scans over unknown tables and the
+    /// panic would surface far from the cause.
+    fn validate_from_tables(&self, from: &FromClause) -> Result<(), String> {
+        match from {
+            FromClause::Table(name) => {
+                if self.catalog.get_table(name).is_none() {
+                    return Err(format!("Table '{}' does not exist", name));
+                }
+                self.record_catalog_read(name);
+                Ok(())
+            }
+            FromClause::Join { left, right, .. } => {
+                for side in [left, right] {
+                    if self.catalog.get_table(side).is_none() {
+                        return Err(format!("Table '{}' does not exist", side));
+                    }
+                    self.record_catalog_read(side);
+                }
+                Ok(())
+            }
+        }
+    }
+
     fn exec_select_legacy(
         &self,
         columns: &[SelectColumn],
@@ -612,6 +932,7 @@ impl SqlExecutor {
                     .catalog
                     .get_table(name)
                     .ok_or_else(|| format!("Table '{}' not found", name))?;
+                self.record_catalog_read(name);
                 self.load_table_rows(&table)
             }
             FromClause::Join {
@@ -621,6 +942,8 @@ impl SqlExecutor {
                 on_left,
                 on_right,
             } => {
+                self.record_catalog_read(left);
+                self.record_catalog_read(right);
                 let lt = self
                     .catalog
                     .get_table(left)
@@ -896,6 +1219,7 @@ impl SqlExecutor {
             .catalog
             .get_table(table_name)
             .ok_or_else(|| format!("Table '{}' not found", table_name))?;
+        self.record_catalog_read(table_name);
         let mut rows = self.load_table_rows(&table);
 
         if let Some(expr) = where_clause {
@@ -915,9 +1239,7 @@ impl SqlExecutor {
         }
 
         if count > 0 {
-            self.db
-                .commit_batch(&batch)
-                .map_err(|e| format!("{:?}", e))?;
+            self.stage_or_commit(batch)?;
         }
         Ok(ExecResult::Modified {
             count,
@@ -934,6 +1256,7 @@ impl SqlExecutor {
             .catalog
             .get_table(table_name)
             .ok_or_else(|| format!("Table '{}' not found", table_name))?;
+        self.record_catalog_read(table_name);
         let mut rows = self.load_table_rows(&table);
 
         if let Some(expr) = where_clause {
@@ -949,9 +1272,7 @@ impl SqlExecutor {
         }
 
         if count > 0 {
-            self.db
-                .commit_batch(&batch)
-                .map_err(|e| format!("{:?}", e))?;
+            self.stage_or_commit(batch)?;
         }
         Ok(ExecResult::Modified {
             count,

@@ -92,8 +92,39 @@ value (length -1) binds as `NULL`; a placeholder with no corresponding Bind
 value is a `08P01` "no value specified for parameter $n" error — missing is
 not NULL (full NULL literal support in comparisons is tracked by #111).
 Parameterized statements require the SQL grammar; the legacy KV grammar
-rejects them with `0A000`. Write buffering inside explicit transactions is
-tracked by #121.
+rejects them with `0A000`.
+
+### Transactional DML inside BEGIN blocks
+
+DML (`INSERT`/`UPDATE`/`DELETE`, and the legacy KV `SET`/`UPDATE key`/`DELETE`)
+executed inside an explicit `BEGIN` block is **staged, not committed**: the
+writes land in the open transaction's write set, are invisible to every
+other connection until `COMMIT` applies them atomically (after SSI
+conflict validation), and are discarded untouched by `ROLLBACK`.
+Read-your-own-writes holds for the whole block — later statements see
+earlier statements' uncommitted writes, including through the optimizer
+plan path (the plan's scans read at the transaction's snapshot with its
+staged writes overlaid).
+
+DDL is transactional the same way: `CREATE TABLE` / `DROP TABLE` inside a
+`BEGIN` block stage their catalog entry (and the dropped table's row
+deletes) in the same write set, so `COMMIT` applies them atomically and
+`ROLLBACK` undoes them — matching PostgreSQL's transactional DDL. The
+creating transaction sees its own tables immediately; other connections
+see them only after `COMMIT`. A table that was rolled back (dropped and
+not re-created) fails later statements with `42P01`
+(`undefined_table`), and a duplicate `CREATE TABLE` fails with `42P07`,
+both the same states PostgreSQL reports.
+
+Conflict detection is serializable (SSI) across connections: every
+statement's reads — point lookups, table scans, the catalog lookups
+behind table resolution, and the legacy KV range selects — become read
+dependencies of the open transaction, and range reads act as predicate
+locks. A `COMMIT` whose reads were invalidated by a concurrently
+committed write aborts with `40001` (`serialization_failure`), which is
+also what stops a phantom insert from surviving a concurrent
+`DROP TABLE`. One transaction manager is shared by all connections, so
+conflicts are detected between connections, not just within one.
 
 ## QUIC binary protocol
 

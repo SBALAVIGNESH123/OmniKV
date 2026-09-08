@@ -59,6 +59,8 @@ pub struct Savepoint {
     write_set_snapshot: HashMap<String, (Option<String>, u64)>,
     /// Snapshot of the read_set at the time of the savepoint.
     read_set_snapshot: HashSet<String>,
+    /// Snapshot of the read ranges at the time of the savepoint.
+    read_ranges_snapshot: Vec<(String, String)>,
 }
 
 /// A single in-flight transaction with read/write tracking.
@@ -72,6 +74,13 @@ pub struct Transaction {
     pub state: TxnState,
     /// Keys read during this transaction (for SSI conflict detection).
     pub read_set: HashSet<String>,
+    /// Ranges (start, end) scanned during this transaction — predicate
+    /// locks. A key written by a concurrently committed transaction
+    /// that falls in one of our read ranges aborts our COMMIT exactly
+    /// like a point-read conflict: this is what stops phantom writes
+    /// from sneaking past a scan — and a concurrently inserted row from
+    /// surviving a DROP TABLE that scanned the same range earlier.
+    pub read_ranges: Vec<(String, String)>,
     /// Buffered writes: key → (value, ttl). None value = delete.
     pub write_set: HashMap<String, (Option<String>, u64)>,
     /// When this transaction was started.
@@ -87,6 +96,7 @@ impl Transaction {
             read_seq,
             state: TxnState::Active,
             read_set: HashSet::new(),
+            read_ranges: Vec::new(),
             write_set: HashMap::new(),
             started_at: Instant::now(),
             savepoints: Vec::new(),
@@ -105,6 +115,11 @@ struct CommittedTxn {
     write_keys: HashSet<String>,
     /// Keys read by this transaction.
     read_keys: HashSet<String>,
+    /// Ranges (start, end) scanned by this transaction — its predicate
+    /// locks, kept in the committed history so transactions that write
+    /// inside a range scanned by an EARLIER committed transaction can
+    /// be caught at their own COMMIT.
+    read_ranges: Vec<(String, String)>,
 }
 
 /// RW-dependency edge: T_from read a key that T_to later wrote.
@@ -283,6 +298,26 @@ impl TransactionManager {
         self.db.find(key, txn.read_seq)
     }
 
+    /// Records a range read ([start, end)) for SSI conflict detection —
+    /// a predicate lock. Called for every scan serving a statement in an
+    /// explicit transaction (SQL table scans, legacy KV range selects,
+    /// DROP TABLE's row collection), so a write committed inside the
+    /// range after this transaction's snapshot aborts its COMMIT:
+    /// phantom-write protection, the range counterpart of read_set.
+    pub fn record_read_range(
+        &self,
+        txn: &mut Transaction,
+        start_key: &str,
+        end_key: &str,
+    ) -> Result<(), OmniError> {
+        if txn.state != TxnState::Active {
+            return Err(OmniError::IoError("Transaction is not active".into()));
+        }
+        txn.read_ranges
+            .push((start_key.to_string(), end_key.to_string()));
+        Ok(())
+    }
+
     /// SET — buffers a write in the transaction (not yet committed).
     pub fn set(&self, txn: &mut Transaction, key: &str, value: String) -> Result<(), OmniError> {
         if txn.state != TxnState::Active {
@@ -328,6 +363,7 @@ impl TransactionManager {
             name: name.to_string(),
             write_set_snapshot: txn.write_set.clone(),
             read_set_snapshot: txn.read_set.clone(),
+            read_ranges_snapshot: txn.read_ranges.clone(),
         });
 
         self.metrics
@@ -359,6 +395,7 @@ impl TransactionManager {
         let savepoint = txn.savepoints[pos].clone();
         txn.write_set = savepoint.write_set_snapshot;
         txn.read_set = savepoint.read_set_snapshot;
+        txn.read_ranges = savepoint.read_ranges_snapshot;
 
         // Discard all savepoints after (and including) the target
         txn.savepoints.truncate(pos);
@@ -427,6 +464,7 @@ impl TransactionManager {
             .write_set
             .keys()
             .chain(txn.read_set.iter())
+            .chain(txn.read_ranges.iter().flat_map(|(s, e)| [s, e]))
             .map(|k| {
                 let mut h: u64 = 5381;
                 for b in k.bytes() {
@@ -506,6 +544,48 @@ impl TransactionManager {
                             });
                         }
                     }
+
+                    // ── Range (predicate) conflicts ─────────────────
+                    // A write they committed inside one of OUR read
+                    // ranges: we scanned the range, they changed it after
+                    // our snapshot — the phantom-write conflict, caught
+                    // at COMMIT. This is the DROP TABLE vs. concurrent
+                    // INSERT race and every seq-scan write-skew.
+                    for key in committed_txn.write_keys.iter() {
+                        for (start, end) in &txn.read_ranges {
+                            if key.as_str() >= start.as_str() && key.as_str() < end.as_str() {
+                                rw_deps.push(RWDependency {
+                                    from_txn: txn.id,
+                                    to_txn: committed_txn.txn_id,
+                                });
+                                found = Some(format!(
+                                    "SSI CONFLICT (RANGE): key '{}' written by txn {} at seq {} inside our read range [{}, {})",
+                                    key, committed_txn.txn_id, committed_txn.commit_seq, start, end
+                                ));
+                                break 'outer;
+                            }
+                        }
+                    }
+
+                    // Our writes inside one of THEIR committed read
+                    // ranges: they scanned the range, we changed it
+                    // after their snapshot — the mirror image, so the
+                    // race cannot slip through by ordering alone.
+                    for key in txn.write_set.keys() {
+                        for (start, end) in &committed_txn.read_ranges {
+                            if key.as_str() >= start.as_str() && key.as_str() < end.as_str() {
+                                rw_deps.push(RWDependency {
+                                    from_txn: committed_txn.txn_id,
+                                    to_txn: txn.id,
+                                });
+                                found = Some(format!(
+                                    "SSI CONFLICT (RANGE): our key '{}' falls in txn {}'s read range [{}, {}] (seq {})",
+                                    key, committed_txn.txn_id, start, end, committed_txn.commit_seq
+                                ));
+                                break 'outer;
+                            }
+                        }
+                    }
                 }
             }
 
@@ -563,6 +643,7 @@ impl TransactionManager {
             commit_seq,
             write_keys: txn.write_set.keys().cloned().collect(),
             read_keys: txn.read_set.clone(),
+            read_ranges: txn.read_ranges.clone(),
         });
         drop(committed); // release committed_txns lock
 
@@ -582,6 +663,7 @@ impl TransactionManager {
         txn.state = TxnState::Aborted;
         txn.write_set.clear();
         txn.read_set.clear();
+        txn.read_ranges.clear();
         txn.savepoints.clear();
         self.cleanup_txn(txn.id, txn.read_seq);
         self.metrics.txns_aborted.fetch_add(1, Ordering::Relaxed);
