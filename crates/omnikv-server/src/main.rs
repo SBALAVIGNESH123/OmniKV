@@ -9,7 +9,7 @@
 #![expect(
     dead_code,
     unused_mut,
-    reason = "The server crate includes staged cluster, Raft route, and QUIC client helpers that are built in CI before every protocol surface is enabled by the binary."
+    reason = "The server crate keeps staged QUIC client helpers that are built in CI before every protocol surface is enabled by the binary."
 )]
 #![expect(
     clippy::doc_markdown,
@@ -27,22 +27,30 @@
 
 mod api;
 mod auth;
-mod cluster;
 mod quic_server;
+mod raft_node;
 mod raft_routes;
 
 use std::sync::Arc;
 
 use omni_engine::{OmniKV, config::ServerConfig, hardening::RateLimiter};
 
-fn print_banner(cfg: &ServerConfig) {
+fn print_banner(cfg: &ServerConfig, cluster_mode: Option<u64>) {
+    // The honesty rules this banner follows (issue #113): "Distributed"
+    // only when consensus is actually wired (a raft node booted), and
+    // the build credit names openraft instead of claiming every byte.
+    let dist_line = match cluster_mode {
+        Some(node_id) => format!("Raft cluster (node {node_id})"),
+        None => "Single-node".to_string(),
+    };
+    let feature_line = format!("Embeddable · Transactional KV · {dist_line}");
     println!();
     println!("  ╔════════════════════════════════════════════════════╗");
     println!(
         "  ║        ⚡ OmniKV v{}                       ║",
         env!("CARGO_PKG_VERSION")
     );
-    println!("  ║  Embeddable · Distributed · Transactional KV      ║");
+    println!("  ║  {feature_line:<48}      ║");
     println!("  ╠════════════════════════════════════════════════════╣");
     println!(
         "  ║  HTTP/1.1 + HTTP/2 (TLS)  → {}           ║",
@@ -61,7 +69,8 @@ fn print_banner(cfg: &ServerConfig) {
         cfg.tcp_addr
     );
     println!("  ╠════════════════════════════════════════════════════╣");
-    println!("  ║  Built from scratch in Rust. Every byte is ours.  ║");
+    println!("  ║  Storage · SQL · wire protocols built from scratch ║");
+    println!("  ║  Consensus: openraft (Raft)                         ║");
     println!("  ╚════════════════════════════════════════════════════╝");
     println!();
 }
@@ -117,7 +126,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // legacy OMNI_CONFIG. Production mode then fails closed on invalid or
     // unsafe settings.
     let cfg = ServerConfig::load_server_from_args(std::env::args().skip(1))?;
-    print_banner(&cfg);
     tracing::info!(
         mode = ?cfg.mode,
         http_addr = %cfg.http_addr,
@@ -133,6 +141,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let db = OmniKV::open(&manifest_path, &wal_path)?;
     let _compaction_handle = start_storage_maintenance(&db, &cfg)?;
     log_database_opened(&db, &cfg);
+
+    // ─── Cluster boot (issue #113): a real raft node when configured ──
+    // OMNIKV_RAFT_ADDR + OMNIKV_NODE_ID make this server a cluster
+    // member: every client write routes through consensus before it is
+    // acknowledged, and this node serves consensus RPCs for its peers.
+    // Absent, the process stays a fully independent single-node engine
+    // and none of the cluster machinery runs.
+    let cluster = raft_node::boot_cluster_node(&cfg, &db).await?;
+    let cluster_mode = if cluster.is_some() {
+        cfg.raft.node_id
+    } else {
+        None
+    };
+    print_banner(&cfg, cluster_mode);
 
     let rate_limiter = Arc::new(RateLimiter::new(
         cfg.rate_limit_per_sec,
@@ -153,14 +175,65 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         manifest_path,
         wal_path,
         rate_limiter: rate_limiter.clone(),
+        cluster_gateway: cluster.as_ref().map(|c| c.gateway.clone()),
+        cluster_node_id: cfg.raft.node_id,
     };
 
+    let (http_handle, quic_handle, tcp_handle) =
+        spawn_protocol_servers(db, &cfg, rate_limiter, app_state).await?;
+
+    // ─── 5. Raft consensus listener (cluster mode only) ───────
+    // Serves /raft/{append,vote,snapshot} for this node's peers on the
+    // dedicated plaintext port. A dead listener means a deaf cluster
+    // member, so its exit is handled like any other server exit below.
+    let raft_handle = cluster.map(|node| {
+        tokio::spawn(async move {
+            if let Err(e) = raft_node::serve_raft_rpc(node).await {
+                tracing::error!("Raft consensus listener exited: {e}");
+            }
+        })
+    });
+
+    tracing::info!("All servers started. OmniKV is ready.");
+
+    // Wait for any server to exit (they should not)
+    tokio::select! {
+        _ = http_handle => tracing::error!("HTTP server exited"),
+        _ = quic_handle => tracing::error!("QUIC server exited"),
+        _ = tcp_handle => tracing::error!("TCP server exited"),
+        _ = async {
+            match raft_handle {
+                Some(handle) => handle.await.expect("raft listener task"),
+                // Single-node mode: never resolves; the other branches
+                // still decide the outcome.
+                None => std::future::pending::<()>().await,
+            }
+        } => tracing::error!("Raft consensus listener exited"),
+    }
+
+    Ok(())
+}
+
+/// Starts the four protocol servers (HTTP/2, QUIC, PgWire, TCP) and
+/// returns their supervision handles. Each logs its own fatal error;
+/// the caller's select treats any exit as a broken server.
+async fn spawn_protocol_servers(
+    db: Arc<OmniKV>,
+    cfg: &ServerConfig,
+    rate_limiter: Arc<RateLimiter>,
+    app_state: api::AppState,
+) -> Result<
+    (
+        tokio::task::JoinHandle<()>,
+        tokio::task::JoinHandle<()>,
+        tokio::task::JoinHandle<()>,
+    ),
+    Box<dyn std::error::Error>,
+> {
     let router = api::build_router(app_state);
 
-    // Generate self-signed certs for HTTP/2 + QUIC
+    // ─── 1. HTTP/1.1 + HTTP/2 (TLS, ALPN) ──────────────────────
     let (certs, key) = quic_server::generate_self_signed_cert()?;
-
-    // HTTP/2 server with TLS (ALPN h2 + http/1.1)
     let tls_config = axum_server::tls_rustls::RustlsConfig::from_der(
         certs.iter().map(|c| c.as_ref().to_vec()).collect(),
         key.secret_der().to_vec(),
@@ -217,16 +290,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    tracing::info!("All servers started. OmniKV is ready.");
-
-    // Wait for any server to exit (they should not)
-    tokio::select! {
-        _ = http_handle => tracing::error!("HTTP server exited"),
-        _ = quic_handle => tracing::error!("QUIC server exited"),
-        _ = tcp_handle => tracing::error!("TCP server exited"),
-    }
-
-    Ok(())
+    Ok((http_handle, quic_handle, tcp_handle))
 }
 
 /// Simple TCP command interface for telnet/debugging.

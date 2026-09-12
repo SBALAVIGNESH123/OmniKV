@@ -53,6 +53,11 @@ pub struct AppState {
     pub manifest_path: String,
     pub wal_path: String,
     pub rate_limiter: Arc<RateLimiter>,
+    /// The cluster write gateway when this server booted as a Raft
+    /// member. `None` = single-node mode.
+    pub cluster_gateway: Option<Arc<omni_engine::raft_gateway::ClusterGateway>>,
+    /// This node's openraft id when clustered.
+    pub cluster_node_id: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -288,6 +293,10 @@ pub fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/health", axum::routing::get(health_handler))
         .route("/ready", axum::routing::get(ready_handler))
+        .route(
+            "/cluster/status",
+            axum::routing::get(cluster_status_handler),
+        )
         .route("/auth/token", axum::routing::post(token_handler))
         .merge(read_routes)
         .merge(write_routes)
@@ -526,6 +535,53 @@ async fn ready_handler(State(state): State<AppState>) -> impl IntoResponse {
     } else {
         (StatusCode::SERVICE_UNAVAILABLE, ApiResponse::ok(status))
     }
+}
+
+/// Cluster topology snapshot — no user data, same posture as /health
+/// (public) so monitoring and the compose smoke script can watch leader
+/// failover without minting tokens.
+#[derive(Serialize)]
+struct ClusterStatus {
+    mode: &'static str,
+    node_id: Option<u64>,
+    leader_id: Option<u64>,
+    term: u64,
+    last_applied_index: u64,
+    members: Vec<(u64, String)>,
+}
+
+async fn cluster_status_handler(State(state): State<AppState>) -> impl IntoResponse {
+    let Some(gateway) = &state.cluster_gateway else {
+        return (
+            StatusCode::OK,
+            ApiResponse::ok(ClusterStatus {
+                mode: "single-node",
+                node_id: None,
+                leader_id: None,
+                term: 0,
+                last_applied_index: 0,
+                members: Vec::new(),
+            }),
+        );
+    };
+    let metrics = gateway.metrics().borrow().clone();
+    let members: Vec<(u64, String)> = metrics
+        .membership_config
+        .membership()
+        .nodes()
+        .map(|(id, node)| (*id, node.addr.clone()))
+        .collect();
+    (
+        StatusCode::OK,
+        ApiResponse::ok(ClusterStatus {
+            mode: "raft-cluster",
+            node_id: state.cluster_node_id,
+            leader_id: metrics.current_leader,
+            term: metrics.current_term,
+            last_applied_index: metrics.last_applied.map(|l| l.index).unwrap_or_default(),
+            members,
+        }),
+    )
 }
 
 async fn get_handler(State(state): State<AppState>, Path(key): Path<String>) -> impl IntoResponse {
@@ -951,6 +1007,8 @@ mod tests {
             manifest_path: manifest.to_string_lossy().to_string(),
             wal_path: wal.to_string_lossy().to_string(),
             rate_limiter: Arc::new(RateLimiter::new(1000.0, 100, 10_000)),
+            cluster_gateway: None,
+            cluster_node_id: None,
         });
         (router, dir, jwt_secret)
     }
@@ -1404,6 +1462,8 @@ mod tests {
             manifest_path: manifest.to_string_lossy().to_string(),
             wal_path: wal.to_string_lossy().to_string(),
             rate_limiter: Arc::new(RateLimiter::new(0.01, 1, 10)),
+            cluster_gateway: None,
+            cluster_node_id: None,
         });
         let token =
             crate::auth::generate_token("reader", "read", &jwt_secret, 60).expect("read token");

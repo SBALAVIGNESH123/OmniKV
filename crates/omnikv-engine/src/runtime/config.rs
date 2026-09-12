@@ -92,6 +92,32 @@ impl StorageConfig {
     }
 }
 
+/// Cluster (Raft) configuration. Absent — `raft_addr` and `node_id`
+/// both unset — the server runs as an independent single-node engine,
+/// exactly as it always has. Present, the server boots an openraft node
+/// on `raft_addr` and every write goes through consensus before it is
+/// acknowledged.
+///
+/// `peers` are the OTHER nodes' raft addresses ("host:port"), used only
+/// at bootstrap to seed cluster membership; a node joining an existing
+/// cluster learns the full membership from the leader.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RaftConfig {
+    /// This node's cluster ID (openraft NodeId). 1-based.
+    pub node_id: Option<u64>,
+    /// The plaintext listener for consensus traffic (etcd's peer-port
+    /// model: client TLS never terminates here).
+    pub raft_addr: Option<String>,
+    /// The other initial members, "host:port" per entry. Empty means
+    /// single-node cluster when raft_addr is set.
+    pub peers: Vec<String>,
+    /// Override election/heartbeat tuning (defaults suit tests and LANs).
+    pub heartbeat_interval_ms: Option<u64>,
+    pub election_timeout_min_ms: Option<u64>,
+    pub election_timeout_max_ms: Option<u64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServerConfig {
@@ -125,6 +151,8 @@ pub struct ServerConfig {
     pub log_level: String,
     #[serde(default)]
     pub storage: StorageConfig,
+    #[serde(default)]
+    pub raft: RaftConfig,
 }
 
 fn default_http_addr() -> String {
@@ -185,6 +213,7 @@ impl Default for ServerConfig {
             tls_insecure_skip: false,
             log_level: default_log_level(),
             storage: StorageConfig::default(),
+            raft: RaftConfig::default(),
         }
     }
 }
@@ -353,10 +382,63 @@ impl ServerConfig {
             self.storage.compaction_check_interval_ms =
                 parse_env_value("OMNIKV_COMPACTION_CHECK_INTERVAL_MS", &v)?;
         }
+
+        // ── Cluster (Raft) ── OMNIKV_* names with the OMNI_NODE_ID /
+        // OMNI_PEERS legacy names the docker-compose files already set.
+        if let Ok(v) = std::env::var("OMNIKV_RAFT_ADDR") {
+            self.raft.raft_addr = if v.is_empty() { None } else { Some(v) };
+        }
+        if let Ok(v) = std::env::var("OMNIKV_NODE_ID").or_else(|_| std::env::var("OMNI_NODE_ID")) {
+            self.raft.node_id = Some(
+                v.parse()
+                    .map_err(|_| ConfigError("Invalid OMNIKV_NODE_ID".into()))?,
+            );
+        }
+        if let Ok(v) = std::env::var("OMNIKV_RAFT_PEERS").or_else(|_| std::env::var("OMNI_PEERS")) {
+            self.raft.peers = v
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect();
+        }
+        if let Ok(v) = std::env::var("OMNIKV_RAFT_HEARTBEAT_MS") {
+            self.raft.heartbeat_interval_ms = Some(
+                v.parse()
+                    .map_err(|_| ConfigError("Invalid OMNIKV_RAFT_HEARTBEAT_MS".into()))?,
+            );
+        }
+        if let Ok(v) = std::env::var("OMNIKV_RAFT_ELECTION_MIN_MS") {
+            self.raft.election_timeout_min_ms = Some(
+                v.parse()
+                    .map_err(|_| ConfigError("Invalid OMNIKV_RAFT_ELECTION_MIN_MS".into()))?,
+            );
+        }
+        if let Ok(v) = std::env::var("OMNIKV_RAFT_ELECTION_MAX_MS") {
+            self.raft.election_timeout_max_ms = Some(
+                v.parse()
+                    .map_err(|_| ConfigError("Invalid OMNIKV_RAFT_ELECTION_MAX_MS".into()))?,
+            );
+        }
         Ok(())
     }
 
     pub fn validate_runtime(&self) -> Result<(), ConfigError> {
+        // A node id without a raft listener, or a listener without a
+        // node id, is a half-configured cluster: refuse to boot rather
+        // than silently degrade to single-node.
+        if self.raft.node_id.is_some() != self.raft.raft_addr.is_some() {
+            return Err(ConfigError(
+                "raft.node_id and raft.raft_addr must be set together (OMNIKV_NODE_ID / OMNIKV_RAFT_ADDR)".into(),
+            ));
+        }
+        if self.raft.election_timeout_min_ms.unwrap_or(0)
+            > self.raft.election_timeout_max_ms.unwrap_or(u64::MAX)
+        {
+            return Err(ConfigError(
+                "raft.election_timeout_min_ms must be <= election_timeout_max_ms".into(),
+            ));
+        }
         self.validate_common()?;
         if self.mode == ServerMode::Production {
             self.validate_production()?;

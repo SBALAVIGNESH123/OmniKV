@@ -8,7 +8,7 @@
 ![Soak](https://img.shields.io/badge/soak-10%20min%20%2F%200%20errors-brightgreen?style=for-the-badge)
 ![License](https://img.shields.io/badge/license-MIT-blue?style=for-the-badge)
 
-OmniKV is an experimental database engine written from scratch in Rust. It is not a wrapper around RocksDB and it is not a fork of SQLite. It includes its own storage engine, write-ahead log, transaction manager, SQL parser, and Raft-oriented consensus work.
+OmniKV is an experimental database engine written from scratch in Rust. It is not a wrapper around RocksDB and it is not a fork of SQLite. It includes its own storage engine, write-ahead log, transaction manager, SQL parser, and PostgreSQL wire protocol; consensus (Raft) is provided by the openraft library.
 
 The primary goal is correctness and durability. The project includes crash-recovery checks, corruption-detection tests, concurrent stress tests, SQL coverage, operational diagnostics, and Raft cluster tests.
 
@@ -23,7 +23,7 @@ For SketchLog, OmniKV is the durable embedded storage foundation: local telemetr
 - Concurrency: lock-free reads through `ArcSwap` and Multi-Version Concurrency Control.
 - Transactions: Serializable Snapshot Isolation with savepoint support.
 - SQL engine: recursive-descent parser, cost-based optimizer, and iterator-based execution work.
-- Consensus: Raft integration for multi-node replication and leader failover experiments.
+- Consensus (openraft): cluster mode with consensus-gated writes, leader election, failover on leader loss, and a 3-node docker-compose demo. A multi-process kill-the-leader test runs in CI ([cluster docs](docs/cluster.md)).
 - Operations: health checks, metrics, diagnostics, Docker packaging, and example config.
 - Recovery: portable plain/encrypted backup and restore APIs with restore-time metadata validation.
 - Embedded API: stable directory-based Rust facade and Python/native bridge with namespaces, batch writes, snapshots, scans, backup/restore, SQL execution, and SketchLog-oriented integration docs.
@@ -146,6 +146,7 @@ On Windows/MSVC, full debug test linking can require significant free disk space
 - [Backup and restore](docs/backup_restore.md)
 - [Security model](docs/security.md)
 - [Distributed correctness](docs/distributed-correctness.md)
+- [Cluster mode](docs/cluster.md)
 - [Embedded API for SketchLog integration](docs/embedded-api.md)
 - [Python embedded bridge](docs/python-bridge.md)
 - [Fuzzing and property testing](docs/fuzzing.md)
@@ -183,7 +184,7 @@ The engine source is grouped by domain under `storage/`, `query/`, `raft/`, and 
 ## Known limitations
 
 - Distributed transactions are not Jepsen-tested. The 2PC protocol is implemented, but has not been rigorously tested against network partitions or coordinator crashes.
-- Multi-node Raft has deterministic partition, failover, membership, snapshot, and restart evidence, but it is not yet Jepsen-grade or validated under real multi-process network faults.
+- Multi-node Raft is real and CI-tested: a multi-process test kills the leader and verifies failover with no data loss, and deterministic partition/failover/membership/snapshot evidence exists. It is still not Jepsen-grade, SSI conflict history is leader-local (transactions spanning a failover may miss conflicts), and peer traffic is plaintext HTTP on a dedicated port (see [docs/cluster.md](docs/cluster.md)).
 - SeqScan currently materializes rows before yielding them. True streaming directly from the storage engine is planned.
 - Long-running stability still needs a 24-hour soak test.
 - Fuzz/property testing is now seeded for SQL, API JSON, WAL, backup restore, Raft log operations, and storage visibility. It still needs long-duration corpus growth before fuzzing can be treated as mature assurance.

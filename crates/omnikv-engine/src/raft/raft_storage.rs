@@ -93,7 +93,7 @@ impl OmniRaftStorage {
         let key = format!("{}{:020}", RAFT_LOG_PREFIX, index);
         let mut batch = WriteBatch::new();
         batch.set(&key, entry.to_string())?;
-        self.db.commit_batch(&batch)?;
+        self.db.commit_batch_local(&batch)?;
         Ok(())
     }
 
@@ -111,7 +111,7 @@ impl OmniRaftStorage {
             if parts.len() == 3 {
                 let mut batch = WriteBatch::new();
                 batch.set(parts[1], parts[2].to_string())?;
-                self.db.commit_batch(&batch)?;
+                self.db.commit_batch_local(&batch)?;
             }
         }
         Ok(())
@@ -131,7 +131,7 @@ impl OmniRaftStorage {
         meta.last_applied = Some(LogId::new(leader_id, index));
         let mut batch = WriteBatch::new();
         self.save_meta(&meta, &mut batch);
-        self.db.commit_batch(&batch)?;
+        self.db.commit_batch_local(&batch)?;
         Ok(())
     }
 
@@ -151,7 +151,7 @@ impl OmniRaftStorage {
             let key = format!("{}{:020}", RAFT_LOG_PREFIX, idx);
             batch.delete(&key)?;
         }
-        self.db.commit_batch(&batch)?;
+        self.db.commit_batch_local(&batch)?;
         Ok(())
     }
 
@@ -160,7 +160,7 @@ impl OmniRaftStorage {
         let key = format!("{}vote", RAFT_LOG_PREFIX);
         let mut batch = WriteBatch::new();
         batch.set(&key, vote_json.to_string())?;
-        self.db.commit_batch(&batch)?;
+        self.db.commit_batch_local(&batch)?;
         Ok(())
     }
 
@@ -309,13 +309,15 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
             meta.vote = Some(*vote);
             self.save_meta(&meta, &mut batch);
         }
-        self.db.commit_batch(&batch).map_err(|e| StorageError::IO {
-            source: StorageIOError::new(
-                openraft::ErrorSubject::Store,
-                openraft::ErrorVerb::Write,
-                AnyError::error(e.to_string()),
-            ),
-        })?;
+        self.db
+            .commit_batch_local(&batch)
+            .map_err(|e| StorageError::IO {
+                source: StorageIOError::new(
+                    openraft::ErrorSubject::Store,
+                    openraft::ErrorVerb::Write,
+                    AnyError::error(e.to_string()),
+                ),
+            })?;
         Ok(())
     }
 
@@ -364,13 +366,15 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
             self.save_meta(&meta, &mut batch);
         }
 
-        self.db.commit_batch(&batch).map_err(|e| StorageError::IO {
-            source: StorageIOError::new(
-                openraft::ErrorSubject::Store,
-                openraft::ErrorVerb::Write,
-                AnyError::error(e.to_string()),
-            ),
-        })?;
+        self.db
+            .commit_batch_local(&batch)
+            .map_err(|e| StorageError::IO {
+                source: StorageIOError::new(
+                    openraft::ErrorSubject::Store,
+                    openraft::ErrorVerb::Write,
+                    AnyError::error(e.to_string()),
+                ),
+            })?;
         Ok(())
     }
 
@@ -411,13 +415,15 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
             }
         }
 
-        self.db.commit_batch(&batch).map_err(|e| StorageError::IO {
-            source: StorageIOError::new(
-                openraft::ErrorSubject::Store,
-                openraft::ErrorVerb::Write,
-                AnyError::error(e.to_string()),
-            ),
-        })?;
+        self.db
+            .commit_batch_local(&batch)
+            .map_err(|e| StorageError::IO {
+                source: StorageIOError::new(
+                    openraft::ErrorSubject::Store,
+                    openraft::ErrorVerb::Write,
+                    AnyError::error(e.to_string()),
+                ),
+            })?;
         Ok(())
     }
 
@@ -446,13 +452,15 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
             self.save_meta(&meta, &mut batch);
         }
 
-        self.db.commit_batch(&batch).map_err(|e| StorageError::IO {
-            source: StorageIOError::new(
-                openraft::ErrorSubject::Store,
-                openraft::ErrorVerb::Write,
-                AnyError::error(e.to_string()),
-            ),
-        })?;
+        self.db
+            .commit_batch_local(&batch)
+            .map_err(|e| StorageError::IO {
+                source: StorageIOError::new(
+                    openraft::ErrorSubject::Store,
+                    openraft::ErrorVerb::Write,
+                    AnyError::error(e.to_string()),
+                ),
+            })?;
         Ok(())
     }
 
@@ -479,16 +487,46 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
             match &entry.payload {
                 EntryPayload::Blank => res.push("".to_string()),
                 EntryPayload::Normal(req) => {
-                    if req.starts_with("SET ") {
-                        let parts: Vec<&str> = req.splitn(3, ' ').collect();
-                        if parts.len() == 3 {
-                            if parts[1].starts_with("__sys__/raft/") {
-                                res.push("ERR".to_string());
-                                continue;
+                    // Structured commands (the cluster write path): one
+                    // entry = one atomic batch of sets and deletes. The
+                    // legacy "SET <key> <value>" text form still applies,
+                    // so pre-cluster log entries and the storage tests
+                    // keep their meaning.
+                    if let Some(cmd) = crate::raft_command::RaftCommand::decode(req) {
+                        let system_key = cmd
+                            .sets
+                            .iter()
+                            .any(|op| op.key.starts_with("__sys__/raft/"))
+                            || cmd.dels.iter().any(|k| k.starts_with("__sys__/raft/"));
+                        if system_key || cmd.is_empty() {
+                            res.push("ERR".to_string());
+                            continue;
+                        }
+                        for op in cmd.sets {
+                            if op.ttl > 0 {
+                                // The entry carries the ABSOLUTE expiry the
+                                // originating node computed — apply it verbatim.
+                                // Re-deriving `now + ttl` here would drift the
+                                // expiry forward by the replication delay on
+                                // every follower hop.
+                                batch
+                                    .set_with_expiry(&op.key, op.value, op.ttl)
+                                    .map_err(|e| storage_write_err(&e))?;
+                            } else {
+                                batch
+                                    .set(&op.key, op.value)
+                                    .map_err(|e| storage_write_err(&e))?;
                             }
-                            let key = parts[1].to_string();
+                        }
+                        for key in &cmd.dels {
+                            batch.delete(key).map_err(|e| storage_write_err(&e))?;
+                        }
+                        res.push("OK".to_string());
+                    } else if let Some(rest) = req.strip_prefix("SET ") {
+                        let parts: Vec<&str> = rest.splitn(2, ' ').collect();
+                        if parts.len() == 2 && !parts[0].starts_with("__sys__/raft/") {
                             batch
-                                .set(&key, parts[2].to_string())
+                                .set(parts[0], parts[1].to_string())
                                 .map_err(|e| storage_write_err(&e))?;
                             res.push("OK".to_string());
                         } else {
@@ -520,13 +558,15 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
             self.save_meta(&meta, &mut batch);
         }
 
-        self.db.commit_batch(&batch).map_err(|e| StorageError::IO {
-            source: StorageIOError::new(
-                openraft::ErrorSubject::Store,
-                openraft::ErrorVerb::Write,
-                AnyError::error(e.to_string()),
-            ),
-        })?;
+        self.db
+            .commit_batch_local(&batch)
+            .map_err(|e| StorageError::IO {
+                source: StorageIOError::new(
+                    openraft::ErrorSubject::Store,
+                    openraft::ErrorVerb::Write,
+                    AnyError::error(e.to_string()),
+                ),
+            })?;
 
         Ok(res)
     }

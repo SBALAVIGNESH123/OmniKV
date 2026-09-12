@@ -11,6 +11,16 @@ x-omnikv-common-env: &omnikv-common-env
   OMNIKV_JWT_SECRET: "${OMNIKV_JWT_SECRET:?set OMNIKV_JWT_SECRET to a strong 32+ character value}"
   OMNIKV_BOOTSTRAP_ADMIN_KEY: "${OMNIKV_BOOTSTRAP_ADMIN_KEY:?set OMNIKV_BOOTSTRAP_ADMIN_KEY to a different strong 32+ character value}"
 
+# Cluster notes (issue #113):
+# - Each node is a Raft member: OMNIKV_NODE_ID + OMNIKV_RAFT_ADDR must
+#   BOTH be set (the config validator refuses a half-configured cluster).
+# - All nodes use the SAME internal raft port (9090); the peers list
+#   carries the peers' addresses INSIDE the compose network.
+# - Node 1 initializes the cluster with the full initial membership
+#   (itself + OMNIKV_RAFT_PEERS in order → node ids 2..); nodes 2/3
+#   start blank and join as the leader's replication reaches them.
+# - Consensus traffic is plaintext HTTP on the dedicated raft port
+#   (etcd's peer-port model) — keep 9090 on the private compose network.
 services:
   omni-node-1:
     build: .
@@ -20,12 +30,14 @@ services:
       - "4433:4433"   # QUIC/HTTP3
       - "5433:5433"   # PostgreSQL Wire Protocol
       - "8080:8080"   # TCP Command Interface
+      - "9433:9090"   # Raft consensus (peer traffic)
     volumes:
       - omni-data-1:/data
     environment:
       <<: *omnikv-common-env
-      OMNI_NODE_ID: "1"
-      OMNI_PEERS: "omni-node-2:4433,omni-node-3:4433"
+      OMNIKV_NODE_ID: "1"
+      OMNIKV_RAFT_ADDR: "0.0.0.0:9090"
+      OMNIKV_RAFT_PEERS: "omni-node-2:9090,omni-node-3:9090"
       OMNIKV_MANIFEST_PATH: "/data/manifest.json"
       OMNIKV_WAL_PATH: "/data/wal.bin"
       RUST_LOG: "${RUST_LOG:-info}"
@@ -40,12 +52,16 @@ services:
       - "8444:8443"
       - "4434:4433"
       - "5434:5433"
+      - "9434:9090"
     volumes:
       - omni-data-2:/data
     environment:
       <<: *omnikv-common-env
-      OMNI_NODE_ID: "2"
-      OMNI_PEERS: "omni-node-1:4433,omni-node-3:4433"
+      OMNIKV_NODE_ID: "2"
+      OMNIKV_RAFT_ADDR: "0.0.0.0:9090"
+      # Only node 1's peer list is consumed (initial membership);
+      # nodes 2/3 join as the leader replicates to them.
+      OMNIKV_RAFT_PEERS: "omni-node-1:9090,omni-node-3:9090"
       OMNIKV_MANIFEST_PATH: "/data/manifest.json"
       OMNIKV_WAL_PATH: "/data/wal.bin"
       RUST_LOG: "${RUST_LOG:-info}"
@@ -60,12 +76,14 @@ services:
       - "8445:8443"
       - "4435:4433"
       - "5435:5433"
+      - "9435:9090"
     volumes:
       - omni-data-3:/data
     environment:
       <<: *omnikv-common-env
-      OMNI_NODE_ID: "3"
-      OMNI_PEERS: "omni-node-1:4433,omni-node-2:4433"
+      OMNIKV_NODE_ID: "3"
+      OMNIKV_RAFT_ADDR: "0.0.0.0:9090"
+      OMNIKV_RAFT_PEERS: "omni-node-1:9090,omni-node-2:9090"
       OMNIKV_MANIFEST_PATH: "/data/manifest.json"
       OMNIKV_WAL_PATH: "/data/wal.bin"
       RUST_LOG: "${RUST_LOG:-info}"
