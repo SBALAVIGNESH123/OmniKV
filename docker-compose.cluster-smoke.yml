@@ -7,7 +7,6 @@ services:
     container_name: omni-cluster-smoke-node-1
     ports:
       - "${OMNIKV_TCP_PORT_1:-18080}:8080"
-      - "9433:9090"
     volumes:
       - omni-cluster-smoke-data-1:/data
     environment: &omni-cluster-smoke-env
@@ -29,6 +28,7 @@ services:
       OMNIKV_RAFT_ELECTION_MAX_MS: "600"
       OMNIKV_NODE_ID: "1"
       OMNIKV_RAFT_ADDR: "0.0.0.0:9090"
+      OMNIKV_RAFT_ADVERTISE_ADDR: "omni-cluster-smoke-node-1:9090"
       # Only node 1's peer list is consumed (initial membership).
       OMNIKV_RAFT_PEERS: "omni-cluster-smoke-node-2:9090,omni-cluster-smoke-node-3:9090"
     restart: unless-stopped
@@ -38,13 +38,13 @@ services:
     container_name: omni-cluster-smoke-node-2
     ports:
       - "${OMNIKV_TCP_PORT_2:-18081}:8080"
-      - "9434:9090"
     volumes:
       - omni-cluster-smoke-data-2:/data
     environment:
       <<: *omni-cluster-smoke-env
       OMNIKV_NODE_ID: "2"
       OMNIKV_RAFT_ADDR: "0.0.0.0:9090"
+      OMNIKV_RAFT_ADVERTISE_ADDR: "omni-cluster-smoke-node-2:9090"
       OMNIKV_RAFT_PEERS: "omni-cluster-smoke-node-1:9090,omni-cluster-smoke-node-3:9090"
     restart: unless-stopped
 
@@ -53,13 +53,13 @@ services:
     container_name: omni-cluster-smoke-node-3
     ports:
       - "${OMNIKV_TCP_PORT_3:-18082}:8080"
-      - "9435:9090"
     volumes:
       - omni-cluster-smoke-data-3:/data
     environment:
       <<: *omni-cluster-smoke-env
       OMNIKV_NODE_ID: "3"
       OMNIKV_RAFT_ADDR: "0.0.0.0:9090"
+      OMNIKV_RAFT_ADVERTISE_ADDR: "omni-cluster-smoke-node-3:9090"
       OMNIKV_RAFT_PEERS: "omni-cluster-smoke-node-1:9090,omni-cluster-smoke-node-2:9090"
     restart: unless-stopped
 

@@ -644,3 +644,88 @@ fn test_load_dev_succeeds() {
         assert_eq!(cfg.mode, ServerMode::Development);
     });
 }
+
+// ── Cluster advertised-address validation (PR #127 review) ──
+// A wildcard ADVERTISED address must fail closed: peers would dial
+// 0.0.0.0:port, which resolves to the DIALER itself, silently breaking
+// replication/votes toward this node after a failover or rejoin.
+
+#[test]
+fn test_raft_wildcard_bind_without_advertise_is_refused() {
+    // The wildcard BIND alone would also be the advertised address.
+    let cfg = ServerConfig {
+        raft: omni_engine::config::RaftConfig {
+            node_id: Some(1),
+            raft_addr: Some("0.0.0.0:9090".into()),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let err = cfg.validate_runtime().unwrap_err();
+    assert!(
+        err.0.contains("OMNIKV_RAFT_ADVERTISE_ADDR"),
+        "wildcard bind without advertise must name the fix: {err}"
+    );
+}
+
+#[test]
+fn test_raft_wildcard_bind_with_advertise_is_accepted() {
+    // The container pattern: bind wide, advertise the routable hostname.
+    let cfg = ServerConfig {
+        raft: omni_engine::config::RaftConfig {
+            node_id: Some(1),
+            raft_addr: Some("0.0.0.0:9090".into()),
+            advertise_addr: Some("omni-node-1:9090".parse().unwrap()),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    cfg.validate_runtime()
+        .unwrap_or_else(|e| panic!("wildcard bind + routable advertise must boot: {e}"));
+}
+
+#[test]
+fn test_raft_wildcard_advertise_override_is_refused() {
+    // An explicit wildcard advertise is never routable, even when the
+    // bind is fine.
+    let cfg = ServerConfig {
+        raft: omni_engine::config::RaftConfig {
+            node_id: Some(1),
+            raft_addr: Some("127.0.0.1:9090".into()),
+            advertise_addr: Some("0.0.0.0:9090".into()),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let err = cfg.validate_runtime().unwrap_err();
+    assert!(err.0.contains("routable"), "got: {err}");
+}
+
+#[test]
+fn test_raft_loopback_bind_without_advertise_is_accepted() {
+    // The single-host/test pattern (what cluster_multiprocess uses):
+    // 127.0.0.1 is routable by peers on the same host, no override
+    // needed.
+    let cfg = ServerConfig {
+        raft: omni_engine::config::RaftConfig {
+            node_id: Some(1),
+            raft_addr: Some("127.0.0.1:9090".into()),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    cfg.validate_runtime()
+        .unwrap_or_else(|e| panic!("loopback bind must not require advertise: {e}"));
+}
+
+#[test]
+fn test_raft_advertise_env_var_sets_field() {
+    with_env(
+        &[("OMNIKV_RAFT_ADVERTISE_ADDR", "omni-node-2:9090")],
+        || {
+            let mut cfg = ServerConfig::default();
+            cfg.apply_env().unwrap();
+            assert_eq!(cfg.raft.advertise_addr.as_deref(), Some("omni-node-2:9090"));
+        },
+    );
+}

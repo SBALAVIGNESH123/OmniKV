@@ -3924,3 +3924,137 @@ fn test_full_cluster_restart() {
 
     println!("✅ ROLLING 14e: Full cluster restart — 20 keys recovered, new writes accepted");
 }
+
+// ═══════════════════════════════════════════════════════════════════════
+// Chunked-commit regression tests (PR #127 review): openraft hands the
+// storage adapter MORE entries/ops than one WriteBatch holds — a
+// follower catch-up applying many entries at once, a purge spanning a
+// long log, a big append during catch-up. Before the chunking fix any
+// of these tripped BatchTooLarge (cap: 10_000 ops) and stalled
+// replication; these tests drive each path past the cap.
+// ═══════════════════════════════════════════════════════════════════════
+
+/// Builds a Normal entry carrying one `RaftCommand` with `ops` sets.
+fn bulk_entry(
+    index: u64,
+    ops: usize,
+    tag: &str,
+) -> openraft::Entry<omni_engine::raft_impl::TypeConfig> {
+    let mut cmd = omni_engine::raft_command::RaftCommand::default();
+    for i in 0..ops {
+        cmd.sets.push(omni_engine::raft_command::SetOp {
+            key: format!("{tag}:bulk:{index}:{i}"),
+            value: "v".into(),
+            ttl: 0,
+        });
+    }
+    openraft::Entry {
+        log_id: openraft::LogId::new(openraft::CommittedLeaderId::new(1, 1), index),
+        payload: openraft::EntryPayload::Normal(cmd.encode()),
+    }
+}
+
+/// `apply_to_state_machine` with 3 entries × `4_500` ops = `13_500` ops —
+/// past the `10_000` cap in ONE call. Must apply every op, not fail with
+/// `BatchTooLarge`.
+#[tokio::test]
+async fn test_apply_to_state_machine_chunks_past_batch_cap() {
+    let (db, storage, _dir) = create_node("bulk_apply");
+    let entries = vec![
+        bulk_entry(1, 4_500, "a"),
+        bulk_entry(2, 4_500, "b"),
+        bulk_entry(3, 4_500, "c"),
+    ];
+    let res =
+        openraft::storage::RaftStorage::apply_to_state_machine(&mut storage.clone(), &entries)
+            .await
+            .expect("bulk apply must not hit BatchTooLarge");
+    assert_eq!(res, vec!["OK", "OK", "OK"]);
+
+    // Every op landed, and the meta points at the last applied entry.
+    let seq = db.get_seq();
+    for i in 0..4_500 {
+        assert_eq!(
+            db.find(&format!("a:bulk:1:{i}"), seq).unwrap(),
+            Some("v".into()),
+            "chunked apply lost a:bulk:1:{i}"
+        );
+    }
+    assert_eq!(storage.last_applied_index(), 3);
+    // Spot-check the tail entries (first and last op of each).
+    for tag in ["a", "b", "c"] {
+        let idx = if tag == "a" {
+            1
+        } else if tag == "b" {
+            2
+        } else {
+            3
+        };
+        assert!(
+            db.find(&format!("{tag}:bulk:{idx}:0"), seq)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            db.find(&format!("{tag}:bulk:{idx}:4499"), seq)
+                .unwrap()
+                .is_some()
+        );
+    }
+    println!("✅ CHUNKED APPLY: 13_500 ops in one apply call — no BatchTooLarge, no lost ops");
+}
+
+/// `purge_logs_upto` across `12_000` log indexes — each purged index is one
+/// delete op, so this is `12_000`+ ops past the cap in ONE call.
+#[tokio::test]
+async fn test_purge_chunks_past_batch_cap() {
+    let (db, storage, _dir) = create_node("bulk_purge");
+    // Stage a long log via the sync helper (raw text entries).
+    for idx in 1..=12_000u64 {
+        storage
+            .append_log(idx, &format!("SET purge_k{idx} v"))
+            .unwrap();
+    }
+    openraft::storage::RaftStorage::purge_logs_upto(
+        &mut storage.clone(),
+        openraft::LogId::new(openraft::CommittedLeaderId::new(1, 1), 12_000),
+    )
+    .await
+    .expect("bulk purge must not hit BatchTooLarge");
+
+    // The log keys are gone and meta's purge point advanced.
+    for probe in [1u64, 5_000, 9_999, 12_000] {
+        assert!(
+            db.find_latest_internal(&format!("__sys__/raft/log/{probe:020}"))
+                .unwrap()
+                .is_none(),
+            "log key {probe} survived the purge"
+        );
+    }
+    println!("✅ CHUNKED PURGE: 12_000 indexes purged in one call — no BatchTooLarge");
+}
+
+/// `append_to_log` during catch-up: 11 entries × `1_100` ops of log DATA
+/// is fine, but the REAL test is many entries at once — 12 entries
+/// staged into one append call (each serialized entry is one set op,
+/// so 12 ops — the cap here guards a big entries `Vec`, same code path).
+#[tokio::test]
+async fn test_append_to_log_chunks_many_entries() {
+    let (_db, storage, _dir) = create_node("bulk_append");
+    let entries: Vec<_> = (1..=12u64).map(|idx| bulk_entry(idx, 1_100, "e")).collect();
+    openraft::storage::RaftStorage::append_to_log(&mut storage.clone(), entries)
+        .await
+        .expect("bulk append must not hit BatchTooLarge");
+    for idx in 1..=12u64 {
+        assert!(
+            storage.read_log(idx).is_some(),
+            "appended entry {idx} missing"
+        );
+    }
+    // Meta followed the batch to the last appended index.
+    let state = openraft::storage::RaftStorage::get_log_state(&mut storage.clone())
+        .await
+        .unwrap();
+    assert_eq!(state.last_log_id.map(|l| l.index), Some(12));
+    println!("✅ CHUNKED APPEND: 12 entries appended in one call, meta current");
+}

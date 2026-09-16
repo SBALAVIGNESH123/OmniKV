@@ -31,25 +31,63 @@ pub struct ClusterGateway {
     /// complete before the next proposal starts. This is what makes the
     /// leader's committed view gap-free for the next write's checks.
     flight: tokio::sync::Mutex<()>,
-    /// Runtime for the blocking facades — the wire servers (pgwire,
-    /// TCP) run one OS thread per connection and cannot `.await`.
-    /// Blocking facades entered from an async context (REST/QUIC
-    /// handlers) hop through a helper thread, because
-    /// `Runtime::block_on` inside a runtime worker panics.
-    block_on: tokio::runtime::Runtime,
+    /// The DEDICATED consensus runtime. Every openraft task (heartbeats,
+    /// elections, replication, the state-machine apply loop), the raft
+    /// RPC listener, and every proposal run here — never on the
+    /// client-facing server runtime. This is the deadlock fix: async
+    /// REST/QUIC handlers that call the blocking facades park their own
+    /// runtime's workers on a channel while consensus proceeds on this
+    /// separate runtime, so no number of concurrent client writes can
+    /// starve the tasks that must complete their proposals.
+    ///
+    /// Larger than the old 2-thread gateway pool: it also carries the
+    /// RPC listener and openraft's replication workers now.
+    consensus_rt: tokio::runtime::Runtime,
+    /// The consensus runtime's handle — how the server boots the openraft
+    /// node (its internal tasks adopt the runtime context current during
+    /// `Raft::new`) and spawns the raft listener onto the same runtime.
+    pub consensus_handle: tokio::runtime::Handle,
 }
 
 impl ClusterGateway {
-    pub fn new(raft: OmniRaft) -> Self {
+    /// Builds the shared consensus runtime — the same configuration
+    /// [`Self::new`] bakes in. The server's cluster boot calls this, runs
+    /// the openraft node construction ON the returned runtime (so
+    /// openraft's internal tasks adopt it), and hands the runtime back
+    /// via [`Self::with_runtime`]; the runtime is never dropped in
+    /// between, so the tasks keep their home.
+    pub fn consensus_runtime() -> tokio::runtime::Runtime {
+        Self::build_consensus_rt()
+    }
+
+    /// Builds the consensus runtime. One place so every constructor
+    /// path gets identical settings.
+    fn build_consensus_rt() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(4)
+            .thread_name("omnikv-consensus")
+            .enable_all()
+            .build()
+            .expect("consensus runtime")
+    }
+
+    /// Adopts an ALREADY-RUNNING consensus runtime — the one the node
+    /// was constructed on (see [`Self::consensus_runtime`]). This is how
+    /// the boot sequence guarantees openraft's internal tasks, the raft
+    /// RPC listener, and every proposal share one runtime that no
+    /// client-facing server worker can starve.
+    pub fn with_runtime(consensus_rt: tokio::runtime::Runtime, raft: OmniRaft) -> Self {
+        let consensus_handle = consensus_rt.handle().clone();
         Self {
             raft,
             flight: tokio::sync::Mutex::new(()),
-            block_on: tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(2)
-                .thread_name("omnikv-cluster-gateway")
-                .build()
-                .expect("cluster gateway runtime"),
+            consensus_rt,
+            consensus_handle,
         }
+    }
+
+    pub fn new(raft: OmniRaft) -> Self {
+        Self::with_runtime(Self::build_consensus_rt(), raft)
     }
 
     /// Proposes one command, waits until it is applied locally, returns
@@ -192,36 +230,37 @@ impl ClusterGateway {
         Ok(on_committed(ack.index))
     }
 
-    /// Runs `fut` to completion for a blocking caller. On a plain
-    /// thread (pgwire connection threads) this is a direct
-    /// `Runtime::block_on`. Inside an async execution context (axum
-    /// REST / QUIC handler tasks on the server runtime) `block_on`
-    /// would panic — "cannot start a runtime from within a runtime" —
-    /// so the future is handed to the gateway's own runtime on a
-    /// helper thread and the caller parks on a channel until it
-    /// finishes. The parked worker is safe: the server runtime is
-    /// multi-threaded, and the flight lock bounds how many callers can
-    /// be inside here at once.
+    /// Runs `fut` to completion for a blocking caller on the CONSENSUS
+    /// runtime. On a plain thread (pgwire connection threads) this is a
+    /// direct `Runtime::block_on`. Inside an async execution context
+    /// (axum REST / QUIC handler tasks on the client-facing server
+    /// runtime) `block_on` would panic — "cannot start a runtime from
+    /// within a runtime" — so the future is handed to the consensus
+    /// runtime on a helper thread and the caller parks on a channel
+    /// until it finishes. Parking is safe no matter HOW many client
+    /// workers do it at once: consensus (openraft tasks, the raft RPC
+    /// listener, the proposal being awaited) runs on the dedicated
+    /// consensus runtime, never on the caller's — the parked workers
+    /// cannot starve the very tasks that must finish to unpark them.
+    /// (The flight lock does NOT bound parked workers: it is acquired
+    /// inside the helper, after the caller is already parked.)
     fn block_on_ctx<F>(&self, fut: F) -> F::Output
     where
         F: std::future::Future + Send,
         F::Output: Send,
     {
         if tokio::runtime::Handle::try_current().is_err() {
-            return self.block_on.block_on(fut);
+            return self.consensus_rt.block_on(fut);
         }
-        let handle = self.block_on.handle().clone();
+        let handle = self.consensus_handle.clone();
         let (tx, rx) = std::sync::mpsc::channel();
-        // A scoped thread lets the future keep borrowing `self`; the
-        // parked caller is a single async worker at most, because the
-        // flight lock serializes every other clustered writer behind
-        // the same hop.
+        // A scoped thread lets the future keep borrowing `self`.
         std::thread::scope(|scope| {
             scope.spawn(move || {
                 let out = handle.block_on(fut);
                 let _ = tx.send(out);
             });
-            rx.recv().expect("cluster gateway runner finished")
+            rx.recv().expect("consensus runtime runner finished")
         })
     }
 

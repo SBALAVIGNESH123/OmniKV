@@ -148,7 +148,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // acknowledged, and this node serves consensus RPCs for its peers.
     // Absent, the process stays a fully independent single-node engine
     // and none of the cluster machinery runs.
-    let cluster = raft_node::boot_cluster_node(&cfg, &db).await?;
+    //
+    // This runs BEFORE any async work (plain thread, no runtime
+    // context): the openraft node and its consensus listener are
+    // constructed on the gateway's DEDICATED consensus runtime, never
+    // the client-facing server runtime — concurrent client writes can
+    // park server workers, but never starve openraft's tasks.
+    let cluster = raft_node::boot_cluster_node(&cfg, &db)?;
     let cluster_mode = if cluster.is_some() {
         cfg.raft.node_id
     } else {
@@ -184,10 +190,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ─── 5. Raft consensus listener (cluster mode only) ───────
     // Serves /raft/{append,vote,snapshot} for this node's peers on the
-    // dedicated plaintext port. A dead listener means a deaf cluster
+    // dedicated plaintext port — ON the consensus runtime (never the
+    // client-facing server runtime), so parked client workers can't
+    // starve peer RPCs either. A dead listener means a deaf cluster
     // member, so its exit is handled like any other server exit below.
     let raft_handle = cluster.map(|node| {
-        tokio::spawn(async move {
+        let handle = node.gateway.consensus_handle.clone();
+        handle.spawn(async move {
             if let Err(e) = raft_node::serve_raft_rpc(node).await {
                 tracing::error!("Raft consensus listener exited: {e}");
             }

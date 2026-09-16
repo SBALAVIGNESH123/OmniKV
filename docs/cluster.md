@@ -22,7 +22,10 @@ set together (the config validator refuses a half-configured cluster):
 
 ```bash
 OMNIKV_NODE_ID=1          # this node's Raft id (1, 2, 3, …)
-OMNIKV_RAFT_ADDR=0.0.0.0:9090  # dedicated plaintext listener for peers
+OMNIKV_RAFT_ADDR=0.0.0.0:9090  # the BIND address for the peer listener
+# When the bind address is a wildcard, peers also need the routable
+# address to DIAL — see "Bind vs advertised address" below.
+OMNIKV_RAFT_ADVERTISE_ADDR=node-1.example:9090
 ```
 
 Optional tuning (defaults suit tests and LANs):
@@ -52,8 +55,26 @@ replication reaches them — the same path openraft learners join through.
 A node that restarts with persisted membership re-joins automatically.
 
 The `docker-compose.yml` demo wires exactly this: all nodes use the
-same internal raft port (9090), node 1 lists the other two, and the
-consensus ports are published on host ports 9433–9435.
+same internal raft port (9090) on the private compose network, node 1
+lists the other two, and each node advertises its compose hostname
+(`omni-node-N:9090`) so peers can dial it. The consensus ports are NOT
+published to the host — nothing off the compose network needs them
+(Prometheus scrapes the client HTTPS port); keeping them private limits
+exposure to the plaintext peer traffic (see "Known limitations").
+
+## Bind vs advertised address
+
+`OMNIKV_RAFT_ADDR` is what the listener **binds** to; a wildcard
+(`0.0.0.0:9090`) is correct inside a container. The address that goes
+into cluster membership — what peers **dial** to reach this node — is
+`OMNIKV_RAFT_ADVERTISE_ADDR`, falling back to the bind address when
+unset. A wildcard must never be advertised: peers dialing `0.0.0.0:9090`
+reach *themselves*, silently breaking votes, replication, and catch-up
+toward this node after any failover or restart. The config validator
+fails closed on a wildcard advertised address (explicit override or
+inferred from the bind), naming the variable to set. A specific IP or
+loopback bind needs no override; the container pattern (bind wide,
+advertise the hostname) is exactly why the split exists.
 
 ## The write path
 
@@ -76,6 +97,16 @@ Followers reject client writes with an error naming the current leader
 (`not the leader; the leader is node 1`) — clients reconnect there. The
 leader can move after a failover; the error always names the current
 one.
+
+The flight lock serializes proposals, but it does not bound how many
+client requests are *waiting* on one: REST/QUIC handlers are async and
+park their own runtime's worker while a proposal runs. Consensus
+(openraft's internal tasks — heartbeats, elections, replication, the
+apply loop — and the peer RPC listener) therefore runs on a **dedicated
+consensus runtime**, never the client-facing server runtime. Any number
+of concurrent writers can park server workers without starving the tasks
+that must finish their proposals to unpark them; the failover test drives
+16 concurrent writers through the leader as part of its evidence.
 
 ## Read semantics
 
@@ -112,16 +143,18 @@ Writes sent to a follower during a leaderless window fail with
   history that powers serializable conflict detection lives on the
   leader. A transaction that began before a failover and commits after
   it may miss a conflict with a write committed by the previous leader.
-  Tracked as a follow-up issue; the fix is replicating SSI commit
-  records inside the Raft command.
+  Tracked as #124; the fix is replicating SSI commit records inside the
+  Raft command.
 - **Peer traffic is plaintext HTTP.** The raft listener is a dedicated
   port following etcd's peer-port model: client TLS never terminates
   there, and consensus nodes authenticate by cluster membership. Keep
-  it on a trusted network (the compose network is). Mutual TLS for
-  peer traffic is follow-up work alongside the client-TLS issue.
+  it on a trusted network — the compose demos publish only the client
+  ports to the host and leave the consensus port on the private compose
+  network, so nothing off-network can reach it. Mutual TLS for peer
+  traffic is tracked as #125, alongside the client-TLS work.
 - **One write in flight cluster-wide.** The flight lock trades write
   throughput for a gap-free serialization point. Pipelined proposals
-  are follow-up work.
+  are tracked as #126.
 - **Follower reads lag.** See Read semantics above. Read-index
   (linearizable follower reads) is follow-up work.
 - **Membership changes are restart-scoped.** Initial membership comes

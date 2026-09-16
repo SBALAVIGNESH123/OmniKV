@@ -466,7 +466,12 @@ impl BloomFilter {
     }
 }
 
-const MAX_BATCH_SIZE: usize = 10_000;
+/// Per-batch op cap. Exceeding it is a caller bug — `commit_batch` and
+/// friends reject the batch — but the raft storage adapter must never
+/// construct one bigger: follower catch-up, log purge, and snapshot
+/// install can carry far more ops than a client batch, so they commit
+/// in chunks of this size (`WriteBatch::MAX_OPS`).
+pub const MAX_BATCH_SIZE: usize = 10_000;
 const MAX_VALUE_SIZE: usize = 10 * 1024 * 1024; // 10 MB
 const UNCOMPRESSED_FLAG: u64 = 1 << 63;
 const NUM_SHARDS: usize = 16;
@@ -581,6 +586,23 @@ impl WriteBatch {
     pub fn is_empty(&self) -> bool {
         self.buffered_writes.is_empty() && self.buffered_deletes.is_empty()
     }
+    /// Number of operations staged so far. The raft storage adapter
+    /// flushes and starts a fresh batch before this reaches
+    /// [`MAX_OPS`](Self::MAX_OPS).
+    pub fn op_count(&self) -> usize {
+        self.buffered_writes.len() + self.buffered_deletes.len()
+    }
+    /// Empties the batch (e.g. after a chunk was committed), keeping
+    /// capacity for the next chunk.
+    pub fn clear(&mut self) {
+        self.buffered_writes.clear();
+        self.buffered_deletes.clear();
+    }
+
+    /// The op cap every commit path enforces. Raft-side callers that can
+    /// legitimately exceed one client batch (catch-up appends, purges,
+    /// snapshot installs) chunk their work at this size.
+    pub const MAX_OPS: usize = MAX_BATCH_SIZE;
 }
 
 /// Current on-disk manifest format version. Increment for incompatible changes.

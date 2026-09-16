@@ -107,8 +107,17 @@ pub struct RaftConfig {
     /// This node's cluster ID (openraft NodeId). 1-based.
     pub node_id: Option<u64>,
     /// The plaintext listener for consensus traffic (etcd's peer-port
-    /// model: client TLS never terminates here).
+    /// model: client TLS never terminates here). This is the BIND
+    /// address — `0.0.0.0:port` is valid here.
     pub raft_addr: Option<String>,
+    /// What PEERS dial to reach this node — the address that goes into
+    /// cluster membership. Must be routable FROM other nodes; a
+    /// wildcard (0.0.0.0/::) is refused by validation because it would
+    /// resolve to the dialer itself. When unset, the bind address is
+    /// advertised (fine for specific-IP/loopback binds; a wildcard bind
+    /// REQUIRES this override).
+    #[serde(default)]
+    pub advertise_addr: Option<String>,
     /// The other initial members, "host:port" per entry. Empty means
     /// single-node cluster when raft_addr is set.
     pub peers: Vec<String>,
@@ -388,6 +397,9 @@ impl ServerConfig {
         if let Ok(v) = std::env::var("OMNIKV_RAFT_ADDR") {
             self.raft.raft_addr = if v.is_empty() { None } else { Some(v) };
         }
+        if let Ok(v) = std::env::var("OMNIKV_RAFT_ADVERTISE_ADDR") {
+            self.raft.advertise_addr = if v.is_empty() { None } else { Some(v) };
+        }
         if let Ok(v) = std::env::var("OMNIKV_NODE_ID").or_else(|_| std::env::var("OMNI_NODE_ID")) {
             self.raft.node_id = Some(
                 v.parse()
@@ -438,6 +450,47 @@ impl ServerConfig {
             return Err(ConfigError(
                 "raft.election_timeout_min_ms must be <= election_timeout_max_ms".into(),
             ));
+        }
+        // The ADVERTISED address is what peers dial — it must never be
+        // a wildcard. When the explicit override is set, validate it;
+        // when it is not, the bind address is the advertised one, so a
+        // wildcard bind requires the override (a cluster member bound
+        // to 0.0.0.0 without a routable advertise address would poison
+        // every peer's routing table with an address that resolves to
+        // the dialer itself).
+        let advertised = self
+            .raft
+            .advertise_addr
+            .as_deref()
+            .or(self.raft.raft_addr.as_deref());
+        if let Some(addr) = advertised
+            && is_wildcard_addr(addr)
+        {
+            return Err(ConfigError(
+                "raft advertise address must be routable by peers (got a wildcard; set \
+                 OMNIKV_RAFT_ADVERTISE_ADDR to this node's reachable host:port)"
+                    .into(),
+            ));
+        }
+        // Shape check on the explicit override only: "host:port" with a
+        // non-empty host and a valid port. Hostnames (the container
+        // pattern: omni-node-1:9090) are valid here — peers resolve them
+        // through the compose network.
+        if let Some(advertise) = &self.raft.advertise_addr {
+            let shape_err = || {
+                ConfigError(
+                    "raft.advertise_addr must be a valid host:port (OMNIKV_RAFT_ADVERTISE_ADDR)"
+                        .into(),
+                )
+            };
+            match advertise.rsplit_once(':') {
+                Some((host, port)) => {
+                    if host.is_empty() || port.parse::<u16>().is_err() {
+                        return Err(shape_err());
+                    }
+                }
+                None => return Err(shape_err()),
+            }
         }
         self.validate_common()?;
         if self.mode == ServerMode::Production {
@@ -653,6 +706,15 @@ fn validate_addr(name: &str, value: &str) -> Result<(), ConfigError> {
         .parse::<std::net::SocketAddr>()
         .map(|_| ())
         .map_err(|e| ConfigError(format!("{name} must be a valid socket address: {e}")))
+}
+
+/// Whether an address string is a wildcard ANY-address ("0.0.0.0:port",
+/// "[::]:port") — valid to BIND, never valid to ADVERTISE (peers dialing
+/// it reach themselves). Unparseable strings (bare hostnames) are not
+/// wildcards; the advertise-shape check handles those separately.
+fn is_wildcard_addr(addr: &str) -> bool {
+    addr.parse::<std::net::SocketAddr>()
+        .is_ok_and(|sock| sock.ip().is_unspecified())
 }
 
 fn path_to_string(path: PathBuf) -> Result<String, ConfigError> {

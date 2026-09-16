@@ -178,6 +178,49 @@ fn retry_until<T>(deadline: Instant, f: impl Fn() -> Option<T>) -> Option<T> {
     None
 }
 
+/// 16 simultaneous writers against the leader — the PR #127 review's
+/// deadlock finding. Async REST/QUIC handlers park their own runtime's
+/// workers waiting for consensus; before the dedicated consensus
+/// runtime, enough concurrent writes could park every worker and starve
+/// the very openraft tasks that had to finish their proposals to release
+/// them. 16 writers at once (more than typical CI worker counts) must
+/// all get answers — serialized by the flight lock, but NEVER stuck —
+/// and every write must replicate to every node. Extracted to a helper
+/// to keep the failover test under clippy's function-length limit.
+fn concurrent_writers_do_not_deadlock(leader_tcp: u16, nodes: &[Node]) {
+    let acknowledged = std::sync::atomic::AtomicUsize::new(0);
+    // A shared ref is Copy, so each `move` writer copies the ref
+    // instead of fighting over ownership of the atomic itself.
+    let ack = &acknowledged;
+    // thread::scope joins every writer before it returns, so the count
+    // is complete by the time we read it back below.
+    std::thread::scope(|scope| {
+        for w in 0..16u32 {
+            scope.spawn(move || {
+                let resp = tcp_cmd(leader_tcp, &format!("SET conc:w{w} v{w}")).unwrap_or_default();
+                if resp.starts_with("OK") {
+                    ack.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            });
+        }
+    });
+    let ok = acknowledged.into_inner();
+    assert_eq!(ok, 16, "concurrent writes: {ok}/16 acknowledged");
+    // Every concurrent write must replicate to every node.
+    for node in nodes {
+        let seen = retry_until(Instant::now() + Duration::from_secs(10), || {
+            (0..16u32)
+                .all(|w| {
+                    matches!(tcp_cmd(node.tcp_port(), &format!("GET conc:w{w}")),
+                             Ok(r) if r == format!("OK: v{w}"))
+                })
+                .then_some(())
+        });
+        assert!(seen.is_some(), "node {} missed a concurrent write", node.id);
+    }
+    println!("16 concurrent writers all acknowledged and replicated");
+}
+
 /// THE test: three real processes, one replicated write, kill the
 /// leader, a new leader is elected, and no data is lost.
 #[test]
@@ -226,6 +269,13 @@ fn cluster_failover_kill_leader_no_data_loss() {
         "follower accepted a write: {resp}"
     );
     println!("follower correctly rejected a write: {resp}");
+
+    // ── 3b. CONCURRENT writers do not deadlock the cluster ──
+    // The PR #127 review's P1: async handlers on the server runtime
+    // park their workers waiting for consensus; before the dedicated
+    // consensus runtime, enough concurrent writes starved the very
+    // openraft tasks that had to complete their proposals.
+    concurrent_writers_do_not_deadlock(leader_tcp, &nodes);
 
     // ── 4. Kill the leader — hard kill, no graceful shutdown ──
     // Capture the survivors' endpoints BEFORE consuming `nodes`.
