@@ -4004,6 +4004,47 @@ async fn test_apply_to_state_machine_chunks_past_batch_cap() {
     println!("✅ CHUNKED APPLY: 13_500 ops in one apply call — no BatchTooLarge, no lost ops");
 }
 
+/// Chunk boundaries must fall BETWEEN entries, never inside one. Two
+/// entries of `6_000` ops each = `12_000` in one apply call, so a flush
+/// is unavoidable before the second entry — and that flush must land at
+/// the entry boundary: one Raft entry is one atomic client write, so a
+/// reader (or a crash) between commits must never see half of entry 2.
+/// Asserting every op of BOTH entries is present after the call guards
+/// the no-`BatchTooLarge`/no-lost-ops property at the straddle point.
+#[tokio::test]
+async fn test_apply_chunks_never_split_an_entry() {
+    let (db, storage, _dir) = create_node("bulk_straddle");
+    // 6_000 + 6_000 = 12_000: the second entry cannot fit alongside the
+    // first in one batch, forcing a flush exactly at the boundary.
+    let entries = vec![bulk_entry(1, 6_000, "x"), bulk_entry(2, 6_000, "y")];
+    let res =
+        openraft::storage::RaftStorage::apply_to_state_machine(&mut storage.clone(), &entries)
+            .await
+            .expect("straddled apply must not hit BatchTooLarge");
+    assert_eq!(res, vec!["OK", "OK"]);
+
+    let seq = db.get_seq();
+    // The FIRST entry's ops all landed.
+    for i in 0..6_000 {
+        assert_eq!(
+            db.find(&format!("x:bulk:1:{i}"), seq).unwrap(),
+            Some("v".into()),
+            "straddled apply lost x:bulk:1:{i}"
+        );
+    }
+    // The SECOND entry applied whole — not partially, which is what a
+    // mid-entry flush boundary would have produced.
+    for i in 0..6_000 {
+        assert_eq!(
+            db.find(&format!("y:bulk:2:{i}"), seq).unwrap(),
+            Some("v".into()),
+            "straddled apply lost y:bulk:2:{i} — entry 2 was split at the chunk boundary"
+        );
+    }
+    assert_eq!(storage.last_applied_index(), 2);
+    println!("✅ ENTRY-ALIGNED CHUNKING: 6_000 + 6_000 ops, flush at the boundary, no entry split");
+}
+
 /// `purge_logs_upto` across `12_000` log indexes — each purged index is one
 /// delete op, so this is `12_000`+ ops past the cap in ONE call.
 #[tokio::test]

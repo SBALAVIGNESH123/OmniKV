@@ -566,13 +566,22 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
         let mut batch = WriteBatch::new();
         let mut last_applied = None;
         let mut new_membership = None;
-        // Flushes the accumulated batch when it nears the op cap —
-        // openraft applies in batches, and a follower catch-up can
-        // easily carry more ops than one WriteBatch holds. Chunking here
-        // is what keeps a big apply from failing with BatchTooLarge and
-        // stalling replication. Ordering is preserved (chunks commit in
-        // log order); atomicity across entries was never guaranteed
-        // anyway (openraft may split/merge entry batches).
+        // openraft applies entries in batches, and a follower catch-up
+        // can carry more ops in ONE apply call than a WriteBatch holds —
+        // before the chunking, that tripped BatchTooLarge and stalled
+        // replication forever. The fix is to commit in capped chunks, but
+        // the chunk boundary must never fall INSIDE a Raft entry: one
+        // entry is one atomic client write, and splitting it would let a
+        // reader (or a crash) see only part of it. So we flush only at
+        // ENTRY boundaries — before staging an entry whose ops would not
+        // fit alongside what is already staged.
+        //
+        // This is safe because a single RaftCommand can never exceed the
+        // cap on its own: the engine's WriteBatch rejects the op that
+        // would exceed MAX_BATCH_SIZE before the command is ever proposed
+        // (RaftCommand::from_batch carries that cap), so any one entry
+        // always fits in a fresh batch and the flush keeps every commit
+        // ≤ MAX_OPS without ever splitting an entry.
         let io_err = |e: crate::OmniError| StorageError::IO {
             source: StorageIOError::new(
                 openraft::ErrorSubject::Store,
@@ -580,16 +589,18 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
                 AnyError::error(e.to_string()),
             ),
         };
-        // Returns the small engine error (openraft's StorageError is
-        // ~224 bytes; mapping it here keeps clippy's result_large_err
-        // quiet and the closure cheap to invoke per op).
-        let flush_if_full = |batch: &mut WriteBatch| -> Result<(), crate::OmniError> {
-            if batch.op_count() >= WriteBatch::MAX_OPS {
-                self.db.commit_batch_local(batch)?;
-                batch.clear();
-            }
-            Ok(())
-        };
+        // Flushes the staged batch (if non-empty) when `incoming` more
+        // ops would not fit alongside it. Returns the small engine error
+        // (openraft's StorageError is ~224 bytes; mapping it here keeps
+        // clippy's result_large_err quiet and the closure cheap).
+        let flush_before_entry =
+            |batch: &mut WriteBatch, incoming: usize| -> Result<(), crate::OmniError> {
+                if !batch.is_empty() && batch.op_count() + incoming > WriteBatch::MAX_OPS {
+                    self.db.commit_batch_local(batch)?;
+                    batch.clear();
+                }
+                Ok(())
+            };
 
         for entry in entries {
             match &entry.payload {
@@ -610,6 +621,11 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
                             res.push("ERR".to_string());
                             continue;
                         }
+                        // Flush at the ENTRY boundary (never mid-command):
+                        // a reader or crash between commits must never see
+                        // part of this entry's writes.
+                        flush_before_entry(&mut batch, cmd.sets.len() + cmd.dels.len())
+                            .map_err(io_err)?;
                         for op in cmd.sets {
                             // The entry carries the ABSOLUTE expiry the
                             // originating node computed — apply it verbatim.
@@ -619,20 +635,18 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
                             batch
                                 .set_with_expiry(&op.key, op.value, op.ttl)
                                 .map_err(|e| storage_write_err(&e))?;
-                            flush_if_full(&mut batch).map_err(io_err)?;
                         }
                         for key in &cmd.dels {
                             batch.delete(key).map_err(|e| storage_write_err(&e))?;
-                            flush_if_full(&mut batch).map_err(io_err)?;
                         }
                         res.push("OK".to_string());
                     } else if let Some(rest) = req.strip_prefix("SET ") {
                         let parts: Vec<&str> = rest.splitn(2, ' ').collect();
                         if parts.len() == 2 && !parts[0].starts_with("__sys__/raft/") {
+                            flush_before_entry(&mut batch, 1).map_err(io_err)?;
                             batch
                                 .set(parts[0], parts[1].to_string())
                                 .map_err(|e| storage_write_err(&e))?;
-                            flush_if_full(&mut batch).map_err(io_err)?;
                             res.push("OK".to_string());
                         } else {
                             res.push("ERR".to_string());
