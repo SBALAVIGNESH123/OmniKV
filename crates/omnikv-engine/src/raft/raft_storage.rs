@@ -595,7 +595,12 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
         // clippy's result_large_err quiet and the closure cheap).
         let flush_before_entry =
             |batch: &mut WriteBatch, incoming: usize| -> Result<(), crate::OmniError> {
-                if !batch.is_empty() && batch.op_count() + incoming > WriteBatch::MAX_OPS {
+                // `>=`, not `>`: an apply whose ops sum to EXACTLY the cap
+                // (e.g. 6_000 + 4_000) must still leave the batch strictly
+                // under it, because the last_applied meta record is appended
+                // afterwards and needs a slot (save_meta would otherwise hit
+                // BatchTooLarge, which it treats as a fatal invariant).
+                if !batch.is_empty() && batch.op_count() + incoming >= WriteBatch::MAX_OPS {
                     self.db.commit_batch_local(batch)?;
                     batch.clear();
                 }
@@ -664,6 +669,17 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
         }
 
         if last_applied.is_some() || new_membership.is_some() {
+            // The last_applied meta record appends one more op BELOW. A
+            // single entry of exactly MAX_OPS ops (reachable: the client
+            // batch allows exactly the cap) fills the batch to the cap and
+            // no boundary flush can prevent that, so commit the entries'
+            // chunk here if needed. Data-before-pointer is the correct
+            // order: a crash between the two just re-applies idempotently
+            // from the pre-crash last_applied on recovery.
+            if !batch.is_empty() && batch.op_count() >= WriteBatch::MAX_OPS {
+                self.db.commit_batch_local(&batch).map_err(io_err)?;
+                batch.clear();
+            }
             let mut meta = self
                 .meta
                 .lock()

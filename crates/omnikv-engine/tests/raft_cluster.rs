@@ -4045,6 +4045,67 @@ async fn test_apply_chunks_never_split_an_entry() {
     println!("✅ ENTRY-ALIGNED CHUNKING: 6_000 + 6_000 ops, flush at the boundary, no entry split");
 }
 
+/// Ops summing to EXACTLY the cap (`6_000` + `4_000` = `10_000`) used to
+/// leave the batch full; the `last_applied` meta record appended
+/// afterwards then hit `BatchTooLarge`, which `save_meta` treats as a
+/// fatal invariant — a panic instead of advancing Raft state. The flush
+/// must keep the batch strictly under the cap so the meta record fits.
+#[tokio::test]
+async fn test_apply_summing_exactly_to_batch_cap_keeps_room_for_meta() {
+    let (db, storage, _dir) = create_node("exact_cap_sum");
+    let entries = vec![bulk_entry(1, 6_000, "s"), bulk_entry(2, 4_000, "t")];
+    let res =
+        openraft::storage::RaftStorage::apply_to_state_machine(&mut storage.clone(), &entries)
+            .await
+            .expect("apply summing to exactly the cap must not panic on the meta record");
+    assert_eq!(res, vec!["OK", "OK"]);
+
+    let seq = db.get_seq();
+    for i in 0..6_000 {
+        assert_eq!(
+            db.find(&format!("s:bulk:1:{i}"), seq).unwrap(),
+            Some("v".into()),
+            "exact-cap apply lost s:bulk:1:{i}"
+        );
+    }
+    for i in 0..4_000 {
+        assert_eq!(
+            db.find(&format!("t:bulk:2:{i}"), seq).unwrap(),
+            Some("v".into()),
+            "exact-cap apply lost t:bulk:2:{i}"
+        );
+    }
+    assert_eq!(storage.last_applied_index(), 2);
+    println!("✅ EXACT-CAP SUM: 6_000 + 4_000 = the cap, meta record still appended without panic");
+}
+
+/// A single entry carrying EXACTLY the cap in ops is reachable (the
+/// client batch allows exactly `MAX_OPS`), and no entry-boundary flush
+/// can prevent the batch from filling to the cap. The meta append must
+/// still not panic.
+#[tokio::test]
+async fn test_apply_single_entry_at_batch_cap_keeps_room_for_meta() {
+    let (db, storage, _dir) = create_node("exact_cap_single");
+    let entries = vec![bulk_entry(1, 10_000, "u")];
+    openraft::storage::RaftStorage::apply_to_state_machine(&mut storage.clone(), &entries)
+        .await
+        .expect("a single at-cap entry must not panic on the meta record");
+
+    let seq = db.get_seq();
+    assert_eq!(
+        db.find("u:bulk:1:0", seq).unwrap(),
+        Some("v".into()),
+        "first op of the at-cap entry missing"
+    );
+    assert_eq!(
+        db.find("u:bulk:1:9999", seq).unwrap(),
+        Some("v".into()),
+        "last op of the at-cap entry missing"
+    );
+    assert_eq!(storage.last_applied_index(), 1);
+    println!("✅ SINGLE AT-CAP ENTRY: 10_000 ops in one entry, meta appended without panic");
+}
+
 /// `purge_logs_upto` across `12_000` log indexes — each purged index is one
 /// delete op, so this is `12_000`+ ops past the cap in ONE call.
 #[tokio::test]
