@@ -1,0 +1,248 @@
+//! Cluster boot: constructs the real openraft node when the config says
+//! this server is a cluster member.
+//!
+//! `OMNIKV_RAFT_ADDR` + `OMNIKV_NODE_ID` present → the server boots an
+//! openraft node, serves consensus RPCs on a dedicated plaintext
+//! listener, and routes every client write through consensus before
+//! acknowledging it. Absent → the server stays an independent
+//! single-node engine and none of this runs.
+//!
+//! Bind vs advertised address (PR #127 review): `OMNIKV_RAFT_ADDR` is
+//! what the listener BINDS to (0.0.0.0 is fine there);
+//! `OMNIKV_RAFT_ADVERTISE_ADDR` is what peers DIAL to reach this node
+//! (0.0.0.0 is not — it resolves to the dialer itself). The advertised
+//! address is what goes into cluster membership; without it, a wildcard
+//! bind address would poison every peer's routing table for this node.
+
+use std::collections::BTreeMap;
+use std::net::SocketAddr;
+use std::sync::Arc;
+
+use omni_engine::raft_gateway::ClusterGateway;
+use omni_engine::raft_impl::OmniRaft;
+use omni_engine::raft_network::OmniNetwork;
+use omni_engine::raft_storage::OmniRaftStorage;
+use omni_engine::{OmniKV, config::ServerConfig};
+use openraft::BasicNode;
+
+use crate::raft_routes::{RaftState, build_raft_router};
+
+/// A booted cluster node: the openraft handle, the write gateway (whose
+/// consensus runtime hosts every openraft task and the RPC listener
+/// bound here), and the bound consensus listener.
+pub struct ClusterNode {
+    pub raft: Arc<OmniRaft>,
+    pub gateway: Arc<ClusterGateway>,
+    pub raft_listener: tokio::net::TcpListener,
+    pub raft_addr: SocketAddr,
+}
+
+/// Builds the openraft config with the engine defaults plus the
+/// config-file/env overrides applied. Constructed directly (not via
+/// `build_raft_config`) so the overrides can never be silently dropped
+/// by an `Arc` clone.
+fn raft_config_from(
+    cfg: &ServerConfig,
+) -> Result<Arc<openraft::Config>, Box<dyn std::error::Error>> {
+    let mut c = openraft::Config {
+        // Defaults that suit tests and LANs; env/config overrides below.
+        heartbeat_interval: 500,
+        election_timeout_min: 1500,
+        election_timeout_max: 3000,
+        ..Default::default()
+    };
+    if let Some(h) = cfg.raft.heartbeat_interval_ms {
+        c.heartbeat_interval = h;
+    }
+    if let Some(min) = cfg.raft.election_timeout_min_ms {
+        c.election_timeout_min = min;
+    }
+    if let Some(max) = cfg.raft.election_timeout_max_ms {
+        c.election_timeout_max = max;
+    }
+    if c.election_timeout_min > c.election_timeout_max {
+        return Err(format!(
+            "raft election timeout min ({}) > max ({})",
+            c.election_timeout_min, c.election_timeout_max
+        )
+        .into());
+    }
+    Ok(Arc::new(
+        c.validate().map_err(|e| format!("raft config: {e}"))?,
+    ))
+}
+
+/// Boots the cluster node described by `cfg.raft`. Returns `None` when
+/// the config has no raft section — single-node mode, nothing started.
+///
+/// Membership bootstrap: node 1 of a FRESH cluster (no prior state)
+/// initializes the cluster with the full initial peer set — the
+/// openraft pattern where blank follower nodes adopt the cluster as the
+/// initialized leader replicates the membership entry to them. A node
+/// with persisted membership (a restart) recognizes it and re-joins;
+/// openraft errors on double-init, which is exactly the guard here.
+///
+/// Runtime isolation (PR #127 review): the consensus runtime is built
+/// FIRST, the openraft node constructed and the listener bound ON it
+/// (`rt.block_on` from this plain boot thread — no runtime context
+/// here, so openraft's internal tasks adopt the consensus runtime, not
+/// the client-facing server runtime), and the runtime is then ADOPTED
+/// by the gateway ([`ClusterGateway::with_runtime`]) — never dropped in
+/// between, so those tasks keep their home for the process lifetime.
+/// Concurrent client writes may park server-runtime workers on the
+/// gateway's channel hop; they can never starve these tasks.
+fn boot_rt(
+    cfg: &ServerConfig,
+    db: &Arc<OmniKV>,
+    rt: tokio::runtime::Runtime,
+) -> Result<Option<ClusterNode>, Box<dyn std::error::Error>> {
+    let Some(node_id) = cfg.raft.node_id else {
+        return Ok(None);
+    };
+    let Some(raft_addr_str) = cfg.raft.raft_addr.clone() else {
+        return Ok(None);
+    };
+    let raft_addr: SocketAddr = raft_addr_str.parse()?;
+    // What peers dial to reach this node. Falls back to the bind
+    // address for the common single-host case (127.0.0.1:port); the
+    // config validator already refuses a wildcard ADVERTISED address,
+    // so this can never poison membership with 0.0.0.0.
+    let advertise_addr = cfg
+        .raft
+        .advertise_addr
+        .clone()
+        .unwrap_or_else(|| raft_addr_str.clone());
+
+    let config = raft_config_from(cfg)?;
+
+    // One storage instance split by openraft's Adaptor into the
+    // log-store and state-machine roles.
+    let storage = OmniRaftStorage::new(db.clone());
+    let (log_store, state_machine) = openraft::storage::Adaptor::new(storage);
+
+    let raft = rt.block_on(async {
+        OmniRaft::new(
+            node_id,
+            config,
+            OmniNetwork::new(),
+            log_store,
+            state_machine,
+        )
+        .await
+    })?;
+    let raft = Arc::new(raft);
+
+    // ── Membership bootstrap ──
+    let metrics = raft.metrics().borrow().clone();
+    let already_initialized = metrics
+        .membership_config
+        .membership()
+        .nodes()
+        .next()
+        .is_some()
+        || rt.block_on(raft.current_leader()).is_some();
+    if already_initialized {
+        tracing::info!("Node {node_id} re-joining existing cluster");
+    } else if node_id == 1 {
+        // Node 1 of a fresh cluster carries the complete initial
+        // membership (itself + every peer as voters). Other nodes start
+        // blank: they adopt the cluster as the leader's replication
+        // (heartbeats, votes, the membership log entry) reaches them —
+        // the same path a learner joins through.
+        let mut members = BTreeMap::new();
+        members.insert(
+            node_id,
+            BasicNode {
+                addr: advertise_addr,
+            },
+        );
+        for (i, peer) in cfg.raft.peers.iter().enumerate() {
+            // Peer node ids are 2.. in declaration order — the
+            // compose file pairs OMNI_NODE_ID with OMNI_PEERS, so
+            // every node declares the same ordered peer list.
+            let peer_id: u64 = i as u64 + 2;
+            members.insert(peer_id, BasicNode { addr: peer.clone() });
+        }
+        rt.block_on(raft.initialize(members))?;
+        tracing::info!(
+            members = cfg.raft.peers.len() + 1,
+            "Raft cluster initialized"
+        );
+    } else {
+        // A fresh non-1 node: no local state, cluster not reachable
+        // yet. openraft leaves it a follower; it joins when the
+        // leader's RPCs (it is already in the initial membership)
+        // arrive.
+        tracing::info!(
+            "Node {node_id} starting blank; it joins the cluster as the leader reaches it"
+        );
+    }
+
+    // ── Write gateway + engine hooks ──
+    // The gateway ADOPTS the consensus runtime the node was built on
+    // (moved in, never dropped — openraft's tasks keep their home).
+    let gateway = Arc::new(ClusterGateway::with_runtime(rt, (*raft).clone()));
+    db.set_cluster_gateway(gateway.clone());
+
+    // Bind the consensus listener up front: a taken port must fail the
+    // boot (the node would look alive but never hear a vote otherwise).
+    // Uses the gateway's runtime handle — `rt` has been adopted above.
+    let raft_listener = gateway
+        .consensus_handle
+        .block_on(tokio::net::TcpListener::bind(raft_addr))?;
+    tracing::info!(%raft_addr, "Raft consensus listener bound");
+
+    Ok(Some(ClusterNode {
+        raft,
+        gateway,
+        raft_listener,
+        raft_addr,
+    }))
+}
+
+/// The server-facing boot: builds the consensus runtime, then
+/// constructs the openraft node ON it so openraft's internal tasks
+/// adopt that runtime (never the client-facing server runtime).
+///
+/// `main` is `#[tokio::main]`, so this runs inside an async context and
+/// `Runtime::block_on` from a runtime worker would panic ("cannot start
+/// a runtime from within a runtime"). When a runtime context is
+/// present the whole boot hops through a plain OS thread — the same
+/// pattern the gateway's `block_on_ctx` uses — and the caller parks on
+/// a channel until it finishes. The boot is one-shot, so the parked
+/// task costs nothing, and the runtime under construction is moved
+/// into the returned node (never dropped mid-boot).
+pub fn boot_cluster_node(
+    cfg: &ServerConfig,
+    db: &Arc<OmniKV>,
+) -> Result<Option<ClusterNode>, Box<dyn std::error::Error>> {
+    let rt = ClusterGateway::consensus_runtime();
+    if tokio::runtime::Handle::try_current().is_err() {
+        // Plain thread (some tests): block_on is safe directly.
+        return boot_rt(cfg, db, rt);
+    }
+    // Async context (main): hop off the runtime worker. The error
+    // crosses the channel as a String — a boxed `dyn Error` is not
+    // `Send`, and a boot failure is fatal anyway (only its message
+    // matters).
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::scope(|scope| {
+        scope.spawn(move || {
+            let _ = tx.send(boot_rt(cfg, db, rt).map_err(|e| e.to_string()));
+        });
+        rx.recv()
+            .expect("cluster boot thread finished")
+            .map_err(|msg: String| -> Box<dyn std::error::Error> { msg.into() })
+    })
+}
+
+/// Serves the consensus RPC routes on the node's dedicated plaintext
+/// listener. Call from a task spawned on the gateway's consensus
+/// runtime — never returns under normal operation.
+pub async fn serve_raft_rpc(node: ClusterNode) -> std::io::Result<()> {
+    let app = build_raft_router(RaftState {
+        raft: node.raft.clone(),
+    });
+    tracing::info!("Raft consensus listener on {}", node.raft_addr);
+    axum::serve(node.raft_listener, app).await
+}

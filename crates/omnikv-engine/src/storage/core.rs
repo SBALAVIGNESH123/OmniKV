@@ -466,7 +466,12 @@ impl BloomFilter {
     }
 }
 
-const MAX_BATCH_SIZE: usize = 10_000;
+/// Per-batch op cap. Exceeding it is a caller bug — `commit_batch` and
+/// friends reject the batch — but the raft storage adapter must never
+/// construct one bigger: follower catch-up, log purge, and snapshot
+/// install can carry far more ops than a client batch, so they commit
+/// in chunks of this size (`WriteBatch::MAX_OPS`).
+pub const MAX_BATCH_SIZE: usize = 10_000;
 const MAX_VALUE_SIZE: usize = 10 * 1024 * 1024; // 10 MB
 const UNCOMPRESSED_FLAG: u64 = 1 << 63;
 const NUM_SHARDS: usize = 16;
@@ -548,6 +553,29 @@ impl WriteBatch {
             .push((string_to_key(key), value, expiry));
         Ok(())
     }
+    /// Writes a key with an ABSOLUTE unix-expiry timestamp (0 = never),
+    /// the storage-level primitive `set_with_ttl` computes from now.
+    /// The raft apply path needs this: a replicated entry carries the
+    /// expiry the originating node computed, and re-deriving it from
+    /// `now + ttl` on every follower would drift the expiry forward by
+    /// the replication delay on every hop.
+    pub fn set_with_expiry(
+        &mut self,
+        key: &str,
+        value: String,
+        expiry: u64,
+    ) -> Result<(), OmniError> {
+        if self.buffered_writes.len() + self.buffered_deletes.len() >= MAX_BATCH_SIZE {
+            return Err(OmniError::BatchTooLarge(MAX_BATCH_SIZE));
+        }
+        if value.len() > MAX_VALUE_SIZE {
+            return Err(OmniError::ValueTooLarge(MAX_VALUE_SIZE));
+        }
+        self.buffered_writes
+            .push((string_to_key(key), value, expiry));
+        Ok(())
+    }
+
     pub fn delete(&mut self, key: &str) -> Result<(), OmniError> {
         if self.buffered_writes.len() + self.buffered_deletes.len() >= MAX_BATCH_SIZE {
             return Err(OmniError::BatchTooLarge(MAX_BATCH_SIZE));
@@ -558,6 +586,23 @@ impl WriteBatch {
     pub fn is_empty(&self) -> bool {
         self.buffered_writes.is_empty() && self.buffered_deletes.is_empty()
     }
+    /// Number of operations staged so far. The raft storage adapter
+    /// flushes and starts a fresh batch before this reaches
+    /// [`MAX_OPS`](Self::MAX_OPS).
+    pub fn op_count(&self) -> usize {
+        self.buffered_writes.len() + self.buffered_deletes.len()
+    }
+    /// Empties the batch (e.g. after a chunk was committed), keeping
+    /// capacity for the next chunk.
+    pub fn clear(&mut self) {
+        self.buffered_writes.clear();
+        self.buffered_deletes.clear();
+    }
+
+    /// The op cap every commit path enforces. Raft-side callers that can
+    /// legitimately exceed one client batch (catch-up appends, purges,
+    /// snapshot installs) chunk their work at this size.
+    pub const MAX_OPS: usize = MAX_BATCH_SIZE;
 }
 
 /// Current on-disk manifest format version. Increment for incompatible changes.
@@ -1043,6 +1088,14 @@ pub struct OmniKV {
     // Shared (read) lock: commit_batch, compaction, flush.
     // Exclusive (write) lock: snapshot install only — freezes all writers/compactors.
     pub(crate) transition_guard: RwLock<()>,
+    /// When clustered: routes client writes through consensus before
+    /// they touch local storage (the leader proposes, every node's raft
+    /// state machine applies — including this one). `None` in
+    /// single-node mode: commit_batch applies directly, exactly as
+    /// before. Set once at server boot via
+    /// [`OmniKV::set_cluster_gateway`].
+    pub(crate) cluster_gateway:
+        std::sync::OnceLock<std::sync::Arc<crate::raft_gateway::ClusterGateway>>,
 
     // Must be declared last: Rust drops struct fields in declaration order, so
     // all mmap-bearing roots and files are released before the database LOCK
@@ -1051,6 +1104,29 @@ pub struct OmniKV {
 }
 
 impl OmniKV {
+    /// Attaches the cluster gateway (server boot, before serving
+    /// clients). After this, every `commit_batch` on this handle
+    /// proposes through consensus instead of writing locally first.
+    /// Idempotent-guarded: a second attach is a no-op.
+    pub fn set_cluster_gateway(
+        &self,
+        gateway: std::sync::Arc<crate::raft_gateway::ClusterGateway>,
+    ) {
+        let _ = self.cluster_gateway.set(gateway);
+    }
+
+    /// Whether writes on this handle route through consensus.
+    pub fn is_clustered(&self) -> bool {
+        self.cluster_gateway.get().is_some()
+    }
+
+    /// The attached cluster gateway, when clustered. Engine internals
+    /// (the SSI transaction manager's clustered commit path) use this
+    /// to reach the gateway without re-cloning the OnceLock contents.
+    pub fn cluster_gateway(&self) -> Option<std::sync::Arc<crate::raft_gateway::ClusterGateway>> {
+        self.cluster_gateway.get().cloned()
+    }
+
     /// Opens an OmniKV database from the given manifest and WAL paths.
     /// Recovers state from WAL and initializes the storage engine.
     pub fn open(manifest_path: &str, wal_path: &str) -> Result<Arc<Self>, OmniError> {
@@ -1087,6 +1163,7 @@ impl OmniKV {
             // On SSDs, this batches 5-50 concurrent writes into a single fsync.
             group_commit: crate::hardening::GroupCommitEngine::new(200),
             transition_guard: RwLock::new(()),
+            cluster_gateway: std::sync::OnceLock::new(),
             db_lock,
         }))
     }
@@ -1567,6 +1644,22 @@ impl OmniKV {
     /// This allows multiple concurrent batches to overlap their CPU-intensive
     /// compression work and only serialize briefly for sequence numbering.
     pub fn commit_batch(&self, tx: &WriteBatch) -> Result<u64, OmniError> {
+        // Clustered: client writes must be consensus-replicated before
+        // they are acknowledged. The gateway proposes this batch as one
+        // raft entry; raft's state machine (not this call) applies it
+        // locally on every node, including this one. The returned number
+        // is the raft log index the write was applied at — on followers
+        // too, since only the leader accepts client writes.
+        if let Some(gateway) = self.cluster_gateway.get() {
+            return gateway.commit_batch(tx);
+        }
+        self.commit_batch_local(tx)
+    }
+
+    /// The single-node commit path, also used by the raft state machine
+    /// itself when it applies entries: raft's own bookkeeping must
+    /// never route back through the cluster gateway.
+    pub(crate) fn commit_batch_local(&self, tx: &WriteBatch) -> Result<u64, OmniError> {
         // Acquire shared topology lock — blocks only during exclusive snapshot install.
         // Thousands of concurrent writers can hold this simultaneously.
         let _topology_guard = self

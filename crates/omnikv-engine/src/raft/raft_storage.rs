@@ -93,7 +93,7 @@ impl OmniRaftStorage {
         let key = format!("{}{:020}", RAFT_LOG_PREFIX, index);
         let mut batch = WriteBatch::new();
         batch.set(&key, entry.to_string())?;
-        self.db.commit_batch(&batch)?;
+        self.db.commit_batch_local(&batch)?;
         Ok(())
     }
 
@@ -111,7 +111,7 @@ impl OmniRaftStorage {
             if parts.len() == 3 {
                 let mut batch = WriteBatch::new();
                 batch.set(parts[1], parts[2].to_string())?;
-                self.db.commit_batch(&batch)?;
+                self.db.commit_batch_local(&batch)?;
             }
         }
         Ok(())
@@ -131,7 +131,7 @@ impl OmniRaftStorage {
         meta.last_applied = Some(LogId::new(leader_id, index));
         let mut batch = WriteBatch::new();
         self.save_meta(&meta, &mut batch);
-        self.db.commit_batch(&batch)?;
+        self.db.commit_batch_local(&batch)?;
         Ok(())
     }
 
@@ -151,7 +151,7 @@ impl OmniRaftStorage {
             let key = format!("{}{:020}", RAFT_LOG_PREFIX, idx);
             batch.delete(&key)?;
         }
-        self.db.commit_batch(&batch)?;
+        self.db.commit_batch_local(&batch)?;
         Ok(())
     }
 
@@ -160,7 +160,7 @@ impl OmniRaftStorage {
         let key = format!("{}vote", RAFT_LOG_PREFIX);
         let mut batch = WriteBatch::new();
         batch.set(&key, vote_json.to_string())?;
-        self.db.commit_batch(&batch)?;
+        self.db.commit_batch_local(&batch)?;
         Ok(())
     }
 
@@ -291,6 +291,46 @@ fn storage_read_err(e: impl std::fmt::Display) -> openraft::StorageError<u64> {
     )
 }
 
+/// Commits `batch` locally, in [`WriteBatch::MAX_OPS`]-sized chunks if
+/// it exceeds the op cap. The raft storage paths are the only callers
+/// that can legitimately exceed one client batch: a follower catch-up
+/// appends many log entries in one call, a purge deletes one key per
+/// purged index, and a snapshot install replays the whole captured
+/// dataset. Committing the whole thing as ONE batch used to trip
+/// `BatchTooLarge` there and stall replication; the chunk boundaries are
+/// invisible to the engine because every op is idempotent (same-key ops
+/// re-apply in log order) and each chunk gets its own monotonically
+/// increasing storage seq.
+fn commit_chunked(db: &OmniKV, batch: &mut WriteBatch) -> Result<(), crate::OmniError> {
+    if batch.op_count() <= WriteBatch::MAX_OPS {
+        db.commit_batch_local(batch).map(|_| ())?;
+        return Ok(());
+    }
+    // Drain in chunks: buffered_writes and buffered_deletes are each
+    // <= MAX_OPS-safe in the original only if the TOTAL was; draining
+    // one op at a time into a fresh capped batch preserves order.
+    let mut chunk = WriteBatch::new();
+    for (key, value, expiry) in std::mem::take(&mut batch.buffered_writes) {
+        if chunk.op_count() >= WriteBatch::MAX_OPS {
+            db.commit_batch_local(&chunk).map(|_| ())?;
+            chunk.clear();
+        }
+        // Absolute expiry: the entry already carries it.
+        chunk.set_with_expiry(&String::from_utf8_lossy(&key), value, expiry)?;
+    }
+    for key in std::mem::take(&mut batch.buffered_deletes) {
+        if chunk.op_count() >= WriteBatch::MAX_OPS {
+            db.commit_batch_local(&chunk).map(|_| ())?;
+            chunk.clear();
+        }
+        chunk.delete(&String::from_utf8_lossy(&key))?;
+    }
+    if !chunk.is_empty() {
+        db.commit_batch_local(&chunk).map(|_| ())?;
+    }
+    Ok(())
+}
+
 #[expect(
     clippy::unused_async_trait_impl,
     reason = "openraft's storage/network traits declare async fns; the storage and network adapters are synchronous internally and async is required by the trait signatures."
@@ -309,13 +349,15 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
             meta.vote = Some(*vote);
             self.save_meta(&meta, &mut batch);
         }
-        self.db.commit_batch(&batch).map_err(|e| StorageError::IO {
-            source: StorageIOError::new(
-                openraft::ErrorSubject::Store,
-                openraft::ErrorVerb::Write,
-                AnyError::error(e.to_string()),
-            ),
-        })?;
+        self.db
+            .commit_batch_local(&batch)
+            .map_err(|e| StorageError::IO {
+                source: StorageIOError::new(
+                    openraft::ErrorSubject::Store,
+                    openraft::ErrorVerb::Write,
+                    AnyError::error(e.to_string()),
+                ),
+            })?;
         Ok(())
     }
 
@@ -352,6 +394,20 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
             let key = format!("{}{:020}", RAFT_LOG_PREFIX, entry.log_id.index);
             let val = serde_json::to_string(&entry).map_err(|e| storage_write_err(&e))?;
             batch.set(&key, val).map_err(|e| storage_write_err(&e))?;
+            // A follower catch-up can append more entries in one call
+            // than one batch holds; flush chunks as we go.
+            if batch.op_count() >= WriteBatch::MAX_OPS {
+                self.db
+                    .commit_batch_local(&batch)
+                    .map_err(|e| StorageError::IO {
+                        source: StorageIOError::new(
+                            openraft::ErrorSubject::Store,
+                            openraft::ErrorVerb::Write,
+                            AnyError::error(e.to_string()),
+                        ),
+                    })?;
+                batch.clear();
+            }
             last_log_id = Some(entry.log_id);
         }
 
@@ -364,7 +420,9 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
             self.save_meta(&meta, &mut batch);
         }
 
-        self.db.commit_batch(&batch).map_err(|e| StorageError::IO {
+        // Tail chunk (never larger than MAX_OPS thanks to the flushes
+        // above; commit_chunked is belt-and-braces for the meta op).
+        commit_chunked(&self.db, &mut batch).map_err(|e| StorageError::IO {
             source: StorageIOError::new(
                 openraft::ErrorSubject::Store,
                 openraft::ErrorVerb::Write,
@@ -384,6 +442,20 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
             let key = format!("{}{:020}", RAFT_LOG_PREFIX, idx);
             if let Ok(Some(_)) = self.db.find_latest_internal(&key) {
                 batch.delete(&key).map_err(|e| storage_write_err(&e))?;
+                // Conflict truncation is normally small, but a long
+                // divergent tail can exceed one batch; flush chunks.
+                if batch.op_count() >= WriteBatch::MAX_OPS {
+                    self.db
+                        .commit_batch_local(&batch)
+                        .map_err(|e| StorageError::IO {
+                            source: StorageIOError::new(
+                                openraft::ErrorSubject::Store,
+                                openraft::ErrorVerb::Write,
+                                AnyError::error(e.to_string()),
+                            ),
+                        })?;
+                    batch.clear();
+                }
                 idx += 1;
             } else {
                 break;
@@ -411,13 +483,15 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
             }
         }
 
-        self.db.commit_batch(&batch).map_err(|e| StorageError::IO {
-            source: StorageIOError::new(
-                openraft::ErrorSubject::Store,
-                openraft::ErrorVerb::Write,
-                AnyError::error(e.to_string()),
-            ),
-        })?;
+        self.db
+            .commit_batch_local(&batch)
+            .map_err(|e| StorageError::IO {
+                source: StorageIOError::new(
+                    openraft::ErrorSubject::Store,
+                    openraft::ErrorVerb::Write,
+                    AnyError::error(e.to_string()),
+                ),
+            })?;
         Ok(())
     }
 
@@ -435,6 +509,22 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
         for idx in start_idx..=log_id.index {
             let key = format!("{}{:020}", RAFT_LOG_PREFIX, idx);
             batch.delete(&key).map_err(|e| storage_write_err(&e))?;
+            // A purge after snapshot/compaction can span far more log
+            // indexes than one batch holds; flush chunks as we go. The
+            // meta update (last_purged_log_id) rides the FINAL chunk
+            // only — a crash mid-purge just re-purges idempotently.
+            if batch.op_count() >= WriteBatch::MAX_OPS {
+                self.db
+                    .commit_batch_local(&batch)
+                    .map_err(|e| StorageError::IO {
+                        source: StorageIOError::new(
+                            openraft::ErrorSubject::Store,
+                            openraft::ErrorVerb::Write,
+                            AnyError::error(e.to_string()),
+                        ),
+                    })?;
+                batch.clear();
+            }
         }
 
         {
@@ -446,13 +536,15 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
             self.save_meta(&meta, &mut batch);
         }
 
-        self.db.commit_batch(&batch).map_err(|e| StorageError::IO {
-            source: StorageIOError::new(
-                openraft::ErrorSubject::Store,
-                openraft::ErrorVerb::Write,
-                AnyError::error(e.to_string()),
-            ),
-        })?;
+        self.db
+            .commit_batch_local(&batch)
+            .map_err(|e| StorageError::IO {
+                source: StorageIOError::new(
+                    openraft::ErrorSubject::Store,
+                    openraft::ErrorVerb::Write,
+                    AnyError::error(e.to_string()),
+                ),
+            })?;
         Ok(())
     }
 
@@ -474,23 +566,132 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
         let mut batch = WriteBatch::new();
         let mut last_applied = None;
         let mut new_membership = None;
+        // openraft applies entries in batches, and a follower catch-up
+        // can carry more ops in ONE apply call than a WriteBatch holds —
+        // before the chunking, that tripped BatchTooLarge and stalled
+        // replication forever. The fix is to commit in capped chunks, but
+        // the chunk boundary must never fall INSIDE a Raft entry: one
+        // entry is one atomic client write, and splitting it would let a
+        // reader (or a crash) see only part of it. So we flush only at
+        // ENTRY boundaries — before staging an entry whose ops would not
+        // fit alongside what is already staged.
+        //
+        // This is safe because a single RaftCommand can never exceed the
+        // cap on its own: the engine's WriteBatch rejects the op that
+        // would exceed MAX_BATCH_SIZE before the command is ever proposed
+        // (RaftCommand::from_batch carries that cap), so any one entry
+        // always fits in a fresh batch and the flush keeps every commit
+        // ≤ MAX_OPS without ever splitting an entry.
+        let io_err = |e: crate::OmniError| StorageError::IO {
+            source: StorageIOError::new(
+                openraft::ErrorSubject::Store,
+                openraft::ErrorVerb::Write,
+                AnyError::error(e.to_string()),
+            ),
+        };
+        // Slots in `res` for entries whose ops are staged in `batch` but
+        // not yet committed. Their placeholder responses are stamped with
+        // the batch's commit marker when the batch flushes.
+        let mut staged_slots: Vec<usize> = Vec::new();
+        // Flushes the staged batch (if non-empty) and stamps every entry
+        // staged in it with the batch's COMMIT MARKER, which the proposer
+        // reads back through client_write's response as the sequence its
+        // write became visible at.
+        //
+        // The marker is captured HERE, never reconstructed from
+        // db.get_seq() after the apply returns: log purges and snapshot
+        // installs reserve from the same global counter and can fire
+        // between this commit and any later read, which would hand back a
+        // bookkeeping marker instead of the transaction's and abort a
+        // later transaction spuriously. (openraft's StorageError is ~224
+        // bytes; mapping it at the call sites keeps this closure cheap and
+        // clippy's result_large_err quiet.)
+        let flush_staged = |batch: &mut WriteBatch,
+                            slots: &mut Vec<usize>,
+                            res: &mut Vec<String>|
+         -> Result<(), crate::OmniError> {
+            if batch.is_empty() {
+                return Ok(());
+            }
+            let marker = self.db.commit_batch_local(batch)?;
+            // Entries sharing a batch committed atomically at one marker —
+            // a transaction whose read_seq equals it sees all of them.
+            for &slot in slots.iter() {
+                res[slot] = marker.to_string();
+            }
+            slots.clear();
+            batch.clear();
+            Ok(())
+        };
 
         for entry in entries {
             match &entry.payload {
                 EntryPayload::Blank => res.push("".to_string()),
                 EntryPayload::Normal(req) => {
-                    if req.starts_with("SET ") {
-                        let parts: Vec<&str> = req.splitn(3, ' ').collect();
-                        if parts.len() == 3 {
-                            if parts[1].starts_with("__sys__/raft/") {
-                                res.push("ERR".to_string());
-                                continue;
-                            }
-                            let key = parts[1].to_string();
+                    // Structured commands (the cluster write path): one
+                    // entry = one atomic batch of sets and deletes. The
+                    // legacy "SET <key> <value>" text form still applies,
+                    // so pre-cluster log entries and the storage tests
+                    // keep their meaning.
+                    if let Some(cmd) = crate::raft_command::RaftCommand::decode(req) {
+                        let system_key = cmd
+                            .sets
+                            .iter()
+                            .any(|op| op.key.starts_with("__sys__/raft/"))
+                            || cmd.dels.iter().any(|k| k.starts_with("__sys__/raft/"));
+                        if system_key || cmd.is_empty() {
+                            res.push("ERR".to_string());
+                            // A rejected entry is still DECIDED and applied —
+                            // record the index so openraft advances past it.
+                            // Skipping it would leave the durable applied
+                            // index behind the committed log and stall the
+                            // state machine on this entry forever.
+                            last_applied = Some(entry.log_id);
+                            continue;
+                        }
+                        // Flush at the ENTRY boundary (never mid-command):
+                        // a reader or crash between commits must never see
+                        // part of this entry's writes. `>=`, not `>`: an
+                        // apply whose ops sum to EXACTLY the cap must still
+                        // leave the batch strictly under it so the next
+                        // entry (and the meta record appended after the
+                        // loop) always has a slot.
+                        if !batch.is_empty()
+                            && batch.op_count() + cmd.sets.len() + cmd.dels.len()
+                                >= WriteBatch::MAX_OPS
+                        {
+                            flush_staged(&mut batch, &mut staged_slots, &mut res)
+                                .map_err(io_err)?;
+                        }
+                        for op in cmd.sets {
+                            // The entry carries the ABSOLUTE expiry the
+                            // originating node computed — apply it verbatim.
+                            // Re-deriving `now + ttl` here would drift the
+                            // expiry forward by the replication delay on
+                            // every follower hop.
                             batch
-                                .set(&key, parts[2].to_string())
+                                .set_with_expiry(&op.key, op.value, op.ttl)
                                 .map_err(|e| storage_write_err(&e))?;
-                            res.push("OK".to_string());
+                        }
+                        for key in &cmd.dels {
+                            batch.delete(key).map_err(|e| storage_write_err(&e))?;
+                        }
+                        // Placeholder: stamped with the batch's commit
+                        // marker when it flushes. Empty until then.
+                        res.push(String::new());
+                        staged_slots.push(res.len() - 1);
+                    } else if let Some(rest) = req.strip_prefix("SET ") {
+                        let parts: Vec<&str> = rest.splitn(2, ' ').collect();
+                        if parts.len() == 2 && !parts[0].starts_with("__sys__/raft/") {
+                            if !batch.is_empty() && batch.op_count() + 1 >= WriteBatch::MAX_OPS {
+                                flush_staged(&mut batch, &mut staged_slots, &mut res)
+                                    .map_err(io_err)?;
+                            }
+                            batch
+                                .set(parts[0], parts[1].to_string())
+                                .map_err(|e| storage_write_err(&e))?;
+                            res.push(String::new());
+                            staged_slots.push(res.len() - 1);
                         } else {
                             res.push("ERR".to_string());
                         }
@@ -506,6 +707,15 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
             last_applied = Some(entry.log_id);
         }
 
+        // Flush any remaining staged user data BEFORE the meta record
+        // joins the batch. This stamps the last staged entries with their
+        // marker, and it is also the crash-safe order — data before
+        // pointer, so a crash between the two re-applies idempotently from
+        // the pre-crash last_applied. Flushing here (rather than letting
+        // data ride along with the meta op) removes the exact-cap special
+        // case: the batch is empty when the single meta op is appended.
+        flush_staged(&mut batch, &mut staged_slots, &mut res).map_err(io_err)?;
+
         if last_applied.is_some() || new_membership.is_some() {
             let mut meta = self
                 .meta
@@ -520,13 +730,9 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
             self.save_meta(&meta, &mut batch);
         }
 
-        self.db.commit_batch(&batch).map_err(|e| StorageError::IO {
-            source: StorageIOError::new(
-                openraft::ErrorSubject::Store,
-                openraft::ErrorVerb::Write,
-                AnyError::error(e.to_string()),
-            ),
-        })?;
+        // Final chunk: the meta record only (user data flushed above).
+        // commit_chunked is belt-and-braces for that single op.
+        commit_chunked(&self.db, &mut batch).map_err(io_err)?;
 
         Ok(res)
     }
@@ -636,12 +842,31 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
 
         let mut batch = crate::WriteBatch::new();
         for (k, v) in &envelope.entries {
+            // The captured dataset can exceed one batch's op cap; stage
+            // into a fresh tmp batch per chunk so a large snapshot
+            // installs without BatchTooLarge.
+            if batch.op_count() >= crate::WriteBatch::MAX_OPS {
+                tmp_db
+                    .commit_batch(&batch)
+                    .map_err(|e| io_err(&format!("commit snapshot batch: {}", e)))?;
+                batch = crate::WriteBatch::new();
+            }
             batch
                 .set(k, v.clone())
                 .map_err(|e| io_err(&format!("batch set: {}", e)))?;
         }
 
         // ── Atomically include Raft metadata in the snapshot build ──
+        // If the entries filled the batch to EXACTLY the cap, the meta
+        // set below would hit BatchTooLarge and the snapshot install
+        // would fail. Commit the full data chunk first (same guard as the
+        // apply path): data before pointer.
+        if batch.op_count() >= crate::WriteBatch::MAX_OPS {
+            tmp_db
+                .commit_batch(&batch)
+                .map_err(|e| io_err(&format!("commit snapshot batch: {}", e)))?;
+            batch = crate::WriteBatch::new();
+        }
         let mut meta = self
             .meta
             .lock()

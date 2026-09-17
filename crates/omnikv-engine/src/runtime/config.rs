@@ -92,6 +92,41 @@ impl StorageConfig {
     }
 }
 
+/// Cluster (Raft) configuration. Absent — `raft_addr` and `node_id`
+/// both unset — the server runs as an independent single-node engine,
+/// exactly as it always has. Present, the server boots an openraft node
+/// on `raft_addr` and every write goes through consensus before it is
+/// acknowledged.
+///
+/// `peers` are the OTHER nodes' raft addresses ("host:port"), used only
+/// at bootstrap to seed cluster membership; a node joining an existing
+/// cluster learns the full membership from the leader.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RaftConfig {
+    /// This node's cluster ID (openraft NodeId). 1-based.
+    pub node_id: Option<u64>,
+    /// The plaintext listener for consensus traffic (etcd's peer-port
+    /// model: client TLS never terminates here). This is the BIND
+    /// address — `0.0.0.0:port` is valid here.
+    pub raft_addr: Option<String>,
+    /// What PEERS dial to reach this node — the address that goes into
+    /// cluster membership. Must be routable FROM other nodes; a
+    /// wildcard (0.0.0.0/::) is refused by validation because it would
+    /// resolve to the dialer itself. When unset, the bind address is
+    /// advertised (fine for specific-IP/loopback binds; a wildcard bind
+    /// REQUIRES this override).
+    #[serde(default)]
+    pub advertise_addr: Option<String>,
+    /// The other initial members, "host:port" per entry. Empty means
+    /// single-node cluster when raft_addr is set.
+    pub peers: Vec<String>,
+    /// Override election/heartbeat tuning (defaults suit tests and LANs).
+    pub heartbeat_interval_ms: Option<u64>,
+    pub election_timeout_min_ms: Option<u64>,
+    pub election_timeout_max_ms: Option<u64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServerConfig {
@@ -125,6 +160,8 @@ pub struct ServerConfig {
     pub log_level: String,
     #[serde(default)]
     pub storage: StorageConfig,
+    #[serde(default)]
+    pub raft: RaftConfig,
 }
 
 fn default_http_addr() -> String {
@@ -185,6 +222,7 @@ impl Default for ServerConfig {
             tls_insecure_skip: false,
             log_level: default_log_level(),
             storage: StorageConfig::default(),
+            raft: RaftConfig::default(),
         }
     }
 }
@@ -353,10 +391,121 @@ impl ServerConfig {
             self.storage.compaction_check_interval_ms =
                 parse_env_value("OMNIKV_COMPACTION_CHECK_INTERVAL_MS", &v)?;
         }
+
+        // ── Cluster (Raft) ── OMNIKV_* names with the OMNI_NODE_ID /
+        // OMNI_PEERS legacy names the docker-compose files already set.
+        if let Ok(v) = std::env::var("OMNIKV_RAFT_ADDR") {
+            self.raft.raft_addr = if v.is_empty() { None } else { Some(v) };
+        }
+        if let Ok(v) = std::env::var("OMNIKV_RAFT_ADVERTISE_ADDR") {
+            self.raft.advertise_addr = if v.is_empty() { None } else { Some(v) };
+        }
+        if let Ok(v) = std::env::var("OMNIKV_NODE_ID").or_else(|_| std::env::var("OMNI_NODE_ID")) {
+            self.raft.node_id = Some(
+                v.parse()
+                    .map_err(|_| ConfigError("Invalid OMNIKV_NODE_ID".into()))?,
+            );
+        }
+        if let Ok(v) = std::env::var("OMNIKV_RAFT_PEERS").or_else(|_| std::env::var("OMNI_PEERS")) {
+            self.raft.peers = v
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect();
+        }
+        if let Ok(v) = std::env::var("OMNIKV_RAFT_HEARTBEAT_MS") {
+            self.raft.heartbeat_interval_ms = Some(
+                v.parse()
+                    .map_err(|_| ConfigError("Invalid OMNIKV_RAFT_HEARTBEAT_MS".into()))?,
+            );
+        }
+        if let Ok(v) = std::env::var("OMNIKV_RAFT_ELECTION_MIN_MS") {
+            self.raft.election_timeout_min_ms = Some(
+                v.parse()
+                    .map_err(|_| ConfigError("Invalid OMNIKV_RAFT_ELECTION_MIN_MS".into()))?,
+            );
+        }
+        if let Ok(v) = std::env::var("OMNIKV_RAFT_ELECTION_MAX_MS") {
+            self.raft.election_timeout_max_ms = Some(
+                v.parse()
+                    .map_err(|_| ConfigError("Invalid OMNIKV_RAFT_ELECTION_MAX_MS".into()))?,
+            );
+        }
         Ok(())
     }
 
     pub fn validate_runtime(&self) -> Result<(), ConfigError> {
+        // A node id without a raft listener, or a listener without a
+        // node id, is a half-configured cluster: refuse to boot rather
+        // than silently degrade to single-node.
+        if self.raft.node_id.is_some() != self.raft.raft_addr.is_some() {
+            return Err(ConfigError(
+                "raft.node_id and raft.raft_addr must be set together (OMNIKV_NODE_ID / OMNIKV_RAFT_ADDR)".into(),
+            ));
+        }
+        if self.raft.election_timeout_min_ms.unwrap_or(0)
+            > self.raft.election_timeout_max_ms.unwrap_or(u64::MAX)
+        {
+            return Err(ConfigError(
+                "raft.election_timeout_min_ms must be <= election_timeout_max_ms".into(),
+            ));
+        }
+        // The ADVERTISED address is what peers dial — it must never be
+        // a wildcard. When the explicit override is set, validate it;
+        // when it is not, the bind address is the advertised one, so a
+        // wildcard bind requires the override (a cluster member bound
+        // to 0.0.0.0 without a routable advertise address would poison
+        // every peer's routing table with an address that resolves to
+        // the dialer itself).
+        let advertised = self
+            .raft
+            .advertise_addr
+            .as_deref()
+            .or(self.raft.raft_addr.as_deref());
+        if let Some(addr) = advertised
+            && is_wildcard_addr(addr)
+        {
+            return Err(ConfigError(
+                "raft advertise address must be routable by peers (got a wildcard; set \
+                 OMNIKV_RAFT_ADVERTISE_ADDR to this node's reachable host:port)"
+                    .into(),
+            ));
+        }
+        // Shape check on the explicit override only: "host:port" with a
+        // non-empty host and a valid port. Hostnames (the container
+        // pattern: omni-node-1:9090) are valid here — peers resolve them
+        // through the compose network.
+        if let Some(advertise) = &self.raft.advertise_addr {
+            validate_raft_endpoint(advertise, "raft.advertise_addr")?;
+        }
+        // Each network address must map to exactly one peer identity:
+        // duplicate peer endpoints (or a peer that duplicates this node's
+        // advertised address) let openraft route several member ids to one
+        // listener, which breaks quorum arithmetic in subtle ways.
+        //
+        // Every peer is also dialed exactly as written (boot_cluster_node
+        // copies it into openraft::BasicNode.addr and OmniNetwork builds
+        // the RPC URL from it), so a malformed, wildcard, or port-zero
+        // peer is not a typo a operator can recover from later — it is a
+        // member that can never be reached. Validate each one up front,
+        // with the same rules as the advertised address.
+        if let Some(me) = advertised {
+            let mut seen = std::collections::HashSet::new();
+            for peer in &self.raft.peers {
+                if peer == me {
+                    return Err(ConfigError(
+                        "raft peers must not include this node's own advertised address".into(),
+                    ));
+                }
+                validate_raft_endpoint(peer, "raft peer")?;
+                if !seen.insert(peer) {
+                    return Err(ConfigError(format!(
+                        "raft peers must be unique (duplicate: {peer})"
+                    )));
+                }
+            }
+        }
         self.validate_common()?;
         if self.mode == ServerMode::Production {
             self.validate_production()?;
@@ -571,6 +720,46 @@ fn validate_addr(name: &str, value: &str) -> Result<(), ConfigError> {
         .parse::<std::net::SocketAddr>()
         .map(|_| ())
         .map_err(|e| ConfigError(format!("{name} must be a valid socket address: {e}")))
+}
+
+/// Whether an address string is a wildcard ANY-address ("0.0.0.0:port",
+/// "[::]:port") — valid to BIND, never valid to ADVERTISE (peers dialing
+/// it reach themselves). Unparseable strings (bare hostnames) are not
+/// wildcards; the advertise-shape check handles those separately.
+fn is_wildcard_addr(addr: &str) -> bool {
+    addr.parse::<std::net::SocketAddr>()
+        .is_ok_and(|sock| sock.ip().is_unspecified())
+}
+
+/// Validates a raft endpoint exactly as it will be dialed: a non-wildcard
+/// `host:port` with a non-empty host and an explicit nonzero port. Hostnames
+/// (the container pattern: `omni-node-1:9090`) are valid — peers resolve them
+/// through the compose network. Applies to both this node's advertised address
+/// and to every peer, since both are copied into cluster membership verbatim.
+fn validate_raft_endpoint(addr: &str, field: &str) -> Result<(), ConfigError> {
+    if is_wildcard_addr(addr) {
+        return Err(ConfigError(format!(
+            "{field} must be routable by peers (got a wildcard: {addr})"
+        )));
+    }
+    match addr.rsplit_once(':') {
+        Some((host, port)) => {
+            // Port 0 means "ephemeral" to a BIND, but in an ADVERTISED or
+            // PEER address it tells the dialer to hit a random port — never
+            // reachable. Require an explicit port.
+            if host.is_empty() || port.parse::<u16>().map_or(true, |p| p == 0) {
+                return Err(ConfigError(format!(
+                    "{field} must be a valid host:port with a nonzero port (got {addr})"
+                )));
+            }
+        }
+        None => {
+            return Err(ConfigError(format!(
+                "{field} must be a valid host:port (got {addr})"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn path_to_string(path: PathBuf) -> Result<String, ConfigError> {

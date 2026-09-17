@@ -1,0 +1,69 @@
+# The 3-node cluster failover smoke (issue #113) — scripts/cluster-compose-smoke.sh
+# drives this: leader election, replication to every node, kill the
+# leader container, new leader, no data loss.
+services:
+  omni-node-1:
+    image: ${OMNIKV_IMAGE:-omnikv:cluster-smoke}
+    container_name: omni-cluster-smoke-node-1
+    ports:
+      - "127.0.0.1:${OMNIKV_TCP_PORT_1:-18080}:8080"
+    volumes:
+      - omni-cluster-smoke-data-1:/data
+    environment: &omni-cluster-smoke-env
+      OMNIKV_MODE: "production"
+      OMNIKV_HTTP_ADDR: "0.0.0.0:8443"
+      OMNIKV_PGWIRE_ADDR: "0.0.0.0:5433"
+      OMNIKV_TCP_ADDR: "0.0.0.0:8080"
+      OMNIKV_QUIC_ADDR: "0.0.0.0:4433"
+      OMNIKV_MANIFEST_PATH: "/data/manifest.json"
+      OMNIKV_WAL_PATH: "/data/wal.bin"
+      OMNIKV_BACKUP_DIR: "/data/backups"
+      OMNIKV_TLS_INSECURE_SKIP: "true"
+      OMNIKV_JWT_SECRET: "${OMNIKV_JWT_SECRET:?set OMNIKV_JWT_SECRET for smoke tests}"
+      OMNIKV_BOOTSTRAP_ADMIN_KEY: "${OMNIKV_BOOTSTRAP_ADMIN_KEY:?set OMNIKV_BOOTSTRAP_ADMIN_KEY for smoke tests}"
+      RUST_LOG: "${RUST_LOG:-info}"
+      # Fast election timers so CI converges in seconds.
+      OMNIKV_RAFT_HEARTBEAT_MS: "100"
+      OMNIKV_RAFT_ELECTION_MIN_MS: "300"
+      OMNIKV_RAFT_ELECTION_MAX_MS: "600"
+      OMNIKV_NODE_ID: "1"
+      OMNIKV_RAFT_ADDR: "0.0.0.0:9090"
+      OMNIKV_RAFT_ADVERTISE_ADDR: "omni-cluster-smoke-node-1:9090"
+      # Only node 1's peer list is consumed (initial membership).
+      OMNIKV_RAFT_PEERS: "omni-cluster-smoke-node-2:9090,omni-cluster-smoke-node-3:9090"
+    restart: unless-stopped
+
+  omni-node-2:
+    image: ${OMNIKV_IMAGE:-omnikv:cluster-smoke}
+    container_name: omni-cluster-smoke-node-2
+    ports:
+      - "127.0.0.1:${OMNIKV_TCP_PORT_2:-18081}:8080"
+    volumes:
+      - omni-cluster-smoke-data-2:/data
+    environment:
+      <<: *omni-cluster-smoke-env
+      OMNIKV_NODE_ID: "2"
+      OMNIKV_RAFT_ADDR: "0.0.0.0:9090"
+      OMNIKV_RAFT_ADVERTISE_ADDR: "omni-cluster-smoke-node-2:9090"
+      OMNIKV_RAFT_PEERS: "omni-cluster-smoke-node-1:9090,omni-cluster-smoke-node-3:9090"
+    restart: unless-stopped
+
+  omni-node-3:
+    image: ${OMNIKV_IMAGE:-omnikv:cluster-smoke}
+    container_name: omni-cluster-smoke-node-3
+    ports:
+      - "127.0.0.1:${OMNIKV_TCP_PORT_3:-18082}:8080"
+    volumes:
+      - omni-cluster-smoke-data-3:/data
+    environment:
+      <<: *omni-cluster-smoke-env
+      OMNIKV_NODE_ID: "3"
+      OMNIKV_RAFT_ADDR: "0.0.0.0:9090"
+      OMNIKV_RAFT_ADVERTISE_ADDR: "omni-cluster-smoke-node-3:9090"
+      OMNIKV_RAFT_PEERS: "omni-cluster-smoke-node-1:9090,omni-cluster-smoke-node-2:9090"
+    restart: unless-stopped
+
+volumes:
+  omni-cluster-smoke-data-1:
+  omni-cluster-smoke-data-2:
+  omni-cluster-smoke-data-3:

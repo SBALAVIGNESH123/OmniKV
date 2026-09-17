@@ -644,3 +644,241 @@ fn test_load_dev_succeeds() {
         assert_eq!(cfg.mode, ServerMode::Development);
     });
 }
+
+// ── Cluster advertised-address validation (PR #127 review) ──
+// A wildcard ADVERTISED address must fail closed: peers would dial
+// 0.0.0.0:port, which resolves to the DIALER itself, silently breaking
+// replication/votes toward this node after a failover or rejoin.
+
+#[test]
+fn test_raft_wildcard_bind_without_advertise_is_refused() {
+    // The wildcard BIND alone would also be the advertised address.
+    let cfg = ServerConfig {
+        raft: omni_engine::config::RaftConfig {
+            node_id: Some(1),
+            raft_addr: Some("0.0.0.0:9090".into()),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let err = cfg.validate_runtime().unwrap_err();
+    assert!(
+        err.0.contains("OMNIKV_RAFT_ADVERTISE_ADDR"),
+        "wildcard bind without advertise must name the fix: {err}"
+    );
+}
+
+#[test]
+fn test_raft_wildcard_bind_with_advertise_is_accepted() {
+    // The container pattern: bind wide, advertise the routable hostname.
+    let cfg = ServerConfig {
+        raft: omni_engine::config::RaftConfig {
+            node_id: Some(1),
+            raft_addr: Some("0.0.0.0:9090".into()),
+            advertise_addr: Some("omni-node-1:9090".parse().unwrap()),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    cfg.validate_runtime()
+        .unwrap_or_else(|e| panic!("wildcard bind + routable advertise must boot: {e}"));
+}
+
+#[test]
+fn test_raft_wildcard_advertise_override_is_refused() {
+    // An explicit wildcard advertise is never routable, even when the
+    // bind is fine.
+    let cfg = ServerConfig {
+        raft: omni_engine::config::RaftConfig {
+            node_id: Some(1),
+            raft_addr: Some("127.0.0.1:9090".into()),
+            advertise_addr: Some("0.0.0.0:9090".into()),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let err = cfg.validate_runtime().unwrap_err();
+    assert!(err.0.contains("routable"), "got: {err}");
+}
+
+#[test]
+fn test_raft_loopback_bind_without_advertise_is_accepted() {
+    // The single-host/test pattern (what cluster_multiprocess uses):
+    // 127.0.0.1 is routable by peers on the same host, no override
+    // needed.
+    let cfg = ServerConfig {
+        raft: omni_engine::config::RaftConfig {
+            node_id: Some(1),
+            raft_addr: Some("127.0.0.1:9090".into()),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    cfg.validate_runtime()
+        .unwrap_or_else(|e| panic!("loopback bind must not require advertise: {e}"));
+}
+
+#[test]
+fn test_raft_advertise_env_var_sets_field() {
+    with_env(
+        &[("OMNIKV_RAFT_ADVERTISE_ADDR", "omni-node-2:9090")],
+        || {
+            let mut cfg = ServerConfig::default();
+            cfg.apply_env().unwrap();
+            assert_eq!(cfg.raft.advertise_addr.as_deref(), Some("omni-node-2:9090"));
+        },
+    );
+}
+
+// ── Peer/address sanity (PR #127 review round 4) ──
+
+#[test]
+fn test_raft_advertise_port_zero_is_refused() {
+    // Port 0 is "ephemeral" to a bind, but advertised it tells peers to
+    // dial a random port — never reachable.
+    let cfg = ServerConfig {
+        raft: omni_engine::config::RaftConfig {
+            node_id: Some(1),
+            raft_addr: Some("127.0.0.1:9090".into()),
+            advertise_addr: Some("omni-node-1:0".into()),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let err = cfg.validate_runtime().unwrap_err();
+    assert!(
+        err.0.contains("advertise_addr"),
+        "port-0 advertise must be rejected: {err}"
+    );
+}
+
+#[test]
+fn test_raft_duplicate_peers_are_refused() {
+    // Two member ids pointing at one address breaks quorum arithmetic.
+    let cfg = ServerConfig {
+        raft: omni_engine::config::RaftConfig {
+            node_id: Some(1),
+            raft_addr: Some("127.0.0.1:9090".into()),
+            peers: vec!["127.0.0.1:9091".into(), "127.0.0.1:9091".into()],
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let err = cfg.validate_runtime().unwrap_err();
+    assert!(
+        err.0.contains("unique"),
+        "duplicate peers must be rejected: {err}"
+    );
+}
+
+#[test]
+fn test_raft_self_in_peers_is_refused() {
+    // A peer list containing this node's own advertised address routes a
+    // member id back to itself.
+    let cfg = ServerConfig {
+        raft: omni_engine::config::RaftConfig {
+            node_id: Some(1),
+            raft_addr: Some("127.0.0.1:9090".into()),
+            peers: vec!["127.0.0.1:9090".into(), "127.0.0.1:9091".into()],
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let err = cfg.validate_runtime().unwrap_err();
+    assert!(
+        err.0.contains("own advertised"),
+        "self-referential peer must be rejected: {err}"
+    );
+}
+
+#[test]
+fn test_raft_distinct_peers_are_accepted() {
+    let cfg = ServerConfig {
+        raft: omni_engine::config::RaftConfig {
+            node_id: Some(1),
+            raft_addr: Some("127.0.0.1:9090".into()),
+            peers: vec!["127.0.0.1:9091".into(), "127.0.0.1:9092".into()],
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    cfg.validate_runtime()
+        .unwrap_or_else(|e| panic!("a clean peer list must validate: {e}"));
+}
+
+// ── Peer endpoint shape (PR #127 review round 7) ──
+// A peer is dialed exactly as written, so the same rules as the
+// advertised address apply to it — a malformed peer is a member that can
+// never be reached, not a typo an operator can fix later.
+
+#[test]
+fn test_raft_peer_missing_port_is_refused() {
+    let cfg = ServerConfig {
+        raft: omni_engine::config::RaftConfig {
+            node_id: Some(1),
+            raft_addr: Some("127.0.0.1:9090".into()),
+            peers: vec!["omni-node-2".into()],
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let err = cfg.validate_runtime().unwrap_err();
+    assert!(
+        err.0.contains("host:port"),
+        "a portless peer must be rejected: {err}"
+    );
+}
+
+#[test]
+fn test_raft_peer_port_zero_is_refused() {
+    // Port 0 dials a random port — the member is unreachable.
+    let cfg = ServerConfig {
+        raft: omni_engine::config::RaftConfig {
+            node_id: Some(1),
+            raft_addr: Some("127.0.0.1:9090".into()),
+            peers: vec!["127.0.0.1:0".into()],
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let err = cfg.validate_runtime().unwrap_err();
+    assert!(
+        err.0.contains("nonzero port"),
+        "a port-zero peer must be rejected: {err}"
+    );
+}
+
+#[test]
+fn test_raft_peer_wildcard_is_refused() {
+    // A wildcard peer address resolves to the DIALER itself.
+    let cfg = ServerConfig {
+        raft: omni_engine::config::RaftConfig {
+            node_id: Some(1),
+            raft_addr: Some("127.0.0.1:9090".into()),
+            peers: vec!["0.0.0.0:9091".into()],
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let err = cfg.validate_runtime().unwrap_err();
+    assert!(
+        err.0.contains("routable"),
+        "a wildcard peer must be rejected: {err}"
+    );
+}
+
+#[test]
+fn test_raft_peer_hostname_is_accepted() {
+    // The container pattern: hostnames resolve through the compose network.
+    let cfg = ServerConfig {
+        raft: omni_engine::config::RaftConfig {
+            node_id: Some(1),
+            raft_addr: Some("127.0.0.1:9090".into()),
+            peers: vec!["omni-node-2:9090".into(), "omni-node-3:9090".into()],
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    cfg.validate_runtime()
+        .unwrap_or_else(|e| panic!("hostname peers must validate: {e}"));
+}

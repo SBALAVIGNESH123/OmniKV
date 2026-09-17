@@ -219,6 +219,8 @@ jobs:
         key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
     - name: Raft cluster (58 tests)
       run: cargo test -p omnikv-engine --test raft_cluster -- --test-threads=1
+    - name: Multi-process cluster failover (kill the leader, issue #113)
+      run: cargo test -p omnikv-server --test cluster_multiprocess -- --test-threads=1
 
   clippy:
     name: Clippy Lint (All Targets)
@@ -299,3 +301,9 @@ jobs:
         OMNIKV_IMAGE: omnikv:ci
         OMNIKV_SMOKE_BUILD: "false"
       run: bash scripts/docker-compose-smoke.sh
+    - name: Docker Compose 3-node cluster failover smoke (issue #113)
+      env:
+        OMNIKV_IMAGE: omnikv:ci
+        OMNIKV_SMOKE_BUILD: "false"
+        OMNIKV_SMOKE_PROJECT: omnikv-cluster-smoke
+      run: bash scripts/cluster-compose-smoke.sh

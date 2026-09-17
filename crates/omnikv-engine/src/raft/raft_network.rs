@@ -7,6 +7,15 @@ use openraft::raft::{
 
 use crate::raft_impl::{OmniNode, OmniTypeConfig};
 
+/// Consensus transport for openraft RPCs.
+///
+/// The raft listener is a dedicated PLAINTEXT port (etcd's peer-port
+/// model: client TLS never terminates there), so consensus traffic is
+/// always `http://` regardless of the target address. Client-facing
+/// TLS is a separate listener with its own certificates; consensus
+/// nodes authenticate each other by cluster membership, and the
+/// peer port must be on a trusted network (documented in
+/// docs/configuration.md).
 pub struct OmniNetwork {
     client: reqwest::Client,
 }
@@ -59,14 +68,7 @@ impl RaftNetwork<OmniTypeConfig> for OmniNetworkConnection {
         req: AppendEntriesRequest<OmniTypeConfig>,
         _option: openraft::network::RPCOption,
     ) -> Result<AppendEntriesResponse<u64>, RPCError<u64, OmniNode, RaftError<u64>>> {
-        let scheme = if self.target.addr.starts_with("127.0.0.1")
-            || self.target.addr.starts_with("localhost")
-        {
-            "http"
-        } else {
-            "https"
-        };
-        let url = format!("{}://{}/raft/append", scheme, self.target.addr);
+        let url = format!("http://{}/raft/append", self.target.addr);
         let resp = self
             .client
             .post(&url)
@@ -90,14 +92,7 @@ impl RaftNetwork<OmniTypeConfig> for OmniNetworkConnection {
         InstallSnapshotResponse<u64>,
         RPCError<u64, OmniNode, RaftError<u64, InstallSnapshotError>>,
     > {
-        let scheme = if self.target.addr.starts_with("127.0.0.1")
-            || self.target.addr.starts_with("localhost")
-        {
-            "http"
-        } else {
-            "https"
-        };
-        let url = format!("{}://{}/raft/snapshot", scheme, self.target.addr);
+        let url = format!("http://{}/raft/snapshot", self.target.addr);
         let resp = self
             .client
             .post(&url)
@@ -118,14 +113,7 @@ impl RaftNetwork<OmniTypeConfig> for OmniNetworkConnection {
         req: VoteRequest<u64>,
         _option: openraft::network::RPCOption,
     ) -> Result<VoteResponse<u64>, RPCError<u64, OmniNode, RaftError<u64>>> {
-        let scheme = if self.target.addr.starts_with("127.0.0.1")
-            || self.target.addr.starts_with("localhost")
-        {
-            "http"
-        } else {
-            "https"
-        };
-        let url = format!("{}://{}/raft/vote", scheme, self.target.addr);
+        let url = format!("http://{}/raft/vote", self.target.addr);
         let resp = self
             .client
             .post(&url)

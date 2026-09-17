@@ -1903,24 +1903,29 @@ fn test_ttl_consistency_across_replicas() {
         }
     }
 
-    // Edge case: write a key with TTL=1 on all nodes simultaneously
+    // Edge case: write a short-TTL key on all nodes simultaneously.
     // All nodes compute expiry from their local clock — since they share
-    // the same system clock in this test, behavior is consistent
+    // the same system clock in this test, behavior is consistent. The
+    // window is 30s, not 1s: this runs under the full parallel workspace
+    // suite, and a 1s TTL can genuinely expire between the write and the
+    // read when the machine is loaded — the DB would be correct and the
+    // assertion wrong. 30s still exercises "short but alive", distinct
+    // from the 3600s key above.
     for db in [&db1, &db2, &db3] {
         let mut batch = omni_engine::WriteBatch::new();
         batch
-            .set_with_ttl("ttl_short_key", "short_value".to_string(), 1)
+            .set_with_ttl("ttl_short_key", "short_value".to_string(), 30)
             .unwrap();
         db.commit_batch(&batch).unwrap();
     }
 
-    // Key should be alive NOW (just written, TTL=1s hasn't elapsed)
+    // Key should be alive NOW (just written, TTL hasn't elapsed)
     for (db, name) in [(&db1, "leader"), (&db2, "follower1"), (&db3, "follower2")] {
         let seq = db.get_seq();
         let val = db.find("ttl_short_key", seq).unwrap();
         assert!(
             val.is_some(),
-            "{name} should see ttl_short_key (just written, TTL=1s)"
+            "{name} should see ttl_short_key (just written, TTL=30s)"
         );
     }
 
@@ -3923,4 +3928,390 @@ fn test_full_cluster_restart() {
     }
 
     println!("✅ ROLLING 14e: Full cluster restart — 20 keys recovered, new writes accepted");
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Chunked-commit regression tests (PR #127 review): openraft hands the
+// storage adapter MORE entries/ops than one WriteBatch holds — a
+// follower catch-up applying many entries at once, a purge spanning a
+// long log, a big append during catch-up. Before the chunking fix any
+// of these tripped BatchTooLarge (cap: 10_000 ops) and stalled
+// replication; these tests drive each path past the cap.
+// ═══════════════════════════════════════════════════════════════════════
+
+/// Builds a Normal entry carrying one `RaftCommand` with `ops` sets.
+fn bulk_entry(
+    index: u64,
+    ops: usize,
+    tag: &str,
+) -> openraft::Entry<omni_engine::raft_impl::TypeConfig> {
+    let mut cmd = omni_engine::raft_command::RaftCommand::default();
+    for i in 0..ops {
+        cmd.sets.push(omni_engine::raft_command::SetOp {
+            key: format!("{tag}:bulk:{index}:{i}"),
+            value: "v".into(),
+            ttl: 0,
+        });
+    }
+    openraft::Entry {
+        log_id: openraft::LogId::new(openraft::CommittedLeaderId::new(1, 1), index),
+        payload: openraft::EntryPayload::Normal(cmd.encode()),
+    }
+}
+
+/// `apply_to_state_machine` with 3 entries × `4_500` ops = `13_500` ops —
+/// past the `10_000` cap in ONE call. Must apply every op, not fail with
+/// `BatchTooLarge`.
+#[tokio::test]
+async fn test_apply_to_state_machine_chunks_past_batch_cap() {
+    let (db, storage, _dir) = create_node("bulk_apply");
+    let entries = vec![
+        bulk_entry(1, 4_500, "a"),
+        bulk_entry(2, 4_500, "b"),
+        bulk_entry(3, 4_500, "c"),
+    ];
+    let res =
+        openraft::storage::RaftStorage::apply_to_state_machine(&mut storage.clone(), &entries)
+            .await
+            .expect("bulk apply must not hit BatchTooLarge");
+    // Responses are commit markers now (not "OK"): each must parse as a
+    // sequence and they must be non-decreasing across entries.
+    let markers: Vec<u64> = res
+        .iter()
+        .map(|s| {
+            s.parse::<u64>()
+                .expect("apply response must be the entry's commit marker")
+        })
+        .collect();
+    assert!(
+        markers.windows(2).all(|w| w[0] <= w[1]),
+        "commit markers must be non-decreasing across entries: {markers:?}"
+    );
+
+    // Every op landed, and the meta points at the last applied entry.
+    let seq = db.get_seq();
+    for i in 0..4_500 {
+        assert_eq!(
+            db.find(&format!("a:bulk:1:{i}"), seq).unwrap(),
+            Some("v".into()),
+            "chunked apply lost a:bulk:1:{i}"
+        );
+    }
+    assert_eq!(storage.last_applied_index(), 3);
+    // Spot-check the tail entries (first and last op of each).
+    for tag in ["a", "b", "c"] {
+        let idx = if tag == "a" {
+            1
+        } else if tag == "b" {
+            2
+        } else {
+            3
+        };
+        assert!(
+            db.find(&format!("{tag}:bulk:{idx}:0"), seq)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            db.find(&format!("{tag}:bulk:{idx}:4499"), seq)
+                .unwrap()
+                .is_some()
+        );
+    }
+    println!("✅ CHUNKED APPLY: 13_500 ops in one apply call — no BatchTooLarge, no lost ops");
+}
+
+/// The apply response must be the entry's COMMIT MARKER (a storage
+/// sequence), not "OK". The clustered SSI commit reads this number back
+/// through `client_write`'s response as the transaction's `commit_seq`, so
+/// that a transaction started afterwards (`read_seq` == the marker) sees
+/// the write as visible. If this response ever becomes a non-parseable
+/// constant again, `WriteAck`'s marker parse fails and clustered commits
+/// error out — so this guards the whole contract.
+#[tokio::test]
+async fn test_apply_response_is_the_commit_marker() {
+    let (db, storage, _dir) = create_node("apply_marker");
+    let entries = vec![bulk_entry(1, 10, "m")];
+
+    let res =
+        openraft::storage::RaftStorage::apply_to_state_machine(&mut storage.clone(), &entries)
+            .await
+            .expect("apply must succeed");
+
+    assert_eq!(res.len(), 1, "one entry → one response");
+    let marker: u64 = res[0]
+        .parse()
+        .expect("apply response must be the commit marker, not a constant");
+
+    // WHY the marker is carried rather than reconstructed: after the
+    // data lands, the apply writes its last_applied meta record, and
+    // that commit reserves sequences too (the meta op PLUS its own
+    // marker). So get_seq() ends up MORE than one past the data marker —
+    // marker+2 here — with no concurrency at all. get_seq()-1 would
+    // return the meta op's sequence, not the data marker. Only the
+    // carried marker is correct.
+    assert!(
+        db.get_seq() > marker + 1,
+        "the apply's own meta commit must advance the counter past marker+1; \
+         got {} for marker {} — if this ever equals marker+1, reconstructing \
+         from the counter would silently become correct and this guard is stale",
+        db.get_seq(),
+        marker
+    );
+    assert_ne!(
+        db.get_seq().saturating_sub(1),
+        marker,
+        "get_seq()-1 must NOT equal the data marker — the meta commit shifts it"
+    );
+
+    // The write is nevertheless visible to a snapshot taken AT the
+    // marker — the visibility property the SSI engine depends on.
+    assert_eq!(
+        db.find("m:bulk:1:0", marker).unwrap(),
+        Some("v".into()),
+        "the committed write must be visible at read_seq == marker"
+    );
+    assert_eq!(
+        db.find("m:bulk:1:9", marker).unwrap(),
+        Some("v".into()),
+        "the last op of the entry must be visible at read_seq == marker"
+    );
+    println!("✅ APPLY MARKER: response carried commit seq {marker}");
+}
+
+/// Chunk boundaries must fall BETWEEN entries, never inside one. Two
+/// entries of `6_000` ops each = `12_000` in one apply call, so a flush
+/// is unavoidable before the second entry — and that flush must land at
+/// the entry boundary: one Raft entry is one atomic client write, so a
+/// reader (or a crash) between commits must never see half of entry 2.
+/// Asserting every op of BOTH entries is present after the call guards
+/// the no-`BatchTooLarge`/no-lost-ops property at the straddle point.
+#[tokio::test]
+async fn test_apply_chunks_never_split_an_entry() {
+    let (db, storage, _dir) = create_node("bulk_straddle");
+    // 6_000 + 6_000 = 12_000: the second entry cannot fit alongside the
+    // first in one batch, forcing a flush exactly at the boundary.
+    let entries = vec![bulk_entry(1, 6_000, "x"), bulk_entry(2, 6_000, "y")];
+    let res =
+        openraft::storage::RaftStorage::apply_to_state_machine(&mut storage.clone(), &entries)
+            .await
+            .expect("straddled apply must not hit BatchTooLarge");
+    // Responses are commit markers now (not "OK"): each must parse as a
+    // sequence and they must be non-decreasing across entries.
+    let markers: Vec<u64> = res
+        .iter()
+        .map(|s| {
+            s.parse::<u64>()
+                .expect("apply response must be the entry's commit marker")
+        })
+        .collect();
+    assert!(
+        markers.windows(2).all(|w| w[0] <= w[1]),
+        "commit markers must be non-decreasing across entries: {markers:?}"
+    );
+
+    let seq = db.get_seq();
+    // The FIRST entry's ops all landed.
+    for i in 0..6_000 {
+        assert_eq!(
+            db.find(&format!("x:bulk:1:{i}"), seq).unwrap(),
+            Some("v".into()),
+            "straddled apply lost x:bulk:1:{i}"
+        );
+    }
+    // The SECOND entry applied whole — not partially, which is what a
+    // mid-entry flush boundary would have produced.
+    for i in 0..6_000 {
+        assert_eq!(
+            db.find(&format!("y:bulk:2:{i}"), seq).unwrap(),
+            Some("v".into()),
+            "straddled apply lost y:bulk:2:{i} — entry 2 was split at the chunk boundary"
+        );
+    }
+    assert_eq!(storage.last_applied_index(), 2);
+    println!("✅ ENTRY-ALIGNED CHUNKING: 6_000 + 6_000 ops, flush at the boundary, no entry split");
+}
+
+/// Ops summing to EXACTLY the cap (`6_000` + `4_000` = `10_000`) used to
+/// leave the batch full; the `last_applied` meta record appended
+/// afterwards then hit `BatchTooLarge`, which `save_meta` treats as a
+/// fatal invariant — a panic instead of advancing Raft state. The flush
+/// must keep the batch strictly under the cap so the meta record fits.
+#[tokio::test]
+async fn test_apply_summing_exactly_to_batch_cap_keeps_room_for_meta() {
+    let (db, storage, _dir) = create_node("exact_cap_sum");
+    let entries = vec![bulk_entry(1, 6_000, "s"), bulk_entry(2, 4_000, "t")];
+    let res =
+        openraft::storage::RaftStorage::apply_to_state_machine(&mut storage.clone(), &entries)
+            .await
+            .expect("apply summing to exactly the cap must not panic on the meta record");
+    // Responses are commit markers now (not "OK"): each must parse as a
+    // sequence and they must be non-decreasing across entries.
+    let markers: Vec<u64> = res
+        .iter()
+        .map(|s| {
+            s.parse::<u64>()
+                .expect("apply response must be the entry's commit marker")
+        })
+        .collect();
+    assert!(
+        markers.windows(2).all(|w| w[0] <= w[1]),
+        "commit markers must be non-decreasing across entries: {markers:?}"
+    );
+
+    let seq = db.get_seq();
+    for i in 0..6_000 {
+        assert_eq!(
+            db.find(&format!("s:bulk:1:{i}"), seq).unwrap(),
+            Some("v".into()),
+            "exact-cap apply lost s:bulk:1:{i}"
+        );
+    }
+    for i in 0..4_000 {
+        assert_eq!(
+            db.find(&format!("t:bulk:2:{i}"), seq).unwrap(),
+            Some("v".into()),
+            "exact-cap apply lost t:bulk:2:{i}"
+        );
+    }
+    assert_eq!(storage.last_applied_index(), 2);
+    println!("✅ EXACT-CAP SUM: 6_000 + 4_000 = the cap, meta record still appended without panic");
+}
+
+/// A single entry carrying EXACTLY the cap in ops is reachable (the
+/// client batch allows exactly `MAX_OPS`), and no entry-boundary flush
+/// can prevent the batch from filling to the cap. The meta append must
+/// still not panic.
+#[tokio::test]
+async fn test_apply_single_entry_at_batch_cap_keeps_room_for_meta() {
+    let (db, storage, _dir) = create_node("exact_cap_single");
+    let entries = vec![bulk_entry(1, 10_000, "u")];
+    openraft::storage::RaftStorage::apply_to_state_machine(&mut storage.clone(), &entries)
+        .await
+        .expect("a single at-cap entry must not panic on the meta record");
+
+    let seq = db.get_seq();
+    assert_eq!(
+        db.find("u:bulk:1:0", seq).unwrap(),
+        Some("v".into()),
+        "first op of the at-cap entry missing"
+    );
+    assert_eq!(
+        db.find("u:bulk:1:9999", seq).unwrap(),
+        Some("v".into()),
+        "last op of the at-cap entry missing"
+    );
+    assert_eq!(storage.last_applied_index(), 1);
+    println!("✅ SINGLE AT-CAP ENTRY: 10_000 ops in one entry, meta appended without panic");
+}
+
+/// `purge_logs_upto` across `12_000` log indexes — each purged index is one
+/// delete op, so this is `12_000`+ ops past the cap in ONE call.
+#[tokio::test]
+async fn test_purge_chunks_past_batch_cap() {
+    let (db, storage, _dir) = create_node("bulk_purge");
+    // Stage a long log via the sync helper (raw text entries).
+    for idx in 1..=12_000u64 {
+        storage
+            .append_log(idx, &format!("SET purge_k{idx} v"))
+            .unwrap();
+    }
+    openraft::storage::RaftStorage::purge_logs_upto(
+        &mut storage.clone(),
+        openraft::LogId::new(openraft::CommittedLeaderId::new(1, 1), 12_000),
+    )
+    .await
+    .expect("bulk purge must not hit BatchTooLarge");
+
+    // The log keys are gone and meta's purge point advanced.
+    for probe in [1u64, 5_000, 9_999, 12_000] {
+        assert!(
+            db.find_latest_internal(&format!("__sys__/raft/log/{probe:020}"))
+                .unwrap()
+                .is_none(),
+            "log key {probe} survived the purge"
+        );
+    }
+    println!("✅ CHUNKED PURGE: 12_000 indexes purged in one call — no BatchTooLarge");
+}
+
+/// `append_to_log` during catch-up: 11 entries × `1_100` ops of log DATA
+/// is fine, but the REAL test is many entries at once — 12 entries
+/// staged into one append call (each serialized entry is one set op,
+/// so 12 ops — the cap here guards a big entries `Vec`, same code path).
+#[tokio::test]
+async fn test_append_to_log_chunks_many_entries() {
+    let (_db, storage, _dir) = create_node("bulk_append");
+    let entries: Vec<_> = (1..=12u64).map(|idx| bulk_entry(idx, 1_100, "e")).collect();
+    openraft::storage::RaftStorage::append_to_log(&mut storage.clone(), entries)
+        .await
+        .expect("bulk append must not hit BatchTooLarge");
+    for idx in 1..=12u64 {
+        assert!(
+            storage.read_log(idx).is_some(),
+            "appended entry {idx} missing"
+        );
+    }
+    // Meta followed the batch to the last appended index.
+    let state = openraft::storage::RaftStorage::get_log_state(&mut storage.clone())
+        .await
+        .unwrap();
+    assert_eq!(state.last_log_id.map(|l| l.index), Some(12));
+    println!("✅ CHUNKED APPEND: 12 entries appended in one call, meta current");
+}
+
+/// A snapshot capturing EXACTLY `WriteBatch::MAX_OPS` entries fills the
+/// install batch to the cap; the raft meta record appended afterwards
+/// then needs its reserved slot or the install fails on a VALID
+/// snapshot. Exercises the snapshot twin of the apply exact-cap fix.
+#[tokio::test]
+async fn test_snapshot_install_at_exact_batch_cap() {
+    let (db, storage, _dir) = create_node("snap_cap_source");
+    let (target_db, target, _tdir) = create_node("snap_cap_target");
+
+    // Exactly the cap in user keys (build_snapshot skips __sys__ keys).
+    let mut batch = omni_engine::WriteBatch::new();
+    for i in 0..omni_engine::WriteBatch::MAX_OPS {
+        batch
+            .set(&format!("snapcap:{i}"), "v".to_string())
+            .expect("staging snapshot key");
+    }
+    db.commit_batch(&batch).expect("committing cap-sized data");
+    // build_snapshot requires last_applied to be set.
+    storage.append_log(1, "SET snapcap_sentinel v").unwrap();
+    storage.mark_applied(1).unwrap();
+
+    let mut builder = storage.clone();
+    let snapshot = builder
+        .build_snapshot()
+        .await
+        .expect("building a cap-sized snapshot");
+    let meta = snapshot.meta.clone();
+
+    let mut installer = target.clone();
+    installer
+        .install_snapshot(&meta, snapshot.snapshot)
+        .await
+        .expect("installing a snapshot at exactly the cap must not fail on the meta record");
+
+    let seq = target_db.get_seq();
+    assert_eq!(
+        target_db.find("snapcap:0", seq).unwrap(),
+        Some("v".into()),
+        "first key of the cap-sized snapshot missing"
+    );
+    assert_eq!(
+        target_db
+            .find(
+                &format!("snapcap:{}", omni_engine::WriteBatch::MAX_OPS - 1),
+                seq
+            )
+            .unwrap(),
+        Some("v".into()),
+        "last key of the cap-sized snapshot missing"
+    );
+    println!(
+        "✅ SNAPSHOT AT CAP: {} entries installed without the meta record overflowing",
+        omni_engine::WriteBatch::MAX_OPS
+    );
 }

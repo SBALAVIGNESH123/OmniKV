@@ -4,6 +4,49 @@
 
 ### Added
 
+- Cluster mode is real (issue #113): `OMNIKV_NODE_ID` + `OMNIKV_RAFT_ADDR`
+  boot an actual openraft node, serve consensus RPCs on a dedicated
+  plaintext listener, and route EVERY client write (REST, QUIC, TCP,
+  pgwire SQL, embedded) through Raft consensus before acknowledging it.
+  Previously the banner said "Distributed" while `main.rs` never
+  constructed a Raft node. The cluster gateway serializes each client
+  write behind a single flight lock (validate → propose → local apply →
+  SSI commit record, all gap-free), SSI transactions re-run their full
+  conflict validation under that lock against the live committed
+  history, and the commit record uses a storage sequence number so
+  conflict checks stay in one number space. Writes on followers fail
+  with the current leader's identity in the error. Followers serve
+  local (eventually-consistent) reads; the leader's reads are current
+  because applies complete before acks. Evidence in CI: a multi-process
+  test (`cluster_multiprocess`) spawns three real server processes,
+  elects a leader, replicates a write to all three nodes, hard-kills
+  the leader, and asserts a new leader is elected with zero data loss;
+  `scripts/cluster-compose-smoke.sh` does the same with containers.
+  `docker-compose.yml` now wires a real 3-node Raft cluster, a public
+  `/cluster/status` endpoint reports topology (node
+  id, leader, term, applied index, members), the startup banner is
+  honest (Single-node vs Raft cluster (node N); consensus credit names
+  openraft), the dead pre-cluster forwarding module is removed, and
+  cluster TTL writes replicate as absolute expiries (no per-hop drift).
+  Operating documentation: `docs/cluster.md` (bootstrap, write path,
+  read semantics, failover, known limitations — leader-local SSI
+  history, plaintext peer port, one write in flight, follower read
+  lag).
+
+- Cluster hardening from the PR #127 review (all four findings fixed
+  and regression-tested): consensus now runs on a **dedicated runtime**
+  so concurrent client writes can never starve the openraft tasks that
+  must finish their proposals (the failover test drives 16 concurrent
+  writers through the leader); the **bind/advertise address split**
+  (`OMNIKV_RAFT_ADVERTISE_ADDR`) keeps a wildcard bind from poisoning
+  cluster membership, and the config validator fails closed on an
+  unroutable advertised address; the consensus port is no longer
+  published to the host in either compose file (peer traffic stays on
+  the private network — mTLS remains #125); and the raft storage
+  adapter now **commits in ≤10k-op chunks**, so follower catch-up, log
+  purge, and snapshot install can no longer trip `BatchTooLarge` and
+  stall replication (regression tests drive each path past the cap).
+
 - PgWire now implements the extended query protocol (issue #119): `Parse`,
   `Bind`, `Describe`, `Execute`, `Close`, `Flush`, and `Sync` are answered
   per the PostgreSQL v3 wire contract. DBAPI drivers drive `commit()` and

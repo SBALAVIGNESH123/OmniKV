@@ -427,6 +427,19 @@ impl TransactionManager {
     ///
     /// Returns the commit sequence number on success, or an error if a
     /// write-write conflict is detected (the caller should retry).
+    ///
+    /// Clustered mode: consensus is the commit. The gateway serializes
+    /// validate → propose → local apply → record under its flight lock,
+    /// and the returned number is the commit marker's STORAGE sequence —
+    /// the sequence at which the write became visible. The marker is
+    /// stamped by the state machine during the apply and carried back
+    /// through the proposal's response (see `WriteAck::commit_seq`), never
+    /// reconstructed from `db.get_seq()`: the apply's own meta record, and
+    /// any concurrent purge or snapshot install, reserve from the same
+    /// counter afterwards and would yield a different number. The
+    /// single-node path below gets this same number from commit_batch's
+    /// return value; it is the number space the read_seq the conflict
+    /// checks compare against lives in.
     pub fn commit(&self, txn: &mut Transaction) -> Result<u64, OmniError> {
         if txn.state != TxnState::Active {
             return Err(OmniError::IoError("Transaction is not active".into()));
@@ -453,37 +466,94 @@ impl TransactionManager {
         }
 
         // ═══════════════════════════════════════════════════════════════
-        // SERIALIZATION POINT: acquire striped commit locks
-        //
-        // We compute the set of stripe indices touched by this txn's
-        // write keys + read keys, sort them (deadlock prevention via
-        // lock ordering), and hold all of them during validation+commit.
-        // Non-overlapping transactions proceed fully in parallel.
+        // Clustered: consensus IS the commit — and the SERIALIZATION
+        // POINT moves with it. Everything (stripes, conflict check,
+        // propose, local apply, record) runs inside the gateway's single
+        // flight lock, so no other proposal can land between this
+        // transaction's validation and its commit record — the clustered
+        // counterpart of holding the committed-set lock across
+        // check-and-insert in single-node mode below. Engine locks are
+        // taken and released INSIDE that lock, never held across the
+        // await-able propose, so the global lock order is always
+        // flight → stripes → committed → rw_deps with no cycle.
         // ═══════════════════════════════════════════════════════════════
-        let mut stripe_indices: Vec<usize> = txn
-            .write_set
-            .keys()
-            .chain(txn.read_set.iter())
-            .chain(txn.read_ranges.iter().flat_map(|(s, e)| [s, e]))
-            .map(|k| {
-                let mut h: u64 = 5381;
-                for b in k.bytes() {
-                    h = h.wrapping_mul(33).wrapping_add(b as u64);
-                }
-                (h as usize) % COMMIT_STRIPE_COUNT
-            })
-            .collect();
-        stripe_indices.sort_unstable();
-        stripe_indices.dedup();
+        if let Some(gateway) = self.db.cluster_gateway() {
+            let txn_ref: &Transaction = txn;
+            let outcome = gateway.commit_ssi_blocking(
+                move || {
+                    // Full re-validation under the flight lock, against
+                    // the LIVE committed set: the gateway serializes all
+                    // clustered writers behind this lock, so this check
+                    // sees every commit that landed before ours. Nothing
+                    // here holds a lock across the propose that follows.
+                    let _stripe_guards = self.acquire_commit_stripes(txn_ref);
+                    let committed = self.committed_txns.lock().map_err(|_| {
+                        OmniError::LockPoisoned("committed_txns".into()).to_string()
+                    })?;
+                    if let Some(conflict) = self.ssi_detect_conflicts(txn_ref, &committed) {
+                        return Err(conflict);
+                    }
+                    drop(committed);
+                    Self::build_write_batch(txn_ref).map_err(|e| e.to_string())
+                },
+                move |commit_seq: u64| {
+                    // Post-consensus, still under the flight lock: this is
+                    // the commit marker the state machine stamped for OUR
+                    // entry — carried back through the apply response, not
+                    // the raft log index and not a value reconstructed from
+                    // the global counter afterwards (a concurrent purge or
+                    // snapshot install can shift that counter between the
+                    // apply and any later read). It is the same number the
+                    // single-node path records, in the same space as
+                    // read_seq, so a transaction starting after this commit
+                    // (read_seq == marker) sees it as visible.
+                    let mut committed = self
+                        .committed_txns
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    committed.push(CommittedTxn {
+                        txn_id: txn_ref.id,
+                        commit_seq,
+                        write_keys: txn_ref.write_set.keys().cloned().collect(),
+                        read_keys: txn_ref.read_set.clone(),
+                        read_ranges: txn_ref.read_ranges.clone(),
+                    });
+                    drop(committed);
+                    self.prune_committed_txns();
+                    commit_seq
+                },
+            );
 
-        let _guards: Vec<_> = stripe_indices
-            .iter()
-            .map(|&i| {
-                self.commit_stripes[i]
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-            })
-            .collect();
+            return match outcome {
+                Ok(commit_seq) => {
+                    txn.state = TxnState::Committed;
+                    self.cleanup_txn(txn.id, txn.read_seq);
+                    self.metrics.txns_committed.fetch_add(1, Ordering::Relaxed);
+                    Ok(commit_seq)
+                }
+                Err(msg) => {
+                    txn.state = TxnState::Aborted;
+                    self.cleanup_txn(txn.id, txn.read_seq);
+                    if msg.starts_with("SSI CONFLICT") {
+                        self.metrics
+                            .conflicts_detected
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                    self.metrics.txns_aborted.fetch_add(1, Ordering::Relaxed);
+                    Err(OmniError::IoError(msg))
+                }
+            };
+        }
+
+        // ═══════════════════════════════════════════════════════════════
+        // SERIALIZATION POINT (single-node): acquire striped commit locks
+        //
+        // Sorted stripe indices over the txn's write keys + read keys +
+        // read-range endpoints (deadlock prevention via lock ordering);
+        // held across validation+commit. Non-overlapping transactions
+        // proceed fully in parallel.
+        // ═══════════════════════════════════════════════════════════════
+        let _guards = self.acquire_commit_stripes(txn);
 
         // ═══════════════════════════════════════════════════════════════
         // SSI Conflict Detection with Dangerous Structure Analysis
@@ -498,113 +568,7 @@ impl TransactionManager {
             .lock()
             .map_err(|_| OmniError::LockPoisoned("committed_txns".into()))?;
 
-        let conflict: Option<String> = {
-            let mut rw_deps = self
-                .rw_deps
-                .lock()
-                .map_err(|_| OmniError::LockPoisoned("rw_deps".into()))?;
-
-            let mut found = None;
-            'outer: for committed_txn in committed.iter() {
-                if committed_txn.commit_seq > txn.read_seq {
-                    // Write-write conflict check
-                    for key in txn.write_set.keys() {
-                        if committed_txn.write_keys.contains(key) {
-                            found = Some(format!(
-                                "SSI CONFLICT (WW): key '{}' written by txn {} at seq {}",
-                                key, committed_txn.txn_id, committed_txn.commit_seq
-                            ));
-                            break 'outer;
-                        }
-                    }
-
-                    // Read-write anti-dependency: we read key, they wrote it
-                    // This alone is a conflict — abort (PostgreSQL-compatible)
-                    for key in &txn.read_set {
-                        if committed_txn.write_keys.contains(key) {
-                            rw_deps.push(RWDependency {
-                                from_txn: txn.id,
-                                to_txn: committed_txn.txn_id,
-                            });
-                            found = Some(format!(
-                                "SSI CONFLICT (RW): key '{}' read by us, written by txn {} at seq {}",
-                                key, committed_txn.txn_id, committed_txn.commit_seq
-                            ));
-                            break 'outer;
-                        }
-                    }
-
-                    // Write-read anti-dependency: we wrote key, they read it
-                    for key in txn.write_set.keys() {
-                        if committed_txn.read_keys.contains(key) {
-                            // Record rw-dependency: committed_txn →rw→ txn
-                            rw_deps.push(RWDependency {
-                                from_txn: committed_txn.txn_id,
-                                to_txn: txn.id,
-                            });
-                        }
-                    }
-
-                    // ── Range (predicate) conflicts ─────────────────
-                    // A write they committed inside one of OUR read
-                    // ranges: we scanned the range, they changed it after
-                    // our snapshot — the phantom-write conflict, caught
-                    // at COMMIT. This is the DROP TABLE vs. concurrent
-                    // INSERT race and every seq-scan write-skew.
-                    for key in committed_txn.write_keys.iter() {
-                        for (start, end) in &txn.read_ranges {
-                            if key.as_str() >= start.as_str() && key.as_str() < end.as_str() {
-                                rw_deps.push(RWDependency {
-                                    from_txn: txn.id,
-                                    to_txn: committed_txn.txn_id,
-                                });
-                                found = Some(format!(
-                                    "SSI CONFLICT (RANGE): key '{}' written by txn {} at seq {} inside our read range [{}, {})",
-                                    key, committed_txn.txn_id, committed_txn.commit_seq, start, end
-                                ));
-                                break 'outer;
-                            }
-                        }
-                    }
-
-                    // Our writes inside one of THEIR committed read
-                    // ranges: they scanned the range, we changed it
-                    // after their snapshot — the mirror image, so the
-                    // race cannot slip through by ordering alone.
-                    for key in txn.write_set.keys() {
-                        for (start, end) in &committed_txn.read_ranges {
-                            if key.as_str() >= start.as_str() && key.as_str() < end.as_str() {
-                                rw_deps.push(RWDependency {
-                                    from_txn: committed_txn.txn_id,
-                                    to_txn: txn.id,
-                                });
-                                found = Some(format!(
-                                    "SSI CONFLICT (RANGE): our key '{}' falls in txn {}'s read range [{}, {}] (seq {})",
-                                    key, committed_txn.txn_id, start, end, committed_txn.commit_seq
-                                ));
-                                break 'outer;
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Dangerous structure detection:
-            // If txn has BOTH an incoming AND outgoing rw-dependency,
-            // it's the "pivot" in T1→rw→Txn→rw→T3 — must abort.
-            if found.is_none() {
-                let has_incoming = rw_deps.iter().any(|d| d.to_txn == txn.id);
-                let has_outgoing = rw_deps.iter().any(|d| d.from_txn == txn.id);
-                if has_incoming && has_outgoing {
-                    found = Some(format!(
-                        "SSI CONFLICT (DANGEROUS STRUCTURE): txn {} is pivot in rw-dependency cycle",
-                        txn.id
-                    ));
-                }
-            }
-
-            found
-        }; // rw_deps lock released here, committed_txns still held
+        let conflict: Option<String> = self.ssi_detect_conflicts(txn, &committed);
 
         if let Some(conflict_msg) = conflict {
             drop(committed); // release before cleanup
@@ -617,27 +581,13 @@ impl TransactionManager {
             return Err(OmniError::IoError(conflict_msg));
         }
 
-        // No conflicts! Build and commit the WriteBatch atomically.
-        let mut batch = WriteBatch::new();
-        for (key, (value, ttl)) in &txn.write_set {
-            match value {
-                Some(val) => {
-                    if *ttl > 0 {
-                        batch.set_with_ttl(key, val.clone(), *ttl)?;
-                    } else {
-                        batch.set(key, val.clone())?;
-                    }
-                }
-                None => {
-                    batch.delete(key)?;
-                }
-            }
-        }
-
+        // No conflicts! Build the batch the SSI engine would apply.
+        let batch = Self::build_write_batch(txn)?;
         let commit_seq = self.db.commit_batch(&batch)?;
 
-        // Record this transaction in the committed set — still holding the lock
-        // so no other txn can sneak between our validation and our record.
+        // Record this transaction in the committed set — pushing into
+        // the guard we still hold, so no other txn can sneak between
+        // our validation and our record.
         committed.push(CommittedTxn {
             txn_id: txn.id,
             commit_seq,
@@ -698,6 +648,185 @@ impl TransactionManager {
         self.rw_deps.lock().map(|d| d.len()).unwrap_or(0)
     }
 
+    /// Acquires the striped commit locks covering a transaction's write
+    /// keys, read keys, and read-range endpoints, in sorted order
+    /// (deadlock prevention via lock ordering). The single-node path
+    /// holds them across validate+commit+record; the clustered path
+    /// takes them inside the gateway's flight lock and drops them
+    /// before the propose — they must never be held across an
+    /// await-able call.
+    fn acquire_commit_stripes(&self, txn: &Transaction) -> Vec<std::sync::MutexGuard<'_, ()>> {
+        let mut stripe_indices: Vec<usize> = txn
+            .write_set
+            .keys()
+            .chain(txn.read_set.iter())
+            .chain(txn.read_ranges.iter().flat_map(|(s, e)| [s, e]))
+            .map(|k| Self::stripe_index_for_key(k))
+            .collect();
+        stripe_indices.sort_unstable();
+        stripe_indices.dedup();
+        stripe_indices
+            .iter()
+            .map(|&i| {
+                self.commit_stripes[i]
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+            })
+            .collect()
+    }
+
+    /// The stripe a key belongs to (djb2-style hash). The mapping only
+    /// has to be stable within a process: stripes serialize concurrent
+    /// commits, they persist nothing.
+    fn stripe_index_for_key(key: &str) -> usize {
+        let mut h: u64 = 5381;
+        for b in key.bytes() {
+            h = h.wrapping_mul(33).wrapping_add(b as u64);
+        }
+        (h as usize) % COMMIT_STRIPE_COUNT
+    }
+
+    /// The SSI conflict scan over committed history: write-write,
+    /// read-write anti-dependencies (point and range/predicate), and
+    /// the dangerous-structure pivot check. Soft rw-edges are recorded
+    /// into the dependency graph for later pivot detection. The caller
+    /// holds the serialization point — the committed_txns lock in
+    /// single-node mode, the gateway's flight lock in clustered mode —
+    /// so check-and-record is atomic against other committers, and
+    /// `committed` is always the LIVE set, never a pre-lock snapshot.
+    fn ssi_detect_conflicts(
+        &self,
+        txn: &Transaction,
+        committed: &[CommittedTxn],
+    ) -> Option<String> {
+        // Poison-tolerant like the stripes: rw_deps is append-only, so
+        // a panicked holder never leaves it torn.
+        let mut rw_deps = self.rw_deps.lock().unwrap_or_else(|e| e.into_inner()); // released on return
+
+        let mut found = None;
+        'outer: for committed_txn in committed.iter() {
+            if committed_txn.commit_seq > txn.read_seq {
+                // Write-write conflict check
+                for key in txn.write_set.keys() {
+                    if committed_txn.write_keys.contains(key) {
+                        found = Some(format!(
+                            "SSI CONFLICT (WW): key '{}' written by txn {} at seq {}",
+                            key, committed_txn.txn_id, committed_txn.commit_seq
+                        ));
+                        break 'outer;
+                    }
+                }
+
+                // Read-write anti-dependency: we read key, they wrote it
+                // This alone is a conflict — abort (PostgreSQL-compatible)
+                for key in &txn.read_set {
+                    if committed_txn.write_keys.contains(key) {
+                        rw_deps.push(RWDependency {
+                            from_txn: txn.id,
+                            to_txn: committed_txn.txn_id,
+                        });
+                        found = Some(format!(
+                            "SSI CONFLICT (RW): key '{}' read by us, written by txn {} at seq {}",
+                            key, committed_txn.txn_id, committed_txn.commit_seq
+                        ));
+                        break 'outer;
+                    }
+                }
+
+                // Write-read anti-dependency: we wrote key, they read it
+                for key in txn.write_set.keys() {
+                    if committed_txn.read_keys.contains(key) {
+                        // Record rw-dependency: committed_txn →rw→ txn
+                        rw_deps.push(RWDependency {
+                            from_txn: committed_txn.txn_id,
+                            to_txn: txn.id,
+                        });
+                    }
+                }
+
+                // ── Range (predicate) conflicts ─────────────────
+                // A write they committed inside one of OUR read
+                // ranges: we scanned the range, they changed it after
+                // our snapshot — the phantom-write conflict, caught
+                // at COMMIT. This is the DROP TABLE vs. concurrent
+                // INSERT race and every seq-scan write-skew.
+                for key in committed_txn.write_keys.iter() {
+                    for (start, end) in &txn.read_ranges {
+                        if key.as_str() >= start.as_str() && key.as_str() < end.as_str() {
+                            rw_deps.push(RWDependency {
+                                from_txn: txn.id,
+                                to_txn: committed_txn.txn_id,
+                            });
+                            found = Some(format!(
+                                "SSI CONFLICT (RANGE): key '{}' written by txn {} at seq {} inside our read range [{}, {}]",
+                                key, committed_txn.txn_id, committed_txn.commit_seq, start, end
+                            ));
+                            break 'outer;
+                        }
+                    }
+                }
+
+                // Our writes inside one of THEIR committed read
+                // ranges: they scanned the range, we changed it
+                // after their snapshot — the mirror image, so the
+                // race cannot slip through by ordering alone.
+                for key in txn.write_set.keys() {
+                    for (start, end) in &committed_txn.read_ranges {
+                        if key.as_str() >= start.as_str() && key.as_str() < end.as_str() {
+                            rw_deps.push(RWDependency {
+                                from_txn: committed_txn.txn_id,
+                                to_txn: txn.id,
+                            });
+                            found = Some(format!(
+                                "SSI CONFLICT (RANGE): our key '{}' falls in txn {}'s read range [{}, {}] (seq {})",
+                                key, committed_txn.txn_id, start, end, committed_txn.commit_seq
+                            ));
+                            break 'outer;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Dangerous structure detection:
+        // If txn has BOTH an incoming AND outgoing rw-dependency,
+        // it's the "pivot" in T1→rw→Txn→rw→T3 — must abort.
+        if found.is_none() {
+            let has_incoming = rw_deps.iter().any(|d| d.to_txn == txn.id);
+            let has_outgoing = rw_deps.iter().any(|d| d.from_txn == txn.id);
+            if has_incoming && has_outgoing {
+                found = Some(format!(
+                    "SSI CONFLICT (DANGEROUS STRUCTURE): txn {} is pivot in rw-dependency cycle",
+                    txn.id
+                ));
+            }
+        }
+
+        found
+    }
+
+    /// Builds the atomic WriteBatch from a transaction's buffered
+    /// writes — the unit of apply in single-node mode and the single
+    /// replicated raft entry in clustered mode.
+    fn build_write_batch(txn: &Transaction) -> Result<WriteBatch, OmniError> {
+        let mut batch = WriteBatch::new();
+        for (key, (value, ttl)) in &txn.write_set {
+            match value {
+                Some(val) => {
+                    if *ttl > 0 {
+                        batch.set_with_ttl(key, val.clone(), *ttl)?;
+                    } else {
+                        batch.set(key, val.clone())?;
+                    }
+                }
+                None => {
+                    batch.delete(key)?;
+                }
+            }
+        }
+        Ok(batch)
+    }
+
     /// Removes a transaction from the active set and unregisters its snapshot.
     fn cleanup_txn(&self, txn_id: TxnId, read_seq: u64) {
         let mut active = self.active_txns.lock().expect("active_txns");
@@ -739,5 +868,131 @@ impl TransactionManager {
                 !pruned_txn_ids.contains(&dep.from_txn) && !pruned_txn_ids.contains(&dep.to_txn)
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod commit_seq_number_space {
+    //! Guards the commit-sequence number space that SSI conflict detection
+    //! depends on. The clustered commit path records `db.get_seq() - 1` —
+    //! the commit marker's sequence — so that a transaction started AFTER a
+    //! clustered commit (whose `read_seq` is exactly that marker) sees the
+    //! commit as already visible rather than concurrent. Recording the
+    //! unadjusted `get_seq()` made every clustered commit appear one
+    //! sequence too new and aborted such transactions spuriously.
+
+    use super::{CommittedTxn, Transaction, TransactionManager};
+    use crate::{OmniKV, WriteBatch};
+    use std::collections::HashSet;
+
+    fn temp_db() -> std::sync::Arc<OmniKV> {
+        let dir = tempfile::tempdir().expect("temp dir");
+        OmniKV::open(
+            dir.path()
+                .join("manifest.json")
+                .to_str()
+                .expect("manifest path is utf-8"),
+            dir.path()
+                .join("wal.bin")
+                .to_str()
+                .expect("wal path is utf-8"),
+        )
+        .expect("open db")
+    }
+
+    /// `commit_batch_local` reserves one sequence per op plus a final one
+    /// for the commit marker, and returns the MARKER's sequence. This pins
+    /// that `get_seq()` afterwards is exactly one past it — the identity the
+    /// clustered path relies on when it records `get_seq() - 1`.
+    #[test]
+    fn commit_marker_is_exactly_get_seq_minus_one() {
+        let db = temp_db();
+
+        let mut batch = WriteBatch::new();
+        batch.set("k1", "v1".into()).expect("stage k1");
+        batch.set("k2", "v2".into()).expect("stage k2");
+
+        let marker = db
+            .commit_batch_local(&batch)
+            .expect("commit a two-op batch");
+
+        assert_eq!(
+            db.get_seq(),
+            marker + 1,
+            "get_seq() after commit_batch_local must be exactly one past the marker"
+        );
+        assert_eq!(
+            db.get_seq().saturating_sub(1),
+            marker,
+            "the clustered path's get_seq()-1 must equal the marker the \
+             single-node path records"
+        );
+    }
+
+    /// The observable symptom of the off-by-one: a committed txn whose
+    /// `commit_seq` EQUALS a later txn's `read_seq` is visible to that
+    /// snapshot and must NOT conflict; one higher must. If the clustered
+    /// path ever records the marker-plus-one again, this turns a
+    /// legitimate commit into a spurious abort.
+    #[test]
+    fn committed_at_exactly_read_seq_is_visible_not_a_conflict() {
+        let mgr = TransactionManager::new(temp_db());
+
+        let read_seq = 100;
+        let mut later = Transaction::new(2, read_seq);
+        later.write_set.insert("k".into(), (Some("v2".into()), 0));
+
+        // commit_seq == read_seq: the write is already in our snapshot.
+        let visible = CommittedTxn {
+            txn_id: 1,
+            commit_seq: read_seq,
+            write_keys: ["k".into()].into(),
+            read_keys: HashSet::new(),
+            read_ranges: vec![],
+        };
+        assert!(
+            mgr.ssi_detect_conflicts(&later, std::slice::from_ref(&visible))
+                .is_none(),
+            "commit_seq == read_seq must be visible: recording the marker \
+             keeps a later txn from aborting spuriously"
+        );
+
+        // commit_seq == read_seq + 1: genuinely after our snapshot.
+        let after = CommittedTxn {
+            commit_seq: read_seq + 1,
+            ..visible
+        };
+        assert!(
+            mgr.ssi_detect_conflicts(&later, &[after]).is_some(),
+            "commit_seq == read_seq + 1 must conflict: this is the abort \
+             the off-by-one produced when it should not have"
+        );
+    }
+
+    /// The end-to-end property on the single-node path, which the
+    /// clustered path must match exactly: a transaction started right
+    /// after a commit takes `read_seq` == that commit's marker, so the
+    /// write is visible to it. This is why the clustered path records the
+    /// marker reported by the apply rather than the sequence one past it.
+    #[test]
+    fn next_snapshot_sees_a_just_committed_write() {
+        let mgr = TransactionManager::new(temp_db());
+
+        let mut t1 = mgr.begin();
+        mgr.set(&mut t1, "k", "v1".into()).expect("stage write");
+        let commit_seq = mgr.commit(&mut t1).expect("commit t1");
+
+        // A txn begun immediately after snapshots the marker itself.
+        let mut t2 = mgr.begin();
+        assert_eq!(
+            t2.read_seq, commit_seq,
+            "the next txn's read_seq must equal the commit marker — the \
+             clustered path must record that same number"
+        );
+        assert_eq!(
+            mgr.get(&mut t2, "k").expect("read k"),
+            Some("v1".into()),
+            "a write committed before our snapshot must be visible"
+        );
     }
 }

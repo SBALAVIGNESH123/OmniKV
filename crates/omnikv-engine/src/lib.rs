@@ -101,6 +101,10 @@ pub mod sql_exec;
 #[path = "query/volcano.rs"]
 pub mod volcano;
 
+#[path = "raft/raft_command.rs"]
+pub mod raft_command;
+#[path = "raft/raft_gateway.rs"]
+pub mod raft_gateway;
 #[path = "raft/raft_impl.rs"]
 pub mod raft_impl;
 #[path = "raft/raft_init.rs"]
