@@ -430,12 +430,16 @@ impl TransactionManager {
     ///
     /// Clustered mode: consensus is the commit. The gateway serializes
     /// validate → propose → local apply → record under its flight lock,
-    /// and the returned number is the commit marker's STORAGE sequence
-    /// number — one below db.get_seq() after the local apply, since
-    /// commit_batch_local reserves one sequence per op plus one final
-    /// sequence for the marker. The single-node path below gets this same
-    /// number from commit_batch's return value; it is the number space
-    /// the read_seq the conflict checks compare against lives in.
+    /// and the returned number is the commit marker's STORAGE sequence —
+    /// the sequence at which the write became visible. The marker is
+    /// stamped by the state machine during the apply and carried back
+    /// through the proposal's response (see `WriteAck::commit_seq`), never
+    /// reconstructed from `db.get_seq()`: the apply's own meta record, and
+    /// any concurrent purge or snapshot install, reserve from the same
+    /// counter afterwards and would yield a different number. The
+    /// single-node path below gets this same number from commit_batch's
+    /// return value; it is the number space the read_seq the conflict
+    /// checks compare against lives in.
     pub fn commit(&self, txn: &mut Transaction) -> Result<u64, OmniError> {
         if txn.state != TxnState::Active {
             return Err(OmniError::IoError("Transaction is not active".into()));
