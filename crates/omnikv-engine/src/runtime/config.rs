@@ -485,11 +485,33 @@ impl ServerConfig {
             };
             match advertise.rsplit_once(':') {
                 Some((host, port)) => {
-                    if host.is_empty() || port.parse::<u16>().is_err() {
+                    // Port 0 means "ephemeral" to a BIND, but in an
+                    // ADVERTISED address it tells peers to dial a random
+                    // port — never reachable. Require an explicit port.
+                    if host.is_empty() || port.parse::<u16>().map_or(true, |p| p == 0) {
                         return Err(shape_err());
                     }
                 }
                 None => return Err(shape_err()),
+            }
+        }
+        // Each network address must map to exactly one peer identity:
+        // duplicate peer endpoints (or a peer that duplicates this node's
+        // advertised address) let openraft route several member ids to one
+        // listener, which breaks quorum arithmetic in subtle ways.
+        if let Some(me) = advertised {
+            let mut seen = std::collections::HashSet::new();
+            for peer in &self.raft.peers {
+                if peer == me {
+                    return Err(ConfigError(
+                        "raft peers must not include this node's own advertised address".into(),
+                    ));
+                }
+                if !seen.insert(peer) {
+                    return Err(ConfigError(format!(
+                        "raft peers must be unique (duplicate: {peer})"
+                    )));
+                }
             }
         }
         self.validate_common()?;

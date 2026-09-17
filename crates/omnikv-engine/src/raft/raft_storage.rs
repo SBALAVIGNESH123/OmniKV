@@ -624,6 +624,12 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
                             || cmd.dels.iter().any(|k| k.starts_with("__sys__/raft/"));
                         if system_key || cmd.is_empty() {
                             res.push("ERR".to_string());
+                            // A rejected entry is still DECIDED and applied —
+                            // record the index so openraft advances past it.
+                            // Skipping it would leave the durable applied
+                            // index behind the committed log and stall the
+                            // state machine on this entry forever.
+                            last_applied = Some(entry.log_id);
                             continue;
                         }
                         // Flush at the ENTRY boundary (never mid-command):
@@ -820,6 +826,16 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
         }
 
         // ── Atomically include Raft metadata in the snapshot build ──
+        // If the entries filled the batch to EXACTLY the cap, the meta
+        // set below would hit BatchTooLarge and the snapshot install
+        // would fail. Commit the full data chunk first (same guard as the
+        // apply path): data before pointer.
+        if batch.op_count() >= crate::WriteBatch::MAX_OPS {
+            tmp_db
+                .commit_batch(&batch)
+                .map_err(|e| io_err(&format!("commit snapshot batch: {}", e)))?;
+            batch = crate::WriteBatch::new();
+        }
         let mut meta = self
             .meta
             .lock()

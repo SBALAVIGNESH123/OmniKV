@@ -6,7 +6,7 @@ services:
     image: ${OMNIKV_IMAGE:-omnikv:cluster-smoke}
     container_name: omni-cluster-smoke-node-1
     ports:
-      - "${OMNIKV_TCP_PORT_1:-18080}:8080"
+      - "127.0.0.1:${OMNIKV_TCP_PORT_1:-18080}:8080"
     volumes:
       - omni-cluster-smoke-data-1:/data
     environment: &omni-cluster-smoke-env
@@ -37,7 +37,7 @@ services:
     image: ${OMNIKV_IMAGE:-omnikv:cluster-smoke}
     container_name: omni-cluster-smoke-node-2
     ports:
-      - "${OMNIKV_TCP_PORT_2:-18081}:8080"
+      - "127.0.0.1:${OMNIKV_TCP_PORT_2:-18081}:8080"
     volumes:
       - omni-cluster-smoke-data-2:/data
     environment:
@@ -52,7 +52,7 @@ services:
     image: ${OMNIKV_IMAGE:-omnikv:cluster-smoke}
     container_name: omni-cluster-smoke-node-3
     ports:
-      - "${OMNIKV_TCP_PORT_3:-18082}:8080"
+      - "127.0.0.1:${OMNIKV_TCP_PORT_3:-18082}:8080"
     volumes:
       - omni-cluster-smoke-data-3:/data
     environment:

@@ -48,9 +48,23 @@ fn tcp_cmd(port: u16, cmd: &str) -> Result<String, String> {
     stream
         .write_all(format!("{cmd}\n").as_bytes())
         .map_err(|e| format!("write: {e}"))?;
+    // Read until the terminating newline: a single read() can return a
+    // prefix of the response when it arrives in multiple TCP segments,
+    // and the exact-match assertions would then flake without a product
+    // defect.
+    let mut out = Vec::new();
     let mut buf = [0u8; 4096];
-    let n = stream.read(&mut buf).map_err(|e| format!("read: {e}"))?;
-    Ok(String::from_utf8_lossy(&buf[..n]).trim().to_string())
+    loop {
+        let n = stream.read(&mut buf).map_err(|e| format!("read: {e}"))?;
+        if n == 0 {
+            break;
+        }
+        out.extend_from_slice(&buf[..n]);
+        if out.contains(&b'\n') {
+            break;
+        }
+    }
+    Ok(String::from_utf8_lossy(&out).trim().to_string())
 }
 
 /// A free port for a listener the test will bind later. Racy in theory,

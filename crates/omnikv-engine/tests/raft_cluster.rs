@@ -4160,3 +4160,59 @@ async fn test_append_to_log_chunks_many_entries() {
     assert_eq!(state.last_log_id.map(|l| l.index), Some(12));
     println!("✅ CHUNKED APPEND: 12 entries appended in one call, meta current");
 }
+
+/// A snapshot capturing EXACTLY `WriteBatch::MAX_OPS` entries fills the
+/// install batch to the cap; the raft meta record appended afterwards
+/// then needs its reserved slot or the install fails on a VALID
+/// snapshot. Exercises the snapshot twin of the apply exact-cap fix.
+#[tokio::test]
+async fn test_snapshot_install_at_exact_batch_cap() {
+    let (db, storage, _dir) = create_node("snap_cap_source");
+    let (target_db, target, _tdir) = create_node("snap_cap_target");
+
+    // Exactly the cap in user keys (build_snapshot skips __sys__ keys).
+    let mut batch = omni_engine::WriteBatch::new();
+    for i in 0..omni_engine::WriteBatch::MAX_OPS {
+        batch
+            .set(&format!("snapcap:{i}"), "v".to_string())
+            .expect("staging snapshot key");
+    }
+    db.commit_batch(&batch).expect("committing cap-sized data");
+    // build_snapshot requires last_applied to be set.
+    storage.append_log(1, "SET snapcap_sentinel v").unwrap();
+    storage.mark_applied(1).unwrap();
+
+    let mut builder = storage.clone();
+    let snapshot = builder
+        .build_snapshot()
+        .await
+        .expect("building a cap-sized snapshot");
+    let meta = snapshot.meta.clone();
+
+    let mut installer = target.clone();
+    installer
+        .install_snapshot(&meta, snapshot.snapshot)
+        .await
+        .expect("installing a snapshot at exactly the cap must not fail on the meta record");
+
+    let seq = target_db.get_seq();
+    assert_eq!(
+        target_db.find("snapcap:0", seq).unwrap(),
+        Some("v".into()),
+        "first key of the cap-sized snapshot missing"
+    );
+    assert_eq!(
+        target_db
+            .find(
+                &format!("snapcap:{}", omni_engine::WriteBatch::MAX_OPS - 1),
+                seq
+            )
+            .unwrap(),
+        Some("v".into()),
+        "last key of the cap-sized snapshot missing"
+    );
+    println!(
+        "✅ SNAPSHOT AT CAP: {} entries installed without the meta record overflowing",
+        omni_engine::WriteBatch::MAX_OPS
+    );
+}

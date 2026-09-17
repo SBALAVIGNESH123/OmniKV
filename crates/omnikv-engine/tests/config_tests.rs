@@ -729,3 +729,79 @@ fn test_raft_advertise_env_var_sets_field() {
         },
     );
 }
+
+// ── Peer/address sanity (PR #127 review round 4) ──
+
+#[test]
+fn test_raft_advertise_port_zero_is_refused() {
+    // Port 0 is "ephemeral" to a bind, but advertised it tells peers to
+    // dial a random port — never reachable.
+    let cfg = ServerConfig {
+        raft: omni_engine::config::RaftConfig {
+            node_id: Some(1),
+            raft_addr: Some("127.0.0.1:9090".into()),
+            advertise_addr: Some("omni-node-1:0".into()),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let err = cfg.validate_runtime().unwrap_err();
+    assert!(
+        err.0.contains("advertise_addr"),
+        "port-0 advertise must be rejected: {err}"
+    );
+}
+
+#[test]
+fn test_raft_duplicate_peers_are_refused() {
+    // Two member ids pointing at one address breaks quorum arithmetic.
+    let cfg = ServerConfig {
+        raft: omni_engine::config::RaftConfig {
+            node_id: Some(1),
+            raft_addr: Some("127.0.0.1:9090".into()),
+            peers: vec!["127.0.0.1:9091".into(), "127.0.0.1:9091".into()],
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let err = cfg.validate_runtime().unwrap_err();
+    assert!(
+        err.0.contains("unique"),
+        "duplicate peers must be rejected: {err}"
+    );
+}
+
+#[test]
+fn test_raft_self_in_peers_is_refused() {
+    // A peer list containing this node's own advertised address routes a
+    // member id back to itself.
+    let cfg = ServerConfig {
+        raft: omni_engine::config::RaftConfig {
+            node_id: Some(1),
+            raft_addr: Some("127.0.0.1:9090".into()),
+            peers: vec!["127.0.0.1:9090".into(), "127.0.0.1:9091".into()],
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let err = cfg.validate_runtime().unwrap_err();
+    assert!(
+        err.0.contains("own advertised"),
+        "self-referential peer must be rejected: {err}"
+    );
+}
+
+#[test]
+fn test_raft_distinct_peers_are_accepted() {
+    let cfg = ServerConfig {
+        raft: omni_engine::config::RaftConfig {
+            node_id: Some(1),
+            raft_addr: Some("127.0.0.1:9090".into()),
+            peers: vec!["127.0.0.1:9091".into(), "127.0.0.1:9092".into()],
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    cfg.validate_runtime()
+        .unwrap_or_else(|e| panic!("a clean peer list must validate: {e}"));
+}

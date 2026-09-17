@@ -90,8 +90,12 @@ routes through the **cluster gateway**:
 4. The gateway waits until the entry is applied by the local state
    machine, and the SSI commit record is appended **still under the
    lock**, so the next writer's validation can never miss it.
-5. Only then is the client acknowledged. The ack means: durable on a
-   quorum AND applied everywhere, including on this node.
+5. Only then is the client acknowledged. The ack means: **durable on a
+   quorum and applied on this node (the leader)**. It does NOT mean every
+   follower has applied it yet — followers apply asynchronously and their
+   reads can lag by one replication round (see Read semantics). The
+   entry's atomicity is never in question (one Raft log entry, applied in
+   order everywhere), only the *timing* on followers.
 
 Followers reject client writes with an error naming the current leader
 (`not the leader; the leader is node 1`) — clients reconnect there. The
