@@ -149,11 +149,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Absent, the process stays a fully independent single-node engine
     // and none of the cluster machinery runs.
     //
-    // This runs BEFORE any async work (plain thread, no runtime
-    // context): the openraft node and its consensus listener are
-    // constructed on the gateway's DEDICATED consensus runtime, never
-    // the client-facing server runtime — concurrent client writes can
-    // park server workers, but never starve openraft's tasks.
+    // Called from async main, but the boot hops off the runtime worker
+    // internally (see boot_cluster_node): the openraft node and its
+    // consensus listener are constructed on the gateway's DEDICATED
+    // consensus runtime, never the client-facing server runtime —
+    // concurrent client writes can park server workers, but never
+    // starve openraft's tasks.
     let cluster = raft_node::boot_cluster_node(&cfg, &db)?;
     let cluster_mode = if cluster.is_some() {
         cfg.raft.node_id
