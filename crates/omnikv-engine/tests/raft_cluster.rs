@@ -3969,7 +3969,19 @@ async fn test_apply_to_state_machine_chunks_past_batch_cap() {
         openraft::storage::RaftStorage::apply_to_state_machine(&mut storage.clone(), &entries)
             .await
             .expect("bulk apply must not hit BatchTooLarge");
-    assert_eq!(res, vec!["OK", "OK", "OK"]);
+    // Responses are commit markers now (not "OK"): each must parse as a
+    // sequence and they must be non-decreasing across entries.
+    let markers: Vec<u64> = res
+        .iter()
+        .map(|s| {
+            s.parse::<u64>()
+                .expect("apply response must be the entry's commit marker")
+        })
+        .collect();
+    assert!(
+        markers.windows(2).all(|w| w[0] <= w[1]),
+        "commit markers must be non-decreasing across entries: {markers:?}"
+    );
 
     // Every op landed, and the meta points at the last applied entry.
     let seq = db.get_seq();
@@ -4004,6 +4016,64 @@ async fn test_apply_to_state_machine_chunks_past_batch_cap() {
     println!("✅ CHUNKED APPLY: 13_500 ops in one apply call — no BatchTooLarge, no lost ops");
 }
 
+/// The apply response must be the entry's COMMIT MARKER (a storage
+/// sequence), not "OK". The clustered SSI commit reads this number back
+/// through `client_write`'s response as the transaction's `commit_seq`, so
+/// that a transaction started afterwards (`read_seq` == the marker) sees
+/// the write as visible. If this response ever becomes a non-parseable
+/// constant again, `WriteAck`'s marker parse fails and clustered commits
+/// error out — so this guards the whole contract.
+#[tokio::test]
+async fn test_apply_response_is_the_commit_marker() {
+    let (db, storage, _dir) = create_node("apply_marker");
+    let entries = vec![bulk_entry(1, 10, "m")];
+
+    let res =
+        openraft::storage::RaftStorage::apply_to_state_machine(&mut storage.clone(), &entries)
+            .await
+            .expect("apply must succeed");
+
+    assert_eq!(res.len(), 1, "one entry → one response");
+    let marker: u64 = res[0]
+        .parse()
+        .expect("apply response must be the commit marker, not a constant");
+
+    // WHY the marker is carried rather than reconstructed: after the
+    // data lands, the apply writes its last_applied meta record, and
+    // that commit reserves sequences too (the meta op PLUS its own
+    // marker). So get_seq() ends up MORE than one past the data marker —
+    // marker+2 here — with no concurrency at all. get_seq()-1 would
+    // return the meta op's sequence, not the data marker. Only the
+    // carried marker is correct.
+    assert!(
+        db.get_seq() > marker + 1,
+        "the apply's own meta commit must advance the counter past marker+1; \
+         got {} for marker {} — if this ever equals marker+1, reconstructing \
+         from the counter would silently become correct and this guard is stale",
+        db.get_seq(),
+        marker
+    );
+    assert_ne!(
+        db.get_seq().saturating_sub(1),
+        marker,
+        "get_seq()-1 must NOT equal the data marker — the meta commit shifts it"
+    );
+
+    // The write is nevertheless visible to a snapshot taken AT the
+    // marker — the visibility property the SSI engine depends on.
+    assert_eq!(
+        db.find("m:bulk:1:0", marker).unwrap(),
+        Some("v".into()),
+        "the committed write must be visible at read_seq == marker"
+    );
+    assert_eq!(
+        db.find("m:bulk:1:9", marker).unwrap(),
+        Some("v".into()),
+        "the last op of the entry must be visible at read_seq == marker"
+    );
+    println!("✅ APPLY MARKER: response carried commit seq {marker}");
+}
+
 /// Chunk boundaries must fall BETWEEN entries, never inside one. Two
 /// entries of `6_000` ops each = `12_000` in one apply call, so a flush
 /// is unavoidable before the second entry — and that flush must land at
@@ -4021,7 +4091,19 @@ async fn test_apply_chunks_never_split_an_entry() {
         openraft::storage::RaftStorage::apply_to_state_machine(&mut storage.clone(), &entries)
             .await
             .expect("straddled apply must not hit BatchTooLarge");
-    assert_eq!(res, vec!["OK", "OK"]);
+    // Responses are commit markers now (not "OK"): each must parse as a
+    // sequence and they must be non-decreasing across entries.
+    let markers: Vec<u64> = res
+        .iter()
+        .map(|s| {
+            s.parse::<u64>()
+                .expect("apply response must be the entry's commit marker")
+        })
+        .collect();
+    assert!(
+        markers.windows(2).all(|w| w[0] <= w[1]),
+        "commit markers must be non-decreasing across entries: {markers:?}"
+    );
 
     let seq = db.get_seq();
     // The FIRST entry's ops all landed.
@@ -4058,7 +4140,19 @@ async fn test_apply_summing_exactly_to_batch_cap_keeps_room_for_meta() {
         openraft::storage::RaftStorage::apply_to_state_machine(&mut storage.clone(), &entries)
             .await
             .expect("apply summing to exactly the cap must not panic on the meta record");
-    assert_eq!(res, vec!["OK", "OK"]);
+    // Responses are commit markers now (not "OK"): each must parse as a
+    // sequence and they must be non-decreasing across entries.
+    let markers: Vec<u64> = res
+        .iter()
+        .map(|s| {
+            s.parse::<u64>()
+                .expect("apply response must be the entry's commit marker")
+        })
+        .collect();
+    assert!(
+        markers.windows(2).all(|w| w[0] <= w[1]),
+        "commit markers must be non-decreasing across entries: {markers:?}"
+    );
 
     let seq = db.get_seq();
     for i in 0..6_000 {

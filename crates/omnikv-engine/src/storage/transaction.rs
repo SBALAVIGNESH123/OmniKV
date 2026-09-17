@@ -492,12 +492,17 @@ impl TransactionManager {
                     drop(committed);
                     Self::build_write_batch(txn_ref).map_err(|e| e.to_string())
                 },
-                move |_raft_index| {
-                    // Post-consensus, still under the flight lock: no
-                    // other proposal could have landed between our local
-                    // apply and this record, so this yields exactly OUR
-                    // commit marker — see clustered_commit_seq.
-                    let commit_seq = self.clustered_commit_seq();
+                move |commit_seq: u64| {
+                    // Post-consensus, still under the flight lock: this is
+                    // the commit marker the state machine stamped for OUR
+                    // entry — carried back through the apply response, not
+                    // the raft log index and not a value reconstructed from
+                    // the global counter afterwards (a concurrent purge or
+                    // snapshot install can shift that counter between the
+                    // apply and any later read). It is the same number the
+                    // single-node path records, in the same space as
+                    // read_seq, so a transaction starting after this commit
+                    // (read_seq == marker) sees it as visible.
                     let mut committed = self
                         .committed_txns
                         .lock()
@@ -597,28 +602,6 @@ impl TransactionManager {
         self.metrics.txns_committed.fetch_add(1, Ordering::Relaxed);
 
         Ok(commit_seq)
-    }
-
-    /// The storage sequence a CLUSTERED commit must record in the
-    /// committed set: the COMMIT MARKER's sequence, not the number
-    /// [`OmniKV::get_seq`] returns afterwards.
-    ///
-    /// [`OmniKV::commit_batch_local`] reserves one sequence per op plus
-    /// a final one for the commit marker and returns the marker's
-    /// number, so `get_seq()` immediately after the apply is exactly one
-    /// past it. [`ClusterGateway::commit_ssi_blocking`] holds the flight
-    /// lock across the local apply AND this record, so no other commit
-    /// can land between them and shift the counter; subtracting back
-    /// therefore yields exactly OUR marker.
-    ///
-    /// The single-node path above gets this same number from
-    /// `commit_batch`'s return value. Recording the unadjusted
-    /// `get_seq()` here instead would put the two paths one sequence
-    /// apart, and a transaction started right after this commit — whose
-    /// `read_seq` IS the marker — would see the commit as one sequence
-    /// too new and abort spuriously.
-    fn clustered_commit_seq(&self) -> u64 {
-        self.db.get_seq().saturating_sub(1)
     }
 
     /// ABORT — discards all buffered writes without applying them.
@@ -982,28 +965,30 @@ mod commit_seq_number_space {
         );
     }
 
-    /// The regression guard for the clustered off-by-one itself: right
-    /// after a local apply, `clustered_commit_seq()` must yield the
-    /// commit marker — the same number the single-node path records —
-    /// NOT the sequence one past it. Fails loudly if anyone "simplifies"
-    /// the subtraction away again.
+    /// The end-to-end property on the single-node path, which the
+    /// clustered path must match exactly: a transaction started right
+    /// after a commit takes `read_seq` == that commit's marker, so the
+    /// write is visible to it. This is why the clustered path records the
+    /// marker reported by the apply rather than the sequence one past it.
     #[test]
-    fn clustered_commit_seq_is_the_marker_not_the_seq_after_it() {
-        let db = temp_db();
-        let mgr = TransactionManager::new(db.clone());
+    fn next_snapshot_sees_a_just_committed_write() {
+        let mgr = TransactionManager::new(temp_db());
 
-        let mut batch = WriteBatch::new();
-        batch.set("k", "v".into()).expect("stage k");
-        let marker = db
-            .commit_batch_local(&batch)
-            .expect("commit a one-op batch");
+        let mut t1 = mgr.begin();
+        mgr.set(&mut t1, "k", "v1".into()).expect("stage write");
+        let commit_seq = mgr.commit(&mut t1).expect("commit t1");
 
+        // A txn begun immediately after snapshots the marker itself.
+        let mut t2 = mgr.begin();
         assert_eq!(
-            mgr.clustered_commit_seq(),
-            marker,
-            "clustered commit must record the marker ({}), not the seq after it ({})",
-            marker,
-            marker + 1
+            t2.read_seq, commit_seq,
+            "the next txn's read_seq must equal the commit marker — the \
+             clustered path must record that same number"
+        );
+        assert_eq!(
+            mgr.get(&mut t2, "k").expect("read k"),
+            Some("v1".into()),
+            "a write committed before our snapshot must be visible"
         );
     }
 }

@@ -22,6 +22,12 @@ use crate::raft_impl::OmniRaft;
 pub struct WriteAck {
     /// The log index the command was replicated and applied at.
     pub index: u64,
+    /// The storage commit marker the entry's local apply reported — the
+    /// sequence at which the write became visible. Carried from the
+    /// state-machine apply response so callers never reconstruct it from
+    /// the mutable global counter afterwards (a concurrent purge or
+    /// snapshot install can shift that counter in between).
+    pub commit_seq: u64,
 }
 
 /// The server-wide handle for cluster writes. Cheap to clone via `Arc`.
@@ -108,7 +114,10 @@ impl ClusterGateway {
         if cmd.is_empty() {
             // Nothing to replicate — nothing to ack either. Callers that
             // need read-only round-trip semantics use `probe()`.
-            return Ok(WriteAck { index: 0 });
+            return Ok(WriteAck {
+                index: 0,
+                commit_seq: 0,
+            });
         }
         let resp = self
             .raft
@@ -131,7 +140,18 @@ impl ClusterGateway {
                 .await
                 .map_err(|e| format!("cluster write applied but await failed: {e}"))?;
         }
-        Ok(WriteAck { index })
+        // The state machine reports the commit marker it stamped for this
+        // entry. Parsing it (rather than reading db.get_seq() now) is what
+        // keeps the SSI commit record exact against concurrent bookkeeping
+        // commits — see OmniRaftStorage::apply_to_state_machine.
+        let commit_seq = resp.data.parse::<u64>().map_err(|_| {
+            format!(
+                "apply at index {index} returned no commit marker (got {:?}) — \
+                 the entry was rejected or the response is malformed",
+                resp.data
+            )
+        })?;
+        Ok(WriteAck { index, commit_seq })
     }
 
     /// A quorum round trip that confirms this node is the leader and its
@@ -207,12 +227,14 @@ impl ClusterGateway {
     /// under the flight lock (so no other proposal can land between
     /// its conflict checks and its consensus commit), then proposes the
     /// validated batch as ONE raft entry — the atomicity unit across
-    /// the cluster — and runs `on_committed` with the log index while
-    /// still holding the lock, so the caller's committed-history record
-    /// lands in cluster commit order. `on_committed` returns the
-    /// commit number in the caller's own number space (the SSI engine's
-    /// storage seq — NOT the raft index), which becomes this call's
-    /// result. Called from
+    /// the cluster — and runs `on_committed` with the COMMIT MARKER the
+    /// state machine reported for that entry, while still holding the
+    /// lock, so the caller's committed-history record lands in cluster
+    /// commit order. The marker is the caller's own number space (the
+    /// SSI engine's storage seq — NOT the raft index), and it comes
+    /// straight from the apply rather than the global counter, so a
+    /// concurrent bookkeeping commit cannot shift it. `on_committed`'s
+    /// return becomes this call's result. Called from
     /// [`crate::storage::transaction::TransactionManager::commit`] with
     /// its own locks dropped; consensus may take arbitrarily long.
     pub fn commit_ssi_blocking<F, G>(&self, validate: F, on_committed: G) -> Result<u64, String>
@@ -227,7 +249,7 @@ impl ClusterGateway {
             return Ok(0);
         }
         let ack = self.block_on_ctx(async { self.propose_locked(cmd).await })?;
-        Ok(on_committed(ack.index))
+        Ok(on_committed(ack.commit_seq))
     }
 
     /// Runs `fut` to completion for a blocking caller on the CONSENSUS
