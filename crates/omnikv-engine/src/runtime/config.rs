@@ -477,28 +477,19 @@ impl ServerConfig {
         // pattern: omni-node-1:9090) are valid here — peers resolve them
         // through the compose network.
         if let Some(advertise) = &self.raft.advertise_addr {
-            let shape_err = || {
-                ConfigError(
-                    "raft.advertise_addr must be a valid host:port (OMNIKV_RAFT_ADVERTISE_ADDR)"
-                        .into(),
-                )
-            };
-            match advertise.rsplit_once(':') {
-                Some((host, port)) => {
-                    // Port 0 means "ephemeral" to a BIND, but in an
-                    // ADVERTISED address it tells peers to dial a random
-                    // port — never reachable. Require an explicit port.
-                    if host.is_empty() || port.parse::<u16>().map_or(true, |p| p == 0) {
-                        return Err(shape_err());
-                    }
-                }
-                None => return Err(shape_err()),
-            }
+            validate_raft_endpoint(advertise, "raft.advertise_addr")?;
         }
         // Each network address must map to exactly one peer identity:
         // duplicate peer endpoints (or a peer that duplicates this node's
         // advertised address) let openraft route several member ids to one
         // listener, which breaks quorum arithmetic in subtle ways.
+        //
+        // Every peer is also dialed exactly as written (boot_cluster_node
+        // copies it into openraft::BasicNode.addr and OmniNetwork builds
+        // the RPC URL from it), so a malformed, wildcard, or port-zero
+        // peer is not a typo a operator can recover from later — it is a
+        // member that can never be reached. Validate each one up front,
+        // with the same rules as the advertised address.
         if let Some(me) = advertised {
             let mut seen = std::collections::HashSet::new();
             for peer in &self.raft.peers {
@@ -507,6 +498,7 @@ impl ServerConfig {
                         "raft peers must not include this node's own advertised address".into(),
                     ));
                 }
+                validate_raft_endpoint(peer, "raft peer")?;
                 if !seen.insert(peer) {
                     return Err(ConfigError(format!(
                         "raft peers must be unique (duplicate: {peer})"
@@ -737,6 +729,37 @@ fn validate_addr(name: &str, value: &str) -> Result<(), ConfigError> {
 fn is_wildcard_addr(addr: &str) -> bool {
     addr.parse::<std::net::SocketAddr>()
         .is_ok_and(|sock| sock.ip().is_unspecified())
+}
+
+/// Validates a raft endpoint exactly as it will be dialed: a non-wildcard
+/// `host:port` with a non-empty host and an explicit nonzero port. Hostnames
+/// (the container pattern: `omni-node-1:9090`) are valid — peers resolve them
+/// through the compose network. Applies to both this node's advertised address
+/// and to every peer, since both are copied into cluster membership verbatim.
+fn validate_raft_endpoint(addr: &str, field: &str) -> Result<(), ConfigError> {
+    if is_wildcard_addr(addr) {
+        return Err(ConfigError(format!(
+            "{field} must be routable by peers (got a wildcard: {addr})"
+        )));
+    }
+    match addr.rsplit_once(':') {
+        Some((host, port)) => {
+            // Port 0 means "ephemeral" to a BIND, but in an ADVERTISED or
+            // PEER address it tells the dialer to hit a random port — never
+            // reachable. Require an explicit port.
+            if host.is_empty() || port.parse::<u16>().map_or(true, |p| p == 0) {
+                return Err(ConfigError(format!(
+                    "{field} must be a valid host:port with a nonzero port (got {addr})"
+                )));
+            }
+        }
+        None => {
+            return Err(ConfigError(format!(
+                "{field} must be a valid host:port (got {addr})"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn path_to_string(path: PathBuf) -> Result<String, ConfigError> {

@@ -805,3 +805,80 @@ fn test_raft_distinct_peers_are_accepted() {
     cfg.validate_runtime()
         .unwrap_or_else(|e| panic!("a clean peer list must validate: {e}"));
 }
+
+// ── Peer endpoint shape (PR #127 review round 7) ──
+// A peer is dialed exactly as written, so the same rules as the
+// advertised address apply to it — a malformed peer is a member that can
+// never be reached, not a typo an operator can fix later.
+
+#[test]
+fn test_raft_peer_missing_port_is_refused() {
+    let cfg = ServerConfig {
+        raft: omni_engine::config::RaftConfig {
+            node_id: Some(1),
+            raft_addr: Some("127.0.0.1:9090".into()),
+            peers: vec!["omni-node-2".into()],
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let err = cfg.validate_runtime().unwrap_err();
+    assert!(
+        err.0.contains("host:port"),
+        "a portless peer must be rejected: {err}"
+    );
+}
+
+#[test]
+fn test_raft_peer_port_zero_is_refused() {
+    // Port 0 dials a random port — the member is unreachable.
+    let cfg = ServerConfig {
+        raft: omni_engine::config::RaftConfig {
+            node_id: Some(1),
+            raft_addr: Some("127.0.0.1:9090".into()),
+            peers: vec!["127.0.0.1:0".into()],
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let err = cfg.validate_runtime().unwrap_err();
+    assert!(
+        err.0.contains("nonzero port"),
+        "a port-zero peer must be rejected: {err}"
+    );
+}
+
+#[test]
+fn test_raft_peer_wildcard_is_refused() {
+    // A wildcard peer address resolves to the DIALER itself.
+    let cfg = ServerConfig {
+        raft: omni_engine::config::RaftConfig {
+            node_id: Some(1),
+            raft_addr: Some("127.0.0.1:9090".into()),
+            peers: vec!["0.0.0.0:9091".into()],
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let err = cfg.validate_runtime().unwrap_err();
+    assert!(
+        err.0.contains("routable"),
+        "a wildcard peer must be rejected: {err}"
+    );
+}
+
+#[test]
+fn test_raft_peer_hostname_is_accepted() {
+    // The container pattern: hostnames resolve through the compose network.
+    let cfg = ServerConfig {
+        raft: omni_engine::config::RaftConfig {
+            node_id: Some(1),
+            raft_addr: Some("127.0.0.1:9090".into()),
+            peers: vec!["omni-node-2:9090".into(), "omni-node-3:9090".into()],
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    cfg.validate_runtime()
+        .unwrap_or_else(|e| panic!("hostname peers must validate: {e}"));
+}

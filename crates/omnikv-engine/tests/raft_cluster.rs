@@ -1903,24 +1903,29 @@ fn test_ttl_consistency_across_replicas() {
         }
     }
 
-    // Edge case: write a key with TTL=1 on all nodes simultaneously
+    // Edge case: write a short-TTL key on all nodes simultaneously.
     // All nodes compute expiry from their local clock — since they share
-    // the same system clock in this test, behavior is consistent
+    // the same system clock in this test, behavior is consistent. The
+    // window is 30s, not 1s: this runs under the full parallel workspace
+    // suite, and a 1s TTL can genuinely expire between the write and the
+    // read when the machine is loaded — the DB would be correct and the
+    // assertion wrong. 30s still exercises "short but alive", distinct
+    // from the 3600s key above.
     for db in [&db1, &db2, &db3] {
         let mut batch = omni_engine::WriteBatch::new();
         batch
-            .set_with_ttl("ttl_short_key", "short_value".to_string(), 1)
+            .set_with_ttl("ttl_short_key", "short_value".to_string(), 30)
             .unwrap();
         db.commit_batch(&batch).unwrap();
     }
 
-    // Key should be alive NOW (just written, TTL=1s hasn't elapsed)
+    // Key should be alive NOW (just written, TTL hasn't elapsed)
     for (db, name) in [(&db1, "leader"), (&db2, "follower1"), (&db3, "follower2")] {
         let seq = db.get_seq();
         let val = db.find("ttl_short_key", seq).unwrap();
         assert!(
             val.is_some(),
-            "{name} should see ttl_short_key (just written, TTL=1s)"
+            "{name} should see ttl_short_key (just written, TTL=30s)"
         );
     }
 
