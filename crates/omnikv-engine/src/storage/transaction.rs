@@ -430,10 +430,12 @@ impl TransactionManager {
     ///
     /// Clustered mode: consensus is the commit. The gateway serializes
     /// validate → propose → local apply → record under its flight lock,
-    /// and the returned number is a STORAGE sequence number
-    /// (db.get_seq() after the local apply) — the same number space as
-    /// single-node commits and as the read_seq the conflict checks
-    /// compare against.
+    /// and the returned number is the commit marker's STORAGE sequence
+    /// number — one below db.get_seq() after the local apply, since
+    /// commit_batch_local reserves one sequence per op plus one final
+    /// sequence for the marker. The single-node path below gets this same
+    /// number from commit_batch's return value; it is the number space
+    /// the read_seq the conflict checks compare against lives in.
     pub fn commit(&self, txn: &mut Transaction) -> Result<u64, OmniError> {
         if txn.state != TxnState::Active {
             return Err(OmniError::IoError("Transaction is not active".into()));
@@ -491,13 +493,11 @@ impl TransactionManager {
                     Self::build_write_batch(txn_ref).map_err(|e| e.to_string())
                 },
                 move |_raft_index| {
-                    // Post-consensus, still under the flight lock: the
-                    // local apply just completed, so db.get_seq() is past
-                    // every write in our batch. Recording that STORAGE
-                    // seq (not the raft log index) keeps the committed
-                    // history in the same number space as read_seq — the
-                    // space the conflict checks compare in.
-                    let commit_seq = self.db.get_seq();
+                    // Post-consensus, still under the flight lock: no
+                    // other proposal could have landed between our local
+                    // apply and this record, so this yields exactly OUR
+                    // commit marker — see clustered_commit_seq.
+                    let commit_seq = self.clustered_commit_seq();
                     let mut committed = self
                         .committed_txns
                         .lock()
@@ -597,6 +597,28 @@ impl TransactionManager {
         self.metrics.txns_committed.fetch_add(1, Ordering::Relaxed);
 
         Ok(commit_seq)
+    }
+
+    /// The storage sequence a CLUSTERED commit must record in the
+    /// committed set: the COMMIT MARKER's sequence, not the number
+    /// [`OmniKV::get_seq`] returns afterwards.
+    ///
+    /// [`OmniKV::commit_batch_local`] reserves one sequence per op plus
+    /// a final one for the commit marker and returns the marker's
+    /// number, so `get_seq()` immediately after the apply is exactly one
+    /// past it. [`ClusterGateway::commit_ssi_blocking`] holds the flight
+    /// lock across the local apply AND this record, so no other commit
+    /// can land between them and shift the counter; subtracting back
+    /// therefore yields exactly OUR marker.
+    ///
+    /// The single-node path above gets this same number from
+    /// `commit_batch`'s return value. Recording the unadjusted
+    /// `get_seq()` here instead would put the two paths one sequence
+    /// apart, and a transaction started right after this commit — whose
+    /// `read_seq` IS the marker — would see the commit as one sequence
+    /// too new and abort spuriously.
+    fn clustered_commit_seq(&self) -> u64 {
+        self.db.get_seq().saturating_sub(1)
     }
 
     /// ABORT — discards all buffered writes without applying them.
@@ -859,5 +881,129 @@ impl TransactionManager {
                 !pruned_txn_ids.contains(&dep.from_txn) && !pruned_txn_ids.contains(&dep.to_txn)
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod commit_seq_number_space {
+    //! Guards the commit-sequence number space that SSI conflict detection
+    //! depends on. The clustered commit path records `db.get_seq() - 1` —
+    //! the commit marker's sequence — so that a transaction started AFTER a
+    //! clustered commit (whose `read_seq` is exactly that marker) sees the
+    //! commit as already visible rather than concurrent. Recording the
+    //! unadjusted `get_seq()` made every clustered commit appear one
+    //! sequence too new and aborted such transactions spuriously.
+
+    use super::{CommittedTxn, Transaction, TransactionManager};
+    use crate::{OmniKV, WriteBatch};
+    use std::collections::HashSet;
+
+    fn temp_db() -> std::sync::Arc<OmniKV> {
+        let dir = tempfile::tempdir().expect("temp dir");
+        OmniKV::open(
+            dir.path()
+                .join("manifest.json")
+                .to_str()
+                .expect("manifest path is utf-8"),
+            dir.path()
+                .join("wal.bin")
+                .to_str()
+                .expect("wal path is utf-8"),
+        )
+        .expect("open db")
+    }
+
+    /// `commit_batch_local` reserves one sequence per op plus a final one
+    /// for the commit marker, and returns the MARKER's sequence. This pins
+    /// that `get_seq()` afterwards is exactly one past it — the identity the
+    /// clustered path relies on when it records `get_seq() - 1`.
+    #[test]
+    fn commit_marker_is_exactly_get_seq_minus_one() {
+        let db = temp_db();
+
+        let mut batch = WriteBatch::new();
+        batch.set("k1", "v1".into()).expect("stage k1");
+        batch.set("k2", "v2".into()).expect("stage k2");
+
+        let marker = db
+            .commit_batch_local(&batch)
+            .expect("commit a two-op batch");
+
+        assert_eq!(
+            db.get_seq(),
+            marker + 1,
+            "get_seq() after commit_batch_local must be exactly one past the marker"
+        );
+        assert_eq!(
+            db.get_seq().saturating_sub(1),
+            marker,
+            "the clustered path's get_seq()-1 must equal the marker the \
+             single-node path records"
+        );
+    }
+
+    /// The observable symptom of the off-by-one: a committed txn whose
+    /// `commit_seq` EQUALS a later txn's `read_seq` is visible to that
+    /// snapshot and must NOT conflict; one higher must. If the clustered
+    /// path ever records the marker-plus-one again, this turns a
+    /// legitimate commit into a spurious abort.
+    #[test]
+    fn committed_at_exactly_read_seq_is_visible_not_a_conflict() {
+        let mgr = TransactionManager::new(temp_db());
+
+        let read_seq = 100;
+        let mut later = Transaction::new(2, read_seq);
+        later.write_set.insert("k".into(), (Some("v2".into()), 0));
+
+        // commit_seq == read_seq: the write is already in our snapshot.
+        let visible = CommittedTxn {
+            txn_id: 1,
+            commit_seq: read_seq,
+            write_keys: ["k".into()].into(),
+            read_keys: HashSet::new(),
+            read_ranges: vec![],
+        };
+        assert!(
+            mgr.ssi_detect_conflicts(&later, std::slice::from_ref(&visible))
+                .is_none(),
+            "commit_seq == read_seq must be visible: recording the marker \
+             keeps a later txn from aborting spuriously"
+        );
+
+        // commit_seq == read_seq + 1: genuinely after our snapshot.
+        let after = CommittedTxn {
+            commit_seq: read_seq + 1,
+            ..visible
+        };
+        assert!(
+            mgr.ssi_detect_conflicts(&later, &[after]).is_some(),
+            "commit_seq == read_seq + 1 must conflict: this is the abort \
+             the off-by-one produced when it should not have"
+        );
+    }
+
+    /// The regression guard for the clustered off-by-one itself: right
+    /// after a local apply, `clustered_commit_seq()` must yield the
+    /// commit marker — the same number the single-node path records —
+    /// NOT the sequence one past it. Fails loudly if anyone "simplifies"
+    /// the subtraction away again.
+    #[test]
+    fn clustered_commit_seq_is_the_marker_not_the_seq_after_it() {
+        let db = temp_db();
+        let mgr = TransactionManager::new(db.clone());
+
+        let mut batch = WriteBatch::new();
+        batch.set("k", "v".into()).expect("stage k");
+        let marker = db
+            .commit_batch_local(&batch)
+            .expect("commit a one-op batch");
+
+        assert_eq!(
+            mgr.clustered_commit_seq(),
+            marker,
+            "clustered commit must record the marker ({}), not the seq after it ({})",
+            marker,
+            marker + 1
+        );
     }
 }

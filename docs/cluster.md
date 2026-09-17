@@ -50,9 +50,11 @@ OMNIKV_RAFT_PEERS="node-2.example:9090,node-3.example:9090"
 ```
 
 Node 1 calls openraft's `initialize` with itself plus every peer as
-voters. Nodes 2 and 3 start blank and join the cluster as the leader's
-replication reaches them — the same path openraft learners join through.
-A node that restarts with persisted membership re-joins automatically.
+voters, so nodes 2 and 3 are voters from the outset — they never pass
+through openraft's learner path. They start with an empty log and become
+live members as the leader's replication reaches them (the membership
+entry first, then the log behind it). A node that restarts with
+persisted membership re-joins automatically.
 
 The `docker-compose.yml` demo wires exactly this: all nodes use the
 same internal raft port (9090) on the private compose network, node 1
