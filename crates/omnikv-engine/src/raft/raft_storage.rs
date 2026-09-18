@@ -1,6 +1,7 @@
 use crate::OmniKV;
 use crate::WriteBatch;
 use crate::raft_impl::{OmniNode, TypeConfig};
+use crate::transaction::SsiCommitRecord;
 use openraft::{
     AnyError, Entry, EntryPayload, LogId, OptionalSend, RaftTypeConfig, SnapshotMeta, StorageError,
     StorageIOError, StoredMembership, Vote,
@@ -15,7 +16,15 @@ use std::sync::{Arc, Mutex};
 
 const RAFT_LOG_PREFIX: &str = "__sys__/raft/log/";
 const RAFT_META_KEY: &str = "__sys__/raft/meta";
-const SNAPSHOT_VERSION: u32 = 1;
+/// Bumped to 2 when the SSI committed history (`ssi_history`) joined the
+/// envelope. The version check below REJECTS any mismatch, so a snapshot
+/// written by pre-history code (same version number, no field) must not
+/// slip through: `#[serde(default)]` would turn its absent field into an
+/// EMPTY history, and `install_from` would then wipe the installer's own
+/// history — losing every conflict record for commits the snapshot's data
+/// actually carries. Keeping the version in lockstep with the format means
+/// a legacy snapshot is rejected instead of silently corrupting history.
+const SNAPSHOT_VERSION: u32 = 2;
 
 /// Versioned snapshot envelope — adding version field now prevents future migration pain.
 #[derive(Serialize, Deserialize, Debug)]
@@ -27,6 +36,28 @@ struct SnapshotEnvelope {
     /// Critical: global_seq must be set >= this after install to preserve MVCC ordering.
     max_seq: u64,
     entries: Vec<(String, String)>,
+    /// The committed-transaction history at snapshot time, so a node that
+    /// installs this snapshot keeps detecting conflicts against commits
+    /// that arrived IN the snapshot rather than through log apply. Without
+    /// it, a node promoted after installing a snapshot validates against a
+    /// history missing every commit the snapshot carried. No serde default:
+    /// the version gate in install_snapshot rejects anything older before
+    /// this struct is parsed, so an accepted envelope always carries the
+    /// field and a missing one is a malformed snapshot that must fail
+    /// loudly rather than silently install an empty history.
+    ssi_history: Vec<SsiHistoryEntry>,
+}
+
+/// One committed transaction in a snapshot envelope: the SSI record plus
+/// the marker it was recorded at in the sender's sequence space. The
+/// marker is per-node, but the sender's markers are ≤ `max_seq` and the
+/// installer bumps its own counter past `max_seq`, so the carried values
+/// stay ordered correctly below everything the node writes afterwards.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct SsiHistoryEntry {
+    txn_id: u64,
+    commit_seq: u64,
+    record: crate::transaction::SsiCommitRecord,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
@@ -119,18 +150,24 @@ impl OmniRaftStorage {
 
     /// Record the given index as the last applied log index.
     pub fn mark_applied(&self, index: u64) -> Result<(), crate::OmniError> {
-        let mut meta = self
-            .meta
-            .lock()
-            .expect("RaftStorage meta lock poisoned: fatal invariant");
-        // For the test helper, the exact leader_id is not critical — only the index matters.
-        let leader_id = meta
-            .last_applied
-            .map(|existing| existing.leader_id)
-            .unwrap_or_else(|| openraft::CommittedLeaderId::new(0, 0));
-        meta.last_applied = Some(LogId::new(leader_id, index));
         let mut batch = WriteBatch::new();
-        self.save_meta(&meta, &mut batch);
+        {
+            let mut meta = self
+                .meta
+                .lock()
+                .expect("RaftStorage meta lock poisoned: fatal invariant");
+            // For the test helper, the exact leader_id is not critical — only the index matters.
+            let leader_id = meta
+                .last_applied
+                .map(|existing| existing.leader_id)
+                .unwrap_or_else(|| openraft::CommittedLeaderId::new(0, 0));
+            meta.last_applied = Some(LogId::new(leader_id, index));
+            self.save_meta(&meta, &mut batch);
+        }
+        // The meta guard is dropped BEFORE the commit: commit_batch_local
+        // takes the transition lock, and holding meta across it would
+        // invert the lock order against build_snapshot/install_snapshot
+        // (transition -> meta) and deadlock.
         self.db.commit_batch_local(&batch)?;
         Ok(())
     }
@@ -214,6 +251,49 @@ impl RaftLogReader<TypeConfig> for OmniRaftStorage {
 )]
 impl RaftSnapshotBuilder<TypeConfig> for OmniRaftStorage {
     async fn build_snapshot(&mut self) -> Result<Snapshot<TypeConfig>, StorageError<u64>> {
+        // The history, the sequence counter, and the data entries are read as
+        // ONE atomic group under the EXCLUSIVE transition lock. An apply
+        // publishes a commit's DATA and its history record as a pair (the
+        // apply path holds the SHARED lock across both — see flush_staged),
+        // so the exclusive lock here waits for any in-flight apply to finish
+        // publishing both, and blocks new applies from publishing either,
+        // while these reads happen. Without that, an apply landing between
+        // the reads could put data in the scanned entries but its record in
+        // the history sample — or the reverse — and the snapshot would carry
+        // a data/history pair that never existed together. This is the same
+        // lock install_snapshot already holds for its whole rebuild, so
+        // snapshot capture pays the same writer-freeze cost install already
+        // does, and only when one is actually built.
+        let _exclusive = self
+            .db
+            .transition_guard
+            .write()
+            .map_err(|_| StorageError::IO {
+                source: StorageIOError::new(
+                    openraft::ErrorSubject::Store,
+                    openraft::ErrorVerb::Write,
+                    AnyError::error("transition_guard poisoned"),
+                ),
+            })?;
+
+        // Read the committed history BEFORE the sequence counter. A record's
+        // commit_seq is always ≤ the counter at the moment it was pushed, so
+        // sampling history first and max_seq afterwards guarantees every
+        // carried marker is ≤ max_seq — the invariant the installer relies
+        // on when it bumps its own counter past max_seq to keep the carried
+        // records ordered below its own future commits.
+        let ssi_history: Vec<SsiHistoryEntry> = self
+            .db
+            .ssi_history()
+            .snapshot_entries()
+            .into_iter()
+            .map(|(txn_id, commit_seq, record)| SsiHistoryEntry {
+                txn_id,
+                commit_seq,
+                record,
+            })
+            .collect();
+
         let mut entries = Vec::new();
         let (snap_meta, max_seq) = {
             let m = self
@@ -259,6 +339,7 @@ impl RaftSnapshotBuilder<TypeConfig> for OmniRaftStorage {
             membership: snap_meta.last_membership.clone(),
             max_seq,
             entries,
+            ssi_history,
         };
         let serialized = serde_json::to_vec(&envelope).map_err(|e| StorageError::IO {
             source: StorageIOError::new(
@@ -412,12 +493,16 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
         }
 
         if last_log_id.is_some() {
-            let mut meta = self
-                .meta
-                .lock()
-                .expect("RaftStorage meta lock poisoned: fatal invariant");
-            meta.last_log_id = last_log_id;
-            self.save_meta(&meta, &mut batch);
+            // Scoped: the guard must be released before commit_chunked
+            // takes the transition lock (lock order is transition -> meta).
+            {
+                let mut meta = self
+                    .meta
+                    .lock()
+                    .expect("RaftStorage meta lock poisoned: fatal invariant");
+                meta.last_log_id = last_log_id;
+                self.save_meta(&meta, &mut batch);
+            }
         }
 
         // Tail chunk (never larger than MAX_OPS thanks to the flushes
@@ -590,9 +675,12 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
             ),
         };
         // Slots in `res` for entries whose ops are staged in `batch` but
-        // not yet committed. Their placeholder responses are stamped with
-        // the batch's commit marker when the batch flushes.
-        let mut staged_slots: Vec<usize> = Vec::new();
+        // not yet committed, each paired with the SSI commit record the
+        // command carried (None for plain writes). The placeholder
+        // responses are stamped with the batch's commit marker when the
+        // batch flushes, and the record — if any — is entered into this
+        // node's committed history at that same marker.
+        let mut staged_slots: Vec<(usize, Option<SsiCommitRecord>)> = Vec::new();
         // Flushes the staged batch (if non-empty) and stamps every entry
         // staged in it with the batch's COMMIT MARKER, which the proposer
         // reads back through client_write's response as the sequence its
@@ -606,19 +694,53 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
         // later transaction spuriously. (openraft's StorageError is ~224
         // bytes; mapping it at the call sites keeps this closure cheap and
         // clippy's result_large_err quiet.)
+        //
+        // This is also where a replicated SSI record lands in the node's
+        // own history — the fix for the leader-local history bug (#124).
+        // Recording here, rather than at the COMMIT on the node that ran
+        // it, means a follower promoted after a failover already has
+        // every pre-failover commit in its history when it first leads.
         let flush_staged = |batch: &mut WriteBatch,
-                            slots: &mut Vec<usize>,
+                            slots: &mut Vec<(usize, Option<SsiCommitRecord>)>,
                             res: &mut Vec<String>|
          -> Result<(), crate::OmniError> {
             if batch.is_empty() {
                 return Ok(());
             }
-            let marker = self.db.commit_batch_local(batch)?;
+            // One shared transition lock spans the data commit AND the
+            // history record(s) below, so an apply publishes a commit's data
+            // and its record as an indivisible pair. A concurrent
+            // build_snapshot takes the EXCLUSIVE lock for its capture reads
+            // and so cannot observe the data without the record (or the
+            // reverse); without this span the snapshot could carry a
+            // data/history pair that never existed together. Releasing the
+            // guard before the record — as the plain commit_batch_local
+            // would — is exactly the hole this closes.
+            let _topology_guard = self
+                .db
+                .transition_guard
+                .read()
+                .map_err(|_| crate::OmniError::LockPoisoned("transition_guard".into()))?;
+            let marker = self.db.commit_batch_local_locked(batch)?;
+            let history = self.db.ssi_history();
             // Entries sharing a batch committed atomically at one marker —
             // a transaction whose read_seq equals it sees all of them.
-            for &slot in slots.iter() {
+            for &(slot, ref ssi) in slots.iter() {
                 res[slot] = marker.to_string();
+                // The record's commit_seq is this LOCAL marker by design:
+                // the conflict check compares it against read_seqs taken
+                // from this same node's counter, and the marker is exactly
+                // where the write became visible here. The leader that ran
+                // the COMMIT stamps the same value through the same path —
+                // its own apply — so no record is made twice.
+                if let Some(record) = ssi {
+                    history.record_committed(record.txn_id, marker, record);
+                }
             }
+            // Records below the oldest in-play snapshot can never again
+            // be a conflict; drop them so a node that only ever APPLIES
+            // (never runs a local COMMIT) does not grow without bound.
+            history.prune(self.db.min_active_snapshot());
             slots.clear();
             batch.clear();
             Ok(())
@@ -633,7 +755,7 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
                     // legacy "SET <key> <value>" text form still applies,
                     // so pre-cluster log entries and the storage tests
                     // keep their meaning.
-                    if let Some(cmd) = crate::raft_command::RaftCommand::decode(req) {
+                    if let Some(mut cmd) = crate::raft_command::RaftCommand::decode(req) {
                         let system_key = cmd
                             .sets
                             .iter()
@@ -679,7 +801,7 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
                         // Placeholder: stamped with the batch's commit
                         // marker when it flushes. Empty until then.
                         res.push(String::new());
-                        staged_slots.push(res.len() - 1);
+                        staged_slots.push((res.len() - 1, cmd.ssi.take()));
                     } else if let Some(rest) = req.strip_prefix("SET ") {
                         let parts: Vec<&str> = rest.splitn(2, ' ').collect();
                         if parts.len() == 2 && !parts[0].starts_with("__sys__/raft/") {
@@ -691,7 +813,7 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
                                 .set(parts[0], parts[1].to_string())
                                 .map_err(|e| storage_write_err(&e))?;
                             res.push(String::new());
-                            staged_slots.push(res.len() - 1);
+                            staged_slots.push((res.len() - 1, None));
                         } else {
                             res.push("ERR".to_string());
                         }
@@ -717,17 +839,21 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
         flush_staged(&mut batch, &mut staged_slots, &mut res).map_err(io_err)?;
 
         if last_applied.is_some() || new_membership.is_some() {
-            let mut meta = self
-                .meta
-                .lock()
-                .expect("RaftStorage meta lock poisoned: fatal invariant");
-            if let Some(la) = last_applied {
-                meta.last_applied = Some(la);
+            // Scoped: the guard must be released before the final commit
+            // takes the transition lock (lock order is transition -> meta).
+            {
+                let mut meta = self
+                    .meta
+                    .lock()
+                    .expect("RaftStorage meta lock poisoned: fatal invariant");
+                if let Some(la) = last_applied {
+                    meta.last_applied = Some(la);
+                }
+                if let Some(m) = new_membership {
+                    meta.membership = m;
+                }
+                self.save_meta(&meta, &mut batch);
             }
-            if let Some(m) = new_membership {
-                meta.membership = m;
-            }
-            self.save_meta(&meta, &mut batch);
         }
 
         // Final chunk: the meta record only (user data flushed above).
@@ -765,14 +891,26 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
 
         // ── Deserialize snapshot envelope ──
         let data = snapshot.into_inner();
-        let envelope: SnapshotEnvelope = serde_json::from_slice(&data)
-            .map_err(|e| io_err(&format!("Snapshot deserialize: {}", e)))?;
-        if envelope.version != SNAPSHOT_VERSION {
+        // Check the version BEFORE the full deserialize. A snapshot from
+        // pre-SSI-history code has the same envelope shape MINUS
+        // ssi_history, so the useful error for an operator is the version
+        // mismatch — not a raw "missing field" from the struct parse below,
+        // which is why the field carries no serde default: after this gate
+        // every accepted envelope is version 2 and MUST carry the field, so
+        // anything else is a malformed snapshot that fails loudly here
+        // rather than silently installing an empty history.
+        let version = serde_json::from_slice::<serde_json::Value>(&data)
+            .ok()
+            .and_then(|v| v.get("version").and_then(|f| f.as_u64()))
+            .unwrap_or(u64::MAX);
+        if version != SNAPSHOT_VERSION as u64 {
             return Err(io_err(&format!(
                 "Snapshot version mismatch: expected {}, got {}",
-                SNAPSHOT_VERSION, envelope.version
+                SNAPSHOT_VERSION, version
             )));
         }
+        let envelope: SnapshotEnvelope = serde_json::from_slice(&data)
+            .map_err(|e| io_err(&format!("Snapshot deserialize: {}", e)))?;
 
         // ── Determine paths from current manifest ──
         let manifest_path = self.db.manifest_path.clone();
@@ -1044,6 +1182,21 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
                 .global_seq
                 .store(envelope.max_seq + 1, Ordering::SeqCst);
         }
+
+        // The snapshot replaced the data wholesale, so the committed
+        // history must be replaced too — otherwise a node promoted after
+        // installing it validates against a history missing every commit
+        // the snapshot carried (they never passed through its log apply).
+        // The carried markers are ≤ max_seq, which the bump above keeps
+        // below everything the node writes next, so they stay ordered
+        // correctly against its own future commits.
+        self.db.ssi_history().install_from(
+            envelope
+                .ssi_history
+                .into_iter()
+                .map(|e| (e.txn_id, e.commit_seq, e.record))
+                .collect(),
+        );
 
         // ── Phase I: Release exclusive lock (writers resume on new topology) ──
         drop(_exclusive);

@@ -2734,9 +2734,17 @@ fn test_ssi_no_false_positive() {
     println!("✅ DEADLOCK 9c: Non-conflicting txns both committed, no false positive");
 }
 
-/// Gap #9d: Overlapping txns — T2 reads key that T1 writes concurrently
+/// Gap #9d: Overlapping txns — T2 reads a key that T1 writes concurrently.
+///
+/// This is the rw-antidependency conflict (and the shape of the classic
+/// write-skew): T2 snapshotted `chain_y` before T1 committed a new value
+/// for it, so T2's commit must abort. NOTE: despite an earlier name, this
+/// never exercised the "dangerous structure" pivot check — that check was
+/// unreachable dead code and has been removed; the abort here comes from
+/// the plain RW branch, which is what catches the crossing read/write
+/// pair.
 #[test]
-fn test_ssi_dangerous_structure_chain() {
+fn test_ssi_rw_antidependency_chain() {
     let (db, _, _d) = create_node("ssi_chain");
     let tm = TransactionManager::new(db);
 
@@ -4314,4 +4322,495 @@ async fn test_snapshot_install_at_exact_batch_cap() {
         "✅ SNAPSHOT AT CAP: {} entries installed without the meta record overflowing",
         omni_engine::WriteBatch::MAX_OPS
     );
+}
+
+/// Issue #124: the SSI commit history used to be leader-local.
+///
+/// The committed history that powers serializable conflict detection lived
+/// only in the `TransactionManager` of the node that ran the COMMIT. A
+/// follower that applied a replicated write never recorded the transaction,
+/// so once it was promoted its conflict checks validated against a history
+/// missing every pre-failover commit — a write-write or rw-antidependency
+/// against one of them slipped through.
+///
+/// The fix carries the SSI commit record INSIDE the replicated command, and
+/// the state machine's apply records it in the applying node's own history
+/// at the marker its writes became visible at. This test reproduces the
+/// scenario directly on a follower: T1 begins BEFORE the replicated commit
+/// applies, the entry lands, and T1's later COMMIT must still see the
+/// conflict. Before the record rode in the command, the history was empty
+/// and the conflict was missed.
+#[tokio::test]
+async fn test_ssi_commit_history_converges_across_a_failover() {
+    use omni_engine::raft_command::RaftCommand;
+    use omni_engine::transaction::{SsiCommitRecord, TransactionManager};
+
+    let (db, storage, _dir) = create_node("ssi_failover_node");
+
+    // The local transaction manager a client's session would hold on this
+    // node — the one that will validate T1's commit after promotion.
+    let mgr = TransactionManager::new(db.clone());
+
+    // T1 begins on the follower while it is still a follower: BEGIN and
+    // reads work, writes are buffered until COMMIT. Its read_seq predates
+    // every marker the replicated entry will stamp — the precondition for
+    // a real conflict.
+    let mut t1 = mgr.begin();
+    assert_eq!(mgr.get(&mut t1, "acct:alice").unwrap(), None);
+    mgr.set(&mut t1, "acct:alice", "from_t1".into()).unwrap();
+    let t1_read_seq = t1.read_seq;
+    assert!(
+        t1_read_seq < db.get_seq(),
+        "T1's snapshot must precede the apply"
+    );
+
+    // The LEADER's T2, committed and replicated: the command carries its
+    // SSI record, exactly as `commit_ssi_blocking` builds it.
+    let mut batch = omni_engine::WriteBatch::new();
+    batch.set("acct:alice", "from_t2".into()).unwrap();
+    let cmd = RaftCommand::from_batch_with_ssi(
+        &batch,
+        SsiCommitRecord {
+            txn_id: 99,
+            write_keys: vec!["acct:alice".into()],
+            read_keys: vec![],
+            read_ranges: vec![],
+        },
+    );
+    let entry = openraft::Entry {
+        log_id: openraft::LogId::new(openraft::CommittedLeaderId::new(1, 1), 1),
+        payload: openraft::EntryPayload::Normal(cmd.encode()),
+    };
+    storage
+        .append_log(1, &cmd.encode())
+        .expect("replicate entry");
+    openraft::storage::RaftStorage::apply_to_state_machine(&mut storage.clone(), &[entry])
+        .await
+        .expect("apply the replicated commit");
+
+    // The follower's OWN history now carries T2 — recorded by its apply
+    // path from the record in the command, not by the leader. This is the
+    // assertion that fails before the fix (history stays empty).
+    assert_eq!(
+        db.ssi_history().committed_record_count(),
+        1,
+        "the follower's apply must record the replicated transaction"
+    );
+
+    // The write is durable and visible to a snapshot taken now.
+    assert_eq!(
+        db.find("acct:alice", db.get_seq()).unwrap(),
+        Some("from_t2".into()),
+        "the replicated write must be applied"
+    );
+
+    // The conflict: T1's snapshot predates T2's marker and both write the
+    // same key. The check must fire — before #124's fix it found no record
+    // to conflict against and T1 would silently commit over T2.
+    let err = mgr
+        .commit(&mut t1)
+        .expect_err("T1 must abort: T2's record is in the history");
+    assert!(
+        err.to_string().contains("SSI CONFLICT (WW)"),
+        "expected a write-write conflict, got: {err}"
+    );
+
+    // Negative control — the record is at the RIGHT sequence, not spuriously
+    // too new: a transaction begun AFTER the apply sees T2's write as
+    // already-committed and commits cleanly.
+    let mut t3 = mgr.begin();
+    assert_eq!(
+        mgr.get(&mut t3, "acct:alice").unwrap(),
+        Some("from_t2".into()),
+        "a snapshot after the apply must see T2's write"
+    );
+    mgr.set(&mut t3, "acct:bob", "from_t3".into()).unwrap();
+    mgr.commit(&mut t3)
+        .expect("T3 commits: T2 is visible to it");
+
+    println!(
+        "✅ #124: a replicated SSI record lands in the follower's own history and still catches a write-write conflict after promotion"
+    );
+}
+
+/// Review fix (P1): the history lock must span validation AND the commit
+/// record. The commit stripes hash only the range ENDPOINTS, so two
+/// transactions scanning overlapping ranges with different endpoints land
+/// in DISJOINT stripes and run truly in parallel — nothing else serializes
+/// them. If the history lock is released between validation and the record
+/// insertion, each validates against a history missing the other, both
+/// commit, and each wrote inside a range the other scanned: a real
+/// serializability violation. The guard returned by
+/// `detect_conflicts_locked` spans the batch commit, so whichever commits
+/// second always sees the first's record and aborts.
+///
+/// The barrier is load-bearing: both transactions must provably BEGIN and
+/// stage their write before either commits, so both snapshots predate both
+/// commits. Without it the threads can simply run one-after-the-other,
+/// which is a legal serializable interleaving and would let the test pass
+/// even with the lock broken.
+#[test]
+fn test_ssi_range_scan_race_is_closed() {
+    use std::sync::{Arc, Barrier};
+
+    let run = |tag: &str| -> (bool, bool) {
+        let (db, _, _d) = create_node(tag);
+        let tm = Arc::new(TransactionManager::new(db));
+        let tm2 = tm.clone();
+        let barrier = Arc::new(Barrier::new(2));
+        let barrier2 = barrier.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        let handle = std::thread::spawn(move || {
+            // A scans [a, z) — a predicate lock over the whole keyspace —
+            // and writes inside B's scan range.
+            let mut a = tm2.begin();
+            a.read_ranges.push(("range:a".into(), "range:z".into()));
+            tm2.set(&mut a, "range:m", "from_a".into()).unwrap();
+            // Both begun and staged; now race to commit.
+            barrier2.wait();
+            let r = tm2.commit(&mut a);
+            let _ = tx.send(r);
+        });
+
+        // B scans [f, p) and writes inside A's scan range.
+        let mut b = tm.begin();
+        b.read_ranges.push(("range:f".into(), "range:p".into()));
+        tm.set(&mut b, "range:g", "from_b".into()).unwrap();
+        barrier.wait();
+        let b_result = tm.commit(&mut b);
+        let a_result = rx.recv().expect("worker thread panicked");
+        handle.join().expect("worker thread panicked");
+        (a_result.is_ok(), b_result.is_ok())
+    };
+
+    // One shot, so a failure is easy to read.
+    let (a_ok, b_ok) = run("ssi_range_race");
+    assert!(
+        !(a_ok && b_ok),
+        "both range-scanning txns committed — the history lock did not \
+         span validation and record, a serializability violation"
+    );
+
+    // The window is narrow and timing-dependent, so a single shot can pass
+    // by luck. Repeat enough to make a broken lock reliably visible.
+    let mut both = 0;
+    for i in 0..200 {
+        let (a_ok, b_ok) = run(&format!("ssi_range_race_{i}"));
+        if a_ok && b_ok {
+            both += 1;
+        }
+    }
+    assert_eq!(
+        both, 0,
+        "the race window was hit {both}/200 times — overlapping range txns \
+         must never both commit"
+    );
+
+    println!("✅ Range-scan race closed: overlapping range txns cannot both commit");
+}
+
+/// Review fix: a snapshot must carry the committed history, or a node that
+/// installs one is promoted with a history missing every commit the
+/// snapshot delivered.
+///
+/// Those commits never passed through the installer's log-apply path (the
+/// path that records SSI history), so without carrying the history in the
+/// envelope the promoted node misses conflicts against them.
+#[tokio::test]
+async fn test_snapshot_carries_ssi_history() {
+    use omni_engine::transaction::TransactionManager;
+    use openraft::storage::RaftSnapshotBuilder;
+
+    let (leader_db, leader, _leader_dir) = create_node("ssi_snap_leader");
+    let (follower_db, follower, _follower_dir) = create_node("ssi_snap_follower");
+
+    // Give the state machine applied entries so build_snapshot has a
+    // last_applied to snapshot from.
+    for i in 1..=5 {
+        leader
+            .append_log(i, &format!("SET snap_base_k{i} snap_base_v{i}"))
+            .unwrap();
+    }
+    apply_range(&leader, 1, 6);
+
+    // A transaction that writes a key — the record a later conflict check
+    // needs to see.
+    let leader_tm = TransactionManager::new(leader_db.clone());
+    let mut t = leader_tm.begin();
+    leader_tm.set(&mut t, "snap_k", "snap_v".into()).unwrap();
+    let commit_seq = leader_tm.commit(&mut t).unwrap();
+    assert!(
+        commit_seq > 0,
+        "the committed txn must have recorded a marker"
+    );
+    assert_eq!(
+        leader_db.ssi_history().committed_record_count(),
+        1,
+        "the leader recorded its own commit"
+    );
+
+    // The follower has NOT applied anything — its history is empty, as it
+    // would be before catching up.
+    assert_eq!(
+        follower_db.ssi_history().committed_record_count(),
+        0,
+        "the follower starts with no history"
+    );
+
+    // Leader snapshots (carrying the history), follower installs.
+    let mut builder = leader.clone();
+    let snapshot = builder.build_snapshot().await.unwrap();
+    let mut installer = follower.clone();
+    installer
+        .install_snapshot(&snapshot.meta, snapshot.snapshot)
+        .await
+        .unwrap();
+
+    // The follower's history now holds the leader's committed transaction,
+    // stamped below its own post-install counter. This is what lets a
+    // promoted follower detect a conflict against a commit that arrived
+    // in the snapshot rather than through its log.
+    let count = follower_db.ssi_history().committed_record_count();
+    assert_eq!(
+        count, 1,
+        "the installed snapshot must carry the committed history, got {count}"
+    );
+
+    // And the carried marker stays below the follower's bumped counter, so
+    // it orders correctly against the node's own future commits.
+    assert!(
+        commit_seq < follower_db.get_seq(),
+        "the carried commit marker must sit below the post-install counter"
+    );
+
+    println!("✅ Snapshot install carries the SSI committed history");
+}
+
+/// Review fix (P1): the scenario the snapshot gap actually breaks. A
+/// follower BEGINS a transaction (`read_seq` = 1, predating everything),
+/// then installs a snapshot that carries a committed write INSIDE that
+/// transaction's read range. The commit arrived by snapshot, never
+/// through the follower's log-apply path — so unless the snapshot also
+/// carries the history, the promoted node's history has no record of it
+/// and the transaction commits against data its snapshot predates: a
+/// serializability violation.
+#[tokio::test]
+async fn test_snapshot_history_catches_post_install_conflict() {
+    use omni_engine::transaction::TransactionManager;
+    use openraft::storage::RaftSnapshotBuilder;
+
+    let (leader_db, leader, _leader_dir) = create_node("ssi_snap_conflict_leader");
+    let (follower_db, follower, _follower_dir) = create_node("ssi_snap_conflict_follower");
+
+    // Applied entries so the state machine is non-empty and can snapshot.
+    for i in 1..=5 {
+        leader
+            .append_log(i, &format!("SET snap_c_base_k{i} snap_c_base_v{i}"))
+            .unwrap();
+    }
+    apply_range(&leader, 1, 6);
+
+    // The follower has an OPEN transaction scanning [range:f, range:p)
+    // BEFORE the snapshot exists. Its read_seq is the follower's own
+    // counter, still 1 on an empty state machine.
+    let follower_tm = TransactionManager::new(follower_db.clone());
+    let mut open_txn = follower_tm.begin();
+    open_txn
+        .read_ranges
+        .push(("range:f".into(), "range:p".into()));
+    // A write of its own, outside the leader's key: the transaction must
+    // not be read-only (a read-only txn is never aborted, PostgreSQL
+    // style), and this key contributes nothing to the conflict itself.
+    follower_tm
+        .set(&mut open_txn, "range:own", "from_follower".into())
+        .unwrap();
+    assert_eq!(
+        follower_db.get_seq(),
+        1,
+        "the follower's counter must still be at the floor"
+    );
+
+    // The leader commits a write inside that range.
+    let leader_tm = TransactionManager::new(leader_db.clone());
+    let mut t = leader_tm.begin();
+    leader_tm
+        .set(&mut t, "range:m", "from_leader".into())
+        .unwrap();
+    leader_tm.commit(&mut t).expect("leader commits");
+
+    // The follower installs a snapshot carrying both the write and, with
+    // the fix, the history record for it.
+    let mut builder = leader.clone();
+    let snapshot = builder.build_snapshot().await.unwrap();
+    let mut installer = follower.clone();
+    installer
+        .install_snapshot(&snapshot.meta, snapshot.snapshot)
+        .await
+        .unwrap();
+
+    // The write is now in the follower's data...
+    let mut reader = follower_tm.begin();
+    assert_eq!(
+        follower_tm.get(&mut reader, "range:m").unwrap(),
+        Some("from_leader".into()),
+        "the snapshot delivered the leader's write"
+    );
+    drop(reader);
+    // ...and the open transaction's snapshot still predates it, so its
+    // commit MUST be rejected rather than silently accepted.
+    let result = follower_tm.commit(&mut open_txn);
+    let err = result.expect_err(
+        "the open txn must abort: the snapshot carried a write inside its \
+         read range, and its snapshot predates it",
+    );
+    assert!(
+        err.to_string().contains("SSI CONFLICT"),
+        "expected an SSI conflict, got: {err}"
+    );
+
+    println!("✅ Post-install conflict caught against history delivered by snapshot");
+}
+
+/// Review fix: a snapshot written by pre-SSI-history code has the same
+/// envelope version the old code used but no `ssi_history` field. Before
+/// the version was bumped in lockstep with the format, `#[serde(default)]`
+/// turned that absent field into an EMPTY history and `install_snapshot`
+/// then REPLACED the node's own history with it — silently discarding
+/// every conflict record for commits the snapshot's data actually carried.
+/// The version check must reject such a snapshot outright.
+#[tokio::test]
+async fn test_legacy_snapshot_is_rejected_not_history_wiping() {
+    use omni_engine::transaction::TransactionManager;
+    use openraft::storage::RaftSnapshotBuilder;
+
+    let (leader_db, leader, _leader_dir) = create_node("ssi_legacy_snap_leader");
+    let (follower_db, follower, _follower_dir) = create_node("ssi_legacy_snap_follower");
+
+    // Applied entries so the state machine is non-empty and can snapshot.
+    for i in 1..=5 {
+        leader
+            .append_log(i, &format!("SET legacy_base_k{i} legacy_base_v{i}"))
+            .unwrap();
+    }
+    apply_range(&leader, 1, 6);
+
+    // A committed transaction on BOTH nodes — the record a legacy install
+    // would destroy on the follower.
+    let leader_tm = TransactionManager::new(leader_db.clone());
+    let mut t = leader_tm.begin();
+    leader_tm
+        .set(&mut t, "legacy_k", "legacy_v".into())
+        .unwrap();
+    leader_tm.commit(&mut t).unwrap();
+
+    let follower_tm = TransactionManager::new(follower_db.clone());
+    let mut f = follower_tm.begin();
+    follower_tm
+        .set(&mut f, "legacy_k", "legacy_v".into())
+        .unwrap();
+    follower_tm.commit(&mut f).unwrap();
+    assert_eq!(
+        follower_db.ssi_history().committed_record_count(),
+        1,
+        "the follower has its own committed record"
+    );
+
+    // Build a current-format snapshot, then rewrite it into the LEGACY
+    // shape: the version the pre-history code wrote, and no ssi_history
+    // field at all.
+    let mut builder = leader.clone();
+    let snapshot = builder.build_snapshot().await.unwrap();
+    let mut json: serde_json::Value =
+        serde_json::from_slice(&snapshot.snapshot.into_inner()).unwrap();
+    json["version"] = serde_json::json!(1);
+    json.as_object_mut()
+        .expect("snapshot envelope is a JSON object")
+        .remove("ssi_history");
+    let legacy_bytes = serde_json::to_vec(&json).unwrap();
+
+    let mut installer = follower.clone();
+    let result = installer
+        .install_snapshot(&snapshot.meta, Box::new(std::io::Cursor::new(legacy_bytes)))
+        .await;
+
+    assert!(
+        result.is_err(),
+        "a legacy-format snapshot must be rejected, not installed"
+    );
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.contains("ersion"),
+        "expected a version-mismatch error, got: {err}"
+    );
+
+    // The rejection must have left the node's history intact — not wiped
+    // it with a default-empty one.
+    assert_eq!(
+        follower_db.ssi_history().committed_record_count(),
+        1,
+        "a rejected legacy snapshot must not have wiped the node's history"
+    );
+
+    println!("✅ Legacy-format snapshot rejected without wiping history");
+}
+
+/// Review fix: a version-2 envelope that is MISSING `ssi_history` is
+/// malformed, not a legacy snapshot — the field is mandatory at this
+/// version. It must be rejected rather than deserialized to an empty
+/// history that then silently wipes the installer's own records.
+#[tokio::test]
+async fn test_v2_snapshot_missing_history_field_is_rejected() {
+    use omni_engine::transaction::TransactionManager;
+    use openraft::storage::RaftSnapshotBuilder;
+
+    let (leader_db, leader, _leader_dir) = create_node("ssi_v2_missing_leader");
+    let (follower_db, follower, _follower_dir) = create_node("ssi_v2_missing_follower");
+
+    for i in 1..=5 {
+        leader
+            .append_log(i, &format!("SET v2miss_base_k{i} v2miss_base_v{i}"))
+            .unwrap();
+    }
+    apply_range(&leader, 1, 6);
+
+    // The follower has a committed record that a bad install would destroy.
+    let follower_tm = TransactionManager::new(follower_db.clone());
+    let mut f = follower_tm.begin();
+    follower_tm
+        .set(&mut f, "v2miss_k", "v2miss_v".into())
+        .unwrap();
+    follower_tm.commit(&mut f).unwrap();
+    assert_eq!(follower_db.ssi_history().committed_record_count(), 1);
+    let _ = leader_db;
+
+    // Current version, but the history field stripped — malformed.
+    let mut builder = leader.clone();
+    let snapshot = builder.build_snapshot().await.unwrap();
+    let mut json: serde_json::Value =
+        serde_json::from_slice(&snapshot.snapshot.into_inner()).unwrap();
+    assert_eq!(json["version"], 2, "a current snapshot is version 2");
+    json.as_object_mut()
+        .expect("snapshot envelope is a JSON object")
+        .remove("ssi_history");
+    let malformed = serde_json::to_vec(&json).unwrap();
+
+    let mut installer = follower.clone();
+    let result = installer
+        .install_snapshot(&snapshot.meta, Box::new(std::io::Cursor::new(malformed)))
+        .await;
+
+    assert!(
+        result.is_err(),
+        "a version-2 envelope missing ssi_history must be rejected"
+    );
+
+    // The rejection must not have wiped the node's history.
+    assert_eq!(
+        follower_db.ssi_history().committed_record_count(),
+        1,
+        "a rejected malformed snapshot must not wipe the node's history"
+    );
+
+    println!("✅ Malformed v2 snapshot (missing history) rejected");
 }

@@ -1097,6 +1097,17 @@ pub struct OmniKV {
     pub(crate) cluster_gateway:
         std::sync::OnceLock<std::sync::Arc<crate::raft_gateway::ClusterGateway>>,
 
+    /// The SSI committed-transaction history. Created eagerly (not a
+    /// OnceLock) because BOTH transaction paths need it from the first
+    /// moment they can run: the leader's [`TransactionManager::commit`]
+    /// records locally-committed transactions here, and the raft state
+    /// machine's apply path records the [`SsiCommitRecord`] carried inside
+    /// each replicated command — including on a follower that has not yet
+    /// (and may never) run a local COMMIT. Sharing one store at the db
+    /// level is what makes the two converge; see
+    /// [`crate::transaction::SsiHistory`].
+    pub(crate) ssi_history: std::sync::Arc<crate::transaction::SsiHistory>,
+
     // Must be declared last: Rust drops struct fields in declaration order, so
     // all mmap-bearing roots and files are released before the database LOCK
     // file is unlocked and closed.
@@ -1125,6 +1136,16 @@ impl OmniKV {
     /// to reach the gateway without re-cloning the OnceLock contents.
     pub fn cluster_gateway(&self) -> Option<std::sync::Arc<crate::raft_gateway::ClusterGateway>> {
         self.cluster_gateway.get().cloned()
+    }
+
+    /// The SSI committed-transaction history shared by the transaction
+    /// manager (recording locally-committed transactions) and the raft
+    /// state machine apply path (recording replicated
+    /// [`crate::raft_command::SsiCommitRecord`]s). Both must land in the
+    /// same store or a node promoted after a failover validates new
+    /// transactions against a history missing the old leader's commits.
+    pub fn ssi_history(&self) -> std::sync::Arc<crate::transaction::SsiHistory> {
+        self.ssi_history.clone()
     }
 
     /// Opens an OmniKV database from the given manifest and WAL paths.
@@ -1164,6 +1185,7 @@ impl OmniKV {
             group_commit: crate::hardening::GroupCommitEngine::new(200),
             transition_guard: RwLock::new(()),
             cluster_gateway: std::sync::OnceLock::new(),
+            ssi_history: std::sync::Arc::new(crate::transaction::SsiHistory::default()),
             db_lock,
         }))
     }
@@ -1660,13 +1682,23 @@ impl OmniKV {
     /// itself when it applies entries: raft's own bookkeeping must
     /// never route back through the cluster gateway.
     pub(crate) fn commit_batch_local(&self, tx: &WriteBatch) -> Result<u64, OmniError> {
-        // Acquire shared topology lock — blocks only during exclusive snapshot install.
-        // Thousands of concurrent writers can hold this simultaneously.
+        // Acquire shared topology lock — blocks only during an exclusive
+        // snapshot install or a build_snapshot's capture window. Thousands
+        // of concurrent writers can hold this simultaneously.
         let _topology_guard = self
             .transition_guard
             .read()
             .map_err(|_| OmniError::LockPoisoned("transition_guard".into()))?;
+        self.commit_batch_local_locked(tx)
+    }
 
+    /// The commit body for a caller that ALREADY holds the transition guard's
+    /// read lock. The raft apply path uses this so it can keep that ONE lock
+    /// across both the data commit AND the SSI history record that describes
+    /// it: a snapshot built concurrently must never capture the data with its
+    /// record missing (or the reverse), and pairing them under the shared lock
+    /// is what matches build_snapshot's exclusive capture window.
+    pub(crate) fn commit_batch_local_locked(&self, tx: &WriteBatch) -> Result<u64, OmniError> {
         let start_time = std::time::Instant::now();
 
         // Write Backpressure: If L0 SSTables exceed threshold, wait for compaction

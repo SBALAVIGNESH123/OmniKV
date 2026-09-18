@@ -104,6 +104,34 @@ impl Transaction {
     }
 }
 
+/// The SSI commit record carried INSIDE a replicated [`RaftCommand`] so
+/// that every node's apply path can record the transaction in its own
+/// committed history. Without this, the history that powers serializable
+/// conflict detection exists only on the leader that ran the COMMIT: a
+/// transaction that began before a failover and commits after it would
+/// validate against a history missing the old leader's records, and a
+/// write-write or rw anti-dependency against a pre-failover commit would
+/// slip through. Carrying the record in the command makes the history
+/// converge on all nodes. The storage-space `commit_seq` is NOT carried:
+/// it is per-node (each node's sequence counter is its own), so the apply
+/// records it locally — see [`SsiHistory::record_committed`].
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SsiCommitRecord {
+    /// The transaction ID (leader-local, but unique enough for the
+    /// history's purpose: conflict detection only compares records
+    /// against each other within one node's history).
+    pub txn_id: TxnId,
+    /// Keys written by this transaction.
+    pub write_keys: Vec<String>,
+    /// Keys read by this transaction.
+    pub read_keys: Vec<String>,
+    /// Ranges (start, end) scanned by this transaction — its predicate
+    /// locks, kept in the committed history so transactions that write
+    /// inside a range scanned by an EARLIER committed transaction can
+    /// be caught at their own COMMIT.
+    pub read_ranges: Vec<(String, String)>,
+}
+
 /// Record of a committed transaction, used for conflict detection.
 #[derive(Debug, Clone)]
 struct CommittedTxn {
@@ -122,12 +150,31 @@ struct CommittedTxn {
     read_ranges: Vec<(String, String)>,
 }
 
-/// RW-dependency edge: T_from read a key that T_to later wrote.
-/// PostgreSQL calls these "rw-antidependencies" or "SIREAD locks".
-#[derive(Debug, Clone)]
-struct RWDependency {
-    from_txn: TxnId,
-    to_txn: TxnId,
+impl From<&CommittedTxn> for SsiCommitRecord {
+    fn from(txn: &CommittedTxn) -> Self {
+        Self {
+            txn_id: txn.txn_id,
+            // Sets are unordered; the order here is irrelevant because
+            // the receiver rebuilds them into sets.
+            write_keys: txn.write_keys.iter().cloned().collect(),
+            read_keys: txn.read_keys.iter().cloned().collect(),
+            read_ranges: txn.read_ranges.clone(),
+        }
+    }
+}
+
+impl SsiCommitRecord {
+    /// Builds the record from a live transaction at COMMIT time — the
+    /// shape that travels inside the replicated command so every node's
+    /// apply can record it locally.
+    pub fn from_committed_view(txn: &Transaction) -> Self {
+        Self {
+            txn_id: txn.id,
+            write_keys: txn.write_set.keys().cloned().collect(),
+            read_keys: txn.read_set.iter().cloned().collect(),
+            read_ranges: txn.read_ranges.clone(),
+        }
+    }
 }
 
 /// Observable metrics for the transaction engine.
@@ -139,7 +186,8 @@ pub struct TxnMetrics {
     pub txns_committed: AtomicU64,
     /// Total transactions aborted (explicit or conflict).
     pub txns_aborted: AtomicU64,
-    /// Total SSI conflict detections (WW, RW, or dangerous structure).
+    /// Total SSI conflict detections (write-write, read-write, or
+    /// range/predicate).
     pub conflicts_detected: AtomicU64,
     /// Total savepoints created.
     pub savepoints_created: AtomicU64,
@@ -200,19 +248,263 @@ impl TxnMetrics {
 /// The Transaction Manager — coordinates all in-flight and recently
 /// committed transactions for SSI conflict detection.
 ///
-/// ## Dangerous Structure Detection (PostgreSQL-style)
-///
-/// A "dangerous structure" is a cycle of rw-dependencies:
-///   T1 →rw→ T2 →rw→ T3
-/// where T1 committed before T2 started, and T2 committed before T3 started.
-/// This indicates a potential serialization anomaly and the middle
-/// transaction (T2) must be aborted.
 /// Number of stripes in the commit lock array.
 /// Must be a power of 2 for fast modular hashing.
 const COMMIT_STRIPE_COUNT: usize = 64;
 
+/// The committed-transaction history that powers SSI conflict detection,
+/// held by [`OmniKV`] so that BOTH transaction paths reach the same store:
+///
+/// - the leader's [`TransactionManager::commit`] records the transaction
+///   it just committed, and
+/// - the raft state machine's apply path records the SSI commit record
+///   carried inside each replicated [`crate::raft_command::RaftCommand`].
+///
+/// This second path is the fix for the leader-local history bug: before
+/// it, only the node that RAN the COMMIT ever recorded the transaction,
+/// so a follower promoted to leader after a failover validated new
+/// transactions against a history missing every pre-failover commit —
+/// and a write-write or rw anti-dependency against one of them slipped
+/// through. Carrying the record in the replicated command and recording
+/// it at apply on every node keeps all nodes' histories converged.
+///
+/// The `commit_seq` each entry is recorded at is per-node (every node's
+/// sequence counter is its own), so it is stamped by the apply from the
+/// LOCAL batch marker, never carried across the wire.
+pub struct SsiHistory {
+    /// Recently committed transactions, kept for conflict detection.
+    committed_txns: Mutex<Vec<CommittedTxn>>,
+}
+
+impl SsiHistory {
+    /// Records a transaction that committed at the given sequence. Called
+    /// by the single-node commit path, the clustered leader's commit
+    /// closure, AND by every follower's apply path — all three must land
+    /// in the same store or histories diverge across a failover.
+    pub fn record_committed(&self, txn_id: TxnId, commit_seq: u64, record: &SsiCommitRecord) {
+        let mut committed = self
+            .committed_txns
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        committed.push(CommittedTxn {
+            txn_id,
+            commit_seq,
+            write_keys: record.write_keys.iter().cloned().collect(),
+            read_keys: record.read_keys.iter().cloned().collect(),
+            read_ranges: record.read_ranges.clone(),
+        });
+    }
+
+    /// The number of committed transaction records being held for
+    /// conflict detection.
+    pub fn committed_record_count(&self) -> usize {
+        self.committed_txns.lock().map(|c| c.len()).unwrap_or(0)
+    }
+
+    /// A serializable snapshot of the committed history, for a raft
+    /// snapshot envelope. A node that installs that snapshot replays these
+    /// so it keeps detecting conflicts against commits the snapshot
+    /// carried (which never passed through its log-apply path).
+    pub fn snapshot_entries(&self) -> Vec<(TxnId, u64, SsiCommitRecord)> {
+        let committed = self
+            .committed_txns
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        committed
+            .iter()
+            .map(|c| {
+                (
+                    c.txn_id,
+                    c.commit_seq,
+                    SsiCommitRecord {
+                        txn_id: c.txn_id,
+                        write_keys: c.write_keys.iter().cloned().collect(),
+                        read_keys: c.read_keys.iter().cloned().collect(),
+                        read_ranges: c.read_ranges.clone(),
+                    },
+                )
+            })
+            .collect()
+    }
+
+    /// Replaces the whole history, used by snapshot install: the data was
+    /// replaced wholesale, so the in-memory history must be too, then
+    /// refilled from what the snapshot carried.
+    pub fn install_from(&self, entries: Vec<(TxnId, u64, SsiCommitRecord)>) {
+        let mut committed = self
+            .committed_txns
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        committed.clear();
+        for (txn_id, commit_seq, record) in entries {
+            committed.push(CommittedTxn {
+                txn_id,
+                commit_seq,
+                write_keys: record.write_keys.iter().cloned().collect(),
+                read_keys: record.read_keys.iter().cloned().collect(),
+                read_ranges: record.read_ranges,
+            });
+        }
+    }
+
+    /// Runs the SSI conflict scan — write-write, rw anti-dependency
+    /// (point and range/predicate) — of `txn` against the committed
+    /// history, and returns the history guard alongside the result.
+    ///
+    /// The guard is the whole point: the single-node commit path MUST
+    /// hold it across the batch commit AND its own record insertion.
+    /// Without that span, two transactions whose range scans hash to
+    /// disjoint stripes (only the range ENDPOINTS are striped, so
+    /// overlapping ranges can land in different stripes) both validate
+    /// against a history missing the other and both commit — a
+    /// serializability violation. Returning the guard keeps
+    /// check-and-record atomic without holding a lock across an
+    /// await-able propose.
+    fn detect_conflicts_locked(
+        &self,
+        txn: &Transaction,
+    ) -> (Option<String>, std::sync::MutexGuard<'_, Vec<CommittedTxn>>) {
+        // The only lock SsiHistory takes: rw-edges are no longer kept
+        // (see the note below on the removed pivot check), so there is
+        // no second lock to order against. Poison-tolerant like the
+        // stripes: a panicked holder never leaves the Vec torn.
+        let committed = self
+            .committed_txns
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let found = Self::scan_conflicts(txn, &committed);
+        (found, committed)
+    }
+
+    /// The pure conflict scan — no locking. Separated so the clustered
+    /// path (whose serialization point is the gateway's flight lock, not
+    /// this mutex) can validate without holding the history lock across
+    /// the await-able propose, while the single-node path holds the lock
+    /// across both scan and record via `detect_conflicts_locked`.
+    fn scan_conflicts(txn: &Transaction, committed: &[CommittedTxn]) -> Option<String> {
+        let mut found = None;
+        'outer: for committed_txn in committed.iter() {
+            if committed_txn.commit_seq > txn.read_seq {
+                // Write-write conflict check
+                for key in txn.write_set.keys() {
+                    if committed_txn.write_keys.contains(key) {
+                        found = Some(format!(
+                            "SSI CONFLICT (WW): key '{}' written by txn {} at seq {}",
+                            key, committed_txn.txn_id, committed_txn.commit_seq
+                        ));
+                        break 'outer;
+                    }
+                }
+
+                // Read-write anti-dependency: we read key, they wrote it
+                // This alone is a conflict — abort (PostgreSQL-compatible)
+                for key in &txn.read_set {
+                    if committed_txn.write_keys.contains(key) {
+                        found = Some(format!(
+                            "SSI CONFLICT (RW): key '{}' read by us, written by txn {} at seq {}",
+                            key, committed_txn.txn_id, committed_txn.commit_seq
+                        ));
+                        break 'outer;
+                    }
+                }
+
+                // Write-read anti-dependency (we wrote a key a committed
+                // txn read) is deliberately NOT an abort here: a single
+                // rw-antidependency is legal in the PostgreSQL SSI model —
+                // the anomaly needs a pivot in a rw-CYCLE. This engine had
+                // a pivot check, and it was unreachable dead code (every
+                // outgoing edge was pushed only immediately before an
+                // aborting break, so the check never ran with
+                // `found.is_none()` and an outgoing edge present); it is
+                // removed rather than left to misfire. The classic
+                // write-skew is still caught by the RW branch above, which
+                // fires for the crossing read/write pair.
+
+                // ── Range (predicate) conflicts ─────────────────
+                // A write they committed inside one of OUR read
+                // ranges: we scanned the range, they changed it after
+                // our snapshot — the phantom-write conflict, caught
+                // at COMMIT. This is the DROP TABLE vs. concurrent
+                // INSERT race and every seq-scan write-skew.
+                for key in committed_txn.write_keys.iter() {
+                    for (start, end) in &txn.read_ranges {
+                        if key.as_str() >= start.as_str() && key.as_str() < end.as_str() {
+                            found = Some(format!(
+                                "SSI CONFLICT (RANGE): key '{}' written by txn {} at seq {} inside our read range [{}, {}]",
+                                key, committed_txn.txn_id, committed_txn.commit_seq, start, end
+                            ));
+                            break 'outer;
+                        }
+                    }
+                }
+
+                // Our writes inside one of THEIR committed read
+                // ranges: they scanned the range, we changed it
+                // after their snapshot — the mirror image, so the
+                // race cannot slip through by ordering alone.
+                for key in txn.write_set.keys() {
+                    for (start, end) in &committed_txn.read_ranges {
+                        if key.as_str() >= start.as_str() && key.as_str() < end.as_str() {
+                            found = Some(format!(
+                                "SSI CONFLICT (RANGE): our key '{}' falls in txn {}'s read range [{}, {}] (seq {})",
+                                key, committed_txn.txn_id, start, end, committed_txn.commit_seq
+                            ));
+                            break 'outer;
+                        }
+                    }
+                }
+            }
+        }
+
+        found
+    }
+
+    /// The clustered-path entry point: scan and release. The gateway's
+    /// flight lock is the serialization point there — it serializes
+    /// proposals, and the apply (which records the history) completes
+    /// before the lock releases — so the history mutex does not need to
+    /// span the await-able propose. Holding it there would needlessly
+    /// stall every concurrent commit on the node for each consensus
+    /// round trip.
+    fn detect_conflicts(&self, txn: &Transaction) -> Option<String> {
+        let committed = self
+            .committed_txns
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        Self::scan_conflicts(txn, &committed)
+    }
+
+    /// Removes committed transaction records that are no longer needed
+    /// for conflict detection (all active transactions started after
+    /// them). Called after every commit on every node — without it, a
+    /// follower that never runs a local COMMIT would grow its history
+    /// without bound. The floor is the caller's oldest in-play snapshot:
+    /// a record whose commit_seq is at or below it is already visible to
+    /// every live transaction and can never again be a conflict.
+    pub(crate) fn prune(&self, min_active_seq: u64) {
+        let mut committed = self
+            .committed_txns
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        committed.retain(|c| c.commit_seq >= min_active_seq);
+    }
+}
+
+impl Default for SsiHistory {
+    fn default() -> Self {
+        Self {
+            committed_txns: Mutex::new(Vec::new()),
+        }
+    }
+}
+
 pub struct TransactionManager {
     db: Arc<OmniKV>,
+    /// The shared committed-transaction history. Held by reference so the
+    /// raft apply path (recording replicated SSI records) and this
+    /// manager (recording locally-committed ones) see the same store.
+    history: Arc<SsiHistory>,
     /// Monotonically increasing transaction ID counter.
     next_txn_id: AtomicU64,
     /// Striped commit locks — transactions lock only the stripes that cover
@@ -220,12 +512,8 @@ pub struct TransactionManager {
     /// in parallel. Each stripe is a Mutex guarding a logical key-space
     /// partition. This replaces the former single global commit lock.
     commit_stripes: Vec<Mutex<()>>,
-    /// Recently committed transactions, kept for conflict detection.
-    committed_txns: Mutex<Vec<CommittedTxn>>,
     /// Active transactions, indexed by TxnId.
     active_txns: Mutex<HashMap<TxnId, u64>>,
-    /// RW-dependency graph edges for dangerous structure detection.
-    rw_deps: Mutex<Vec<RWDependency>>,
     /// Transaction timeout duration. Transactions older than this are
     /// rejected at commit time and can be detected via check_timeouts().
     txn_timeout: Duration,
@@ -244,15 +532,21 @@ impl TransactionManager {
     pub fn with_timeout(db: Arc<OmniKV>, timeout: Duration) -> Self {
         let stripes = (0..COMMIT_STRIPE_COUNT).map(|_| Mutex::new(())).collect();
         Self {
+            history: db.ssi_history(),
             db,
             next_txn_id: AtomicU64::new(1),
             commit_stripes: stripes,
-            committed_txns: Mutex::new(Vec::new()),
             active_txns: Mutex::new(HashMap::new()),
-            rw_deps: Mutex::new(Vec::new()),
             txn_timeout: timeout,
             metrics: Arc::new(TxnMetrics::new()),
         }
+    }
+
+    /// The shared SSI history — the raft apply path uses this to record
+    /// replicated commit records so a promoted follower's conflict checks
+    /// see pre-failover commits.
+    pub fn history(&self) -> Arc<SsiHistory> {
+        self.history.clone()
     }
 
     /// BEGIN — starts a new transaction with a consistent snapshot.
@@ -475,11 +769,27 @@ impl TransactionManager {
         // check-and-insert in single-node mode below. Engine locks are
         // taken and released INSIDE that lock, never held across the
         // await-able propose, so the global lock order is always
-        // flight → stripes → committed → rw_deps with no cycle.
+        // flight → stripes → committed-history with no cycle.
+        //
+        // The SSI commit record rides INSIDE the replicated command, so
+        // every follower's apply path records this transaction in its OWN
+        // history too. Before that, the history existed only on the node
+        // that ran the COMMIT, and a follower promoted after a failover
+        // validated against a history missing every pre-failover commit
+        // — the serializability hole tracked as #124. The leader does NOT
+        // double-record: its own state machine apply records the same
+        // command, and that apply is what the flight lock waits on before
+        // releasing, so the record is in place for the next transaction's
+        // check.
         // ═══════════════════════════════════════════════════════════════
         if let Some(gateway) = self.db.cluster_gateway() {
             let txn_ref: &Transaction = txn;
             let outcome = gateway.commit_ssi_blocking(
+                // The SSI record carried in the replicated command. The
+                // commit_seq is deliberately NOT here: it is per-node
+                // (each node's sequence counter is its own), so each
+                // apply stamps it from its LOCAL batch marker.
+                SsiCommitRecord::from_committed_view(txn_ref),
                 move || {
                     // Full re-validation under the flight lock, against
                     // the LIVE committed set: the gateway serializes all
@@ -487,40 +797,10 @@ impl TransactionManager {
                     // sees every commit that landed before ours. Nothing
                     // here holds a lock across the propose that follows.
                     let _stripe_guards = self.acquire_commit_stripes(txn_ref);
-                    let committed = self.committed_txns.lock().map_err(|_| {
-                        OmniError::LockPoisoned("committed_txns".into()).to_string()
-                    })?;
-                    if let Some(conflict) = self.ssi_detect_conflicts(txn_ref, &committed) {
+                    if let Some(conflict) = self.history.detect_conflicts(txn_ref) {
                         return Err(conflict);
                     }
-                    drop(committed);
                     Self::build_write_batch(txn_ref).map_err(|e| e.to_string())
-                },
-                move |commit_seq: u64| {
-                    // Post-consensus, still under the flight lock: this is
-                    // the commit marker the state machine stamped for OUR
-                    // entry — carried back through the apply response, not
-                    // the raft log index and not a value reconstructed from
-                    // the global counter afterwards (a concurrent purge or
-                    // snapshot install can shift that counter between the
-                    // apply and any later read). It is the same number the
-                    // single-node path records, in the same space as
-                    // read_seq, so a transaction starting after this commit
-                    // (read_seq == marker) sees it as visible.
-                    let mut committed = self
-                        .committed_txns
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner());
-                    committed.push(CommittedTxn {
-                        txn_id: txn_ref.id,
-                        commit_seq,
-                        write_keys: txn_ref.write_set.keys().cloned().collect(),
-                        read_keys: txn_ref.read_set.clone(),
-                        read_ranges: txn_ref.read_ranges.clone(),
-                    });
-                    drop(committed);
-                    self.prune_committed_txns();
-                    commit_seq
                 },
             );
 
@@ -552,26 +832,42 @@ impl TransactionManager {
         // read-range endpoints (deadlock prevention via lock ordering);
         // held across validation+commit. Non-overlapping transactions
         // proceed fully in parallel.
+        //
+        // The shared transition lock is taken FIRST and held across the
+        // history guard and the commit below, so the order is transition
+        // -> history everywhere. The commit uses commit_batch_local_locked
+        // (it does not re-take this guard: std::sync::RwLock read is not
+        // reentrant) — taking the history guard first and then the
+        // transition lock through a plain commit_batch_local would invert
+        // against build_snapshot/install_snapshot (transition -> history)
+        // and deadlock. Uncontended in single-node mode: the write side is
+        // only ever held by a raft snapshot capture/install, and a node
+        // running this path has no gateway and so no raft.
         // ═══════════════════════════════════════════════════════════════
+        let _topology_guard = self
+            .db
+            .transition_guard
+            .read()
+            .map_err(|_| OmniError::LockPoisoned("transition_guard".into()))?;
         let _guards = self.acquire_commit_stripes(txn);
 
         // ═══════════════════════════════════════════════════════════════
-        // SSI Conflict Detection with Dangerous Structure Analysis
+        // SSI Conflict Detection
         //
-        // CRITICAL: We hold committed_txns lock across BOTH the conflict
-        // check AND the insertion of our own commit record. This prevents
-        // a TOCTOU race where two concurrent txns on the same key both
-        // pass validation before either records its commit.
+        // CRITICAL: The history's committed-set lock is held across BOTH
+        // the conflict check AND the insertion of our own commit record
+        // below — the guard returned here also spans the batch commit.
+        // Without that span, two transactions whose range scans hash into
+        // DISJOINT stripes (only the range endpoints are striped, so
+        // overlapping ranges can land in different stripes) would both
+        // validate against a history missing the other and both commit —
+        // a serializability violation. (The clustered branch above gets
+        // the same guarantee from the gateway's flight lock instead.)
         // ═══════════════════════════════════════════════════════════════
-        let mut committed = self
-            .committed_txns
-            .lock()
-            .map_err(|_| OmniError::LockPoisoned("committed_txns".into()))?;
-
-        let conflict: Option<String> = self.ssi_detect_conflicts(txn, &committed);
+        let (conflict, mut committed_guard) = self.history.detect_conflicts_locked(txn);
 
         if let Some(conflict_msg) = conflict {
-            drop(committed); // release before cleanup
+            drop(committed_guard);
             txn.state = TxnState::Aborted;
             self.cleanup_txn(txn.id, txn.read_seq);
             self.metrics
@@ -583,25 +879,28 @@ impl TransactionManager {
 
         // No conflicts! Build the batch the SSI engine would apply.
         let batch = Self::build_write_batch(txn)?;
-        let commit_seq = self.db.commit_batch(&batch)?;
+        let commit_seq = self.db.commit_batch_local_locked(&batch)?;
 
-        // Record this transaction in the committed set — pushing into
-        // the guard we still hold, so no other txn can sneak between
-        // our validation and our record.
-        committed.push(CommittedTxn {
+        // Record this transaction by pushing into the guard we still hold
+        // — no other txn can have snuck between our validation and this
+        // record.
+        committed_guard.push(CommittedTxn {
             txn_id: txn.id,
             commit_seq,
             write_keys: txn.write_set.keys().cloned().collect(),
             read_keys: txn.read_set.clone(),
             read_ranges: txn.read_ranges.clone(),
         });
-        drop(committed); // release committed_txns lock
+        drop(committed_guard);
 
         txn.state = TxnState::Committed;
         self.cleanup_txn(txn.id, txn.read_seq);
 
-        // Prune old committed transaction records AND stale rw-dependencies
-        self.prune_committed_txns();
+        // Prune records that no live snapshot can conflict with. The floor
+        // is the db-wide oldest snapshot: a record below it can never
+        // conflict with any transaction that can still commit, and the
+        // apply path uses the same source so both paths agree.
+        self.history.prune(self.db.min_active_snapshot());
 
         self.metrics.txns_committed.fetch_add(1, Ordering::Relaxed);
 
@@ -640,12 +939,7 @@ impl TransactionManager {
     /// Returns the number of committed transaction records being held
     /// for conflict detection.
     pub fn committed_record_count(&self) -> usize {
-        self.committed_txns.lock().map(|c| c.len()).unwrap_or(0)
-    }
-
-    /// Returns the number of RW-dependency edges in the graph.
-    pub fn rw_dep_count(&self) -> usize {
-        self.rw_deps.lock().map(|d| d.len()).unwrap_or(0)
+        self.history.committed_record_count()
     }
 
     /// Acquires the striped commit locks covering a transaction's write
@@ -686,125 +980,6 @@ impl TransactionManager {
         (h as usize) % COMMIT_STRIPE_COUNT
     }
 
-    /// The SSI conflict scan over committed history: write-write,
-    /// read-write anti-dependencies (point and range/predicate), and
-    /// the dangerous-structure pivot check. Soft rw-edges are recorded
-    /// into the dependency graph for later pivot detection. The caller
-    /// holds the serialization point — the committed_txns lock in
-    /// single-node mode, the gateway's flight lock in clustered mode —
-    /// so check-and-record is atomic against other committers, and
-    /// `committed` is always the LIVE set, never a pre-lock snapshot.
-    fn ssi_detect_conflicts(
-        &self,
-        txn: &Transaction,
-        committed: &[CommittedTxn],
-    ) -> Option<String> {
-        // Poison-tolerant like the stripes: rw_deps is append-only, so
-        // a panicked holder never leaves it torn.
-        let mut rw_deps = self.rw_deps.lock().unwrap_or_else(|e| e.into_inner()); // released on return
-
-        let mut found = None;
-        'outer: for committed_txn in committed.iter() {
-            if committed_txn.commit_seq > txn.read_seq {
-                // Write-write conflict check
-                for key in txn.write_set.keys() {
-                    if committed_txn.write_keys.contains(key) {
-                        found = Some(format!(
-                            "SSI CONFLICT (WW): key '{}' written by txn {} at seq {}",
-                            key, committed_txn.txn_id, committed_txn.commit_seq
-                        ));
-                        break 'outer;
-                    }
-                }
-
-                // Read-write anti-dependency: we read key, they wrote it
-                // This alone is a conflict — abort (PostgreSQL-compatible)
-                for key in &txn.read_set {
-                    if committed_txn.write_keys.contains(key) {
-                        rw_deps.push(RWDependency {
-                            from_txn: txn.id,
-                            to_txn: committed_txn.txn_id,
-                        });
-                        found = Some(format!(
-                            "SSI CONFLICT (RW): key '{}' read by us, written by txn {} at seq {}",
-                            key, committed_txn.txn_id, committed_txn.commit_seq
-                        ));
-                        break 'outer;
-                    }
-                }
-
-                // Write-read anti-dependency: we wrote key, they read it
-                for key in txn.write_set.keys() {
-                    if committed_txn.read_keys.contains(key) {
-                        // Record rw-dependency: committed_txn →rw→ txn
-                        rw_deps.push(RWDependency {
-                            from_txn: committed_txn.txn_id,
-                            to_txn: txn.id,
-                        });
-                    }
-                }
-
-                // ── Range (predicate) conflicts ─────────────────
-                // A write they committed inside one of OUR read
-                // ranges: we scanned the range, they changed it after
-                // our snapshot — the phantom-write conflict, caught
-                // at COMMIT. This is the DROP TABLE vs. concurrent
-                // INSERT race and every seq-scan write-skew.
-                for key in committed_txn.write_keys.iter() {
-                    for (start, end) in &txn.read_ranges {
-                        if key.as_str() >= start.as_str() && key.as_str() < end.as_str() {
-                            rw_deps.push(RWDependency {
-                                from_txn: txn.id,
-                                to_txn: committed_txn.txn_id,
-                            });
-                            found = Some(format!(
-                                "SSI CONFLICT (RANGE): key '{}' written by txn {} at seq {} inside our read range [{}, {}]",
-                                key, committed_txn.txn_id, committed_txn.commit_seq, start, end
-                            ));
-                            break 'outer;
-                        }
-                    }
-                }
-
-                // Our writes inside one of THEIR committed read
-                // ranges: they scanned the range, we changed it
-                // after their snapshot — the mirror image, so the
-                // race cannot slip through by ordering alone.
-                for key in txn.write_set.keys() {
-                    for (start, end) in &committed_txn.read_ranges {
-                        if key.as_str() >= start.as_str() && key.as_str() < end.as_str() {
-                            rw_deps.push(RWDependency {
-                                from_txn: committed_txn.txn_id,
-                                to_txn: txn.id,
-                            });
-                            found = Some(format!(
-                                "SSI CONFLICT (RANGE): our key '{}' falls in txn {}'s read range [{}, {}] (seq {})",
-                                key, committed_txn.txn_id, start, end, committed_txn.commit_seq
-                            ));
-                            break 'outer;
-                        }
-                    }
-                }
-            }
-        }
-
-        // Dangerous structure detection:
-        // If txn has BOTH an incoming AND outgoing rw-dependency,
-        // it's the "pivot" in T1→rw→Txn→rw→T3 — must abort.
-        if found.is_none() {
-            let has_incoming = rw_deps.iter().any(|d| d.to_txn == txn.id);
-            let has_outgoing = rw_deps.iter().any(|d| d.from_txn == txn.id);
-            if has_incoming && has_outgoing {
-                found = Some(format!(
-                    "SSI CONFLICT (DANGEROUS STRUCTURE): txn {} is pivot in rw-dependency cycle",
-                    txn.id
-                ));
-            }
-        }
-
-        found
-    }
-
     /// Builds the atomic WriteBatch from a transaction's buffered
     /// writes — the unit of apply in single-node mode and the single
     /// replicated raft entry in clustered mode.
@@ -833,42 +1008,6 @@ impl TransactionManager {
         active.remove(&txn_id);
         self.db.unregister_snapshot(read_seq);
     }
-
-    /// Prunes committed transaction records that are no longer needed for
-    /// conflict detection (all active transactions started after them).
-    /// Also prunes RW-dependency edges that reference pruned transactions,
-    /// preventing unbounded memory growth.
-    fn prune_committed_txns(&self) {
-        let min_active_seq = {
-            let active = self.active_txns.lock().expect("active_txns");
-            active.values().copied().min().unwrap_or(u64::MAX)
-        };
-
-        // Collect txn_ids that will be pruned
-        let pruned_txn_ids: HashSet<TxnId> = {
-            let committed = self.committed_txns.lock().expect("committed_txns");
-            committed
-                .iter()
-                .filter(|c| c.commit_seq < min_active_seq)
-                .map(|c| c.txn_id)
-                .collect()
-        };
-
-        // Prune committed transaction records
-        {
-            let mut committed = self.committed_txns.lock().expect("committed_txns");
-            committed.retain(|c| c.commit_seq >= min_active_seq);
-        }
-
-        // Prune RW-dependency edges that reference pruned transactions.
-        // This is critical — without this, rw_deps grows unboundedly.
-        if !pruned_txn_ids.is_empty() {
-            let mut rw_deps = self.rw_deps.lock().expect("rw_deps");
-            rw_deps.retain(|dep| {
-                !pruned_txn_ids.contains(&dep.from_txn) && !pruned_txn_ids.contains(&dep.to_txn)
-            });
-        }
-    }
 }
 
 #[cfg(test)]
@@ -884,6 +1023,17 @@ mod commit_seq_number_space {
     use super::{CommittedTxn, Transaction, TransactionManager};
     use crate::{OmniKV, WriteBatch};
     use std::collections::HashSet;
+
+    /// Records a committed transaction directly into a manager's shared
+    /// history — the shape the raft apply path uses on a follower, which
+    /// never runs a local COMMIT of its own.
+    fn record_committed(mgr: &TransactionManager, txn: &CommittedTxn) {
+        mgr.history.record_committed(
+            txn.txn_id,
+            txn.commit_seq,
+            &super::SsiCommitRecord::from(txn),
+        );
+    }
 
     fn temp_db() -> std::sync::Arc<OmniKV> {
         let dir = tempfile::tempdir().expect("temp dir");
@@ -950,9 +1100,9 @@ mod commit_seq_number_space {
             read_keys: HashSet::new(),
             read_ranges: vec![],
         };
+        record_committed(&mgr, &visible);
         assert!(
-            mgr.ssi_detect_conflicts(&later, std::slice::from_ref(&visible))
-                .is_none(),
+            mgr.history.detect_conflicts(&later).is_none(),
             "commit_seq == read_seq must be visible: recording the marker \
              keeps a later txn from aborting spuriously"
         );
@@ -962,8 +1112,9 @@ mod commit_seq_number_space {
             commit_seq: read_seq + 1,
             ..visible
         };
+        record_committed(&mgr, &after);
         assert!(
-            mgr.ssi_detect_conflicts(&later, &[after]).is_some(),
+            mgr.history.detect_conflicts(&later).is_some(),
             "commit_seq == read_seq + 1 must conflict: this is the abort \
              the off-by-one produced when it should not have"
         );
