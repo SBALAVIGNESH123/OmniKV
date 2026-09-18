@@ -88,10 +88,19 @@ routes through the **cluster gateway**:
    leader: at most one client write is in the air at a time.
 2. SSI transactions re-run their full conflict validation **under that
    lock**, against the live committed history.
-3. The write is proposed as ONE Raft log entry — atomic cluster-wide.
+3. The write is proposed as ONE Raft log entry — atomic cluster-wide —
+   with the transaction's **SSI commit record riding inside the command**.
 4. The gateway waits until the entry is applied by the local state
-   machine, and the SSI commit record is appended **still under the
-   lock**, so the next writer's validation can never miss it.
+   machine. The apply records the commit in the node's history — on the
+   leader and on every follower, **still under the flight lock** on the
+   leader, so the next writer's validation can never miss it. Because
+   every node's apply records the same entry, the committed history
+   converges cluster-wide: a node promoted after a failover already holds
+   every pre-failover commit when it first leads, so a transaction that
+   began before the failover still conflicts correctly with one committed
+   by the previous leader. Each node stamps the record with its OWN apply
+   marker — the sequence at which the write became visible there, the same
+   number space its own transactions snapshot.
 5. Only then is the client acknowledged. The ack means: **durable on a
    quorum and applied on this node (the leader)**. It does NOT mean every
    follower has applied it yet — followers apply asynchronously and their
@@ -145,12 +154,6 @@ Writes sent to a follower during a leaderless window fail with
 
 ## Known limitations (honest, tracked)
 
-- **SSI commit history is leader-local.** The committed-transaction
-  history that powers serializable conflict detection lives on the
-  leader. A transaction that began before a failover and commits after
-  it may miss a conflict with a write committed by the previous leader.
-  Tracked as #124; the fix is replicating SSI commit records inside the
-  Raft command.
 - **Peer traffic is plaintext HTTP.** The raft listener is a dedicated
   port following etcd's peer-port model: client TLS never terminates
   there, and consensus nodes authenticate by cluster membership. Keep

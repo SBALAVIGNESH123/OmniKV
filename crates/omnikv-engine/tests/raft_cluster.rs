@@ -2734,9 +2734,17 @@ fn test_ssi_no_false_positive() {
     println!("✅ DEADLOCK 9c: Non-conflicting txns both committed, no false positive");
 }
 
-/// Gap #9d: Overlapping txns — T2 reads key that T1 writes concurrently
+/// Gap #9d: Overlapping txns — T2 reads a key that T1 writes concurrently.
+///
+/// This is the rw-antidependency conflict (and the shape of the classic
+/// write-skew): T2 snapshotted `chain_y` before T1 committed a new value
+/// for it, so T2's commit must abort. NOTE: despite an earlier name, this
+/// never exercised the "dangerous structure" pivot check — that check was
+/// unreachable dead code and has been removed; the abort here comes from
+/// the plain RW branch, which is what catches the crossing read/write
+/// pair.
 #[test]
-fn test_ssi_dangerous_structure_chain() {
+fn test_ssi_rw_antidependency_chain() {
     let (db, _, _d) = create_node("ssi_chain");
     let tm = TransactionManager::new(db);
 
@@ -4314,4 +4322,107 @@ async fn test_snapshot_install_at_exact_batch_cap() {
         "✅ SNAPSHOT AT CAP: {} entries installed without the meta record overflowing",
         omni_engine::WriteBatch::MAX_OPS
     );
+}
+
+/// Issue #124: the SSI commit history used to be leader-local.
+///
+/// The committed history that powers serializable conflict detection lived
+/// only in the `TransactionManager` of the node that ran the COMMIT. A
+/// follower that applied a replicated write never recorded the transaction,
+/// so once it was promoted its conflict checks validated against a history
+/// missing every pre-failover commit — a write-write or rw-antidependency
+/// against one of them slipped through.
+///
+/// The fix carries the SSI commit record INSIDE the replicated command, and
+/// the state machine's apply records it in the applying node's own history
+/// at the marker its writes became visible at. This test reproduces the
+/// scenario directly on a follower: T1 begins BEFORE the replicated commit
+/// applies, the entry lands, and T1's later COMMIT must still see the
+/// conflict. Before the record rode in the command, the history was empty
+/// and the conflict was missed.
+#[tokio::test]
+async fn test_ssi_commit_history_converges_across_a_failover() {
+    use omni_engine::raft_command::RaftCommand;
+    use omni_engine::transaction::{SsiCommitRecord, TransactionManager};
+
+    let (db, storage, _dir) = create_node("ssi_failover_node");
+
+    // The local transaction manager a client's session would hold on this
+    // node — the one that will validate T1's commit after promotion.
+    let mgr = TransactionManager::new(db.clone());
+
+    // T1 begins on the follower while it is still a follower: BEGIN and
+    // reads work, writes are buffered until COMMIT. Its read_seq predates
+    // every marker the replicated entry will stamp — the precondition for
+    // a real conflict.
+    let mut t1 = mgr.begin();
+    assert_eq!(mgr.get(&mut t1, "acct:alice").unwrap(), None);
+    mgr.set(&mut t1, "acct:alice", "from_t1".into())
+        .unwrap();
+    let t1_read_seq = t1.read_seq;
+    assert!(t1_read_seq < db.get_seq(), "T1's snapshot must precede the apply");
+
+    // The LEADER's T2, committed and replicated: the command carries its
+    // SSI record, exactly as `commit_ssi_blocking` builds it.
+    let mut batch = omni_engine::WriteBatch::new();
+    batch.set("acct:alice", "from_t2".into()).unwrap();
+    let cmd = RaftCommand::from_batch_with_ssi(
+        &batch,
+        SsiCommitRecord {
+            txn_id: 99,
+            write_keys: vec!["acct:alice".into()],
+            read_keys: vec![],
+            read_ranges: vec![],
+        },
+    );
+    let entry = openraft::Entry {
+        log_id: openraft::LogId::new(openraft::CommittedLeaderId::new(1, 1), 1),
+        payload: openraft::EntryPayload::Normal(cmd.encode()),
+    };
+    storage.append_log(1, &cmd.encode()).expect("replicate entry");
+    openraft::storage::RaftStorage::apply_to_state_machine(&mut storage.clone(), &[entry])
+        .await
+        .expect("apply the replicated commit");
+
+    // The follower's OWN history now carries T2 — recorded by its apply
+    // path from the record in the command, not by the leader. This is the
+    // assertion that fails before the fix (history stays empty).
+    assert_eq!(
+        db.ssi_history().committed_record_count(),
+        1,
+        "the follower's apply must record the replicated transaction"
+    );
+
+    // The write is durable and visible to a snapshot taken now.
+    assert_eq!(
+        db.find("acct:alice", db.get_seq()).unwrap(),
+        Some("from_t2".into()),
+        "the replicated write must be applied"
+    );
+
+    // The conflict: T1's snapshot predates T2's marker and both write the
+    // same key. The check must fire — before #124's fix it found no record
+    // to conflict against and T1 would silently commit over T2.
+    let err = mgr
+        .commit(&mut t1)
+        .expect_err("T1 must abort: T2's record is in the history");
+    assert!(
+        err.to_string().contains("SSI CONFLICT (WW)"),
+        "expected a write-write conflict, got: {err}"
+    );
+
+    // Negative control — the record is at the RIGHT sequence, not spuriously
+    // too new: a transaction begun AFTER the apply sees T2's write as
+    // already-committed and commits cleanly.
+    let mut t3 = mgr.begin();
+    assert_eq!(
+        mgr.get(&mut t3, "acct:alice").unwrap(),
+        Some("from_t2".into()),
+        "a snapshot after the apply must see T2's write"
+    );
+    mgr.set(&mut t3, "acct:bob", "from_t3".into())
+        .unwrap();
+    mgr.commit(&mut t3).expect("T3 commits: T2 is visible to it");
+
+    println!("✅ #124: a replicated SSI record lands in the follower's own history and still catches a write-write conflict after promotion");
 }

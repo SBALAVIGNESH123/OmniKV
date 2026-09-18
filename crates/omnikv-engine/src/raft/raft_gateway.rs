@@ -226,30 +226,39 @@ impl ClusterGateway {
     /// The clustered SSI COMMIT: runs the transaction's validation
     /// under the flight lock (so no other proposal can land between
     /// its conflict checks and its consensus commit), then proposes the
-    /// validated batch as ONE raft entry — the atomicity unit across
-    /// the cluster — and runs `on_committed` with the COMMIT MARKER the
-    /// state machine reported for that entry, while still holding the
-    /// lock, so the caller's committed-history record lands in cluster
-    /// commit order. The marker is the caller's own number space (the
-    /// SSI engine's storage seq — NOT the raft index), and it comes
-    /// straight from the apply rather than the global counter, so a
-    /// concurrent bookkeeping commit cannot shift it. `on_committed`'s
-    /// return becomes this call's result. Called from
-    /// [`crate::storage::transaction::TransactionManager::commit`] with
-    /// its own locks dropped; consensus may take arbitrarily long.
-    pub fn commit_ssi_blocking<F, G>(&self, validate: F, on_committed: G) -> Result<u64, String>
+    /// validated batch — with the SSI commit record riding inside the
+    /// command — as ONE raft entry, the atomicity unit across the
+    /// cluster. Returns the COMMIT MARKER the state machine reported for
+    /// that entry: the caller's own number space (the SSI engine's
+    /// storage seq — NOT the raft index), straight from the apply rather
+    /// than the global counter, so a concurrent bookkeeping commit
+    /// cannot shift it.
+    ///
+    /// The history record is NOT made here: the state machine's apply
+    /// records it, on every node, when it stamps the marker — including
+    /// on this leader, whose own apply `propose_locked` waits for before
+    /// returning. So the record is in place before the flight lock
+    /// releases, and the next transaction's validation sees it. That is
+    /// the fix for the leader-local history: before the record rode in
+    /// the command, only the node that ran the COMMIT ever recorded it,
+    /// and a node promoted after a failover validated against a history
+    /// missing every pre-failover commit.
+    pub fn commit_ssi_blocking<F>(
+        &self,
+        ssi: crate::transaction::SsiCommitRecord,
+        validate: F,
+    ) -> Result<u64, String>
     where
         F: FnOnce() -> Result<crate::WriteBatch, String>,
-        G: FnOnce(u64) -> u64,
     {
         let _flight = self.flight_blocking();
         let batch = validate()?;
-        let cmd = RaftCommand::from_batch(&batch);
+        let cmd = RaftCommand::from_batch_with_ssi(&batch, ssi);
         if cmd.is_empty() {
             return Ok(0);
         }
         let ack = self.block_on_ctx(async { self.propose_locked(cmd).await })?;
-        Ok(on_committed(ack.commit_seq))
+        Ok(ack.commit_seq)
     }
 
     /// Runs `fut` to completion for a blocking caller on the CONSENSUS

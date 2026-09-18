@@ -1,5 +1,6 @@
 use crate::OmniKV;
 use crate::WriteBatch;
+use crate::transaction::SsiCommitRecord;
 use crate::raft_impl::{OmniNode, TypeConfig};
 use openraft::{
     AnyError, Entry, EntryPayload, LogId, OptionalSend, RaftTypeConfig, SnapshotMeta, StorageError,
@@ -590,9 +591,12 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
             ),
         };
         // Slots in `res` for entries whose ops are staged in `batch` but
-        // not yet committed. Their placeholder responses are stamped with
-        // the batch's commit marker when the batch flushes.
-        let mut staged_slots: Vec<usize> = Vec::new();
+        // not yet committed, each paired with the SSI commit record the
+        // command carried (None for plain writes). The placeholder
+        // responses are stamped with the batch's commit marker when the
+        // batch flushes, and the record — if any — is entered into this
+        // node's committed history at that same marker.
+        let mut staged_slots: Vec<(usize, Option<SsiCommitRecord>)> = Vec::new();
         // Flushes the staged batch (if non-empty) and stamps every entry
         // staged in it with the batch's COMMIT MARKER, which the proposer
         // reads back through client_write's response as the sequence its
@@ -606,19 +610,39 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
         // later transaction spuriously. (openraft's StorageError is ~224
         // bytes; mapping it at the call sites keeps this closure cheap and
         // clippy's result_large_err quiet.)
+        //
+        // This is also where a replicated SSI record lands in the node's
+        // own history — the fix for the leader-local history bug (#124).
+        // Recording here, rather than at the COMMIT on the node that ran
+        // it, means a follower promoted after a failover already has
+        // every pre-failover commit in its history when it first leads.
         let flush_staged = |batch: &mut WriteBatch,
-                            slots: &mut Vec<usize>,
+                            slots: &mut Vec<(usize, Option<SsiCommitRecord>)>,
                             res: &mut Vec<String>|
          -> Result<(), crate::OmniError> {
             if batch.is_empty() {
                 return Ok(());
             }
             let marker = self.db.commit_batch_local(batch)?;
+            let history = self.db.ssi_history();
             // Entries sharing a batch committed atomically at one marker —
             // a transaction whose read_seq equals it sees all of them.
-            for &slot in slots.iter() {
+            for &(slot, ref ssi) in slots.iter() {
                 res[slot] = marker.to_string();
+                // The record's commit_seq is this LOCAL marker by design:
+                // the conflict check compares it against read_seqs taken
+                // from this same node's counter, and the marker is exactly
+                // where the write became visible here. The leader that ran
+                // the COMMIT stamps the same value through the same path —
+                // its own apply — so no record is made twice.
+                if let Some(record) = ssi {
+                    history.record_committed(record.txn_id, marker, record);
+                }
             }
+            // Records below the oldest in-play snapshot can never again
+            // be a conflict; drop them so a node that only ever APPLIES
+            // (never runs a local COMMIT) does not grow without bound.
+            history.prune(self.db.min_active_snapshot());
             slots.clear();
             batch.clear();
             Ok(())
@@ -633,7 +657,7 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
                     // legacy "SET <key> <value>" text form still applies,
                     // so pre-cluster log entries and the storage tests
                     // keep their meaning.
-                    if let Some(cmd) = crate::raft_command::RaftCommand::decode(req) {
+                    if let Some(mut cmd) = crate::raft_command::RaftCommand::decode(req) {
                         let system_key = cmd
                             .sets
                             .iter()
@@ -679,7 +703,7 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
                         // Placeholder: stamped with the batch's commit
                         // marker when it flushes. Empty until then.
                         res.push(String::new());
-                        staged_slots.push(res.len() - 1);
+                        staged_slots.push((res.len() - 1, cmd.ssi.take()));
                     } else if let Some(rest) = req.strip_prefix("SET ") {
                         let parts: Vec<&str> = rest.splitn(2, ' ').collect();
                         if parts.len() == 2 && !parts[0].starts_with("__sys__/raft/") {
@@ -691,7 +715,7 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
                                 .set(parts[0], parts[1].to_string())
                                 .map_err(|e| storage_write_err(&e))?;
                             res.push(String::new());
-                            staged_slots.push(res.len() - 1);
+                            staged_slots.push((res.len() - 1, None));
                         } else {
                             res.push("ERR".to_string());
                         }
