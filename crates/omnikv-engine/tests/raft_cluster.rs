@@ -4357,10 +4357,12 @@ async fn test_ssi_commit_history_converges_across_a_failover() {
     // a real conflict.
     let mut t1 = mgr.begin();
     assert_eq!(mgr.get(&mut t1, "acct:alice").unwrap(), None);
-    mgr.set(&mut t1, "acct:alice", "from_t1".into())
-        .unwrap();
+    mgr.set(&mut t1, "acct:alice", "from_t1".into()).unwrap();
     let t1_read_seq = t1.read_seq;
-    assert!(t1_read_seq < db.get_seq(), "T1's snapshot must precede the apply");
+    assert!(
+        t1_read_seq < db.get_seq(),
+        "T1's snapshot must precede the apply"
+    );
 
     // The LEADER's T2, committed and replicated: the command carries its
     // SSI record, exactly as `commit_ssi_blocking` builds it.
@@ -4379,7 +4381,9 @@ async fn test_ssi_commit_history_converges_across_a_failover() {
         log_id: openraft::LogId::new(openraft::CommittedLeaderId::new(1, 1), 1),
         payload: openraft::EntryPayload::Normal(cmd.encode()),
     };
-    storage.append_log(1, &cmd.encode()).expect("replicate entry");
+    storage
+        .append_log(1, &cmd.encode())
+        .expect("replicate entry");
     openraft::storage::RaftStorage::apply_to_state_machine(&mut storage.clone(), &[entry])
         .await
         .expect("apply the replicated commit");
@@ -4420,9 +4424,11 @@ async fn test_ssi_commit_history_converges_across_a_failover() {
         Some("from_t2".into()),
         "a snapshot after the apply must see T2's write"
     );
-    mgr.set(&mut t3, "acct:bob", "from_t3".into())
-        .unwrap();
-    mgr.commit(&mut t3).expect("T3 commits: T2 is visible to it");
+    mgr.set(&mut t3, "acct:bob", "from_t3".into()).unwrap();
+    mgr.commit(&mut t3)
+        .expect("T3 commits: T2 is visible to it");
 
-    println!("✅ #124: a replicated SSI record lands in the follower's own history and still catches a write-write conflict after promotion");
+    println!(
+        "✅ #124: a replicated SSI record lands in the follower's own history and still catches a write-write conflict after promotion"
+    );
 }

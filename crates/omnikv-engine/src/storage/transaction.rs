@@ -282,7 +282,10 @@ impl SsiHistory {
     /// closure, AND by every follower's apply path — all three must land
     /// in the same store or histories diverge across a failover.
     pub fn record_committed(&self, txn_id: TxnId, commit_seq: u64, record: &SsiCommitRecord) {
-        let mut committed = self.committed_txns.lock().unwrap_or_else(|e| e.into_inner());
+        let mut committed = self
+            .committed_txns
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         committed.push(CommittedTxn {
             txn_id,
             commit_seq,
@@ -398,7 +401,10 @@ impl SsiHistory {
     /// a record whose commit_seq is at or below it is already visible to
     /// every live transaction and can never again be a conflict.
     pub(crate) fn prune(&self, min_active_seq: u64) {
-        let mut committed = self.committed_txns.lock().unwrap_or_else(|e| e.into_inner());
+        let mut committed = self
+            .committed_txns
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         committed.retain(|c| c.commit_seq >= min_active_seq);
     }
 }
@@ -709,10 +715,7 @@ impl TransactionManager {
                     // sees every commit that landed before ours. Nothing
                     // here holds a lock across the propose that follows.
                     let _stripe_guards = self.acquire_commit_stripes(txn_ref);
-                    if let Some(conflict) = self
-                        .history
-                        .detect_conflicts(txn_ref)
-                    {
+                    if let Some(conflict) = self.history.detect_conflicts(txn_ref) {
                         return Err(conflict);
                     }
                     Self::build_write_batch(txn_ref).map_err(|e| e.to_string())
@@ -760,9 +763,7 @@ impl TransactionManager {
         // commit. (The clustered branch above gets the same guarantee from
         // the gateway's flight lock instead.)
         // ═══════════════════════════════════════════════════════════════
-        let conflict: Option<String> = self
-            .history
-            .detect_conflicts(txn);
+        let conflict: Option<String> = self.history.detect_conflicts(txn);
 
         if let Some(conflict_msg) = conflict {
             txn.state = TxnState::Aborted;
@@ -781,8 +782,11 @@ impl TransactionManager {
         // Record this transaction in the committed set — under the
         // history's lock, so no other txn can sneak between our
         // validation and our record.
-        self.history
-            .record_committed(txn.id, commit_seq, &SsiCommitRecord::from_committed_view(txn));
+        self.history.record_committed(
+            txn.id,
+            commit_seq,
+            &SsiCommitRecord::from_committed_view(txn),
+        );
 
         txn.state = TxnState::Committed;
         self.cleanup_txn(txn.id, txn.read_seq);
@@ -919,8 +923,11 @@ mod commit_seq_number_space {
     /// history — the shape the raft apply path uses on a follower, which
     /// never runs a local COMMIT of its own.
     fn record_committed(mgr: &TransactionManager, txn: &CommittedTxn) {
-        mgr.history
-            .record_committed(txn.txn_id, txn.commit_seq, &super::SsiCommitRecord::from(txn));
+        mgr.history.record_committed(
+            txn.txn_id,
+            txn.commit_seq,
+            &super::SsiCommitRecord::from(txn),
+        );
     }
 
     fn temp_db() -> std::sync::Arc<OmniKV> {

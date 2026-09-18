@@ -1,7 +1,7 @@
 use crate::OmniKV;
 use crate::WriteBatch;
-use crate::transaction::SsiCommitRecord;
 use crate::raft_impl::{OmniNode, TypeConfig};
+use crate::transaction::SsiCommitRecord;
 use openraft::{
     AnyError, Entry, EntryPayload, LogId, OptionalSend, RaftTypeConfig, SnapshotMeta, StorageError,
     StorageIOError, StoredMembership, Vote,

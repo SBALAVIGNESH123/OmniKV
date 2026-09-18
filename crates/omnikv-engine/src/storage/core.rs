@@ -1185,9 +1185,7 @@ impl OmniKV {
             group_commit: crate::hardening::GroupCommitEngine::new(200),
             transition_guard: RwLock::new(()),
             cluster_gateway: std::sync::OnceLock::new(),
-            ssi_history: std::sync::Arc::new(
-                crate::transaction::SsiHistory::default(),
-            ),
+            ssi_history: std::sync::Arc::new(crate::transaction::SsiHistory::default()),
             db_lock,
         }))
     }
