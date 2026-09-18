@@ -40,9 +40,11 @@ struct SnapshotEnvelope {
     /// installs this snapshot keeps detecting conflicts against commits
     /// that arrived IN the snapshot rather than through log apply. Without
     /// it, a node promoted after installing a snapshot validates against a
-    /// history missing every commit the snapshot carried. `serde(default)`
-    /// keeps snapshots from before the field existing decodable.
-    #[serde(default)]
+    /// history missing every commit the snapshot carried. No serde default:
+    /// the version gate in install_snapshot rejects anything older before
+    /// this struct is parsed, so an accepted envelope always carries the
+    /// field and a missing one is a malformed snapshot that must fail
+    /// loudly rather than silently install an empty history.
     ssi_history: Vec<SsiHistoryEntry>,
 }
 
@@ -889,14 +891,26 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
 
         // ── Deserialize snapshot envelope ──
         let data = snapshot.into_inner();
-        let envelope: SnapshotEnvelope = serde_json::from_slice(&data)
-            .map_err(|e| io_err(&format!("Snapshot deserialize: {}", e)))?;
-        if envelope.version != SNAPSHOT_VERSION {
+        // Check the version BEFORE the full deserialize. A snapshot from
+        // pre-SSI-history code has the same envelope shape MINUS
+        // ssi_history, so the useful error for an operator is the version
+        // mismatch — not a raw "missing field" from the struct parse below,
+        // which is why the field carries no serde default: after this gate
+        // every accepted envelope is version 2 and MUST carry the field, so
+        // anything else is a malformed snapshot that fails loudly here
+        // rather than silently installing an empty history.
+        let version = serde_json::from_slice::<serde_json::Value>(&data)
+            .ok()
+            .and_then(|v| v.get("version").and_then(|f| f.as_u64()))
+            .unwrap_or(u64::MAX);
+        if version != SNAPSHOT_VERSION as u64 {
             return Err(io_err(&format!(
                 "Snapshot version mismatch: expected {}, got {}",
-                SNAPSHOT_VERSION, envelope.version
+                SNAPSHOT_VERSION, version
             )));
         }
+        let envelope: SnapshotEnvelope = serde_json::from_slice(&data)
+            .map_err(|e| io_err(&format!("Snapshot deserialize: {}", e)))?;
 
         // ── Determine paths from current manifest ──
         let manifest_path = self.db.manifest_path.clone();

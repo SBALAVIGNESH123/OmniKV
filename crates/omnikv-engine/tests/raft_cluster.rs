@@ -4754,3 +4754,63 @@ async fn test_legacy_snapshot_is_rejected_not_history_wiping() {
 
     println!("✅ Legacy-format snapshot rejected without wiping history");
 }
+
+/// Review fix: a version-2 envelope that is MISSING `ssi_history` is
+/// malformed, not a legacy snapshot — the field is mandatory at this
+/// version. It must be rejected rather than deserialized to an empty
+/// history that then silently wipes the installer's own records.
+#[tokio::test]
+async fn test_v2_snapshot_missing_history_field_is_rejected() {
+    use omni_engine::transaction::TransactionManager;
+    use openraft::storage::RaftSnapshotBuilder;
+
+    let (leader_db, leader, _leader_dir) = create_node("ssi_v2_missing_leader");
+    let (follower_db, follower, _follower_dir) = create_node("ssi_v2_missing_follower");
+
+    for i in 1..=5 {
+        leader
+            .append_log(i, &format!("SET v2miss_base_k{i} v2miss_base_v{i}"))
+            .unwrap();
+    }
+    apply_range(&leader, 1, 6);
+
+    // The follower has a committed record that a bad install would destroy.
+    let follower_tm = TransactionManager::new(follower_db.clone());
+    let mut f = follower_tm.begin();
+    follower_tm
+        .set(&mut f, "v2miss_k", "v2miss_v".into())
+        .unwrap();
+    follower_tm.commit(&mut f).unwrap();
+    assert_eq!(follower_db.ssi_history().committed_record_count(), 1);
+    let _ = leader_db;
+
+    // Current version, but the history field stripped — malformed.
+    let mut builder = leader.clone();
+    let snapshot = builder.build_snapshot().await.unwrap();
+    let mut json: serde_json::Value =
+        serde_json::from_slice(&snapshot.snapshot.into_inner()).unwrap();
+    assert_eq!(json["version"], 2, "a current snapshot is version 2");
+    json.as_object_mut()
+        .expect("snapshot envelope is a JSON object")
+        .remove("ssi_history");
+    let malformed = serde_json::to_vec(&json).unwrap();
+
+    let mut installer = follower.clone();
+    let result = installer
+        .install_snapshot(&snapshot.meta, Box::new(std::io::Cursor::new(malformed)))
+        .await;
+
+    assert!(
+        result.is_err(),
+        "a version-2 envelope missing ssi_history must be rejected"
+    );
+
+    // The rejection must not have wiped the node's history.
+    assert_eq!(
+        follower_db.ssi_history().committed_record_count(),
+        1,
+        "a rejected malformed snapshot must not wipe the node's history"
+    );
+
+    println!("✅ Malformed v2 snapshot (missing history) rejected");
+}
