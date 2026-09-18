@@ -4671,3 +4671,86 @@ async fn test_snapshot_history_catches_post_install_conflict() {
 
     println!("✅ Post-install conflict caught against history delivered by snapshot");
 }
+
+/// Review fix: a snapshot written by pre-SSI-history code has the same
+/// envelope version the old code used but no `ssi_history` field. Before
+/// the version was bumped in lockstep with the format, `#[serde(default)]`
+/// turned that absent field into an EMPTY history and `install_snapshot`
+/// then REPLACED the node's own history with it — silently discarding
+/// every conflict record for commits the snapshot's data actually carried.
+/// The version check must reject such a snapshot outright.
+#[tokio::test]
+async fn test_legacy_snapshot_is_rejected_not_history_wiping() {
+    use omni_engine::transaction::TransactionManager;
+    use openraft::storage::RaftSnapshotBuilder;
+
+    let (leader_db, leader, _leader_dir) = create_node("ssi_legacy_snap_leader");
+    let (follower_db, follower, _follower_dir) = create_node("ssi_legacy_snap_follower");
+
+    // Applied entries so the state machine is non-empty and can snapshot.
+    for i in 1..=5 {
+        leader
+            .append_log(i, &format!("SET legacy_base_k{i} legacy_base_v{i}"))
+            .unwrap();
+    }
+    apply_range(&leader, 1, 6);
+
+    // A committed transaction on BOTH nodes — the record a legacy install
+    // would destroy on the follower.
+    let leader_tm = TransactionManager::new(leader_db.clone());
+    let mut t = leader_tm.begin();
+    leader_tm
+        .set(&mut t, "legacy_k", "legacy_v".into())
+        .unwrap();
+    leader_tm.commit(&mut t).unwrap();
+
+    let follower_tm = TransactionManager::new(follower_db.clone());
+    let mut f = follower_tm.begin();
+    follower_tm
+        .set(&mut f, "legacy_k", "legacy_v".into())
+        .unwrap();
+    follower_tm.commit(&mut f).unwrap();
+    assert_eq!(
+        follower_db.ssi_history().committed_record_count(),
+        1,
+        "the follower has its own committed record"
+    );
+
+    // Build a current-format snapshot, then rewrite it into the LEGACY
+    // shape: the version the pre-history code wrote, and no ssi_history
+    // field at all.
+    let mut builder = leader.clone();
+    let snapshot = builder.build_snapshot().await.unwrap();
+    let mut json: serde_json::Value =
+        serde_json::from_slice(&snapshot.snapshot.into_inner()).unwrap();
+    json["version"] = serde_json::json!(1);
+    json.as_object_mut()
+        .expect("snapshot envelope is a JSON object")
+        .remove("ssi_history");
+    let legacy_bytes = serde_json::to_vec(&json).unwrap();
+
+    let mut installer = follower.clone();
+    let result = installer
+        .install_snapshot(&snapshot.meta, Box::new(std::io::Cursor::new(legacy_bytes)))
+        .await;
+
+    assert!(
+        result.is_err(),
+        "a legacy-format snapshot must be rejected, not installed"
+    );
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.contains("ersion"),
+        "expected a version-mismatch error, got: {err}"
+    );
+
+    // The rejection must have left the node's history intact — not wiped
+    // it with a default-empty one.
+    assert_eq!(
+        follower_db.ssi_history().committed_record_count(),
+        1,
+        "a rejected legacy snapshot must not have wiped the node's history"
+    );
+
+    println!("✅ Legacy-format snapshot rejected without wiping history");
+}

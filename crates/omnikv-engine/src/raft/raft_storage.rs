@@ -16,7 +16,15 @@ use std::sync::{Arc, Mutex};
 
 const RAFT_LOG_PREFIX: &str = "__sys__/raft/log/";
 const RAFT_META_KEY: &str = "__sys__/raft/meta";
-const SNAPSHOT_VERSION: u32 = 1;
+/// Bumped to 2 when the SSI committed history (`ssi_history`) joined the
+/// envelope. The version check below REJECTS any mismatch, so a snapshot
+/// written by pre-history code (same version number, no field) must not
+/// slip through: `#[serde(default)]` would turn its absent field into an
+/// EMPTY history, and `install_from` would then wipe the installer's own
+/// history — losing every conflict record for commits the snapshot's data
+/// actually carries. Keeping the version in lockstep with the format means
+/// a legacy snapshot is rejected instead of silently corrupting history.
+const SNAPSHOT_VERSION: u32 = 2;
 
 /// Versioned snapshot envelope — adding version field now prevents future migration pain.
 #[derive(Serialize, Deserialize, Debug)]
@@ -140,18 +148,24 @@ impl OmniRaftStorage {
 
     /// Record the given index as the last applied log index.
     pub fn mark_applied(&self, index: u64) -> Result<(), crate::OmniError> {
-        let mut meta = self
-            .meta
-            .lock()
-            .expect("RaftStorage meta lock poisoned: fatal invariant");
-        // For the test helper, the exact leader_id is not critical — only the index matters.
-        let leader_id = meta
-            .last_applied
-            .map(|existing| existing.leader_id)
-            .unwrap_or_else(|| openraft::CommittedLeaderId::new(0, 0));
-        meta.last_applied = Some(LogId::new(leader_id, index));
         let mut batch = WriteBatch::new();
-        self.save_meta(&meta, &mut batch);
+        {
+            let mut meta = self
+                .meta
+                .lock()
+                .expect("RaftStorage meta lock poisoned: fatal invariant");
+            // For the test helper, the exact leader_id is not critical — only the index matters.
+            let leader_id = meta
+                .last_applied
+                .map(|existing| existing.leader_id)
+                .unwrap_or_else(|| openraft::CommittedLeaderId::new(0, 0));
+            meta.last_applied = Some(LogId::new(leader_id, index));
+            self.save_meta(&meta, &mut batch);
+        }
+        // The meta guard is dropped BEFORE the commit: commit_batch_local
+        // takes the transition lock, and holding meta across it would
+        // invert the lock order against build_snapshot/install_snapshot
+        // (transition -> meta) and deadlock.
         self.db.commit_batch_local(&batch)?;
         Ok(())
     }
@@ -235,15 +249,37 @@ impl RaftLogReader<TypeConfig> for OmniRaftStorage {
 )]
 impl RaftSnapshotBuilder<TypeConfig> for OmniRaftStorage {
     async fn build_snapshot(&mut self) -> Result<Snapshot<TypeConfig>, StorageError<u64>> {
+        // The history, the sequence counter, and the data entries are read as
+        // ONE atomic group under the EXCLUSIVE transition lock. An apply
+        // publishes a commit's DATA and its history record as a pair (the
+        // apply path holds the SHARED lock across both — see flush_staged),
+        // so the exclusive lock here waits for any in-flight apply to finish
+        // publishing both, and blocks new applies from publishing either,
+        // while these reads happen. Without that, an apply landing between
+        // the reads could put data in the scanned entries but its record in
+        // the history sample — or the reverse — and the snapshot would carry
+        // a data/history pair that never existed together. This is the same
+        // lock install_snapshot already holds for its whole rebuild, so
+        // snapshot capture pays the same writer-freeze cost install already
+        // does, and only when one is actually built.
+        let _exclusive = self
+            .db
+            .transition_guard
+            .write()
+            .map_err(|_| StorageError::IO {
+                source: StorageIOError::new(
+                    openraft::ErrorSubject::Store,
+                    openraft::ErrorVerb::Write,
+                    AnyError::error("transition_guard poisoned"),
+                ),
+            })?;
+
         // Read the committed history BEFORE the sequence counter. A record's
         // commit_seq is always ≤ the counter at the moment it was pushed, so
         // sampling history first and max_seq afterwards guarantees every
         // carried marker is ≤ max_seq — the invariant the installer relies
         // on when it bumps its own counter past max_seq to keep the carried
-        // records ordered below its own future commits. (Snapshot building
-        // runs on the multi-threaded consensus runtime and can interleave
-        // with an apply on another worker; a commit landing in between pushes
-        // a record whose commit_seq is still ≤ the later max_seq.)
+        // records ordered below its own future commits.
         let ssi_history: Vec<SsiHistoryEntry> = self
             .db
             .ssi_history()
@@ -455,12 +491,16 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
         }
 
         if last_log_id.is_some() {
-            let mut meta = self
-                .meta
-                .lock()
-                .expect("RaftStorage meta lock poisoned: fatal invariant");
-            meta.last_log_id = last_log_id;
-            self.save_meta(&meta, &mut batch);
+            // Scoped: the guard must be released before commit_chunked
+            // takes the transition lock (lock order is transition -> meta).
+            {
+                let mut meta = self
+                    .meta
+                    .lock()
+                    .expect("RaftStorage meta lock poisoned: fatal invariant");
+                meta.last_log_id = last_log_id;
+                self.save_meta(&meta, &mut batch);
+            }
         }
 
         // Tail chunk (never larger than MAX_OPS thanks to the flushes
@@ -665,7 +705,21 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
             if batch.is_empty() {
                 return Ok(());
             }
-            let marker = self.db.commit_batch_local(batch)?;
+            // One shared transition lock spans the data commit AND the
+            // history record(s) below, so an apply publishes a commit's data
+            // and its record as an indivisible pair. A concurrent
+            // build_snapshot takes the EXCLUSIVE lock for its capture reads
+            // and so cannot observe the data without the record (or the
+            // reverse); without this span the snapshot could carry a
+            // data/history pair that never existed together. Releasing the
+            // guard before the record — as the plain commit_batch_local
+            // would — is exactly the hole this closes.
+            let _topology_guard = self
+                .db
+                .transition_guard
+                .read()
+                .map_err(|_| crate::OmniError::LockPoisoned("transition_guard".into()))?;
+            let marker = self.db.commit_batch_local_locked(batch)?;
             let history = self.db.ssi_history();
             // Entries sharing a batch committed atomically at one marker —
             // a transaction whose read_seq equals it sees all of them.
@@ -783,17 +837,21 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
         flush_staged(&mut batch, &mut staged_slots, &mut res).map_err(io_err)?;
 
         if last_applied.is_some() || new_membership.is_some() {
-            let mut meta = self
-                .meta
-                .lock()
-                .expect("RaftStorage meta lock poisoned: fatal invariant");
-            if let Some(la) = last_applied {
-                meta.last_applied = Some(la);
+            // Scoped: the guard must be released before the final commit
+            // takes the transition lock (lock order is transition -> meta).
+            {
+                let mut meta = self
+                    .meta
+                    .lock()
+                    .expect("RaftStorage meta lock poisoned: fatal invariant");
+                if let Some(la) = last_applied {
+                    meta.last_applied = Some(la);
+                }
+                if let Some(m) = new_membership {
+                    meta.membership = m;
+                }
+                self.save_meta(&meta, &mut batch);
             }
-            if let Some(m) = new_membership {
-                meta.membership = m;
-            }
-            self.save_meta(&meta, &mut batch);
         }
 
         // Final chunk: the meta record only (user data flushed above).

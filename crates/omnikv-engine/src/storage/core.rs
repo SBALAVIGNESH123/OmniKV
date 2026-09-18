@@ -1682,13 +1682,23 @@ impl OmniKV {
     /// itself when it applies entries: raft's own bookkeeping must
     /// never route back through the cluster gateway.
     pub(crate) fn commit_batch_local(&self, tx: &WriteBatch) -> Result<u64, OmniError> {
-        // Acquire shared topology lock — blocks only during exclusive snapshot install.
-        // Thousands of concurrent writers can hold this simultaneously.
+        // Acquire shared topology lock — blocks only during an exclusive
+        // snapshot install or a build_snapshot's capture window. Thousands
+        // of concurrent writers can hold this simultaneously.
         let _topology_guard = self
             .transition_guard
             .read()
             .map_err(|_| OmniError::LockPoisoned("transition_guard".into()))?;
+        self.commit_batch_local_locked(tx)
+    }
 
+    /// The commit body for a caller that ALREADY holds the transition guard's
+    /// read lock. The raft apply path uses this so it can keep that ONE lock
+    /// across both the data commit AND the SSI history record that describes
+    /// it: a snapshot built concurrently must never capture the data with its
+    /// record missing (or the reverse), and pairing them under the shared lock
+    /// is what matches build_snapshot's exclusive capture window.
+    pub(crate) fn commit_batch_local_locked(&self, tx: &WriteBatch) -> Result<u64, OmniError> {
         let start_time = std::time::Instant::now();
 
         // Write Backpressure: If L0 SSTables exceed threshold, wait for compaction
