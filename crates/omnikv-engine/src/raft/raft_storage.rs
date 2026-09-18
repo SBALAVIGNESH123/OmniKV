@@ -28,6 +28,26 @@ struct SnapshotEnvelope {
     /// Critical: global_seq must be set >= this after install to preserve MVCC ordering.
     max_seq: u64,
     entries: Vec<(String, String)>,
+    /// The committed-transaction history at snapshot time, so a node that
+    /// installs this snapshot keeps detecting conflicts against commits
+    /// that arrived IN the snapshot rather than through log apply. Without
+    /// it, a node promoted after installing a snapshot validates against a
+    /// history missing every commit the snapshot carried. `serde(default)`
+    /// keeps snapshots from before the field existing decodable.
+    #[serde(default)]
+    ssi_history: Vec<SsiHistoryEntry>,
+}
+
+/// One committed transaction in a snapshot envelope: the SSI record plus
+/// the marker it was recorded at in the sender's sequence space. The
+/// marker is per-node, but the sender's markers are ≤ `max_seq` and the
+/// installer bumps its own counter past `max_seq`, so the carried values
+/// stay ordered correctly below everything the node writes afterwards.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct SsiHistoryEntry {
+    txn_id: u64,
+    commit_seq: u64,
+    record: crate::transaction::SsiCommitRecord,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
@@ -215,6 +235,27 @@ impl RaftLogReader<TypeConfig> for OmniRaftStorage {
 )]
 impl RaftSnapshotBuilder<TypeConfig> for OmniRaftStorage {
     async fn build_snapshot(&mut self) -> Result<Snapshot<TypeConfig>, StorageError<u64>> {
+        // Read the committed history BEFORE the sequence counter. A record's
+        // commit_seq is always ≤ the counter at the moment it was pushed, so
+        // sampling history first and max_seq afterwards guarantees every
+        // carried marker is ≤ max_seq — the invariant the installer relies
+        // on when it bumps its own counter past max_seq to keep the carried
+        // records ordered below its own future commits. (Snapshot building
+        // runs on the multi-threaded consensus runtime and can interleave
+        // with an apply on another worker; a commit landing in between pushes
+        // a record whose commit_seq is still ≤ the later max_seq.)
+        let ssi_history: Vec<SsiHistoryEntry> = self
+            .db
+            .ssi_history()
+            .snapshot_entries()
+            .into_iter()
+            .map(|(txn_id, commit_seq, record)| SsiHistoryEntry {
+                txn_id,
+                commit_seq,
+                record,
+            })
+            .collect();
+
         let mut entries = Vec::new();
         let (snap_meta, max_seq) = {
             let m = self
@@ -260,6 +301,7 @@ impl RaftSnapshotBuilder<TypeConfig> for OmniRaftStorage {
             membership: snap_meta.last_membership.clone(),
             max_seq,
             entries,
+            ssi_history,
         };
         let serialized = serde_json::to_vec(&envelope).map_err(|e| StorageError::IO {
             source: StorageIOError::new(
@@ -1068,6 +1110,21 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
                 .global_seq
                 .store(envelope.max_seq + 1, Ordering::SeqCst);
         }
+
+        // The snapshot replaced the data wholesale, so the committed
+        // history must be replaced too — otherwise a node promoted after
+        // installing it validates against a history missing every commit
+        // the snapshot carried (they never passed through its log apply).
+        // The carried markers are ≤ max_seq, which the bump above keeps
+        // below everything the node writes next, so they stay ordered
+        // correctly against its own future commits.
+        self.db.ssi_history().install_from(
+            envelope
+                .ssi_history
+                .into_iter()
+                .map(|e| (e.txn_id, e.commit_seq, e.record))
+                .collect(),
+        );
 
         // ── Phase I: Release exclusive lock (writers resume on new topology) ──
         drop(_exclusive);

@@ -301,12 +301,69 @@ impl SsiHistory {
         self.committed_txns.lock().map(|c| c.len()).unwrap_or(0)
     }
 
+    /// A serializable snapshot of the committed history, for a raft
+    /// snapshot envelope. A node that installs that snapshot replays these
+    /// so it keeps detecting conflicts against commits the snapshot
+    /// carried (which never passed through its log-apply path).
+    pub fn snapshot_entries(&self) -> Vec<(TxnId, u64, SsiCommitRecord)> {
+        let committed = self
+            .committed_txns
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        committed
+            .iter()
+            .map(|c| {
+                (
+                    c.txn_id,
+                    c.commit_seq,
+                    SsiCommitRecord {
+                        txn_id: c.txn_id,
+                        write_keys: c.write_keys.iter().cloned().collect(),
+                        read_keys: c.read_keys.iter().cloned().collect(),
+                        read_ranges: c.read_ranges.clone(),
+                    },
+                )
+            })
+            .collect()
+    }
+
+    /// Replaces the whole history, used by snapshot install: the data was
+    /// replaced wholesale, so the in-memory history must be too, then
+    /// refilled from what the snapshot carried.
+    pub fn install_from(&self, entries: Vec<(TxnId, u64, SsiCommitRecord)>) {
+        let mut committed = self
+            .committed_txns
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        committed.clear();
+        for (txn_id, commit_seq, record) in entries {
+            committed.push(CommittedTxn {
+                txn_id,
+                commit_seq,
+                write_keys: record.write_keys.iter().cloned().collect(),
+                read_keys: record.read_keys.iter().cloned().collect(),
+                read_ranges: record.read_ranges,
+            });
+        }
+    }
+
     /// Runs the SSI conflict scan — write-write, rw anti-dependency
     /// (point and range/predicate) — of `txn` against the committed
-    /// history. The caller holds the serialization point, so
-    /// check-and-record is atomic against other committers, and
-    /// `committed` is always the LIVE set, never a pre-lock snapshot.
-    fn detect_conflicts(&self, txn: &Transaction) -> Option<String> {
+    /// history, and returns the history guard alongside the result.
+    ///
+    /// The guard is the whole point: the single-node commit path MUST
+    /// hold it across the batch commit AND its own record insertion.
+    /// Without that span, two transactions whose range scans hash to
+    /// disjoint stripes (only the range ENDPOINTS are striped, so
+    /// overlapping ranges can land in different stripes) both validate
+    /// against a history missing the other and both commit — a
+    /// serializability violation. Returning the guard keeps
+    /// check-and-record atomic without holding a lock across an
+    /// await-able propose.
+    fn detect_conflicts_locked(
+        &self,
+        txn: &Transaction,
+    ) -> (Option<String>, std::sync::MutexGuard<'_, Vec<CommittedTxn>>) {
         // The only lock SsiHistory takes: rw-edges are no longer kept
         // (see the note below on the removed pivot check), so there is
         // no second lock to order against. Poison-tolerant like the
@@ -316,6 +373,16 @@ impl SsiHistory {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
 
+        let found = Self::scan_conflicts(txn, &committed);
+        (found, committed)
+    }
+
+    /// The pure conflict scan — no locking. Separated so the clustered
+    /// path (whose serialization point is the gateway's flight lock, not
+    /// this mutex) can validate without holding the history lock across
+    /// the await-able propose, while the single-node path holds the lock
+    /// across both scan and record via `detect_conflicts_locked`.
+    fn scan_conflicts(txn: &Transaction, committed: &[CommittedTxn]) -> Option<String> {
         let mut found = None;
         'outer: for committed_txn in committed.iter() {
             if committed_txn.commit_seq > txn.read_seq {
@@ -391,6 +458,21 @@ impl SsiHistory {
         }
 
         found
+    }
+
+    /// The clustered-path entry point: scan and release. The gateway's
+    /// flight lock is the serialization point there — it serializes
+    /// proposals, and the apply (which records the history) completes
+    /// before the lock releases — so the history mutex does not need to
+    /// span the await-able propose. Holding it there would needlessly
+    /// stall every concurrent commit on the node for each consensus
+    /// round trip.
+    fn detect_conflicts(&self, txn: &Transaction) -> Option<String> {
+        let committed = self
+            .committed_txns
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        Self::scan_conflicts(txn, &committed)
     }
 
     /// Removes committed transaction records that are no longer needed
@@ -758,14 +840,18 @@ impl TransactionManager {
         //
         // CRITICAL: The history's committed-set lock is held across BOTH
         // the conflict check AND the insertion of our own commit record
-        // below. This prevents a TOCTOU race where two concurrent txns on
-        // the same key both pass validation before either records its
-        // commit. (The clustered branch above gets the same guarantee from
-        // the gateway's flight lock instead.)
+        // below — the guard returned here also spans the batch commit.
+        // Without that span, two transactions whose range scans hash into
+        // DISJOINT stripes (only the range endpoints are striped, so
+        // overlapping ranges can land in different stripes) would both
+        // validate against a history missing the other and both commit —
+        // a serializability violation. (The clustered branch above gets
+        // the same guarantee from the gateway's flight lock instead.)
         // ═══════════════════════════════════════════════════════════════
-        let conflict: Option<String> = self.history.detect_conflicts(txn);
+        let (conflict, mut committed_guard) = self.history.detect_conflicts_locked(txn);
 
         if let Some(conflict_msg) = conflict {
+            drop(committed_guard);
             txn.state = TxnState::Aborted;
             self.cleanup_txn(txn.id, txn.read_seq);
             self.metrics
@@ -779,14 +865,17 @@ impl TransactionManager {
         let batch = Self::build_write_batch(txn)?;
         let commit_seq = self.db.commit_batch(&batch)?;
 
-        // Record this transaction in the committed set — under the
-        // history's lock, so no other txn can sneak between our
-        // validation and our record.
-        self.history.record_committed(
-            txn.id,
+        // Record this transaction by pushing into the guard we still hold
+        // — no other txn can have snuck between our validation and this
+        // record.
+        committed_guard.push(CommittedTxn {
+            txn_id: txn.id,
             commit_seq,
-            &SsiCommitRecord::from_committed_view(txn),
-        );
+            write_keys: txn.write_set.keys().cloned().collect(),
+            read_keys: txn.read_set.clone(),
+            read_ranges: txn.read_ranges.clone(),
+        });
+        drop(committed_guard);
 
         txn.state = TxnState::Committed;
         self.cleanup_txn(txn.id, txn.read_seq);

@@ -100,7 +100,12 @@ routes through the **cluster gateway**:
    began before the failover still conflicts correctly with one committed
    by the previous leader. Each node stamps the record with its OWN apply
    marker — the sequence at which the write became visible there, the same
-   number space its own transactions snapshot.
+   number space its own transactions snapshot. A node that catches up by
+   **snapshot install** instead of log apply never applies those entries,
+   so the snapshot envelope carries the committed history too, stamped with
+   the sender's markers (all ≤ the envelope's `max_seq`, which the installer
+   bumps its own counter past, keeping the carried records ordered below its
+   own future commits).
 5. Only then is the client acknowledged. The ack means: **durable on a
    quorum and applied on this node (the leader)**. It does NOT mean every
    follower has applied it yet — followers apply asynchronously and their

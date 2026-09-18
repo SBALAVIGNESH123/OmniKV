@@ -253,6 +253,17 @@ impl ClusterGateway {
     {
         let _flight = self.flight_blocking();
         let batch = validate()?;
+        // An empty batch carries no writes, so the SSI record has nothing
+        // conflict-bearing to record either — and the apply path stamps a
+        // record's commit_seq from the batch marker, which an empty batch
+        // never produces. Short-circuit here rather than propose a
+        // record-carrying command the state machine cannot stamp. (The
+        // TransactionManager never reaches this path for a read-only txn —
+        // it returns before the clustered branch — so this guards the
+        // public API itself.)
+        if batch.is_empty() {
+            return Ok(0);
+        }
         let cmd = RaftCommand::from_batch_with_ssi(&batch, ssi);
         if cmd.is_empty() {
             return Ok(0);

@@ -92,12 +92,14 @@ impl RaftCommand {
         }
     }
 
-    /// Whether the command would change anything. A command carrying an
-    /// SSI record is never empty: it may be the only evidence of a
-    /// transaction's commit, and dropping it would leave a hole in every
-    /// node's history.
+    /// Whether the command carries any mutation. An SSI record is not
+    /// counted: it describes writes, and a record with no writes to
+    /// describe has no commit marker to stamp it at (the marker comes from
+    /// the batch the apply commits). `commit_ssi_blocking` short-circuits
+    /// an empty batch before a record-carrying command is ever built, so a
+    /// command that reaches the log always has both.
     pub fn is_empty(&self) -> bool {
-        self.sets.is_empty() && self.dels.is_empty() && self.ssi.is_none()
+        self.sets.is_empty() && self.dels.is_empty()
     }
 
     /// Rejects writes into the raft's own bookkeeping keys — the
