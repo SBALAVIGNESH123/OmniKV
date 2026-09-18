@@ -1,0 +1,49 @@
+name: AI PR Review
+on:
+  pull_request:
+    types: [opened, synchronize]
+  issue_comment:
+    types: [created]
+
+concurrency:
+  # Keyed by PR number so a fresh push (or a fresh /command) cancels an
+  # in-flight run for the same PR instead of racing it -- otherwise rapid
+  # pushes burn through the user's own LLM quota on runs whose diff is
+  # already stale before the review is even posted.
+  group: ai-pr-review-${{ github.event.pull_request.number || github.event.issue.number }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    # For issue_comment: only PR comments (not plain issues) starting with a
+    # recognized command, from someone with at least collaborator-level
+    # access -- otherwise any commenter on a public repo could trigger paid
+    # LLM calls against the repo owner's key.
+    if: >
+      github.event_name == 'pull_request' ||
+      (
+        github.event.issue.pull_request != null &&
+        startsWith(github.event.comment.body, '/') &&
+        contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association)
+      )
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+      contents: read
+      id-token: write
+      checks: write
+    steps:
+      - uses: docker://ghcr.io/huseyincenik/pr-reviewer-app:latest
+        with:
+          provider: openrouter
+          model: deepseek/deepseek-v4-flash-0731:free
+          api-key: ${{ secrets.PR_REVIEWER_API_KEY }}
+          review-event: COMMENT
+          # action.yml's input defaults (like this one) are only applied
+          # when an action is resolved via a repo reference; a raw
+          # docker://image reference skips metadata resolution entirely, so
+          # every input -- including ones with a "default" in action.yml --
+          # must be passed explicitly here.
+          github-token: ${{ github.token }}
+          app-token-endpoint: https://pr-reviewer-token-service.huseyinceniik.workers.dev
+          auto-fallback: false
