@@ -832,7 +832,23 @@ impl TransactionManager {
         // read-range endpoints (deadlock prevention via lock ordering);
         // held across validation+commit. Non-overlapping transactions
         // proceed fully in parallel.
+        //
+        // The shared transition lock is taken FIRST and held across the
+        // history guard and the commit below, so the order is transition
+        // -> history everywhere. The commit uses commit_batch_local_locked
+        // (it does not re-take this guard: std::sync::RwLock read is not
+        // reentrant) — taking the history guard first and then the
+        // transition lock through a plain commit_batch_local would invert
+        // against build_snapshot/install_snapshot (transition -> history)
+        // and deadlock. Uncontended in single-node mode: the write side is
+        // only ever held by a raft snapshot capture/install, and a node
+        // running this path has no gateway and so no raft.
         // ═══════════════════════════════════════════════════════════════
+        let _topology_guard = self
+            .db
+            .transition_guard
+            .read()
+            .map_err(|_| OmniError::LockPoisoned("transition_guard".into()))?;
         let _guards = self.acquire_commit_stripes(txn);
 
         // ═══════════════════════════════════════════════════════════════
@@ -863,7 +879,7 @@ impl TransactionManager {
 
         // No conflicts! Build the batch the SSI engine would apply.
         let batch = Self::build_write_batch(txn)?;
-        let commit_seq = self.db.commit_batch(&batch)?;
+        let commit_seq = self.db.commit_batch_local_locked(&batch)?;
 
         // Record this transaction by pushing into the guard we still hold
         // — no other txn can have snuck between our validation and this
