@@ -35,8 +35,10 @@ jobs:
     steps:
       - uses: docker://ghcr.io/huseyincenik/pr-reviewer-app:latest
         with:
-          provider: openrouter
-          model: deepseek/deepseek-v4-flash-0731:free
+          # gemini-2.5-pro was deprecated and now 404s for new users;
+          # gemini-3.1-pro-preview is the replacement Gemini points at.
+          provider: gemini
+          model: gemini-3.1-pro-preview
           api-key: ${{ secrets.PR_REVIEWER_API_KEY }}
           review-event: COMMENT
           # action.yml's input defaults (like this one) are only applied
