@@ -294,8 +294,10 @@ async fn spawn_protocol_servers(
 
     // ─── 4. TCP Command Interface (for telnet/debug) ──────────
     let tcp_db = db.clone();
+    let tcp_secret = cfg.jwt_secret.clone();
+    let tcp_rate_limiter = rate_limiter.clone();
     let tcp_handle = tokio::spawn(async move {
-        if let Err(e) = run_tcp_server(tcp_db, &tcp_addr_str).await {
+        if let Err(e) = run_tcp_server(tcp_db, &tcp_addr_str, tcp_secret, tcp_rate_limiter).await {
             tracing::error!("TCP server error: {e}");
         }
     });
@@ -303,104 +305,418 @@ async fn spawn_protocol_servers(
     Ok((http_handle, quic_handle, tcp_handle))
 }
 
-/// Simple TCP command interface for telnet/debugging.
-async fn run_tcp_server(db: Arc<OmniKV>, addr: &str) -> Result<(), Box<dyn std::error::Error>> {
-    use omni_engine::WriteBatch;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+/// Upper bound on one buffered command line. Sits above `max_value_size`
+/// (10 MiB) so a legitimate single-line SET still fits; beyond it the
+/// connection is dropped rather than absorbing unbounded memory per peer.
+const MAX_TCP_LINE: usize = 12 * 1024 * 1024;
 
+/// Failed AUTH attempts tolerated on one connection before it is dropped.
+/// Slows token grinding on a publicly bound interface; a legitimate client
+/// that authenticates never reaches it.
+const MAX_TCP_AUTH_FAILURES: u32 = 5;
+
+/// Simple TCP command interface for telnet/debugging.
+///
+/// # Authentication
+/// Every command other than `AUTH` and `QUIT` is rejected with
+/// `ERR AUTH_REQUIRED` until the connection authenticates:
+///
+/// ```text
+/// AUTH <jwt-token>
+/// OK: authenticated as <subject>
+/// GET some-key
+/// OK: <value>
+/// ```
+///
+/// The token is the same JWT the REST and QUIC paths accept (`sub` +
+/// `role` + expiry, HS256-signed with the configured secret), verified
+/// through [`crate::auth::verify_token`]. This closes the hole where the
+/// interface granted unauthenticated full read/write to anyone who could
+/// reach the port, bypassing the auth layer guarding every other protocol.
+/// Like the QUIC listener, a connection to a node with no secret configured
+/// cannot authenticate at all (`ERR AUTH_NOT_CONFIGURED`) — bind loopback
+/// and configure a secret, or leave the interface off. Authenticated
+/// commands share the QUIC path's per-identity rate limiter, and a session
+/// that fails `AUTH` five times is dropped (`ERR TOO_MANY_FAILURES`) to slow
+/// token grinding. Error replies are sanitized: engine internals never reach
+/// the client (see [`tcp_err_response`]).
+///
+/// Commands are framed on newlines, so a client may pipeline several
+/// commands per segment; lines above [`MAX_TCP_LINE`] are rejected and the
+/// connection closed.
+async fn run_tcp_server(
+    db: Arc<OmniKV>,
+    addr: &str,
+    jwt_secret: String,
+    rate_limiter: Arc<RateLimiter>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!("TCP command interface on {addr}");
 
     loop {
-        let (mut socket, _addr) = listener.accept().await?;
-        let db = db.clone();
+        let (socket, peer) = listener.accept().await?;
+        tokio::spawn(handle_tcp_connection(
+            socket,
+            peer,
+            db.clone(),
+            jwt_secret.clone(),
+            rate_limiter.clone(),
+        ));
+    }
+}
 
-        tokio::spawn(async move {
-            let mut buf = [0u8; 4096];
+/// One authenticated client session. See [`run_tcp_server`] for the
+/// protocol's security model; this is the per-connection state machine.
+async fn handle_tcp_connection(
+    socket: tokio::net::TcpStream,
+    peer: std::net::SocketAddr,
+    db: Arc<OmniKV>,
+    jwt_secret: String,
+    rate_limiter: Arc<RateLimiter>,
+) {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
-            loop {
-                let n = match socket.read(&mut buf).await {
-                    Ok(0) => return,
-                    Ok(n) => n,
-                    Err(_) => return,
-                };
+    // Frame on newlines: a client may pipeline several commands in
+    // one segment, and a single command may straddle a read
+    // boundary. Buffering by line (instead of consuming one command
+    // per 4096-byte read) keeps both cases intact.
+    let (read_half, mut write_half) = socket.into_split();
+    let mut reader = tokio::io::BufReader::new(read_half);
+    let mut raw = Vec::with_capacity(512);
 
-                let request = String::from_utf8_lossy(&buf[..n]);
-                let request = request.trim();
-                if request.is_empty() {
-                    continue;
+    // A connection is unauthenticated until a valid AUTH lands.
+    // Every data command before then is refused, so an open port
+    // never doubles as an open database.
+    let mut authenticated = false;
+    let mut identity = String::new();
+    let mut auth_failures = 0u32;
+
+    loop {
+        raw.clear();
+        match reader.read_until(b'\n', &mut raw).await {
+            Ok(0) => return,
+            Ok(_) => {}
+            Err(_) => return,
+        }
+
+        // Cap the line length: without it, a client can make the
+        // server buffer an unbounded "value" per connection. The
+        // limit sits above max_value_size so legitimate writes fit.
+        if raw.len() > MAX_TCP_LINE {
+            let _ = write_half.write_all(b"ERROR: LINE_TOO_LONG\n").await;
+            return;
+        }
+
+        let request = String::from_utf8_lossy(&raw);
+        let request = request.trim();
+        if request.is_empty() {
+            continue;
+        }
+
+        let mut parts = request.splitn(3, char::is_whitespace);
+        let cmd = parts.next().unwrap_or("");
+
+        let response = match cmd.to_uppercase().as_str() {
+            "AUTH" => match handle_tcp_auth(&mut parts, &jwt_secret, peer) {
+                AuthOutcome::Accepted { subject } => {
+                    authenticated = true;
+                    identity = format!("tcp:user:{subject}");
+                    format!("OK: authenticated as {subject}\n")
                 }
-
-                let mut parts = request.splitn(3, char::is_whitespace);
-                let cmd = parts.next().unwrap_or("");
-
-                let response = match cmd.to_uppercase().as_str() {
-                    "GET" => {
-                        if let Some(key) = parts.next() {
-                            let seq = db.get_seq();
-                            match db.find(key, seq) {
-                                Ok(Some(val)) => format!("OK: {val}\n"),
-                                Ok(None) => "NOT_FOUND\n".to_string(),
-                                Err(e) => format!("ERROR: {e:?}\n"),
-                            }
-                        } else {
-                            "ERROR: Missing key\n".to_string()
-                        }
-                    }
-                    "SET" => {
-                        if let (Some(key), Some(value)) = (parts.next(), parts.next()) {
-                            let mut batch = WriteBatch::new();
-                            match batch.set(key, value.to_string()) {
-                                Ok(_) => match db.commit_batch(&batch) {
-                                    Ok(seq) => format!("OK: seq={seq}\n"),
-                                    Err(e) => format!("ERROR: {e:?}\n"),
-                                },
-                                Err(e) => format!("ERROR: {e:?}\n"),
-                            }
-                        } else {
-                            "ERROR: SET <key> <value>\n".to_string()
-                        }
-                    }
-                    "DELETE" => {
-                        if let Some(key) = parts.next() {
-                            let mut batch = WriteBatch::new();
-                            match batch.delete(key) {
-                                Ok(_) => match db.commit_batch(&batch) {
-                                    Ok(seq) => format!("DELETED: seq={seq}\n"),
-                                    Err(e) => format!("ERROR: {e:?}\n"),
-                                },
-                                Err(e) => format!("ERROR: {e:?}\n"),
-                            }
-                        } else {
-                            "ERROR: Missing key\n".to_string()
-                        }
-                    }
-                    "SCAN" => {
-                        let start = parts.next().unwrap_or("");
-                        let end = parts.next().unwrap_or("\x7F");
-                        let seq = db.get_seq();
-                        match db.scan(start, end, seq) {
-                            Ok(results) => {
-                                let mut out = format!("{} results:\n", results.len());
-                                for (k, v) in results.iter().take(50) {
-                                    out.push_str(&format!("  {k} = {v}\n"));
-                                }
-                                out
-                            }
-                            Err(e) => format!("ERROR: {e:?}\n"),
-                        }
-                    }
-                    "QUIT" | "EXIT" => {
-                        let _ = socket.write_all(b"Goodbye.\n").await;
+                AuthOutcome::Rejected { message } => {
+                    auth_failures += 1;
+                    if auth_failures >= MAX_TCP_AUTH_FAILURES {
+                        tracing::warn!(
+                            peer = %peer,
+                            "dropping TCP session after \
+                             {MAX_TCP_AUTH_FAILURES} failed AUTH attempts"
+                        );
+                        let _ = write_half.write_all(b"ERR TOO_MANY_FAILURES\n").await;
                         return;
                     }
-                    _ => "ERROR: Unknown command (GET, SET, DELETE, SCAN, QUIT)\n".to_string(),
-                };
-
-                if socket.write_all(response.as_bytes()).await.is_err() {
-                    return;
+                    message
+                }
+                AuthOutcome::Unconfigured => "ERR AUTH_NOT_CONFIGURED\n".to_string(),
+            },
+            "QUIT" | "EXIT" => {
+                let _ = write_half.write_all(b"Goodbye.\n").await;
+                return;
+            }
+            // Everything else requires an authenticated session.
+            _ if !authenticated => "ERR AUTH_REQUIRED\n".to_string(),
+            _ => {
+                // Same per-identity limiter the QUIC path uses: one
+                // authenticated client cannot starve the node.
+                match rate_limiter.try_acquire(&identity) {
+                    Ok(_) => dispatch_tcp_command(cmd, &mut parts, &db),
+                    Err(retry_after_ms) => {
+                        omni_engine::metrics_prometheus::record_rate_limit_rejection("tcp");
+                        format!("ERR RATE_LIMITED retry_after_ms={retry_after_ms}\n")
+                    }
                 }
             }
-        });
+        };
+
+        if write_half.write_all(response.as_bytes()).await.is_err() {
+            return;
+        }
+    }
+}
+
+/// What `AUTH` decided about a session.
+enum AuthOutcome {
+    /// The token verified; `subject` is the principal to rate-limit under.
+    Accepted { subject: String },
+    /// The token was missing or invalid; `message` is the reply to send.
+    Rejected { message: String },
+    /// No JWT secret is configured, so no token could ever verify.
+    Unconfigured,
+}
+
+/// Verify one `AUTH <token>` line. The token carries no whitespace, so the
+/// whole remainder of the line is it.
+fn handle_tcp_auth(
+    parts: &mut std::str::SplitN<'_, impl Fn(char) -> bool>,
+    jwt_secret: &str,
+    peer: std::net::SocketAddr,
+) -> AuthOutcome {
+    if jwt_secret.is_empty() {
+        tracing::error!(
+            peer = %peer,
+            "TCP AUTH attempted but no JWT secret is configured"
+        );
+        return AuthOutcome::Unconfigured;
+    }
+    let token = parts.next().unwrap_or("").trim();
+    if token.is_empty() {
+        return AuthOutcome::Rejected {
+            message: "ERR MISSING_AUTH_TOKEN\n".into(),
+        };
+    }
+    match crate::auth::verify_token(token, jwt_secret) {
+        Ok(claims) => {
+            tracing::info!(
+                peer = %peer,
+                sub = %claims.sub,
+                role = %claims.role,
+                "TCP session authenticated"
+            );
+            AuthOutcome::Accepted {
+                subject: claims.sub,
+            }
+        }
+        Err(_) => {
+            tracing::warn!(peer = %peer, "TCP JWT verification failed");
+            AuthOutcome::Rejected {
+                message: "ERR INVALID_TOKEN\n".into(),
+            }
+        }
+    }
+}
+
+/// Run one authenticated data command against the database and return the
+/// client-facing response line. Extracted from the connection loop so the
+/// command surface (and its error sanitization) is unit-testable without
+/// a socket.
+fn dispatch_tcp_command(
+    cmd: &str,
+    parts: &mut std::str::SplitN<'_, impl Fn(char) -> bool>,
+    db: &Arc<OmniKV>,
+) -> String {
+    use omni_engine::WriteBatch;
+
+    match cmd {
+        "GET" => {
+            if let Some(key) = parts.next() {
+                let seq = db.get_seq();
+                match db.find(key, seq) {
+                    Ok(Some(val)) => format!("OK: {val}\n"),
+                    Ok(None) => "NOT_FOUND\n".to_string(),
+                    Err(e) => tcp_err_response(&e),
+                }
+            } else {
+                "ERROR: Missing key\n".to_string()
+            }
+        }
+        "SET" => {
+            if let (Some(key), Some(value)) = (parts.next(), parts.next()) {
+                let mut batch = WriteBatch::new();
+                match batch.set(key, value.to_string()) {
+                    Ok(_) => match db.commit_batch(&batch) {
+                        Ok(seq) => format!("OK: seq={seq}\n"),
+                        Err(e) => tcp_err_response(&e),
+                    },
+                    Err(e) => tcp_err_response(&e),
+                }
+            } else {
+                "ERROR: SET <key> <value>\n".to_string()
+            }
+        }
+        "DELETE" => {
+            if let Some(key) = parts.next() {
+                let mut batch = WriteBatch::new();
+                match batch.delete(key) {
+                    Ok(_) => match db.commit_batch(&batch) {
+                        Ok(seq) => format!("DELETED: seq={seq}\n"),
+                        Err(e) => tcp_err_response(&e),
+                    },
+                    Err(e) => tcp_err_response(&e),
+                }
+            } else {
+                "ERROR: Missing key\n".to_string()
+            }
+        }
+        "SCAN" => {
+            let start = parts.next().unwrap_or("");
+            let end = parts.next().unwrap_or("\x7F");
+            let seq = db.get_seq();
+            match db.scan(start, end, seq) {
+                Ok(results) => {
+                    let mut out = format!("{} results:\n", results.len());
+                    for (k, v) in results.iter().take(50) {
+                        out.push_str(&format!("  {k} = {v}\n"));
+                    }
+                    out
+                }
+                Err(e) => tcp_err_response(&e),
+            }
+        }
+        _ => "ERROR: Unknown command (AUTH, GET, SET, DELETE, SCAN, QUIT)\n".to_string(),
+    }
+}
+
+/// Map a storage error to a safe client-facing TCP response line.
+///
+/// Client-caused errors get a specific, safe message; everything else is
+/// logged server-side and reported as a generic `INTERNAL`. The previous
+/// `{e:?}` formatting leaked engine internals (paths, lock names, batch
+/// state) to anyone who could reach the port.
+fn tcp_err_response(e: &omni_engine::OmniError) -> String {
+    match e {
+        omni_engine::OmniError::KeyNotFound => "ERROR: NOT_FOUND\n".into(),
+        omni_engine::OmniError::BatchTooLarge(_) | omni_engine::OmniError::ValueTooLarge(_) => {
+            "ERROR: REQUEST_TOO_LARGE\n".into()
+        }
+        omni_engine::OmniError::WriteStall => "ERROR: BUSY\n".into(),
+        // Client-caused and safe to expose: in a cluster the caller hit a
+        // follower, and it needs the leader's identity to retry there.
+        // Answering INTERNAL for the most common clustered-write failure
+        // would make the interface unusable for real clients.
+        omni_engine::OmniError::NotLeader { leader_id } => match leader_id {
+            Some(id) => format!("ERROR: NOT_LEADER the leader is node {id}\n"),
+            None => "ERROR: NOT_LEADER no leader elected yet\n".into(),
+        },
+        _ => {
+            tracing::error!(error = ?e, "TCP command internal error");
+            "ERROR: INTERNAL\n".into()
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A scratch database in a temp dir for one test.
+    fn test_db() -> Arc<OmniKV> {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let manifest = dir.path().join("manifest.json");
+        let wal = dir.path().join("wal.bin");
+        OmniKV::open(&manifest.to_string_lossy(), &wal.to_string_lossy())
+            .expect("open test database")
+    }
+
+    fn run(db: &Arc<OmniKV>, line: &str) -> String {
+        let mut parts = line.splitn(3, char::is_whitespace);
+        let cmd = parts.next().unwrap_or("");
+        dispatch_tcp_command(cmd, &mut parts, db)
+    }
+
+    #[test]
+    fn tcp_dispatch_set_get_delete_round_trip() {
+        let db = test_db();
+
+        let set = run(&db, "SET k1 hello");
+        assert!(set.starts_with("OK: seq="), "SET replied: {set}");
+
+        assert_eq!(run(&db, "GET k1"), "OK: hello\n");
+        assert_eq!(run(&db, "GET missing"), "NOT_FOUND\n");
+
+        let del = run(&db, "DELETE k1");
+        assert!(del.starts_with("DELETED: seq="), "DELETE replied: {del}");
+        assert_eq!(run(&db, "GET k1"), "NOT_FOUND\n");
+    }
+
+    #[test]
+    fn tcp_dispatch_rejects_missing_arguments() {
+        let db = test_db();
+        assert_eq!(run(&db, "GET"), "ERROR: Missing key\n");
+        assert_eq!(run(&db, "SET only-a-key"), "ERROR: SET <key> <value>\n");
+        assert_eq!(run(&db, "DELETE"), "ERROR: Missing key\n");
+    }
+
+    #[test]
+    fn tcp_dispatch_unknown_command_lists_the_surface() {
+        let db = test_db();
+        let resp = run(&db, "DROP TABLE users");
+        assert!(resp.starts_with("ERROR: Unknown command"), "got: {resp}");
+        // The listing is what a legitimate operator needs to discover
+        // AUTH; it must not hint at anything beyond the public surface.
+        for cmd in ["AUTH", "GET", "SET", "DELETE", "SCAN", "QUIT"] {
+            assert!(
+                resp.contains(cmd),
+                "unknown-command help omits {cmd}: {resp}"
+            );
+        }
+    }
+
+    #[test]
+    fn tcp_scan_reports_the_count() {
+        let db = test_db();
+        run(&db, "SET scan:a 1");
+        run(&db, "SET scan:b 2");
+        let resp = run(&db, "SCAN scan:a scan:z");
+        assert!(resp.starts_with("2 results:"), "got: {resp}");
+        assert!(resp.contains("scan:a = 1") && resp.contains("scan:b = 2"));
+    }
+
+    #[test]
+    fn tcp_error_sanitization_hides_engine_internals() {
+        // Client-caused errors get a specific, safe message.
+        assert_eq!(
+            tcp_err_response(&omni_engine::OmniError::KeyNotFound),
+            "ERROR: NOT_FOUND\n"
+        );
+        assert_eq!(
+            tcp_err_response(&omni_engine::OmniError::ValueTooLarge(999)),
+            "ERROR: REQUEST_TOO_LARGE\n"
+        );
+        assert_eq!(
+            tcp_err_response(&omni_engine::OmniError::WriteStall),
+            "ERROR: BUSY\n"
+        );
+
+        // A clustered write to a follower: the client needs the leader's
+        // identity to retry there, so it is exposed rather than collapsed
+        // to INTERNAL.
+        assert_eq!(
+            tcp_err_response(&omni_engine::OmniError::NotLeader { leader_id: Some(2) }),
+            "ERROR: NOT_LEADER the leader is node 2\n"
+        );
+        assert_eq!(
+            tcp_err_response(&omni_engine::OmniError::NotLeader { leader_id: None }),
+            "ERROR: NOT_LEADER no leader elected yet\n"
+        );
+
+        // Everything else collapses to a generic INTERNAL. The old
+        // `{e:?}` formatting handed paths and lock names to any client
+        // who could reach the port (issue #117).
+        let sensitive = omni_engine::OmniError::DatabaseAlreadyOpen {
+            lock_path: "/var/lib/omnikv/.lock".into(),
+        };
+        let resp = tcp_err_response(&sensitive);
+        assert_eq!(resp, "ERROR: INTERNAL\n");
+        assert!(!resp.contains("/var/lib"), "leaked a path: {resp}");
+        assert!(!resp.contains("lock"), "leaked a lock name: {resp}");
     }
 }
