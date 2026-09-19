@@ -6,6 +6,10 @@ services:
     image: ${OMNIKV_IMAGE:-omnikv:cluster-smoke}
     container_name: omni-cluster-smoke-node-1
     ports:
+      # HTTPS is published so the harness can mint a JWT through the real
+      # token endpoint (POST /auth/token) — the TCP interface requires it
+      # now (issue #117). Loopback-only, like the TCP ports.
+      - "127.0.0.1:${OMNIKV_HTTP_PORT_1:-18443}:8443"
       - "127.0.0.1:${OMNIKV_TCP_PORT_1:-18080}:8080"
     volumes:
       - omni-cluster-smoke-data-1:/data
