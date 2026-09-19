@@ -247,6 +247,15 @@ fn sanitize_storage_err(e: &OmniError) -> String {
         OmniError::BatchTooLarge(_) => "BATCH_TOO_LARGE".to_string(),
         OmniError::ValueTooLarge(_) => "VALUE_TOO_LARGE".to_string(),
         OmniError::UnsupportedVersion { .. } => "UNSUPPORTED_VERSION".to_string(),
+        // The one client-caused error that is safe — and useful — to
+        // explain: the write hit a follower, and the caller needs the
+        // leader's id to retry there. Without it, a clustered client
+        // sees STORAGE_ERROR on every write to a follower and has no
+        // way to recover.
+        OmniError::NotLeader { leader_id } => match leader_id {
+            Some(id) => format!("NOT_LEADER the leader is node {id}"),
+            None => "NOT_LEADER no leader elected yet".to_string(),
+        },
         _ => "STORAGE_ERROR".to_string(),
     }
 }
@@ -262,6 +271,10 @@ fn http_status_for_storage_err(e: &OmniError) -> StatusCode {
     match e {
         OmniError::KeyNotFound => StatusCode::NOT_FOUND,
         OmniError::BatchTooLarge(_) | OmniError::ValueTooLarge(_) => StatusCode::BAD_REQUEST,
+        // The client asked the wrong node: the write is well-formed, it
+        // just has to go to the leader. 503 (not 500) keeps it out of the
+        // "server is broken" bucket for operators' alerting.
+        OmniError::NotLeader { .. } => StatusCode::SERVICE_UNAVAILABLE,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }
@@ -1495,5 +1508,33 @@ mod tests {
             .expect("second response");
         assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
         assert!(second.headers().contains_key(header::RETRY_AFTER));
+    }
+
+    #[test]
+    fn sanitize_exposes_leader_redirect_but_hides_internals() {
+        // A follower write is the common clustered failure, and the client
+        // can act on it: it needs the leader's id. That is safe to expose.
+        let msg = sanitize_storage_err(&OmniError::NotLeader { leader_id: Some(3) });
+        assert_eq!(msg, "NOT_LEADER the leader is node 3");
+        assert_eq!(
+            http_status_for_storage_err(&OmniError::NotLeader { leader_id: Some(3) }),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        // No leader yet (election in flight): still a redirect-class error.
+        assert!(
+            sanitize_storage_err(&OmniError::NotLeader { leader_id: None }).contains("NOT_LEADER")
+        );
+        assert_eq!(
+            http_status_for_storage_err(&OmniError::NotLeader { leader_id: None }),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+
+        // Everything else stays opaque: paths and lock names never reach a
+        // client (issue #117 — the TCP path leaked these for real).
+        let internal = sanitize_storage_err(&OmniError::DatabaseAlreadyOpen {
+            lock_path: "/var/lib/omnikv/.lock".into(),
+        });
+        assert_eq!(internal, "STORAGE_ERROR");
+        assert!(!internal.contains("/var/lib"));
     }
 }

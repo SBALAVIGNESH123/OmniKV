@@ -882,3 +882,50 @@ fn test_raft_peer_hostname_is_accepted() {
     cfg.validate_runtime()
         .unwrap_or_else(|e| panic!("hostname peers must validate: {e}"));
 }
+
+#[test]
+fn test_tcp_loopback_bind_is_the_default() {
+    // Every other listener defaults to loopback; the TCP command
+    // interface must too (issue #117) — it grants full read/write.
+    let cfg = ServerConfig::default();
+    assert_eq!(cfg.tcp_addr, "127.0.0.1:7072");
+    cfg.validate_runtime()
+        .unwrap_or_else(|e| panic!("loopback default must validate: {e}"));
+}
+
+#[test]
+fn test_tcp_public_bind_requires_opt_in() {
+    // A non-loopback bind exposes an unrestricted read/write path to
+    // every host that can reach the port. It must be deliberate.
+    let mut cfg = ServerConfig {
+        tcp_addr: "0.0.0.0:8080".into(),
+        ..Default::default()
+    };
+    let err = cfg.validate_runtime().unwrap_err();
+    assert!(
+        err.0.contains("OMNIKV_TCP_BIND_PUBLIC"),
+        "public TCP bind must name the opt-in: {err}"
+    );
+
+    // The opt-in acknowledges the exposure; the config then validates.
+    cfg.tcp_bind_public = true;
+    cfg.validate_runtime()
+        .unwrap_or_else(|e| panic!("opted-in public bind must validate: {e}"));
+}
+
+#[test]
+fn test_tcp_public_bind_env_opt_in_round_trip() {
+    with_env(
+        &[
+            ("OMNIKV_TCP_ADDR", "0.0.0.0:8080"),
+            ("OMNIKV_TCP_BIND_PUBLIC", "true"),
+        ],
+        || {
+            let mut cfg = ServerConfig::default();
+            cfg.apply_env().unwrap();
+            assert!(cfg.tcp_bind_public);
+            cfg.validate_runtime()
+                .unwrap_or_else(|e| panic!("env opt-in must validate: {e}"));
+        },
+    );
+}

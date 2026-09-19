@@ -6,13 +6,18 @@
 //! Runs anywhere the test suite runs (Linux CI, Windows dev): it spawns
 //! the `omnikv-server` binary three times with distinct ports, data
 //! dirs, and raft node ids, drives writes through the TCP command
-//! interface (no auth needed — see issue #117), and observes leadership
-//! by write-probing (a write succeeds only where the leader is).
+//! interface (AUTH pipelined ahead of each command — see issue #117),
+//! and observes leadership by write-probing (a write succeeds only where
+//! the leader is).
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::process::{Child, Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+/// JWT secret the nodes boot with (see `spawn_node`) and the tests sign
+/// tokens with. A node with a mismatched secret refuses every command.
+const TEST_JWT_SECRET: &str = "test-jwt-secret-0123456789abcdef";
 
 /// One spawned cluster node. `kill()`ed tests read `ports` after the
 /// child is gone, so the connection endpoints live here, not on Child.
@@ -37,34 +42,88 @@ impl Drop for Node {
     }
 }
 
+/// Sign the JWT every command is authorized with (issue #117): the TCP
+/// interface refuses all data commands until a valid token arrives.
+fn test_token() -> String {
+    use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
+    use serde::Serialize;
+
+    #[derive(Serialize)]
+    struct Claims {
+        sub: String,
+        role: String,
+        exp: u64,
+        iat: u64,
+    }
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock")
+        .as_secs();
+    let claims = Claims {
+        sub: "cluster-test".into(),
+        role: "admin".into(),
+        exp: now + 3600,
+        iat: now,
+    };
+    encode(
+        &Header::new(Algorithm::HS256),
+        &claims,
+        &EncodingKey::from_secret(TEST_JWT_SECRET.as_bytes()),
+    )
+    .expect("sign test token")
+}
+
 /// Sends one command to the TCP command interface, returns the
-/// response (line-oriented: request `\n`, response ends with `\n`).
+/// response. `AUTH <token>` is pipelined ahead of the command on the
+/// same connection; the interface authenticates the session and then
+/// runs the command, replying with one line per request.
 fn tcp_cmd(port: u16, cmd: &str) -> Result<String, String> {
+    tcp_cmd_raw_lines(port, &format!("AUTH {}\n{cmd}\n", test_token()), 2)
+}
+
+/// Sends a command with NO auth header — the interface must refuse it.
+/// Used to prove the regression fixed in issue #117 stays fixed.
+fn tcp_cmd_unauthenticated(port: u16, cmd: &str) -> Result<String, String> {
+    tcp_cmd_raw_lines(port, &format!("{cmd}\n"), 1)
+}
+
+/// Write `request`, read back until `expect_lines` complete lines have
+/// arrived, return the last non-empty one. Reading a fixed number of
+/// lines matters: a single `read()` can return a prefix of the response
+/// when it arrives in multiple TCP segments, and the exact-match
+/// assertions would flake without a product defect. For a pipelined
+/// AUTH+command the last line is the command's own reply.
+fn tcp_cmd_raw_lines(port: u16, request: &str, expect_lines: usize) -> Result<String, String> {
     let mut stream =
         TcpStream::connect(("127.0.0.1", port)).map_err(|e| format!("connect: {e}"))?;
     stream
         .set_read_timeout(Some(Duration::from_secs(10)))
         .map_err(|e| format!("timeout set: {e}"))?;
     stream
-        .write_all(format!("{cmd}\n").as_bytes())
+        .write_all(request.as_bytes())
         .map_err(|e| format!("write: {e}"))?;
-    // Read until the terminating newline: a single read() can return a
-    // prefix of the response when it arrives in multiple TCP segments,
-    // and the exact-match assertions would then flake without a product
-    // defect.
+
+    // Peel whole lines out of the buffer as they arrive; a partial line
+    // stays in `out` until the next read completes it.
     let mut out = Vec::new();
+    let mut lines = Vec::new();
     let mut buf = [0u8; 4096];
-    loop {
+    while lines.len() < expect_lines {
         let n = stream.read(&mut buf).map_err(|e| format!("read: {e}"))?;
         if n == 0 {
             break;
         }
         out.extend_from_slice(&buf[..n]);
-        if out.contains(&b'\n') {
-            break;
+        while let Some(nl) = out.iter().position(|&b| b == b'\n') {
+            let line = String::from_utf8_lossy(&out[..nl]).trim().to_string();
+            out.drain(..=nl);
+            if !line.is_empty() {
+                lines.push(line);
+            }
         }
     }
-    Ok(String::from_utf8_lossy(&out).trim().to_string())
+    Ok(lines.pop().unwrap_or_default())
 }
 
 /// A free port for a listener the test will bind later. Racy in theory,
@@ -116,7 +175,7 @@ fn spawn_node(id: u64, ports: &[(u16, u16, u16, u16, u16)]) -> Node {
             "OMNIKV_WAL_PATH",
             dir.join("wal.bin").to_string_lossy().to_string(),
         )
-        .env("OMNIKV_JWT_SECRET", "test-jwt-secret-0123456789abcdef")
+        .env("OMNIKV_JWT_SECRET", TEST_JWT_SECRET)
         .env(
             "OMNIKV_BOOTSTRAP_ADMIN_KEY",
             "test-bootstrap-key-0123456789",
@@ -241,6 +300,19 @@ fn concurrent_writers_do_not_deadlock(leader_tcp: u16, nodes: &[Node]) {
 fn cluster_failover_kill_leader_no_data_loss() {
     let nodes = boot_cluster();
     let refs: Vec<&Node> = nodes.iter().collect();
+
+    // ── 0. The command interface refuses work before AUTH (issue #117) ──
+    // Before the fix, anyone who could reach the port had unrestricted
+    // read/write. Now every data command is gated behind a verified JWT.
+    for node in &refs {
+        let refused = tcp_cmd_unauthenticated(node.tcp_port(), "GET failover:key");
+        assert!(
+            matches!(&refused, Ok(r) if r.contains("AUTH_REQUIRED")),
+            "node {} accepted an unauthenticated command: {refused:?}",
+            node.id
+        );
+    }
+    println!("all nodes refuse unauthenticated commands");
 
     // ── 1. A leader is elected and accepts writes ──
     let deadline = Instant::now() + Duration::from_secs(30);

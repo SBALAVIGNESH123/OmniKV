@@ -2,7 +2,12 @@ x-omnikv-common-env: &omnikv-common-env
   OMNIKV_HTTP_ADDR: "0.0.0.0:8443"
   OMNIKV_QUIC_ADDR: "0.0.0.0:4433"
   OMNIKV_PGWIRE_ADDR: "0.0.0.0:5433"
-  OMNIKV_TCP_ADDR: "0.0.0.0:8080"
+  # The TCP command interface is a plaintext, unrestricted read/write
+  # path into the whole database (issue #117). It is JWT-gated, but it is
+  # still not something to publish to the host network: REST (8443) and
+  # PgWire (5433) cover every documented use case. It stays loopback-only
+  # inside the container, reachable via `docker exec` for debugging.
+  OMNIKV_TCP_ADDR: "127.0.0.1:7072"
   OMNIKV_BACKUP_DIR: "/data/backups"
   # Set true only for local demos with generated self-signed certificates.
   # Production deployments should provide trusted TLS material in omnikv.toml.
@@ -35,7 +40,6 @@ services:
       - "8443:8443"   # HTTP/2 REST API
       - "4433:4433"   # QUIC/HTTP3
       - "5433:5433"   # PostgreSQL Wire Protocol
-      - "8080:8080"   # TCP Command Interface
     volumes:
       - omni-data-1:/data
     environment:

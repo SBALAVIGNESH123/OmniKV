@@ -140,6 +140,12 @@ pub struct ServerConfig {
     pub pgwire_addr: String,
     #[serde(default = "default_tcp_addr")]
     pub tcp_addr: String,
+    /// Explicit opt-in for binding the TCP command interface on a
+    /// non-loopback address. The interface is JWT-gated either way, but a
+    /// public bind still exposes an unrestricted read/write path to every
+    /// host that can reach the port, so it never happens by accident.
+    #[serde(default)]
+    pub tcp_bind_public: bool,
     #[serde(default = "default_jwt_secret")]
     pub jwt_secret: String,
     #[serde(default = "default_bootstrap_admin_key")]
@@ -212,6 +218,7 @@ impl Default for ServerConfig {
             quic_addr: default_quic_addr(),
             pgwire_addr: default_pgwire_addr(),
             tcp_addr: default_tcp_addr(),
+            tcp_bind_public: false,
             jwt_secret: default_jwt_secret(),
             bootstrap_admin_key: default_bootstrap_admin_key(),
             rate_limit_per_sec: default_rate_limit_per_sec(),
@@ -290,6 +297,9 @@ impl ServerConfig {
         }
         if let Ok(v) = std::env::var("OMNIKV_TCP_ADDR") {
             self.tcp_addr = v;
+        }
+        if let Ok(v) = std::env::var("OMNIKV_TCP_BIND_PUBLIC") {
+            self.tcp_bind_public = parse_env_value("OMNIKV_TCP_BIND_PUBLIC", &v)?;
         }
         if let Ok(v) = std::env::var("OMNIKV_JWT_SECRET") {
             self.jwt_secret = v;
@@ -568,6 +578,20 @@ impl ServerConfig {
         validate_addr("quic_addr", &self.quic_addr)?;
         validate_addr("pgwire_addr", &self.pgwire_addr)?;
         validate_addr("tcp_addr", &self.tcp_addr)?;
+        // The TCP command interface grants full read/write access once
+        // authenticated. Loopback is the safe default; anything reachable
+        // from other hosts has to be turned on deliberately.
+        if !self.tcp_bind_public
+            && let Ok(sock) = self.tcp_addr.parse::<std::net::SocketAddr>()
+            && !sock.ip().is_loopback()
+        {
+            return Err(ConfigError(
+                "tcp_addr is bound to a non-loopback address; set \
+                 OMNIKV_TCP_BIND_PUBLIC=true to confirm you want the command \
+                 interface reachable from other hosts"
+                    .into(),
+            ));
+        }
 
         if self.log_level.trim().is_empty() {
             return Err(ConfigError("log_level must not be empty".into()));

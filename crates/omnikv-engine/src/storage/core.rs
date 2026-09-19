@@ -50,6 +50,14 @@ pub enum OmniError {
     LockPoisoned(String),
     WriteStall,
     InvalidCompactionPolicy(String),
+    /// A clustered write was rejected because this node is not the
+    /// leader. Unlike most errors this one is **client-caused and safe
+    /// to expose**: the caller needs `leader_id` to retry there, and it
+    /// carries no internal state. `None` means the cluster has no leader
+    /// yet (an election in progress).
+    NotLeader {
+        leader_id: Option<u64>,
+    },
     /// The on-disk format version is newer than this binary understands.
     /// The `found` version was read; `supported` is the maximum this build accepts.
     UnsupportedVersion {
@@ -71,6 +79,10 @@ impl std::fmt::Display for OmniError {
             OmniError::InvalidCompactionPolicy(reason) => {
                 write!(f, "invalid compaction policy: {reason}")
             }
+            OmniError::NotLeader { leader_id } => match leader_id {
+                Some(id) => write!(f, "not the leader; the leader is node {id}"),
+                None => write!(f, "not the leader; no leader elected yet"),
+            },
             other => write!(f, "{other:?}"),
         }
     }
@@ -3172,6 +3184,24 @@ mod tests {
         assert!(
             metrics_prometheus::render_metrics().contains("omnikv_compaction_latency_seconds"),
             "empty compaction should still emit compaction metrics"
+        );
+    }
+
+    #[test]
+    fn not_leader_error_names_the_leader_for_clients() {
+        // This is the one error whose details ARE client-facing: a clustered
+        // write landed on a follower and the caller needs the leader's id to
+        // retry. The message shape is load-bearing — protocol layers map it
+        // to a redirect, and the failover test matches on it.
+        let with_leader = OmniError::NotLeader { leader_id: Some(7) };
+        assert_eq!(
+            with_leader.to_string(),
+            "not the leader; the leader is node 7"
+        );
+        let no_leader = OmniError::NotLeader { leader_id: None };
+        assert_eq!(
+            no_leader.to_string(),
+            "not the leader; no leader elected yet"
         );
     }
 }

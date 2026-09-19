@@ -14,6 +14,10 @@ services:
       OMNIKV_HTTP_ADDR: "0.0.0.0:8443"
       OMNIKV_PGWIRE_ADDR: "0.0.0.0:5433"
       OMNIKV_TCP_ADDR: "0.0.0.0:8080"
+      # Deliberate: this harness drives the failover check over the TCP
+      # command interface (host ports are bound to 127.0.0.1 above). The
+      # validator refuses a public TCP bind without this opt-in (#117).
+      OMNIKV_TCP_BIND_PUBLIC: "true"
       OMNIKV_QUIC_ADDR: "0.0.0.0:4433"
       OMNIKV_MANIFEST_PATH: "/data/manifest.json"
       OMNIKV_WAL_PATH: "/data/wal.bin"
