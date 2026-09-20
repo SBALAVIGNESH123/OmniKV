@@ -372,8 +372,9 @@ fn tcp_pipelined_commands_all_get_replies() {
 /// around but must not mutate, and a write token may. Authentication
 /// without per-command authorization is a bypass (CWE-862). Extracted to
 /// a helper to keep the failover test under clippy's function-length
-/// limit. Runs against any node — the role gate fires before dispatch,
-/// before leadership even enters the picture.
+/// limit. The refusals would hold on any node — the role gate fires
+/// before dispatch — but the write token's `SET` has to reach the leader
+/// to come back `OK`, so the caller passes a leader's port.
 fn roles_are_enforced_on_the_command_interface(port: u16) {
     let read_get = tcp_cmd_role(port, "read", "GET failover:key");
     assert!(
@@ -419,10 +420,6 @@ fn cluster_failover_kill_leader_no_data_loss() {
     }
     println!("all nodes refuse unauthenticated commands");
 
-    // ── 0b. A token's role gates each command (see the helper: any node
-    // will do, the check fires before dispatch).
-    roles_are_enforced_on_the_command_interface(refs[0].tcp_port());
-
     // ── 1. A leader is elected and accepts writes ──
     let deadline = Instant::now() + Duration::from_secs(30);
     let leader_idx =
@@ -430,6 +427,13 @@ fn cluster_failover_kill_leader_no_data_loss() {
     let leader_id = refs[leader_idx].id;
     let leader_tcp = refs[leader_idx].tcp_port();
     println!("leader elected: node {leader_id}");
+
+    // ── 1b. A token's role gates each command. Runs here, after the
+    // leader is known: the refusals hold on any node (the role gate fires
+    // before dispatch), but the write token's SET only comes back OK from
+    // the leader — a follower answers NOT_LEADER, which would make this
+    // assertion flake on which node won the election.
+    roles_are_enforced_on_the_command_interface(leader_tcp);
 
     // ── 2. A write on the leader replicates to every node ──
     let write = tcp_cmd(leader_tcp, "SET failover:key hello-cluster");
