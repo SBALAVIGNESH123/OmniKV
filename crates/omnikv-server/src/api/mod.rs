@@ -146,33 +146,9 @@ pub struct MetricsOutput {
     pub text: String,
 }
 
-#[derive(Clone, Copy)]
-enum RequiredRole {
-    Read,
-    Write,
-    Backup,
-    Admin,
-}
-
-impl RequiredRole {
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::Read => "read",
-            Self::Write => "write",
-            Self::Backup => "backup",
-            Self::Admin => "admin",
-        }
-    }
-
-    fn allows(self, role: &str) -> bool {
-        match self {
-            Self::Read => matches!(role, "read" | "write" | "admin"),
-            Self::Write => matches!(role, "write" | "admin"),
-            Self::Backup => matches!(role, "backup" | "admin"),
-            Self::Admin => role == "admin",
-        }
-    }
-}
+// The role model lives in `crate::auth` so the TCP command interface and
+// this middleware enforce identical rules from one definition.
+use crate::auth::RequiredRole;
 
 #[derive(Clone, Copy)]
 enum AuditOutcome {

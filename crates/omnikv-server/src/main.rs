@@ -374,7 +374,7 @@ async fn handle_tcp_connection(
     jwt_secret: String,
     rate_limiter: Arc<RateLimiter>,
 ) {
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     // Frame on newlines: a client may pipeline several commands in
     // one segment, and a single command may straddle a read
@@ -382,32 +382,46 @@ async fn handle_tcp_connection(
     // per 4096-byte read) keeps both cases intact.
     let (read_half, mut write_half) = socket.into_split();
     let mut reader = tokio::io::BufReader::new(read_half);
-    let mut raw = Vec::with_capacity(512);
 
     // A connection is unauthenticated until a valid AUTH lands.
     // Every data command before then is refused, so an open port
     // never doubles as an open database.
     let mut authenticated = false;
     let mut identity = String::new();
+    let mut session_role = String::new();
     let mut auth_failures = 0u32;
 
+    // Holds partial input between reads: a client may pipeline several
+    // commands in one segment, and a single command may straddle a read
+    // boundary. Both cases need the leftover preserved, not discarded.
+    let mut buffer = Vec::with_capacity(512);
+    let mut chunk = [0u8; 8192];
+
     loop {
-        raw.clear();
-        match reader.read_until(b'\n', &mut raw).await {
-            Ok(0) => return,
-            Ok(_) => {}
-            Err(_) => return,
+        // Read until at least one complete line is buffered, bounding the
+        // growth as we go. read_until would buffer an entire newline-free
+        // line first — an unauthenticated peer could omit the newline and
+        // grow the buffer until the process exhausted memory (CWE-400).
+        while !buffer.contains(&b'\n') {
+            match reader.read(&mut chunk).await {
+                Ok(0) => return,
+                Ok(n) => buffer.extend_from_slice(&chunk[..n]),
+                Err(_) => return,
+            }
+            // The cap sits above max_value_size so a legitimate single-line
+            // SET still fits; a peer past it is dropped, not humored.
+            if buffer.len() > MAX_TCP_LINE {
+                let _ = write_half.write_all(b"ERROR: LINE_TOO_LONG\n").await;
+                return;
+            }
         }
 
-        // Cap the line length: without it, a client can make the
-        // server buffer an unbounded "value" per connection. The
-        // limit sits above max_value_size so legitimate writes fit.
-        if raw.len() > MAX_TCP_LINE {
-            let _ = write_half.write_all(b"ERROR: LINE_TOO_LONG\n").await;
-            return;
-        }
+        // Peel exactly one line. Anything after its newline stays in
+        // `buffer` for the next pass, so pipelined commands are never lost.
+        let newline = buffer.iter().position(|&b| b == b'\n').unwrap();
+        let line = buffer.drain(..=newline).collect::<Vec<u8>>();
 
-        let request = String::from_utf8_lossy(&raw);
+        let request = String::from_utf8_lossy(&line);
         let request = request.trim();
         if request.is_empty() {
             continue;
@@ -418,9 +432,10 @@ async fn handle_tcp_connection(
 
         let response = match cmd.to_uppercase().as_str() {
             "AUTH" => match handle_tcp_auth(&mut parts, &jwt_secret, peer) {
-                AuthOutcome::Accepted { subject } => {
+                AuthOutcome::Accepted { subject, role } => {
                     authenticated = true;
                     identity = format!("tcp:user:{subject}");
+                    session_role = role;
                     format!("OK: authenticated as {subject}\n")
                 }
                 AuthOutcome::Rejected { message } => {
@@ -445,13 +460,31 @@ async fn handle_tcp_connection(
             // Everything else requires an authenticated session.
             _ if !authenticated => "ERR AUTH_REQUIRED\n".to_string(),
             _ => {
-                // Same per-identity limiter the QUIC path uses: one
-                // authenticated client cannot starve the node.
-                match rate_limiter.try_acquire(&identity) {
-                    Ok(_) => dispatch_tcp_command(cmd, &mut parts, &db),
-                    Err(retry_after_ms) => {
-                        omni_engine::metrics_prometheus::record_rate_limit_rejection("tcp");
-                        format!("ERR RATE_LIMITED retry_after_ms={retry_after_ms}\n")
+                // The same role model the REST middleware uses: a read
+                // token may not mutate, a write token may not read only by
+                // accident — the token's role has to cover the command.
+                // Anything less and a `read` token could DELETE.
+                match required_role_for(cmd) {
+                    Some(required) if !required.allows(&session_role) => {
+                        tracing::warn!(
+                            peer = %peer,
+                            sub = %identity,
+                            role = %session_role,
+                            required = required.as_str(),
+                            "TCP command refused: insufficient role"
+                        );
+                        "ERR FORBIDDEN insufficient role\n".to_string()
+                    }
+                    _ => {
+                        // Same per-identity limiter the QUIC path uses: one
+                        // authenticated client cannot starve the node.
+                        match rate_limiter.try_acquire(&identity) {
+                            Ok(_) => dispatch_tcp_command(cmd, &mut parts, &db),
+                            Err(retry_after_ms) => {
+                                omni_engine::metrics_prometheus::record_rate_limit_rejection("tcp");
+                                format!("ERR RATE_LIMITED retry_after_ms={retry_after_ms}\n")
+                            }
+                        }
                     }
                 }
             }
@@ -465,8 +498,9 @@ async fn handle_tcp_connection(
 
 /// What `AUTH` decided about a session.
 enum AuthOutcome {
-    /// The token verified; `subject` is the principal to rate-limit under.
-    Accepted { subject: String },
+    /// The token verified; `subject` is the principal to rate-limit under
+    /// and `role` is what it is authorized to do.
+    Accepted { subject: String, role: String },
     /// The token was missing or invalid; `message` is the reply to send.
     Rejected { message: String },
     /// No JWT secret is configured, so no token could ever verify.
@@ -503,6 +537,7 @@ fn handle_tcp_auth(
             );
             AuthOutcome::Accepted {
                 subject: claims.sub,
+                role: claims.role,
             }
         }
         Err(_) => {
@@ -511,6 +546,17 @@ fn handle_tcp_auth(
                 message: "ERR INVALID_TOKEN\n".into(),
             }
         }
+    }
+}
+
+/// Which role a data command requires, mirroring the REST route guards:
+/// `GET`/`SCAN` need read, `SET`/`DELETE` need write. `None` for commands
+/// with no data-plane effect.
+fn required_role_for(cmd: &str) -> Option<crate::auth::RequiredRole> {
+    match cmd {
+        "GET" | "SCAN" => Some(crate::auth::RequiredRole::Read),
+        "SET" | "DELETE" => Some(crate::auth::RequiredRole::Write),
+        _ => None,
     }
 }
 
@@ -668,6 +714,26 @@ mod tests {
                 "unknown-command help omits {cmd}: {resp}"
             );
         }
+    }
+
+    #[test]
+    fn tcp_role_requirements_match_the_rest_guards() {
+        // The token a client holds has to cover the command: a read token
+        // must not mutate, and the mapping has to agree with the REST
+        // route guards or the two protocols drift apart.
+        use crate::auth::RequiredRole;
+
+        assert_eq!(required_role_for("GET"), Some(RequiredRole::Read));
+        assert_eq!(required_role_for("SCAN"), Some(RequiredRole::Read));
+        assert_eq!(required_role_for("SET"), Some(RequiredRole::Write));
+        assert_eq!(required_role_for("DELETE"), Some(RequiredRole::Write));
+
+        // A read token reads, and may not write; admin covers everything.
+        assert!(RequiredRole::Read.allows("read"));
+        assert!(!RequiredRole::Write.allows("read"));
+        assert!(RequiredRole::Write.allows("write"));
+        assert!(RequiredRole::Write.allows("admin"));
+        assert!(RequiredRole::Read.allows("admin"));
     }
 
     #[test]

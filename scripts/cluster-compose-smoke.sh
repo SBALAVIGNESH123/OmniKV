@@ -104,9 +104,14 @@ if ! wait_for_cluster; then
 fi
 
 # The token endpoint is ready once the listeners are; retry past startup.
+# The assignment is guarded: with set -e, a failing curl inside the
+# substitution would abort the script before the retry and the diagnostics
+# below could ever run.
 TOKEN=""
 for _ in $(seq 1 30); do
-  TOKEN="$(mint_token)"
+  if ! TOKEN="$(mint_token)"; then
+    TOKEN=""
+  fi
   [[ -n "$TOKEN" ]] && break
   sleep 1
 done

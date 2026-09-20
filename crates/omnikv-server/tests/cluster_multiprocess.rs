@@ -26,6 +26,9 @@ struct Node {
     /// (tcp, http, quic, pgwire, raft)
     ports: (u16, u16, u16, u16, u16),
     id: u64,
+    /// Where the node keeps WAL/manifest/raft state. Held so `drop` can
+    /// clean it up — a hard-killed node leaves a lock and a log behind.
+    dir: std::path::PathBuf,
 }
 
 impl Node {
@@ -39,12 +42,19 @@ impl Drop for Node {
         // Test hygiene: never leak server processes, even on failure.
         let _ = self.child.kill();
         let _ = self.child.wait();
+        // ...and never leak their state. A stale raft log left behind is
+        // not just clutter: the next test to land on this directory
+        // inherits it, and openraft then refuses to initialize ("not
+        // allowed to initialize due to current raft state"), which shows
+        // up from the test as a listener that never comes up.
+        let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
 
-/// Sign the JWT every command is authorized with (issue #117): the TCP
-/// interface refuses all data commands until a valid token arrives.
-fn test_token() -> String {
+/// Sign a JWT the TCP interface will accept (issue #117): it refuses all
+/// data commands until a valid token arrives, and the token's role has to
+/// cover the command.
+fn test_token_role(role: &str) -> String {
     use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
     use serde::Serialize;
 
@@ -62,7 +72,7 @@ fn test_token() -> String {
         .as_secs();
     let claims = Claims {
         sub: "cluster-test".into(),
-        role: "admin".into(),
+        role: role.into(),
         exp: now + 3600,
         iat: now,
     };
@@ -74,12 +84,23 @@ fn test_token() -> String {
     .expect("sign test token")
 }
 
+/// The admin token the failover check drives writes with.
+fn test_token() -> String {
+    test_token_role("admin")
+}
+
 /// Sends one command to the TCP command interface, returns the
 /// response. `AUTH <token>` is pipelined ahead of the command on the
 /// same connection; the interface authenticates the session and then
 /// runs the command, replying with one line per request.
 fn tcp_cmd(port: u16, cmd: &str) -> Result<String, String> {
     tcp_cmd_raw_lines(port, &format!("AUTH {}\n{cmd}\n", test_token()), 2)
+}
+
+/// Same wire, a token scoped to `role`: for checking that the interface
+/// authorizes per command, not just per session.
+fn tcp_cmd_role(port: u16, role: &str, cmd: &str) -> Result<String, String> {
+    tcp_cmd_raw_lines(port, &format!("AUTH {}\n{cmd}\n", test_token_role(role)), 2)
 }
 
 /// Sends a command with NO auth header — the interface must refuse it.
@@ -136,14 +157,32 @@ fn free_port() -> u16 {
         .port()
 }
 
+/// Hands out a fresh data dir for every node, in every test. The naive
+/// `omnikv-cluster-{id}-{pid}` collides: two tests in one test binary
+/// share a pid, so the second cluster boots on the first one's raft log.
+/// openraft then refuses to initialize a node that already has one ("not
+/// allowed to initialize due to current raft state"), and the failure
+/// surfaces only as a listener that never comes up inside a 30s timeout.
+fn fresh_node_dir(id: u64) -> std::path::PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let dir =
+        std::env::temp_dir().join(format!("omnikv-cluster-{id}-{}-{seq}", std::process::id()));
+    // A previous run may have died without dropping its nodes; booting on
+    // that state is the exact failure this function exists to prevent.
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("create node dir");
+    dir
+}
+
 /// The command for one cluster node: distinct TCP/HTTP/QUIC/pgwire/
 /// raft ports, a private data dir, fast election timers (the test must
 /// converge in seconds, not minutes).
 fn spawn_node(id: u64, ports: &[(u16, u16, u16, u16, u16)]) -> Node {
     let idx = usize::try_from(id - 1).expect("node id fits usize");
     let (tcp, http, quic, pgwire, raft) = ports[idx];
-    let dir = std::env::temp_dir().join(format!("omnikv-cluster-{id}-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("create node dir");
+    let dir = fresh_node_dir(id);
     let child = Command::new(env!("CARGO_BIN_EXE_omnikv-server"))
         .env("OMNIKV_MODE", "development")
         .env("OMNIKV_TCP_ADDR", format!("127.0.0.1:{tcp}"))
@@ -186,13 +225,19 @@ fn spawn_node(id: u64, ports: &[(u16, u16, u16, u16, u16)]) -> Node {
         .env("OMNIKV_RAFT_ELECTION_MAX_MS", "300")
         .env("RUST_LOG", "warn")
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        // Server stderr goes to the node dir, not /dev/null: a node that
+        // never binds its listener is otherwise invisible from the test,
+        // and the failure shows up only as a 30s timeout.
+        .stderr(std::process::Stdio::from(
+            std::fs::File::create(dir.join("stderr.log")).expect("create stderr log"),
+        ))
         .spawn()
         .expect("spawn omnikv-server");
     Node {
         child,
         ports: (tcp, http, quic, pgwire, raft),
         id,
+        dir,
     }
 }
 
@@ -294,6 +339,66 @@ fn concurrent_writers_do_not_deadlock(leader_tcp: u16, nodes: &[Node]) {
     println!("16 concurrent writers all acknowledged and replicated");
 }
 
+/// Several commands in ONE write segment must each get a reply. This is
+/// the framing contract the interface's line buffer has to keep: an early
+/// version of the bounded reader consumed the whole segment, answered the
+/// first line, and discarded the rest — the client hung waiting for
+/// replies that were never coming, with no error anywhere.
+#[test]
+fn tcp_pipelined_commands_all_get_replies() {
+    let nodes = boot_cluster();
+    let port = nodes[0].tcp_port();
+
+    // AUTH plus three data commands, written as one segment.
+    let request = format!(
+        "AUTH {}\nSET pipe:k one\nGET pipe:k\nDELETE pipe:k\n",
+        test_token()
+    );
+    let got = tcp_cmd_raw_lines(port, &request, 4).expect("pipelined round trip");
+
+    // The LAST reply is the one the assertions care about, but every line
+    // must have arrived — a dropped command is the failure mode.
+    assert!(got.starts_with("DELETED"), "DELETE reply missing: {got}");
+
+    // And the write/read really happened, not just replies returned:
+    assert_eq!(
+        tcp_cmd(port, "GET pipe:k").unwrap_or_default(),
+        "NOT_FOUND",
+        "pipelined delete did not take effect"
+    );
+}
+
+/// A valid token is not a blanket grant: a read-scoped token may look
+/// around but must not mutate, and a write token may. Authentication
+/// without per-command authorization is a bypass (CWE-862). Extracted to
+/// a helper to keep the failover test under clippy's function-length
+/// limit. Runs against any node — the role gate fires before dispatch,
+/// before leadership even enters the picture.
+fn roles_are_enforced_on_the_command_interface(port: u16) {
+    let read_get = tcp_cmd_role(port, "read", "GET failover:key");
+    assert!(
+        matches!(&read_get, Ok(r) if r.starts_with("OK:") || r == "NOT_FOUND"),
+        "read token must be able to GET (got: {read_get:?})"
+    );
+    let denied = tcp_cmd_role(port, "read", "SET role-check nope").unwrap_or_default();
+    assert!(
+        denied.contains("FORBIDDEN"),
+        "read token accepted a write: {denied}"
+    );
+    let denied_del = tcp_cmd_role(port, "read", "DELETE role-check").unwrap_or_default();
+    assert!(
+        denied_del.contains("FORBIDDEN"),
+        "read token accepted a delete: {denied_del}"
+    );
+    assert!(
+        tcp_cmd_role(port, "write", "SET role-check ok")
+            .unwrap_or_default()
+            .starts_with("OK"),
+        "write token must be able to SET"
+    );
+    println!("roles enforced: read cannot write, write can");
+}
+
 /// THE test: three real processes, one replicated write, kill the
 /// leader, a new leader is elected, and no data is lost.
 #[test]
@@ -313,6 +418,10 @@ fn cluster_failover_kill_leader_no_data_loss() {
         );
     }
     println!("all nodes refuse unauthenticated commands");
+
+    // ── 0b. A token's role gates each command (see the helper: any node
+    // will do, the check fires before dispatch).
+    roles_are_enforced_on_the_command_interface(refs[0].tcp_port());
 
     // ── 1. A leader is elected and accepts writes ──
     let deadline = Instant::now() + Duration::from_secs(30);
@@ -420,7 +529,7 @@ fn cluster_failover_kill_leader_no_data_loss() {
     println!("post-failover write replicated — no data loss, cluster fully alive");
 
     // Nodes are dropped here: Drop kills the survivors (the leader is
-    // already dead) and cleans the temp dirs on the next boot.
+    // already dead) and removes their data dirs.
 }
 
 /// Leadership among a subset of (`tcp_port`, `node_id`) pairs.

@@ -592,6 +592,19 @@ impl ServerConfig {
                     .into(),
             ));
         }
+        // The opt-in says the operator accepts the exposure; the built-in
+        // dev secret makes that exposure equivalent to no auth at all —
+        // it is published in source, so anyone can mint a valid token.
+        // Production mode already rejects the dev secret; this catches a
+        // development-mode node that was deliberately bound publicly.
+        if self.tcp_bind_public && self.jwt_secret == DEV_JWT_SECRET {
+            return Err(ConfigError(
+                "tcp_bind_public is set but jwt_secret is the built-in dev \
+                 value, which is public — anyone can forge a token. Set \
+                 OMNIKV_JWT_SECRET to a strong 32+ character secret"
+                    .into(),
+            ));
+        }
 
         if self.log_level.trim().is_empty() {
             return Err(ConfigError("log_level must not be empty".into()));
