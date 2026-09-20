@@ -347,7 +347,16 @@ fn concurrent_writers_do_not_deadlock(leader_tcp: u16, nodes: &[Node]) {
 #[test]
 fn tcp_pipelined_commands_all_get_replies() {
     let nodes = boot_cluster();
-    let port = nodes[0].tcp_port();
+    let refs: Vec<&Node> = nodes.iter().collect();
+
+    // The SET has to land on the leader: boot_cluster waits for the
+    // listeners, not for an election, and a pre-election batch comes back
+    // NOT_LEADER with nothing to DELETE. Whichever node won does not
+    // matter, only that one has by the time the batch goes out.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let leader =
+        retry_until(deadline, || find_leader(&refs)).expect("no leader elected within 30s");
+    let port = refs[leader].tcp_port();
 
     // AUTH plus three data commands, written as one segment.
     let request = format!(
