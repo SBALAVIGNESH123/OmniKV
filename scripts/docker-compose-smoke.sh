@@ -40,18 +40,26 @@ wait_for_health() {
   return 1
 }
 
+# The REST envelope is {"success":bool,"data":...,"error":...}. A JSON
+# parser would be cleaner, but python3 is not guaranteed where this runs
+# (it is absent on Windows hosts), and the fields are simple enough that
+# grep is exact: the token is base64url with no quotes, and the value's
+# closing quote stops a prefix from matching a longer value.
 json_field() {
-  python3 -c 'import json, sys; print(json.load(sys.stdin)["data"])'
+  grep -o '"data":"[^"]*"' | cut -d'"' -f4
 }
 
 assert_value() {
-  local expected="$1"
-  python3 -c 'import json, sys
-expected = sys.argv[1]
-body = json.load(sys.stdin)
-assert body["success"] is True, body
-assert body["data"]["value"] == expected, body
-' "$expected"
+  local expected="$1" body
+  body="$(cat)"
+  if [[ "$body" != *'"success":true'* ]]; then
+    echo "response was not a success: $body" >&2
+    return 1
+  fi
+  if [[ "$body" != *"\"value\":\"$expected\""* ]]; then
+    echo "expected value $expected, got: $body" >&2
+    return 1
+  fi
 }
 
 wait_for_health

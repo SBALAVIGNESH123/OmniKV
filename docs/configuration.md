@@ -137,7 +137,11 @@ Prometheus metrics expose maintenance health:
   it on a non-loopback address requires `OMNIKV_TCP_BIND_PUBLIC=true`,
   and the server refuses to boot otherwise. A public bind still exposes
   an unrestricted read/write path to every host that can reach the port,
-  so prefer REST (TLS, scoped roles) or PgWire for off-node access.
+  so prefer REST (TLS, scoped roles) or PgWire for off-node access. The
+  interface has no transport encryption: `AUTH` sends the token in
+  cleartext, so on a public bind the credential is readable by anyone on
+  the path — bind it where the network is already trusted, or terminate
+  TLS in a sidecar in front of it.
 - Tune rate limits for your workload and alert on
   `omnikv_rate_limit_rejections_total{protocol=...}`.
 - Alert on `omnikv_cleanup_delete_failures_total{context=...,error_kind=...}`;

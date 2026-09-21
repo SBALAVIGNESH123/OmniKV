@@ -315,6 +315,23 @@ const MAX_TCP_LINE: usize = 12 * 1024 * 1024;
 /// that authenticates never reaches it.
 const MAX_TCP_AUTH_FAILURES: u32 = 5;
 
+/// Failed AUTH attempts tolerated from one peer address within
+/// [`TCP_AUTH_FAILURE_WINDOW`] before that address is refused outright.
+/// The per-connection limit above is trivially reset by reconnecting, so
+/// without a per-peer budget a grinding client gets five fresh guesses
+/// per TCP handshake.
+const MAX_TCP_PEER_AUTH_FAILURES: u32 = 25;
+
+/// How long a peer's AUTH failures are counted before its budget resets.
+const TCP_AUTH_FAILURE_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Upper bound on simultaneous TCP sessions. Each one can buffer up to
+/// [`MAX_TCP_LINE`] before it authenticates, so an unbounded accept loop
+/// lets a farm of unauthenticated peers reserve a bounded-but-large
+/// chunk of memory each. This caps the aggregate at a level that serves
+/// every realistic debugging workload.
+const MAX_TCP_SESSIONS: usize = 256;
+
 /// Simple TCP command interface for telnet/debugging.
 ///
 /// # Authentication
@@ -353,15 +370,119 @@ async fn run_tcp_server(
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!("TCP command interface on {addr}");
 
+    // Bound concurrent sessions. Each one can buffer up to MAX_TCP_LINE
+    // before authenticating, so without a ceiling the memory an
+    // unauthenticated peer farm can reserve grows with the connection
+    // count. Acquiring before spawn (rather than inside the task) makes a
+    // saturated interface apply backpressure to the accept loop: a peer
+    // that arrives when every permit is out waits, and is served when a
+    // session ends, instead of adding to the pile.
+    let session_limit = Arc::new(tokio::sync::Semaphore::new(MAX_TCP_SESSIONS));
+    let auth_failures = Arc::new(TcpAuthFailures::new());
+
     loop {
         let (socket, peer) = listener.accept().await?;
-        tokio::spawn(handle_tcp_connection(
-            socket,
-            peer,
-            db.clone(),
-            jwt_secret.clone(),
-            rate_limiter.clone(),
-        ));
+        let permit = match session_limit.clone().acquire_owned().await {
+            Ok(permit) => permit,
+            // Only reachable at shutdown, when the semaphore is closed.
+            Err(_) => break,
+        };
+        // Clone before the move closure: `db.clone()` inside an
+        // `async move` captures `db` itself, and the accept loop would
+        // move it on the first iteration.
+        let db = db.clone();
+        let jwt_secret = jwt_secret.clone();
+        let rate_limiter = rate_limiter.clone();
+        let auth_tracker = auth_failures.clone();
+        tokio::spawn(async move {
+            // Held for the session: released on drop, when the task ends.
+            let _permit = permit;
+            handle_tcp_connection(socket, peer, db, jwt_secret, rate_limiter, auth_tracker).await;
+        });
+    }
+    Ok(())
+}
+
+/// Failed `AUTH` attempts by peer address, so a client cannot reset its
+/// budget by reconnecting. Entries are counts over a rolling window (see
+/// [`TCP_AUTH_FAILURE_WINDOW`]); an address that burns through
+/// [`MAX_TCP_PEER_AUTH_FAILURES`] inside one is refused until the window
+/// closes. Lock contention is negligible — the map is touched only on the
+/// AUTH failure path, which the rate limiter already made the slow path.
+struct TcpAuthFailures {
+    by_peer:
+        std::sync::Mutex<std::collections::HashMap<std::net::IpAddr, (u32, std::time::Instant)>>,
+}
+
+impl TcpAuthFailures {
+    fn new() -> Self {
+        Self {
+            by_peer: std::sync::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    /// Whether this address is currently over its AUTH budget. Failure to
+    /// take the lock fails open rather than dropping a legitimate client
+    /// because bookkeeping is wedged.
+    fn is_banned(&self, peer: &std::net::IpAddr) -> bool {
+        let Ok(by_peer) = self.by_peer.lock() else {
+            return false;
+        };
+        match by_peer.get(peer) {
+            Some((count, first_at)) => {
+                *count >= MAX_TCP_PEER_AUTH_FAILURES && first_at.elapsed() < TCP_AUTH_FAILURE_WINDOW
+            }
+            None => false,
+        }
+    }
+
+    /// Record one failure and return the address's count within the
+    /// current window. The window starts at the first failure and does not
+    /// slide per attempt, so a slow grind over minutes does not evade it.
+    fn record(&self, peer: std::net::IpAddr) -> u32 {
+        let Ok(mut by_peer) = self.by_peer.lock() else {
+            return 0;
+        };
+        // Prune when the map grows, so a rotating farm of source
+        // addresses cannot make bookkeeping unbounded.
+        if by_peer.len() > 4096 {
+            by_peer.retain(|_, (_, first_at)| first_at.elapsed() < TCP_AUTH_FAILURE_WINDOW);
+        }
+        let entry = by_peer
+            .entry(peer)
+            .or_insert_with(|| (0, std::time::Instant::now()));
+        if entry.1.elapsed() >= TCP_AUTH_FAILURE_WINDOW {
+            *entry = (1, std::time::Instant::now());
+            1
+        } else {
+            entry.0 += 1;
+            entry.0
+        }
+    }
+
+    /// A successful AUTH clears the address's budget: the client proved
+    /// who it is, and stale failures from before should not follow a
+    /// legitimate session around.
+    fn clear(&self, peer: &std::net::IpAddr) {
+        if let Ok(mut by_peer) = self.by_peer.lock() {
+            by_peer.remove(peer);
+        }
+    }
+
+    /// Test-only: force every peer's window closed, so the reset branch
+    /// can be exercised without waiting out a real minute.
+    #[cfg(test)]
+    fn expire_all(&self) {
+        if let Ok(mut by_peer) = self.by_peer.lock() {
+            // checked_sub: a monotonic-clock skew can make now < window,
+            // and panicking test bookkeeping for it is not worth it.
+            let expired = std::time::Instant::now()
+                .checked_sub(TCP_AUTH_FAILURE_WINDOW + std::time::Duration::from_secs(1))
+                .unwrap_or_else(std::time::Instant::now);
+            for (_, first_at) in by_peer.values_mut() {
+                *first_at = expired;
+            }
+        }
     }
 }
 
@@ -373,6 +494,7 @@ async fn handle_tcp_connection(
     db: Arc<OmniKV>,
     jwt_secret: String,
     rate_limiter: Arc<RateLimiter>,
+    auth_tracker: Arc<TcpAuthFailures>,
 ) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -382,6 +504,15 @@ async fn handle_tcp_connection(
     // per 4096-byte read) keeps both cases intact.
     let (read_half, mut write_half) = socket.into_split();
     let mut reader = tokio::io::BufReader::new(read_half);
+
+    // An address that already burned its AUTH budget does not get another
+    // session — checking at entry is what makes the per-peer budget mean
+    // something, since the per-connection counter resets on reconnect.
+    if auth_tracker.is_banned(&peer.ip()) {
+        tracing::warn!(peer = %peer, "refusing TCP session: peer is over its AUTH failure budget");
+        let _ = write_half.write_all(b"ERR TOO_MANY_FAILURES\n").await;
+        return;
+    }
 
     // A connection is unauthenticated until a valid AUTH lands.
     // Every data command before then is refused, so an open port
@@ -429,22 +560,37 @@ async fn handle_tcp_connection(
 
         let mut parts = request.splitn(3, char::is_whitespace);
         let cmd = parts.next().unwrap_or("");
+        // Normalize once: the gate and the dispatch both match on the
+        // uppercase form, so a client's casing cannot route around the
+        // role check into a command that the raw form happens not to
+        // require a role for.
+        let cmd = cmd.to_uppercase();
 
-        let response = match cmd.to_uppercase().as_str() {
+        let response = match cmd.as_str() {
             "AUTH" => match handle_tcp_auth(&mut parts, &jwt_secret, peer) {
                 AuthOutcome::Accepted { subject, role } => {
                     authenticated = true;
                     identity = format!("tcp:user:{subject}");
                     session_role = role;
+                    // The client proved who it is; forget any failures it
+                    // accumulated getting here.
+                    auth_tracker.clear(&peer.ip());
                     format!("OK: authenticated as {subject}\n")
                 }
                 AuthOutcome::Rejected { message } => {
                     auth_failures += 1;
-                    if auth_failures >= MAX_TCP_AUTH_FAILURES {
+                    // The per-connection limit drops a grinding session
+                    // fast; the per-peer limit is what stops it from
+                    // reconnecting for five more guesses.
+                    let peer_count = auth_tracker.record(peer.ip());
+                    if auth_failures >= MAX_TCP_AUTH_FAILURES
+                        || peer_count >= MAX_TCP_PEER_AUTH_FAILURES
+                    {
                         tracing::warn!(
                             peer = %peer,
-                            "dropping TCP session after \
-                             {MAX_TCP_AUTH_FAILURES} failed AUTH attempts"
+                            connection_failures = auth_failures,
+                            peer_failures = peer_count,
+                            "dropping TCP session after failed AUTH"
                         );
                         let _ = write_half.write_all(b"ERR TOO_MANY_FAILURES\n").await;
                         return;
@@ -464,7 +610,7 @@ async fn handle_tcp_connection(
                 // token may not mutate, a write token may not read only by
                 // accident — the token's role has to cover the command.
                 // Anything less and a `read` token could DELETE.
-                match required_role_for(cmd) {
+                match required_role_for(&cmd) {
                     Some(required) if !required.allows(&session_role) => {
                         tracing::warn!(
                             peer = %peer,
@@ -479,7 +625,7 @@ async fn handle_tcp_connection(
                         // Same per-identity limiter the QUIC path uses: one
                         // authenticated client cannot starve the node.
                         match rate_limiter.try_acquire(&identity) {
-                            Ok(_) => dispatch_tcp_command(cmd, &mut parts, &db),
+                            Ok(_) => dispatch_tcp_command(&cmd, &mut parts, &db),
                             Err(retry_after_ms) => {
                                 omni_engine::metrics_prometheus::record_rate_limit_rejection("tcp");
                                 format!("ERR RATE_LIMITED retry_after_ms={retry_after_ms}\n")
@@ -734,6 +880,194 @@ mod tests {
         assert!(RequiredRole::Write.allows("write"));
         assert!(RequiredRole::Write.allows("admin"));
         assert!(RequiredRole::Read.allows("admin"));
+    }
+
+    /// A session over a socket pair, for exercising the connection loop
+    /// without spawning a listener: read replies as whole lines.
+    struct Session {
+        client: tokio::net::TcpStream,
+        handle: tokio::task::JoinHandle<()>,
+    }
+
+    impl Session {
+        /// Drive one connection: `lines` are written at once, as a client
+        /// pipelining them in one segment would.
+        async fn send(&mut self, lines: &str) -> Vec<String> {
+            use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+            self.client.write_all(lines.as_bytes()).await.unwrap();
+            let mut reader = tokio::io::BufReader::new(&mut self.client);
+            let mut out = Vec::new();
+            // One reply per non-empty request line sent.
+            for _ in 0..lines.lines().filter(|l| !l.is_empty()).count() {
+                let mut buf = String::new();
+                if reader.read_line(&mut buf).await.unwrap() == 0 {
+                    break;
+                }
+                let trimmed = buf.trim().to_string();
+                if !trimmed.is_empty() {
+                    out.push(trimmed);
+                }
+            }
+            out
+        }
+    }
+
+    /// The peer address a synthetic session reports. Real or not, it is
+    /// only ever a logging key and the per-peer ban key, so a fixed one
+    /// lets a test speak as the same client across "reconnections".
+    const TEST_PEER: &str = "127.0.0.1:65530";
+
+    fn test_limiter() -> Arc<RateLimiter> {
+        Arc::new(RateLimiter::new(100.0, 10, 100))
+    }
+
+    /// A token signed with `secret`, carrying `role`.
+    fn token_for(secret: &str, role: &str) -> String {
+        crate::auth::generate_token("test", role, secret, 3600).expect("sign token")
+    }
+
+    /// One connection driven by the real handler, talking to a synthetic
+    /// peer. The task ends when the client side drops.
+    async fn session(db: Arc<OmniKV>, secret: &str, tracker: Arc<TcpAuthFailures>) -> Session {
+        // A loopback socket pair. The peer the handler is told is
+        // TEST_PEER regardless of the real ephemeral port: it is only a
+        // logging and ban key, and a fixed one lets a test speak as the
+        // same client across "reconnections".
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        let secret = secret.to_string();
+        let limiter = test_limiter();
+        let handle = tokio::spawn(async move {
+            handle_tcp_connection(
+                server,
+                TEST_PEER.parse().unwrap(),
+                db,
+                secret,
+                limiter,
+                tracker,
+            )
+            .await;
+        });
+        Session { client, handle }
+    }
+
+    #[tokio::test]
+    async fn tcp_command_casing_cannot_route_around_the_role_gate() {
+        // The gate and dispatch both match the uppercase command, so a
+        // client's casing cannot dodge the role check: a read-scoped
+        // token must be refused a write, whatever case it sends it in.
+        let secret = "unit-test-secret-0123456789abcdef";
+        let db = test_db();
+        let mut s = session(db, secret, Arc::new(TcpAuthFailures::new())).await;
+
+        let token = token_for(secret, "read");
+        let replies = s
+            .send(&format!(
+                "AUTH {token}\nset lowercase-key v\nSET upper-key v\n"
+            ))
+            .await;
+
+        assert_eq!(replies.len(), 3, "every command gets a reply: {replies:?}");
+        assert!(
+            replies[1].contains("FORBIDDEN"),
+            "lowercase SET slipped past the role gate: {replies:?}"
+        );
+        assert!(
+            replies[2].contains("FORBIDDEN"),
+            "uppercase SET was allowed for a read token: {replies:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn tcp_peer_failure_budget_survives_reconnects() {
+        // The per-connection counter resets on reconnect; the per-peer
+        // budget is what makes grinding expensive. A client that fails
+        // AUTH over and over from one address must eventually be refused
+        // at the door, before it can spend another connection's guesses.
+        let secret = "unit-test-secret-0123456789abcdef";
+        let db = test_db();
+        let tracker = Arc::new(TcpAuthFailures::new());
+        let peer: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+
+        // Burn the per-connection budget repeatedly: the handler drops a
+        // session at MAX_TCP_AUTH_FAILURES, so each round is a reconnect.
+        let rounds = (MAX_TCP_PEER_AUTH_FAILURES / MAX_TCP_AUTH_FAILURES) as usize + 1;
+        for _ in 0..rounds {
+            let mut s = session(test_db(), secret, tracker.clone()).await;
+            let bad = "AUTH not-a-valid-token\n".repeat(MAX_TCP_AUTH_FAILURES as usize);
+            let replies = s.send(&bad).await;
+            // The session is dropped once the budget is spent; whatever
+            // replies arrived are all rejections.
+            for r in &replies {
+                assert!(
+                    r.contains("INVALID_TOKEN") || r.contains("TOO_MANY_FAILURES"),
+                    "unexpected reply: {r}"
+                );
+            }
+        }
+        assert!(
+            tracker.is_banned(&peer),
+            "peer should be over its AUTH budget"
+        );
+
+        // A fresh connection from the same address is refused at entry,
+        // without consuming another guess.
+        let mut s = session(db, secret, tracker.clone()).await;
+        let replies = s.send("GET anything\n").await;
+        assert!(
+            replies.iter().any(|r| r.contains("TOO_MANY_FAILURES")),
+            "banned peer was served: {replies:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn tcp_successful_auth_clears_the_peer_budget() {
+        // A client that failed a few times then presents a valid token is
+        // who it claims: its failures should not follow it around.
+        let secret = "unit-test-secret-0123456789abcdef";
+        let tracker = Arc::new(TcpAuthFailures::new());
+        let peer: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+
+        assert_eq!(tracker.record(peer), 1);
+        assert_eq!(tracker.record(peer), 2);
+        tracker.clear(&peer);
+        assert!(!tracker.is_banned(&peer));
+
+        // The same is true through the wire: a valid AUTH forgets the
+        // bad attempts that preceded it on the connection.
+        let mut s = session(test_db(), secret, tracker).await;
+        let token = token_for(secret, "admin");
+        let replies = s.send(&format!("AUTH bad-token\nAUTH {token}\n")).await;
+        assert_eq!(replies.len(), 2);
+        assert!(replies[0].contains("INVALID_TOKEN"));
+        assert!(
+            replies[1].starts_with("OK: authenticated"),
+            "valid AUTH after a failure was rejected: {replies:?}"
+        );
+    }
+
+    #[test]
+    fn tcp_failure_window_resets_when_it_elapses() {
+        // The budget is per window, not lifetime: a slow grind spread
+        // across minutes does not accumulate toward a ban forever.
+        let tracker = TcpAuthFailures::new();
+        let peer: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+
+        for _ in 0..MAX_TCP_PEER_AUTH_FAILURES {
+            tracker.record(peer);
+        }
+        assert!(
+            tracker.is_banned(&peer),
+            "peer should be banned within the window"
+        );
+
+        tracker.expire_all();
+        assert!(!tracker.is_banned(&peer), "ban outlived the window");
+
+        // The next failure starts a fresh window, not a continuation.
+        assert_eq!(tracker.record(peer), 1);
     }
 
     #[test]
