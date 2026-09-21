@@ -114,7 +114,9 @@ fn tcp_cmd_unauthenticated(port: u16, cmd: &str) -> Result<String, String> {
 /// lines matters: a single `read()` can return a prefix of the response
 /// when it arrives in multiple TCP segments, and the exact-match
 /// assertions would flake without a product defect. For a pipelined
-/// AUTH+command the last line is the command's own reply.
+/// AUTH+command the last line is the command's own reply. Every expected
+/// line has to arrive: a peer that closes mid-sequence leaves the caller
+/// asserting a reply that was never fully delivered.
 fn tcp_cmd_raw_lines(port: u16, request: &str, expect_lines: usize) -> Result<String, String> {
     let mut stream =
         TcpStream::connect(("127.0.0.1", port)).map_err(|e| format!("connect: {e}"))?;
@@ -144,7 +146,18 @@ fn tcp_cmd_raw_lines(port: u16, request: &str, expect_lines: usize) -> Result<St
             }
         }
     }
-    Ok(lines.pop().unwrap_or_default())
+    // A peer that closed without delivering every expected line has
+    // incomplete state regardless of what the last line says — returning
+    // it anyway would let a dropped middle reply pass the caller's
+    // assertion on the surviving final one.
+    if lines.len() != expect_lines {
+        return Err(format!(
+            "peer closed after {}/{} replies (got: {lines:?})",
+            lines.len(),
+            expect_lines
+        ));
+    }
+    Ok(lines.pop().expect("checked len above"))
 }
 
 /// A free port for a listener the test will bind later. Racy in theory,
