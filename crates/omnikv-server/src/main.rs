@@ -16,7 +16,6 @@
     clippy::format_push_string,
     clippy::ignored_unit_patterns,
     clippy::manual_let_else,
-    clippy::match_same_arms,
     clippy::missing_const_for_fn,
     clippy::option_if_let_else,
     clippy::single_match_else,
@@ -332,6 +331,19 @@ const TCP_AUTH_FAILURE_WINDOW: std::time::Duration = std::time::Duration::from_s
 /// every realistic debugging workload.
 const MAX_TCP_SESSIONS: usize = 256;
 
+/// How long a session may remain unauthenticated. Permits are bounded,
+/// so a session holding one forever is a denial-of-service vector: 256
+/// idle strangers would drain the pool and the accept loop would stop
+/// serving real clients. AUTH is a single round trip for a legitimate
+/// client, so this is generous for a machine and firm for a loiterer.
+const TCP_AUTH_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How long an authenticated session may idle between reads. Deliberately
+/// generous — the interface is a debugging tool, and an operator's
+/// telnet session should not be cut for thinking — but still finite, so
+/// a forgotten terminal cannot squat on a permit indefinitely.
+const TCP_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
 /// Simple TCP command interface for telnet/debugging.
 ///
 /// # Authentication
@@ -496,7 +508,7 @@ async fn handle_tcp_connection(
     rate_limiter: Arc<RateLimiter>,
     auth_tracker: Arc<TcpAuthFailures>,
 ) {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::AsyncWriteExt;
 
     // Frame on newlines: a client may pipeline several commands in
     // one segment, and a single command may straddle a read
@@ -522,6 +534,12 @@ async fn handle_tcp_connection(
     let mut session_role = String::new();
     let mut auth_failures = 0u32;
 
+    // The session gets a bounded window to authenticate (a permit is
+    // held the whole time, and the pool is finite). Once authenticated,
+    // the much longer idle timeout governs. Both keep a parked peer from
+    // squatting on a permit that a real client is waiting for.
+    let auth_deadline = std::time::Instant::now() + TCP_AUTH_DEADLINE;
+
     // Holds partial input between reads: a client may pipeline several
     // commands in one segment, and a single command may straddle a read
     // boundary. Both cases need the leftover preserved, not discarded.
@@ -529,34 +547,36 @@ async fn handle_tcp_connection(
     let mut chunk = [0u8; 8192];
 
     loop {
-        // Read until at least one complete line is buffered, bounding the
-        // growth as we go. read_until would buffer an entire newline-free
-        // line first — an unauthenticated peer could omit the newline and
-        // grow the buffer until the process exhausted memory (CWE-400).
-        while !buffer.contains(&b'\n') {
-            match reader.read(&mut chunk).await {
-                Ok(0) => return,
-                Ok(n) => buffer.extend_from_slice(&chunk[..n]),
-                Err(_) => return,
+        // Read until a complete line is buffered. Both bounds matter as
+        // much as each other: the length cap stops a newline-free peer
+        // growing the buffer toward OOM (CWE-400), and the time cap stops
+        // a parked peer holding its permit forever — the pool is finite,
+        // and 256 silent connections would drain it.
+        let limit = if authenticated {
+            TCP_IDLE_TIMEOUT
+        } else {
+            auth_deadline.saturating_duration_since(std::time::Instant::now())
+        };
+        match read_bounded_line(&mut reader, &mut buffer, &mut chunk, limit).await {
+            LineRead::Ready => {}
+            LineRead::Closed => return,
+            LineRead::Timeout => {
+                if !authenticated {
+                    tracing::warn!(peer = %peer, "dropping TCP session: no AUTH within the deadline");
+                    let _ = write_half.write_all(b"ERR AUTH_TIMEOUT\n").await;
+                }
+                return;
             }
-            // The cap sits above max_value_size so a legitimate single-line
-            // SET still fits; a peer past it is dropped, not humored.
-            if buffer.len() > MAX_TCP_LINE {
+            LineRead::TooLong => {
                 let _ = write_half.write_all(b"ERROR: LINE_TOO_LONG\n").await;
                 return;
             }
         }
 
-        // Peel exactly one line. Anything after its newline stays in
-        // `buffer` for the next pass, so pipelined commands are never lost.
-        let newline = buffer.iter().position(|&b| b == b'\n').unwrap();
-        let line = buffer.drain(..=newline).collect::<Vec<u8>>();
-
-        let request = String::from_utf8_lossy(&line);
-        let request = request.trim();
-        if request.is_empty() {
+        // Peel exactly one line; the rest stays buffered for next pass.
+        let Some(request) = peel_line(&mut buffer) else {
             continue;
-        }
+        };
 
         let mut parts = request.splitn(3, char::is_whitespace);
         let cmd = parts.next().unwrap_or("");
@@ -605,39 +625,113 @@ async fn handle_tcp_connection(
             }
             // Everything else requires an authenticated session.
             _ if !authenticated => "ERR AUTH_REQUIRED\n".to_string(),
-            _ => {
-                // The same role model the REST middleware uses: a read
-                // token may not mutate, a write token may not read only by
-                // accident — the token's role has to cover the command.
-                // Anything less and a `read` token could DELETE.
-                match required_role_for(&cmd) {
-                    Some(required) if !required.allows(&session_role) => {
-                        tracing::warn!(
-                            peer = %peer,
-                            sub = %identity,
-                            role = %session_role,
-                            required = required.as_str(),
-                            "TCP command refused: insufficient role"
-                        );
-                        "ERR FORBIDDEN insufficient role\n".to_string()
-                    }
-                    _ => {
-                        // Same per-identity limiter the QUIC path uses: one
-                        // authenticated client cannot starve the node.
-                        match rate_limiter.try_acquire(&identity) {
-                            Ok(_) => dispatch_tcp_command(&cmd, &mut parts, &db),
-                            Err(retry_after_ms) => {
-                                omni_engine::metrics_prometheus::record_rate_limit_rejection("tcp");
-                                format!("ERR RATE_LIMITED retry_after_ms={retry_after_ms}\n")
-                            }
-                        }
-                    }
-                }
-            }
+            _ => run_authenticated_command(
+                &cmd,
+                &mut parts,
+                &db,
+                &identity,
+                &session_role,
+                &rate_limiter,
+            ),
         };
 
         if write_half.write_all(response.as_bytes()).await.is_err() {
             return;
+        }
+    }
+}
+
+/// Why [`read_bounded_line`] stopped: a line is ready, the peer went away,
+/// a deadline elapsed, or the peer tried to buffer past the line cap. The
+/// caller owns the reply for the last two — it knows whether the session
+/// had authenticated yet, which changes what is worth saying.
+enum LineRead {
+    Ready,
+    Closed,
+    Timeout,
+    TooLong,
+}
+
+/// Read into `buffer` until it holds a complete line, bounding memory and
+/// time as it goes. `read_until` would buffer an entire newline-free line
+/// before any check, letting an unauthenticated peer grow the buffer until
+/// the process exhausted memory (CWE-400); a plain read loop, in turn,
+/// would let a silent peer hold its permit forever. Both bounds are
+/// enforced here, one read at a time.
+async fn read_bounded_line(
+    reader: &mut tokio::io::BufReader<tokio::net::tcp::OwnedReadHalf>,
+    buffer: &mut Vec<u8>,
+    chunk: &mut [u8],
+    limit: std::time::Duration,
+) -> LineRead {
+    use tokio::io::AsyncReadExt;
+
+    while !buffer.contains(&b'\n') {
+        match tokio::time::timeout(limit, reader.read(chunk)).await {
+            // EOF or a socket error: nothing more is coming.
+            Ok(Ok(0) | Err(_)) => return LineRead::Closed,
+            Ok(Ok(n)) => buffer.extend_from_slice(&chunk[..n]),
+            // The deadline elapsed. Which one is the caller's business.
+            Err(_) => return LineRead::Timeout,
+        }
+        // The cap sits above max_value_size so a legitimate single-line
+        // SET still fits; a peer past it is dropped, not humored.
+        if buffer.len() > MAX_TCP_LINE {
+            return LineRead::TooLong;
+        }
+    }
+    LineRead::Ready
+}
+
+/// Peel exactly one complete line off `buffer`, trimmed. Returns `None`
+/// for a blank line, which the caller skips: it is not a command, and it
+/// gets no reply. Anything after the line's newline stays buffered for
+/// the next pass, so pipelined commands are never lost.
+fn peel_line(buffer: &mut Vec<u8>) -> Option<String> {
+    let newline = buffer.iter().position(|&b| b == b'\n')?;
+    let line = buffer.drain(..=newline).collect::<Vec<u8>>();
+    let request = String::from_utf8_lossy(&line);
+    let request = request.trim();
+    if request.is_empty() {
+        None
+    } else {
+        Some(request.to_string())
+    }
+}
+
+/// Run one authenticated data command: the role gate first, then the
+/// shared rate limiter, then dispatch. Extracted from the connection
+/// loop so the authorization sequence has one definition and the loop
+/// stays readable.
+fn run_authenticated_command(
+    cmd: &str,
+    parts: &mut std::str::SplitN<'_, impl Fn(char) -> bool>,
+    db: &Arc<OmniKV>,
+    identity: &str,
+    session_role: &str,
+    rate_limiter: &Arc<RateLimiter>,
+) -> String {
+    // The same role model the REST middleware uses: the token's role has
+    // to cover the command. Anything less and a `read` token could DELETE.
+    match required_role_for(cmd) {
+        Some(required) if !required.allows(session_role) => {
+            tracing::warn!(
+                role = session_role,
+                required = required.as_str(),
+                "TCP command refused: insufficient role"
+            );
+            "ERR FORBIDDEN insufficient role\n".to_string()
+        }
+        _ => {
+            // Same per-identity limiter the QUIC path uses: one
+            // authenticated client cannot starve the node.
+            match rate_limiter.try_acquire(identity) {
+                Ok(_) => dispatch_tcp_command(cmd, parts, db),
+                Err(retry_after_ms) => {
+                    omni_engine::metrics_prometheus::record_rate_limit_rejection("tcp");
+                    format!("ERR RATE_LIMITED retry_after_ms={retry_after_ms}\n")
+                }
+            }
         }
     }
 }
@@ -1045,6 +1139,29 @@ mod tests {
         assert!(
             replies[1].starts_with("OK: authenticated"),
             "valid AUTH after a failure was rejected: {replies:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn tcp_idle_unauthenticated_session_is_deadlined() {
+        use tokio::io::AsyncReadExt;
+
+        // A session that connects and says nothing still holds a permit,
+        // and the pool is finite — without a deadline, 256 idle strangers
+        // drain it and the accept loop stops serving anyone real. The
+        // session has to be cut once its AUTH window elapses.
+        // start_paused advances the mock clock while no task is runnable,
+        // so the 10s deadline passes in milliseconds of wall clock.
+        let secret = "unit-test-secret-0123456789abcdef";
+        let mut s = session(test_db(), secret, Arc::new(TcpAuthFailures::new())).await;
+
+        // Send nothing. Read until the handler gives up and closes.
+        let mut buf = Vec::new();
+        s.client.read_to_end(&mut buf).await.unwrap();
+        let replied = String::from_utf8_lossy(&buf);
+        assert!(
+            replied.contains("AUTH_TIMEOUT"),
+            "idle unauthenticated session was not deadlined: {replied:?}"
         );
     }
 

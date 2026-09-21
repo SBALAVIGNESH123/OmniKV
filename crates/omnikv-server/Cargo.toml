@@ -32,6 +32,9 @@ openraft = { version = "0.9.24", features = ["serde"] }
 [dev-dependencies]
 tempfile = "3.15"
 tower = { version = "0.5", features = ["util"] }
+# Dev-only: the mock clock (start_paused) the deadline tests use to
+# advance time without sleeping. Stays out of the shipped binary.
+tokio = { version = "1.52.1", features = ["test-util"] }
 
 [lib]
 name = "omnikv_server"
