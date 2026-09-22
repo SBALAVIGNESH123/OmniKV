@@ -1359,9 +1359,21 @@ mod tests {
         let token = token_for(secret, "write");
         s.send(&format!("AUTH {token}\n")).await;
 
-        // Split the client so an aborted write cannot poison the read half
-        // that collects the parting reply afterward.
-        let (read, mut write) = s.client.into_split();
+        // Split the client so the dribbling writes and the reply collection
+        // each have their own half.
+        let (mut read, mut write) = s.client.into_split();
+
+        // Park a reader on the socket *before* the deadline fires. On some
+        // platforms an aborted connection discards whatever the server
+        // queued before the close, so reading afterward can come back empty;
+        // a task already waiting receives the reply the instant it lands.
+        let reply = tokio::spawn(async move {
+            let mut buf = Vec::new();
+            // An abort surfaces as an error here rather than a clean EOF;
+            // either way, whatever arrived first is in the buffer.
+            let _ = read.read_to_end(&mut buf).await;
+            String::from_utf8_lossy(&buf).into_owned()
+        });
 
         // Each gap stays under the idle window, so every dribble resets the
         // idle clock and it cannot fire; the cumulative time crosses the
@@ -1379,9 +1391,7 @@ mod tests {
         let rounds = 5usize;
         let mut cut = false;
         for _ in 0..rounds {
-            // A failed write is the server closing on us. That, not the
-            // parting reply, is the reliable signal: on some platforms an
-            // aborted connection discards buffered receive data.
+            // A failed write is the server closing on us.
             if write.write_all(b"x").await.is_err() {
                 cut = true;
                 break;
@@ -1399,18 +1409,14 @@ mod tests {
             "dribbling session was never cut: the line deadline is missing or too long"
         );
 
-        // Best effort: if the platform still has the parting reply queued,
-        // it names the reason. The cut above is what pins the mechanism;
-        // this only checks the message when delivery survives the abort.
-        let mut read = read;
-        let mut buf = Vec::new();
-        if read.read_to_end(&mut buf).await.is_ok() {
-            let replied = String::from_utf8_lossy(&buf);
-            assert!(
-                replied.is_empty() || replied.contains("IDLE_TIMEOUT"),
-                "dribbling session was cut for the wrong reason: {replied:?}"
-            );
-        }
+        // The reply is part of the contract, not decoration: a session cut
+        // for stalling is told why. The parked reader makes this
+        // deterministic across platforms.
+        let replied = reply.await.unwrap();
+        assert!(
+            replied.contains("IDLE_TIMEOUT"),
+            "dribbling session was cut without an IDLE_TIMEOUT reply: {replied:?}"
+        );
     }
 
     #[tokio::test(start_paused = true)]
