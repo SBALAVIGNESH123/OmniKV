@@ -882,3 +882,80 @@ fn test_raft_peer_hostname_is_accepted() {
     cfg.validate_runtime()
         .unwrap_or_else(|e| panic!("hostname peers must validate: {e}"));
 }
+
+#[test]
+fn test_tcp_loopback_bind_is_the_default() {
+    // Every other listener defaults to loopback; the TCP command
+    // interface must too (issue #117) — it grants full read/write.
+    let cfg = ServerConfig::default();
+    assert_eq!(cfg.tcp_addr, "127.0.0.1:7072");
+    cfg.validate_runtime()
+        .unwrap_or_else(|e| panic!("loopback default must validate: {e}"));
+}
+
+#[test]
+fn test_tcp_public_bind_requires_opt_in() {
+    // A non-loopback bind exposes an unrestricted read/write path to
+    // every host that can reach the port. It must be deliberate.
+    let mut cfg = ServerConfig {
+        tcp_addr: "0.0.0.0:8080".into(),
+        ..Default::default()
+    };
+    let err = cfg.validate_runtime().unwrap_err();
+    assert!(
+        err.0.contains("OMNIKV_TCP_BIND_PUBLIC"),
+        "public TCP bind must name the opt-in: {err}"
+    );
+
+    // The opt-in acknowledges the exposure. It still needs a real secret
+    // — the dev value is public, so a public bind with it is unauthenticated
+    // in practice (see test_tcp_public_bind_rejects_dev_jwt_secret).
+    cfg.tcp_bind_public = true;
+    cfg.jwt_secret = "a-real-secret-not-the-dev-one-0123456789".into();
+    cfg.validate_runtime()
+        .unwrap_or_else(|e| panic!("opted-in public bind must validate: {e}"));
+}
+
+#[test]
+fn test_tcp_public_bind_rejects_dev_jwt_secret() {
+    // The opt-in is an operator acknowledging exposure; the built-in dev
+    // secret is published in source, so that acknowledgment would be
+    // worthless — anyone could mint a token. Refuse the combination.
+    let mut cfg = ServerConfig {
+        tcp_addr: "0.0.0.0:8080".into(),
+        tcp_bind_public: true,
+        ..Default::default()
+    };
+    let err = cfg.validate_runtime().unwrap_err();
+    assert!(
+        err.0.contains("dev") && err.0.contains("jwt_secret"),
+        "public bind with the dev secret must be refused: {err}"
+    );
+
+    // A real secret dissolves the conflict; the bind then validates.
+    cfg.jwt_secret = "a-real-secret-not-the-dev-one-0123456789".into();
+    cfg.validate_runtime()
+        .unwrap_or_else(|e| panic!("public bind with a real secret must validate: {e}"));
+}
+
+#[test]
+fn test_tcp_public_bind_env_opt_in_round_trip() {
+    with_env(
+        &[
+            ("OMNIKV_TCP_ADDR", "0.0.0.0:8080"),
+            ("OMNIKV_TCP_BIND_PUBLIC", "true"),
+            // A public bind is only accepted with a non-default secret.
+            (
+                "OMNIKV_JWT_SECRET",
+                "a-real-secret-not-the-dev-one-0123456789",
+            ),
+        ],
+        || {
+            let mut cfg = ServerConfig::default();
+            cfg.apply_env().unwrap();
+            assert!(cfg.tcp_bind_public);
+            cfg.validate_runtime()
+                .unwrap_or_else(|e| panic!("env opt-in must validate: {e}"));
+        },
+    );
+}

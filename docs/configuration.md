@@ -51,6 +51,7 @@ cargo run -p omnikv-server -- --config /etc/omnikv/omnikv.toml
 | `OMNIKV_QUIC_ADDR` | `127.0.0.1:7071` | QUIC/HTTP3 bind address |
 | `OMNIKV_PGWIRE_ADDR` | `127.0.0.1:5432` | PostgreSQL wire protocol address |
 | `OMNIKV_TCP_ADDR` | `127.0.0.1:7072` | TCP command interface address |
+| `OMNIKV_TCP_BIND_PUBLIC` | `false` | Required to set a non-loopback `OMNIKV_TCP_ADDR` |
 | `OMNIKV_JWT_SECRET` | dev default | JWT signing secret (≥ 32 chars required in production) |
 | `OMNIKV_BOOTSTRAP_ADMIN_KEY` | dev default | Bootstrap key for `POST /auth/token` (≥ 32 chars required in production) |
 | `OMNIKV_TLS_CERT_PATH` | _(none)_ | Path to TLS certificate (PEM) |
@@ -129,6 +130,18 @@ Prometheus metrics expose maintenance health:
   plain environment variables in production deployments.
 - Use scoped, short-lived REST tokens for read, write, backup, and admin
   automation. See [Security model](security.md).
+- The TCP command interface (`OMNIKV_TCP_ADDR`) is authenticated: every
+  command except `AUTH` and `QUIT` is refused with `ERR AUTH_REQUIRED`
+  until the session presents a valid JWT — the same token REST and QUIC
+  accept, minted via `POST /auth/token`. It defaults to loopback; binding
+  it on a non-loopback address requires `OMNIKV_TCP_BIND_PUBLIC=true`,
+  and the server refuses to boot otherwise. A public bind still exposes
+  an unrestricted read/write path to every host that can reach the port,
+  so prefer REST (TLS, scoped roles) or PgWire for off-node access. The
+  interface has no transport encryption: `AUTH` sends the token in
+  cleartext, so on a public bind the credential is readable by anyone on
+  the path — bind it where the network is already trusted, or terminate
+  TLS in a sidecar in front of it.
 - Tune rate limits for your workload and alert on
   `omnikv_rate_limit_rejections_total{protocol=...}`.
 - Alert on `omnikv_cleanup_delete_failures_total{context=...,error_kind=...}`;

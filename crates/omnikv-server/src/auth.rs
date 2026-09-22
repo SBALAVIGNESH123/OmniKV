@@ -56,6 +56,40 @@ pub fn verify_token(token: &str, secret: &str) -> Result<Claims, String> {
     .map_err(|e| format!("Token verify error: {}", e))
 }
 
+/// What a route or command requires of a caller's role. Shared by the
+/// REST middleware and the TCP command interface so the two cannot drift
+/// apart: the same token grants the same access over either protocol.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RequiredRole {
+    Read,
+    Write,
+    Backup,
+    Admin,
+}
+
+impl RequiredRole {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Read => "read",
+            Self::Write => "write",
+            Self::Backup => "backup",
+            Self::Admin => "admin",
+        }
+    }
+
+    /// Whether a token with this role satisfies the requirement. `admin`
+    /// satisfies everything; otherwise a role must outrank the requirement
+    /// (a `write` token may read, but a `read` token may not write).
+    pub fn allows(self, role: &str) -> bool {
+        match self {
+            Self::Read => matches!(role, "read" | "write" | "admin"),
+            Self::Write => matches!(role, "write" | "admin"),
+            Self::Backup => matches!(role, "backup" | "admin"),
+            Self::Admin => role == "admin",
+        }
+    }
+}
+
 /// Validate a raw API key against the expected key.
 ///
 /// Uses hash-then-compare to prevent timing attacks.

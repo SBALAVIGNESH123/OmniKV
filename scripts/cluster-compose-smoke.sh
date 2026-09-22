@@ -21,6 +21,8 @@ export OMNIKV_BOOTSTRAP_ADMIN_KEY="${OMNIKV_BOOTSTRAP_ADMIN_KEY:-omnikv-smoke-ad
 # Host TCP ports the compose file maps for the three nodes.
 TCP_PORTS=(18080 18081 18082)
 NODES=(omni-cluster-smoke-node-1 omni-cluster-smoke-node-2 omni-cluster-smoke-node-3)
+# Node 1's published HTTPS port — the harness mints its JWT here.
+HTTP_PORT="${OMNIKV_HTTP_PORT:-18443}"
 
 cleanup() {
   docker compose -f "$COMPOSE_FILE" -p "$PROJECT_NAME" down -v --remove-orphans >/dev/null 2>&1 || true
@@ -34,8 +36,31 @@ fi
 cleanup
 docker compose -f "$COMPOSE_FILE" -p "$PROJECT_NAME" up -d
 
-# One TCP command round trip: request line in, response line out.
+# Mint the JWT the TCP interface requires (issue #117): same flow a real
+# client uses — POST /auth/token with the bootstrap admin key over TLS.
+# The nodes share one secret, so a token from node 1 is valid on all three
+# and survives the later kill (it is only minted once, up front).
+mint_token() {
+  curl -sk -X POST "https://127.0.0.1:${HTTP_PORT}/auth/token" \
+    -H "x-omni-admin-key: ${OMNIKV_BOOTSTRAP_ADMIN_KEY}" \
+    -H 'content-type: application/json' \
+    -d '{"username":"cluster-smoke","role":"admin","ttl_seconds":3600}' \
+    | grep -o '"data":"[^"]*"' | cut -d'"' -f4
+}
+
+# One TCP command round trip: AUTH and the command are pipelined on one
+# connection (the server frames by newline), and the reply we want is the
+# second line — the command's own answer.
 tcp_cmd() {
+  local port="$1" cmd="$2"
+  # shellcheck disable=SC2086
+  printf 'AUTH %s\n%s\n' "$TOKEN" "$cmd" \
+    | timeout 10 bash -c "exec 3<>/dev/tcp/127.0.0.1/$port; cat >&3; head -2 <&3 | tail -1"
+}
+
+# Same wire, deliberately no AUTH: the interface must refuse. Guards the
+# regression this script caught when the AUTH gate landed.
+tcp_cmd_unauthenticated() {
   local port="$1" cmd="$2"
   # shellcheck disable=SC2086
   printf '%s\n' "$cmd" | timeout 10 bash -c "exec 3<>/dev/tcp/127.0.0.1/$port; cat >&3; head -1 <&3"
@@ -77,6 +102,34 @@ if ! wait_for_cluster; then
   echo "FAIL: cluster nodes did not all come up" >&2
   exit 1
 fi
+
+# The token endpoint is ready once the listeners are; retry past startup.
+# The assignment is guarded: with set -e, a failing curl inside the
+# substitution would abort the script before the retry and the diagnostics
+# below could ever run.
+TOKEN=""
+for _ in $(seq 1 30); do
+  if ! TOKEN="$(mint_token)"; then
+    TOKEN=""
+  fi
+  [[ -n "$TOKEN" ]] && break
+  sleep 1
+done
+if [[ -z "$TOKEN" ]]; then
+  docker compose -f "$COMPOSE_FILE" -p "$PROJECT_NAME" logs --tail=200
+  echo "FAIL: could not mint a review token from https://127.0.0.1:${HTTP_PORT}/auth/token" >&2
+  exit 1
+fi
+
+# The AUTH gate itself: a command with no token must be refused.
+for port in "${TCP_PORTS[@]}"; do
+  refused="$(tcp_cmd_unauthenticated "$port" 'GET cluster-smoke:key')"
+  if [[ "$refused" != *"AUTH_REQUIRED"* ]]; then
+    echo "FAIL: node on :$port accepted an unauthenticated command (${refused})" >&2
+    exit 1
+  fi
+done
+echo "PASS: all nodes refuse unauthenticated commands"
 
 leader_port=""
 for _ in $(seq 1 60); do

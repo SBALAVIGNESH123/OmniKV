@@ -30,6 +30,55 @@ pub struct WriteAck {
     pub commit_seq: u64,
 }
 
+/// Why a clustered write did not complete.
+///
+/// `NotLeader` is a special case in the error taxonomy: it is
+/// client-caused AND safe to hand back to the client, because the caller
+/// needs the leader's identity to retry there and it exposes nothing
+/// about internal state. Every other failure stays opaque — the message
+/// is for the operator's logs, not the wire.
+#[derive(Debug)]
+pub enum RaftWriteError {
+    /// This node is not the leader. The client may retry the write on
+    /// `leader_id`; `None` means an election is still in progress.
+    NotLeader { leader_id: Option<u64> },
+    /// Any other failure. The message is operator-facing only.
+    Other(String),
+}
+
+impl RaftWriteError {
+    fn not_leader(leader_id: Option<u64>) -> Self {
+        Self::NotLeader { leader_id }
+    }
+
+    fn other(msg: impl Into<String>) -> Self {
+        Self::Other(msg.into())
+    }
+
+    /// The boundary into the engine's error type: `NotLeader` keeps its
+    /// identity (so protocol layers can surface it safely to clients and
+    /// map it to the right status code); anything else collapses into the
+    /// opaque `IoError` grab-bag.
+    fn into_omni_error(self) -> crate::OmniError {
+        match self {
+            Self::NotLeader { leader_id } => crate::OmniError::NotLeader { leader_id },
+            Self::Other(msg) => crate::OmniError::IoError(msg),
+        }
+    }
+}
+
+impl std::fmt::Display for RaftWriteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotLeader { leader_id } => match leader_id {
+                Some(id) => write!(f, "not the leader; the leader is node {id}"),
+                None => write!(f, "not the leader; no leader elected yet"),
+            },
+            Self::Other(msg) => write!(f, "{msg}"),
+        }
+    }
+}
+
 /// The server-wide handle for cluster writes. Cheap to clone via `Arc`.
 pub struct ClusterGateway {
     raft: OmniRaft,
@@ -102,15 +151,15 @@ impl ClusterGateway {
     /// the proposal. Async callers (REST/QUIC handlers) use this.
     pub async fn propose(&self, cmd: RaftCommand) -> Result<WriteAck, String> {
         let _flight = self.flight.lock().await;
-        self.propose_locked(cmd).await
+        self.propose_locked(cmd).await.map_err(|e| e.to_string())
     }
 
     /// The propose core — the caller already holds the flight lock.
     /// Everything between a caller's SSI validation and this proposal
     /// being committed+applied is hidden from other writers by that
     /// lock; this is what makes the leader's committed view gap-free.
-    async fn propose_locked(&self, cmd: RaftCommand) -> Result<WriteAck, String> {
-        cmd.protects_system_keys()?;
+    async fn propose_locked(&self, cmd: RaftCommand) -> Result<WriteAck, RaftWriteError> {
+        cmd.protects_system_keys().map_err(RaftWriteError::other)?;
         if cmd.is_empty() {
             // Nothing to replicate — nothing to ack either. Callers that
             // need read-only round-trip semantics use `probe()`.
@@ -125,12 +174,9 @@ impl ClusterGateway {
             .await
             .map_err(|e| match e.api_error() {
                 Some(openraft::error::ClientWriteError::ForwardToLeader(fwd)) => {
-                    match fwd.leader_id {
-                        Some(id) => format!("not the leader; the leader is node {id}"),
-                        None => "not the leader; no leader elected yet".to_string(),
-                    }
+                    RaftWriteError::not_leader(fwd.leader_id)
                 }
-                _ => format!("cluster write failed: {e}"),
+                _ => RaftWriteError::other(format!("cluster write failed: {e}")),
             })?;
         let index = resp.log_id.index;
         if index > 0 {
@@ -138,18 +184,20 @@ impl ClusterGateway {
                 .wait(None)
                 .applied_index_at_least(Some(index), "omnikv-cluster-write-apply")
                 .await
-                .map_err(|e| format!("cluster write applied but await failed: {e}"))?;
+                .map_err(|e| {
+                    RaftWriteError::other(format!("cluster write applied but await failed: {e}"))
+                })?;
         }
         // The state machine reports the commit marker it stamped for this
         // entry. Parsing it (rather than reading db.get_seq() now) is what
         // keeps the SSI commit record exact against concurrent bookkeeping
         // commits — see OmniRaftStorage::apply_to_state_machine.
         let commit_seq = resp.data.parse::<u64>().map_err(|_| {
-            format!(
+            RaftWriteError::other(format!(
                 "apply at index {index} returned no commit marker (got {:?}) — \
                  the entry was rejected or the response is malformed",
                 resp.data
-            )
+            ))
         })?;
         Ok(WriteAck { index, commit_seq })
     }
@@ -199,6 +247,7 @@ impl ClusterGateway {
     pub fn propose_blocking(&self, cmd: RaftCommand) -> Result<WriteAck, String> {
         let _flight = self.flight_blocking();
         self.block_on_ctx(async { self.propose_locked(cmd).await })
+            .map_err(|e| e.to_string())
     }
 
     /// Blocking facade over [`Self::probe`].
@@ -219,7 +268,7 @@ impl ClusterGateway {
         }
         let ack = self
             .block_on_ctx(async { self.propose_locked(cmd).await })
-            .map_err(crate::OmniError::IoError)?;
+            .map_err(RaftWriteError::into_omni_error)?;
         Ok(ack.index)
     }
 
@@ -268,7 +317,9 @@ impl ClusterGateway {
         if cmd.is_empty() {
             return Ok(0);
         }
-        let ack = self.block_on_ctx(async { self.propose_locked(cmd).await })?;
+        let ack = self
+            .block_on_ctx(async { self.propose_locked(cmd).await })
+            .map_err(|e| e.to_string())?;
         Ok(ack.commit_seq)
     }
 
