@@ -833,8 +833,8 @@ async fn read_bounded_line(
 ///
 /// The drain shifts every surviving byte to the front, so `scanned` (an
 /// offset into `buffer`) restarts at zero; completing a line also restarts
-/// the idle deadline, which is what stops a dribbling peer from holding a
-/// permit across arbitrarily many reads.
+/// the line deadline, so a client that keeps finishing commands gets a
+/// fresh budget for each one. The caller restarts the idle clock.
 fn peel_line(
     buffer: &mut Vec<u8>,
     scanned: &mut usize,
@@ -1296,6 +1296,23 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn tcp_failed_auth_does_not_open_the_gate() {
+        // A rejected AUTH must reply with its error and leave the session
+        // exactly as unauthenticated as before. The reply path and the
+        // auth-state path are separate concerns, and wiring the former
+        // without the latter would hand a rejected token the keys.
+        let secret = "unit-test-secret-0123456789abcdef";
+        let mut s = session(test_db(), secret, Arc::new(TcpAuthFailures::new())).await;
+
+        let replies = s.send("AUTH not-a-token\nGET should-not-run\n").await;
+        assert!(replies[0].contains("INVALID_TOKEN"), "{replies:?}");
+        assert!(
+            replies[1].contains("AUTH_REQUIRED"),
+            "a rejected AUTH granted access: {replies:?}"
+        );
+    }
+
     #[tokio::test(start_paused = true)]
     async fn tcp_idle_unauthenticated_session_is_deadlined() {
         use tokio::io::AsyncReadExt;
@@ -1328,6 +1345,11 @@ mod tests {
         // never finishes a line, holding its permit for as long as it
         // cares to keep dribbling. The absolute line deadline is what
         // bounds that case, and it does not reset on activity.
+        //
+        // The test has to keep the peer active: one partial write followed
+        // by silence would let the idle clock fire instead, which the old
+        // per-read timeout cuts just as well. Dribbling within each idle
+        // window leaves only the line deadline to do the work.
         let secret = "unit-test-secret-0123456789abcdef";
         let db = test_db();
         let mut s = session(db, secret, Arc::new(TcpAuthFailures::new())).await;
@@ -1337,20 +1359,58 @@ mod tests {
         let token = token_for(secret, "write");
         s.send(&format!("AUTH {token}\n")).await;
 
-        // Start a line and deliberately never finish it, then go quiet.
-        // The write resets the idle clock, so only the absolute line
-        // deadline can cut this session.
-        s.client.write_all(b"SET k v").await.unwrap();
+        // Split the client so an aborted write cannot poison the read half
+        // that collects the parting reply afterward.
+        let (read, mut write) = s.client.into_split();
 
-        // The mock clock advances while the runtime is idle, past the
-        // line deadline, and the session is cut.
-        let mut buf = Vec::new();
-        s.client.read_to_end(&mut buf).await.unwrap();
-        let replied = String::from_utf8_lossy(&buf);
+        // Each gap stays under the idle window, so every dribble resets the
+        // idle clock and it cannot fire; the cumulative time crosses the
+        // absolute line deadline. The byte deliberately never completes a
+        // line, so the clock that must do the cutting is the one that does
+        // not reset on activity. No reads inside the loop: an awaited read
+        // parks this task, and the paused mock clock then auto-advances to
+        // the *idle* deadline — which would fire first and hide which clock
+        // actually did the work.
+        let gap = TCP_IDLE_TIMEOUT / 2;
+        // The round count is pinned, not derived from TCP_LINE_DEADLINE:
+        // deriving it would scale the wait with any change to the constant,
+        // so a regression that made the deadline arbitrarily long would
+        // scale the test along with it and still pass.
+        let rounds = 5usize;
+        let mut cut = false;
+        for _ in 0..rounds {
+            // A failed write is the server closing on us. That, not the
+            // parting reply, is the reliable signal: on some platforms an
+            // aborted connection discards buffered receive data.
+            if write.write_all(b"x").await.is_err() {
+                cut = true;
+                break;
+            }
+            tokio::time::sleep(gap).await;
+        }
+
+        // Five rounds at half the idle window is 2.5x TCP_IDLE_TIMEOUT, so
+        // only the line deadline can have cut this — the idle clock was
+        // resetting on every dribble. If the line deadline is missing or
+        // lengthened past this window, the loop completes uncut and fails
+        // here.
         assert!(
-            replied.contains("IDLE_TIMEOUT"),
-            "dribbling authenticated session was not deadlined: {replied:?}"
+            cut,
+            "dribbling session was never cut: the line deadline is missing or too long"
         );
+
+        // Best effort: if the platform still has the parting reply queued,
+        // it names the reason. The cut above is what pins the mechanism;
+        // this only checks the message when delivery survives the abort.
+        let mut read = read;
+        let mut buf = Vec::new();
+        if read.read_to_end(&mut buf).await.is_ok() {
+            let replied = String::from_utf8_lossy(&buf);
+            assert!(
+                replied.is_empty() || replied.contains("IDLE_TIMEOUT"),
+                "dribbling session was cut for the wrong reason: {replied:?}"
+            );
+        }
     }
 
     #[tokio::test(start_paused = true)]
