@@ -341,8 +341,18 @@ const TCP_AUTH_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10
 /// How long an authenticated session may idle between reads. Deliberately
 /// generous — the interface is a debugging tool, and an operator's
 /// telnet session should not be cut for thinking — but still finite, so
-/// a forgotten terminal cannot squat on a permit indefinitely.
+/// a forgotten terminal cannot squat on a permit indefinitely. It resets
+/// on any received bytes, so a slow-but-working client is never cut.
 const TCP_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// How long a session may accumulate one incomplete command line, counting
+/// from the first byte of that line. The idle timeout alone does not bound
+/// this: a peer that dribbles one byte every few minutes is never idle by
+/// that measure, yet never finishes a line, holding its permit for as long
+/// as it keeps dribbling. This is the absolute backstop for that case —
+/// generous enough for a large legitimate value over a slow link, firm
+/// enough that a stalled permit comes back to the pool.
+const TCP_LINE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(600);
 
 /// Simple TCP command interface for telnet/debugging.
 ///
@@ -538,33 +548,55 @@ async fn handle_tcp_connection(
     // held the whole time, and the pool is finite). Once authenticated,
     // the much longer idle timeout governs. Both keep a parked peer from
     // squatting on a permit that a real client is waiting for.
-    let auth_deadline = std::time::Instant::now() + TCP_AUTH_DEADLINE;
+    let auth_deadline = tokio::time::Instant::now() + TCP_AUTH_DEADLINE;
 
     // Holds partial input between reads: a client may pipeline several
     // commands in one segment, and a single command may straddle a read
     // boundary. Both cases need the leftover preserved, not discarded.
     let mut buffer = Vec::with_capacity(512);
     let mut chunk = [0u8; 8192];
+    // How many leading bytes are already known to be newline-free, so a
+    // scan covers only what the last read appended — linear, not
+    // quadratic, as a single line grows toward the cap.
+    let mut scanned = 0usize;
+    // Two clocks, because they protect against different things:
+    // - `idle_deadline` resets whenever any bytes arrive, so a slow but
+    //   working client is never cut.
+    // - `line_deadline` is an absolute backstop on accumulating one
+    //   incomplete line, so a peer dribbling a byte every few minutes —
+    //   active by the idle measure, but never finishing a line — cannot
+    //   hold its permit indefinitely.
+    let mut idle_deadline = tokio::time::Instant::now() + TCP_IDLE_TIMEOUT;
+    let mut line_deadline = tokio::time::Instant::now() + TCP_LINE_DEADLINE;
 
     loop {
-        // Read until a complete line is buffered. Both bounds matter as
-        // much as each other: the length cap stops a newline-free peer
-        // growing the buffer toward OOM (CWE-400), and the time cap stops
-        // a parked peer holding its permit forever — the pool is finite,
-        // and 256 silent connections would drain it.
-        let limit = if authenticated {
-            TCP_IDLE_TIMEOUT
+        // Read until a complete line is buffered. Three bounds apply, and
+        // each protects something different: the length cap stops a
+        // newline-free peer growing the buffer toward OOM (CWE-400), the
+        // auth deadline bounds a loitering stranger, and the idle/line
+        // clocks stop a parked or dribbling peer holding a permit forever
+        // — the pool is finite, and 256 such sessions would drain it.
+        // Unauthenticated, the auth deadline governs and the idle clock
+        // does not: no partial command is worth waiting past AUTH for.
+        let absolute = if authenticated {
+            line_deadline
         } else {
-            auth_deadline.saturating_duration_since(std::time::Instant::now())
+            auth_deadline
         };
-        match read_bounded_line(&mut reader, &mut buffer, &mut chunk, limit).await {
+        match read_bounded_line(
+            &mut reader,
+            &mut buffer,
+            &mut chunk,
+            &mut scanned,
+            &mut idle_deadline,
+            absolute,
+        )
+        .await
+        {
             LineRead::Ready => {}
             LineRead::Closed => return,
             LineRead::Timeout => {
-                if !authenticated {
-                    tracing::warn!(peer = %peer, "dropping TCP session: no AUTH within the deadline");
-                    let _ = write_half.write_all(b"ERR AUTH_TIMEOUT\n").await;
-                }
+                write_timeout_reply(&mut write_half, authenticated, peer).await;
                 return;
             }
             LineRead::TooLong => {
@@ -574,9 +606,13 @@ async fn handle_tcp_connection(
         }
 
         // Peel exactly one line; the rest stays buffered for next pass.
-        let Some(request) = peel_line(&mut buffer) else {
+        let Some(request) = peel_line(&mut buffer, &mut scanned, &mut line_deadline) else {
+            // A completed line resets the idle clock too: the client just
+            // proved it is present, even if the line was empty.
+            idle_deadline = tokio::time::Instant::now() + TCP_IDLE_TIMEOUT;
             continue;
         };
+        idle_deadline = tokio::time::Instant::now() + TCP_IDLE_TIMEOUT;
 
         let mut parts = request.splitn(3, char::is_whitespace);
         let cmd = parts.next().unwrap_or("");
@@ -587,38 +623,33 @@ async fn handle_tcp_connection(
         let cmd = cmd.to_uppercase();
 
         let response = match cmd.as_str() {
-            "AUTH" => match handle_tcp_auth(&mut parts, &jwt_secret, peer) {
-                AuthOutcome::Accepted { subject, role } => {
-                    authenticated = true;
-                    identity = format!("tcp:user:{subject}");
-                    session_role = role;
-                    // The client proved who it is; forget any failures it
-                    // accumulated getting here.
-                    auth_tracker.clear(&peer.ip());
-                    format!("OK: authenticated as {subject}\n")
-                }
-                AuthOutcome::Rejected { message } => {
-                    auth_failures += 1;
-                    // The per-connection limit drops a grinding session
-                    // fast; the per-peer limit is what stops it from
-                    // reconnecting for five more guesses.
-                    let peer_count = auth_tracker.record(peer.ip());
-                    if auth_failures >= MAX_TCP_AUTH_FAILURES
-                        || peer_count >= MAX_TCP_PEER_AUTH_FAILURES
-                    {
-                        tracing::warn!(
-                            peer = %peer,
-                            connection_failures = auth_failures,
-                            peer_failures = peer_count,
-                            "dropping TCP session after failed AUTH"
-                        );
-                        let _ = write_half.write_all(b"ERR TOO_MANY_FAILURES\n").await;
-                        return;
+            "AUTH" => {
+                match handle_tcp_auth_outcome(
+                    &mut parts,
+                    &jwt_secret,
+                    peer,
+                    &auth_tracker,
+                    &mut auth_failures,
+                    &mut write_half,
+                )
+                .await
+                {
+                    // The peer went over budget: the session is already
+                    // closed and the reply already sent.
+                    AuthResolution::Dropped => return,
+                    AuthResolution::Reply(reply) => reply,
+                    AuthResolution::Accepted {
+                        subject,
+                        role,
+                        reply,
+                    } => {
+                        authenticated = true;
+                        identity = format!("tcp:user:{subject}");
+                        session_role = role;
+                        reply
                     }
-                    message
                 }
-                AuthOutcome::Unconfigured => "ERR AUTH_NOT_CONFIGURED\n".to_string(),
-            },
+            }
             "QUIT" | "EXIT" => {
                 let _ = write_half.write_all(b"Goodbye.\n").await;
                 return;
@@ -641,6 +672,70 @@ async fn handle_tcp_connection(
     }
 }
 
+/// What an AUTH attempt resolved to: the session was dropped over its
+/// failure budget, a reply was owed (accepted or a routine rejection), or
+/// the token verified and the session is now authenticated.
+enum AuthResolution {
+    /// Over the failure budget: the session is closed and the reply
+    /// already written, so the caller stops rather than sends another.
+    Dropped,
+    /// A reply to send, with the session's auth state unchanged — a
+    /// routine rejection or an unconfigured secret.
+    Reply(String),
+    /// The token verified; the caller records the identity and role.
+    Accepted {
+        subject: String,
+        role: String,
+        reply: String,
+    },
+}
+
+/// Handle one AUTH attempt and its bookkeeping: the failure counters, the
+/// per-peer budget, and the reply. Only a verified token authenticates —
+/// a rejection replies but leaves the session unauthenticated, so a
+/// failed AUTH never grants access by accident.
+async fn handle_tcp_auth_outcome(
+    parts: &mut std::str::SplitN<'_, impl Fn(char) -> bool>,
+    jwt_secret: &str,
+    peer: std::net::SocketAddr,
+    auth_tracker: &Arc<TcpAuthFailures>,
+    auth_failures: &mut u32,
+    write_half: &mut tokio::net::tcp::OwnedWriteHalf,
+) -> AuthResolution {
+    use tokio::io::AsyncWriteExt;
+    match handle_tcp_auth(parts, jwt_secret, peer) {
+        AuthOutcome::Accepted { subject, role } => {
+            // The client proved who it is; forget any failures it
+            // accumulated getting here.
+            auth_tracker.clear(&peer.ip());
+            AuthResolution::Accepted {
+                reply: format!("OK: authenticated as {subject}\n"),
+                subject,
+                role,
+            }
+        }
+        AuthOutcome::Rejected { message } => {
+            *auth_failures += 1;
+            // The per-connection limit drops a grinding session fast; the
+            // per-peer limit is what stops it from reconnecting for five
+            // more guesses.
+            let peer_count = auth_tracker.record(peer.ip());
+            if *auth_failures >= MAX_TCP_AUTH_FAILURES || peer_count >= MAX_TCP_PEER_AUTH_FAILURES {
+                tracing::warn!(
+                    peer = %peer,
+                    connection_failures = *auth_failures,
+                    peer_failures = peer_count,
+                    "dropping TCP session after failed AUTH"
+                );
+                let _ = write_half.write_all(b"ERR TOO_MANY_FAILURES\n").await;
+                return AuthResolution::Dropped;
+            }
+            AuthResolution::Reply(message)
+        }
+        AuthOutcome::Unconfigured => AuthResolution::Reply("ERR AUTH_NOT_CONFIGURED\n".to_string()),
+    }
+}
+
 /// Why [`read_bounded_line`] stopped: a line is ready, the peer went away,
 /// a deadline elapsed, or the peer tried to buffer past the line cap. The
 /// caller owns the reply for the last two — it knows whether the session
@@ -652,25 +747,74 @@ enum LineRead {
     TooLong,
 }
 
+/// Reply to a session whose deadline elapsed, then the caller drops it.
+/// Whether the auth deadline or the idle/line clock fired is a detail the
+/// reply does not leak — either way the session is being cut for stalling,
+/// and the peer's remedy is the same.
+async fn write_timeout_reply(
+    write_half: &mut tokio::net::tcp::OwnedWriteHalf,
+    authenticated: bool,
+    peer: std::net::SocketAddr,
+) {
+    use tokio::io::AsyncWriteExt;
+    if authenticated {
+        tracing::warn!(peer = %peer, "dropping TCP session: stalled past the idle or line deadline");
+        let _ = write_half.write_all(b"ERR IDLE_TIMEOUT\n").await;
+    } else {
+        tracing::warn!(peer = %peer, "dropping TCP session: no AUTH within the deadline");
+        let _ = write_half.write_all(b"ERR AUTH_TIMEOUT\n").await;
+    }
+}
+
 /// Read into `buffer` until it holds a complete line, bounding memory and
 /// time as it goes. `read_until` would buffer an entire newline-free line
 /// before any check, letting an unauthenticated peer grow the buffer until
 /// the process exhausted memory (CWE-400); a plain read loop, in turn,
 /// would let a silent peer hold its permit forever. Both bounds are
 /// enforced here, one read at a time.
+///
+/// Two clocks: `idle` resets whenever bytes arrive, so a slow but working
+/// client is never cut; `line_deadline` is absolute, so a peer dribbling a
+/// byte every few minutes without ever finishing a line cannot hold its
+/// permit indefinitely. The effective wait each pass is the earlier one.
+///
+/// `scanned` is how many leading bytes of `buffer` are already known to be
+/// newline-free, carried across calls: each byte is compared once instead of
+/// re-scanning the whole buffer after every read, which keeps a maxed-out
+/// 12 MiB line linear rather than quadratic in CPU.
 async fn read_bounded_line(
     reader: &mut tokio::io::BufReader<tokio::net::tcp::OwnedReadHalf>,
     buffer: &mut Vec<u8>,
     chunk: &mut [u8],
-    limit: std::time::Duration,
+    scanned: &mut usize,
+    idle: &mut tokio::time::Instant,
+    line_deadline: tokio::time::Instant,
 ) -> LineRead {
     use tokio::io::AsyncReadExt;
 
-    while !buffer.contains(&b'\n') {
+    loop {
+        // Look only at what the last read appended.
+        if buffer[*scanned..].contains(&b'\n') {
+            return LineRead::Ready;
+        }
+        // Everything so far is now known to be newline-free. Only true
+        // when no newline was found — a Ready return leaves the rest of
+        // a pipelined batch unexamined for the next call.
+        *scanned = buffer.len();
+        let now = tokio::time::Instant::now();
+        // Recomputed each pass, so the wait is bounded by whichever clock
+        // fires first, no matter how many reads the line takes.
+        let limit = std::cmp::min(*idle, line_deadline).saturating_duration_since(now);
         match tokio::time::timeout(limit, reader.read(chunk)).await {
             // EOF or a socket error: nothing more is coming.
             Ok(Ok(0) | Err(_)) => return LineRead::Closed,
-            Ok(Ok(n)) => buffer.extend_from_slice(&chunk[..n]),
+            Ok(Ok(n)) => {
+                buffer.extend_from_slice(&chunk[..n]);
+                // Activity: this is a working client, however slow, and
+                // the idle clock starts over. The absolute line deadline
+                // does not, which is what makes the dribble case finite.
+                *idle = tokio::time::Instant::now() + TCP_IDLE_TIMEOUT;
+            }
             // The deadline elapsed. Which one is the caller's business.
             Err(_) => return LineRead::Timeout,
         }
@@ -680,16 +824,26 @@ async fn read_bounded_line(
             return LineRead::TooLong;
         }
     }
-    LineRead::Ready
 }
 
 /// Peel exactly one complete line off `buffer`, trimmed. Returns `None`
 /// for a blank line, which the caller skips: it is not a command, and it
 /// gets no reply. Anything after the line's newline stays buffered for
 /// the next pass, so pipelined commands are never lost.
-fn peel_line(buffer: &mut Vec<u8>) -> Option<String> {
+///
+/// The drain shifts every surviving byte to the front, so `scanned` (an
+/// offset into `buffer`) restarts at zero; completing a line also restarts
+/// the idle deadline, which is what stops a dribbling peer from holding a
+/// permit across arbitrarily many reads.
+fn peel_line(
+    buffer: &mut Vec<u8>,
+    scanned: &mut usize,
+    line_deadline: &mut tokio::time::Instant,
+) -> Option<String> {
     let newline = buffer.iter().position(|&b| b == b'\n')?;
     let line = buffer.drain(..=newline).collect::<Vec<u8>>();
+    *scanned = 0;
+    *line_deadline = tokio::time::Instant::now() + TCP_LINE_DEADLINE;
     let request = String::from_utf8_lossy(&line);
     let request = request.trim();
     if request.is_empty() {
@@ -1162,6 +1316,87 @@ mod tests {
         assert!(
             replied.contains("AUTH_TIMEOUT"),
             "idle unauthenticated session was not deadlined: {replied:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn tcp_authenticated_session_dribbling_a_line_is_deadlined() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // The idle clock resets on any received bytes, so a peer who sends
+        // one byte every few minutes is never idle by that measure — yet
+        // never finishes a line, holding its permit for as long as it
+        // cares to keep dribbling. The absolute line deadline is what
+        // bounds that case, and it does not reset on activity.
+        let secret = "unit-test-secret-0123456789abcdef";
+        let db = test_db();
+        let mut s = session(db, secret, Arc::new(TcpAuthFailures::new())).await;
+
+        // Authenticate first, so the clock in play is the idle/line pair,
+        // not the AUTH deadline.
+        let token = token_for(secret, "write");
+        s.send(&format!("AUTH {token}\n")).await;
+
+        // Start a line and deliberately never finish it, then go quiet.
+        // The write resets the idle clock, so only the absolute line
+        // deadline can cut this session.
+        s.client.write_all(b"SET k v").await.unwrap();
+
+        // The mock clock advances while the runtime is idle, past the
+        // line deadline, and the session is cut.
+        let mut buf = Vec::new();
+        s.client.read_to_end(&mut buf).await.unwrap();
+        let replied = String::from_utf8_lossy(&buf);
+        assert!(
+            replied.contains("IDLE_TIMEOUT"),
+            "dribbling authenticated session was not deadlined: {replied:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn tcp_authenticated_session_completing_lines_is_not_cut() {
+        // The counterpart of the dribble test: a client that keeps
+        // finishing lines keeps getting served. The paused clock
+        // auto-advances whenever the runtime is idle, so this has to send
+        // the whole batch in one segment — the moment the handler parks
+        // between commands the mock clock would jump to the idle
+        // deadline regardless of the reset, which makes an await-per-
+        // command arrangement unable to tell "cut for stalling" from
+        // "clock moved while parked". A single pipelined write keeps the
+        // handler busy and lets every line complete.
+        let secret = "unit-test-secret-0123456789abcdef";
+        let db = test_db();
+        let mut s = session(db, secret, Arc::new(TcpAuthFailures::new())).await;
+
+        let token = token_for(secret, "write");
+        s.send(&format!("AUTH {token}\n")).await;
+
+        // More commands than one idle window would tolerate, all
+        // completed: every one earns its reply, and the session survives
+        // to serve the next.
+        let batch: String = (0..8).fold(String::new(), |mut acc, i| {
+            acc.push_str(&format!("SET k{i} v{i}\n"));
+            acc
+        });
+        let replies = s.send(&batch).await;
+        assert_eq!(
+            replies.len(),
+            8,
+            "completing client lost replies: {replies:?}"
+        );
+        for r in &replies {
+            assert!(
+                r.starts_with("OK"),
+                "completing client was errored: {replies:?}"
+            );
+        }
+
+        // The session is still alive: a later command still gets served.
+        let later = s.send("GET k0\n").await;
+        assert_eq!(
+            later,
+            vec!["OK: v0"],
+            "session died after completing lines: {later:?}"
         );
     }
 
