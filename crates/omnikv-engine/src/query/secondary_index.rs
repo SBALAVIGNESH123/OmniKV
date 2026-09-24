@@ -1,7 +1,6 @@
-//! Production-grade Secondary Index Engine
+//! Secondary Index Engine
 //!
-//! Replaces the naive `__idx:{collection}:{field}:{value}` string hack with
-//! a proper sorted index system that supports:
+//! A sorted index system supporting:
 //!
 //! - **Range queries** on indexed fields (e.g., `age >= 18 AND age < 65`)
 //! - **Composite indexes** (multi-field, ordered)

@@ -245,8 +245,8 @@ mod tests {
 
     #[test]
     fn test_select_all_lowercase_keywords_and_key() {
-        // Issue #109: keywords and the 'key' filter column must be
-        // case-insensitive, matching PostgreSQL behavior.
+        // Keywords and the 'key' filter column must be case-insensitive,
+        // matching PostgreSQL behavior.
         let q = parse_query("select * where key >= 100 and key <= 200").expect("unwrap failed");
         assert_eq!(q.action, Action::SelectAll);
         assert_eq!(q.conditions.len(), 2);

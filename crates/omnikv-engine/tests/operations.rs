@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════════════════════════════════════
-// Operations & Edge Case Tests — Gaps #32 through #47
+// Operations & Edge Case Tests
 // ═══════════════════════════════════════════════════════════════════════════
 
 use omni_engine::transaction::TransactionManager;
@@ -15,10 +15,10 @@ fn create_temp_db(prefix: &str) -> (std::sync::Arc<OmniKV>, tempfile::TempDir) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Gap #32: Concurrent writers stress test
+// Concurrent writers stress test
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Gap #32a: Multiple threads writing concurrently
+/// Multiple threads writing concurrently
 #[test]
 fn test_concurrent_writers() {
     let dir = tempfile::tempdir().unwrap();
@@ -60,10 +60,10 @@ fn test_concurrent_writers() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Gap #33: Large value handling
+// Large value handling
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Gap #33a: 1MB value stored and retrieved
+/// 1MB value stored and retrieved
 #[test]
 fn test_large_value_1mb() {
     let (db, _dir) = create_temp_db("lv");
@@ -80,7 +80,7 @@ fn test_large_value_1mb() {
     println!("✅ OPS 33a: 1MB value stored and retrieved correctly");
 }
 
-/// Gap #33b: Compressed values decompress correctly
+/// Compressed values decompress correctly
 #[test]
 fn test_compressed_value() {
     let (db, _dir) = create_temp_db("comp");
@@ -96,10 +96,10 @@ fn test_compressed_value() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Gap #34: Key length edge cases
+// Key length edge cases
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Gap #34a: Single-byte key
+/// Single-byte key
 #[test]
 fn test_single_byte_key() {
     let (db, _dir) = create_temp_db("sk");
@@ -112,7 +112,7 @@ fn test_single_byte_key() {
     println!("✅ OPS 34a: Single-byte key 'x' works");
 }
 
-/// Gap #34b: Long key (1000 chars)
+/// Long key (1000 chars)
 #[test]
 fn test_long_key() {
     let (db, _dir) = create_temp_db("lk");
@@ -130,10 +130,10 @@ fn test_long_key() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Gap #35: Batch size limits
+// Batch size limits
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Gap #35a: Empty batch commits successfully
+/// Empty batch commits successfully
 #[test]
 fn test_empty_batch() {
     let (db, _dir) = create_temp_db("eb");
@@ -144,7 +144,7 @@ fn test_empty_batch() {
     println!("✅ OPS 35a: Empty batch commits without error");
 }
 
-/// Gap #35b: Large batch with many keys
+/// Large batch with many keys
 #[test]
 fn test_large_batch() {
     let (db, _dir) = create_temp_db("lb");
@@ -162,10 +162,10 @@ fn test_large_batch() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Gap #36: SSTable merge correctness
+// SSTable merge correctness
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Gap #36a: Overwritten keys show latest value after compaction
+/// Overwritten keys show latest value after compaction
 #[test]
 fn test_sstable_overwrite_merge() {
     let (db, _dir) = create_temp_db("ow");
@@ -189,10 +189,10 @@ fn test_sstable_overwrite_merge() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Gap #37: Bloom filter false positive rate
+// Bloom filter false positive rate
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Gap #37a: Bloom filter doesn't block real keys
+/// Bloom filter doesn't block real keys
 #[test]
 fn test_bloom_filter_no_false_negatives() {
     let (db, _dir) = create_temp_db("bf");
@@ -217,10 +217,10 @@ fn test_bloom_filter_no_false_negatives() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Gap #38: TTL expiration accuracy
+// TTL expiration accuracy
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Gap #38a: TTL key with far-future expiry is visible
+/// TTL key with far-future expiry is visible
 #[test]
 fn test_ttl_far_future_visible() {
     let (db, _dir) = create_temp_db("ttl");
@@ -239,7 +239,7 @@ fn test_ttl_far_future_visible() {
     println!("✅ OPS 38a: TTL key with 24h expiry is visible now");
 }
 
-/// Gap #38b: Non-TTL key persists indefinitely
+/// Non-TTL key persists indefinitely
 #[test]
 fn test_no_ttl_persists() {
     let (db, _dir) = create_temp_db("nttl");
@@ -257,10 +257,10 @@ fn test_no_ttl_persists() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Gap #39: Snapshot reference counting
+// Snapshot reference counting
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Gap #39a: Register and unregister snapshots
+/// Register and unregister snapshots
 #[test]
 fn test_snapshot_lifecycle() {
     let (db, _dir) = create_temp_db("snap");
@@ -282,7 +282,7 @@ fn test_snapshot_lifecycle() {
     println!("✅ OPS 39a: Snapshot register/unregister lifecycle works");
 }
 
-/// Gap #39b: Min active snapshot tracking
+/// Min active snapshot tracking
 #[test]
 fn test_min_active_snapshot() {
     let (db, _dir) = create_temp_db("msnap");
@@ -303,10 +303,10 @@ fn test_min_active_snapshot() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Gap #40: WAL rotation under load
+// WAL rotation under load
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Gap #40a: WAL rotation preserves data via `SSTable`
+/// WAL rotation preserves data via `SSTable`
 #[test]
 fn test_wal_rotation() {
     let (db, _dir) = create_temp_db("walr");
@@ -330,10 +330,10 @@ fn test_wal_rotation() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Gap #41: Hot key contention
+// Hot key contention
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Gap #41a: Same key overwritten many times
+/// Same key overwritten many times
 #[test]
 fn test_hot_key_overwrite() {
     let (db, _dir) = create_temp_db("hot");
@@ -353,10 +353,10 @@ fn test_hot_key_overwrite() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Gap #42: Sequential vs random write patterns
+// Sequential vs random write patterns
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Gap #42a: Sequential keys
+/// Sequential keys
 #[test]
 fn test_sequential_writes() {
     let (db, _dir) = create_temp_db("seq");
@@ -374,7 +374,7 @@ fn test_sequential_writes() {
     println!("✅ OPS 42a: 200 sequential keys written and verified");
 }
 
-/// Gap #42b: Random-pattern keys
+/// Random-pattern keys
 #[test]
 fn test_random_pattern_writes() {
     let (db, _dir) = create_temp_db("rnd");
@@ -397,10 +397,10 @@ fn test_random_pattern_writes() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Gap #43: Read-during-compaction consistency
+// Read-during-compaction consistency
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Gap #43a: Reads before and after compaction are consistent
+/// Reads before and after compaction are consistent
 #[test]
 fn test_read_consistency_across_compaction() {
     let (db, _dir) = create_temp_db("rdc");
@@ -423,10 +423,10 @@ fn test_read_consistency_across_compaction() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Gap #44: Scan correctness
+// Scan correctness
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Gap #44a: Scan returns lexicographically ordered results
+/// Scan returns lexicographically ordered results
 #[test]
 fn test_scan_ordering() {
     let (db, _dir) = create_temp_db("scan");
@@ -449,7 +449,7 @@ fn test_scan_ordering() {
     );
 }
 
-/// Gap #44b: Scan with empty range returns empty
+/// Scan with empty range returns empty
 #[test]
 fn test_scan_empty_range() {
     let (db, _dir) = create_temp_db("scanempty");
@@ -461,10 +461,10 @@ fn test_scan_empty_range() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Gap #45: Metrics accuracy
+// Metrics accuracy
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Gap #45a: Memtable size increases after writes
+/// Memtable size increases after writes
 #[test]
 fn test_memtable_size_tracking() {
     let (db, _dir) = create_temp_db("met");
@@ -485,7 +485,7 @@ fn test_memtable_size_tracking() {
     println!("✅ OPS 45a: Memtable size {size_before} → {size_after} after 50 writes");
 }
 
-/// Gap #45b: Sequence number monotonically increases
+/// Sequence number monotonically increases
 #[test]
 fn test_seq_monotonic() {
     let (db, _dir) = create_temp_db("seqm");
@@ -504,10 +504,10 @@ fn test_seq_monotonic() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Gap #46: Graceful shutdown / recovery
+// Graceful shutdown / recovery
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Gap #46a: Multiple open/close cycles preserve data
+/// Multiple open/close cycles preserve data
 #[test]
 fn test_multi_restart_durability() {
     let dir = tempfile::tempdir().unwrap();
@@ -537,10 +537,10 @@ fn test_multi_restart_durability() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Gap #47: Transaction SSI end-to-end
+// Transaction SSI end-to-end
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Gap #47a: SSI transaction commit with read-write set
+/// SSI transaction commit with read-write set
 #[test]
 fn test_ssi_transaction_e2e() {
     let (db, _dir) = create_temp_db("ssi");
@@ -577,7 +577,7 @@ fn test_ssi_transaction_e2e() {
     println!("✅ OPS 47a: SSI transfer 200 A→B: A=800, B=700");
 }
 
-/// Gap #47b: SSI conflict detection aborts conflicting txn
+/// SSI conflict detection aborts conflicting txn
 #[test]
 fn test_ssi_conflict_abort() {
     let (db, _dir) = create_temp_db("ssic");

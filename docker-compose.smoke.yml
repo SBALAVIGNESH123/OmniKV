@@ -11,7 +11,7 @@ services:
       OMNIKV_HTTP_ADDR: "0.0.0.0:8443"
       OMNIKV_PGWIRE_ADDR: "0.0.0.0:5433"
       # The smoke check drives everything over HTTPS; the command
-      # interface stays loopback and unpublished (issue #117).
+      # interface stays loopback and unpublished.
       OMNIKV_TCP_ADDR: "127.0.0.1:7072"
       OMNIKV_QUIC_ADDR: "0.0.0.0:4433"
       OMNIKV_MANIFEST_PATH: "/data/manifest.json"

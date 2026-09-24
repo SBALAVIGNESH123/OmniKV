@@ -16,7 +16,7 @@ use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 /// ═══════════════════════════════════════════════════════════════════════
-/// GROUP COMMIT ENGINE — v2 (No-Sleep Design)
+/// GROUP COMMIT ENGINE
 /// ═══════════════════════════════════════════════════════════════════════
 ///
 /// Coalesces concurrent fsync calls into a single fsync per batch.
@@ -30,9 +30,6 @@ use std::time::{Duration, Instant};
 /// 5. When the leader's sync completes, ALL followers are released.
 /// 6. Natural batching: while leader fsyncs (~2ms), new writers queue up.
 ///    Next leader syncs for everyone who arrived during those 2ms.
-///
-/// This achieves the same throughput as a timed-wait design without the
-/// latency overhead of sleeping on every single-threaded write.
 pub struct GroupCommitEngine {
     /// State of the current write group.
     state: Mutex<GroupState>,

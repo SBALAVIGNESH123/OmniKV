@@ -28,8 +28,13 @@ ENV RUST_LOG=info
 ENV OMNIKV_CONFIG=/etc/omni/omni.toml
 ENV OMNI_CONFIG=/etc/omni/omni.toml
 
+# Liveness probe over loopback. Verification is attempted first so an
+# operator whose certificate covers 127.0.0.1 gets a real check; the -k
+# fallback keeps the probe green for self-signed/demo certificates whose
+# SANs do not name the loopback address.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-  CMD curl -kfsS https://127.0.0.1:8443/health || exit 1
+  CMD curl -fsS --max-time 2 https://127.0.0.1:8443/health \
+    || curl -kfsS --max-time 3 https://127.0.0.1:8443/health || exit 1
 
 USER omnikv
 ENTRYPOINT ["omnikv-server"]

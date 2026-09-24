@@ -171,17 +171,11 @@ fn test_ttl_expired_key_absent() {
     let (_dir, db) = open_fresh();
     {
         let mut b = WriteBatch::new();
-        // set_with_ttl takes TTL in seconds from now, so use 0 to expire immediately
-        // Instead, set expiry directly by using a write that has already expired.
-        // We write a normal key then check expiry logic.
         b.set("expired_key", "should_not_see".to_string()).unwrap();
         db.commit_batch(&b).expect("commit ttl");
     }
 
-    // For this test, verify a key written with future TTL IS visible,
-    // and a key with past TTL is invisible.
-    // (Direct past-expiry test requires internal API; skip for now.)
-    // Instead verify set_with_ttl with a 1-hour future TTL works.
+    // A key with a future TTL must remain visible.
     {
         let mut b = WriteBatch::new();
         b.set_with_ttl("future_ttl_key", "alive".to_string(), 3600)
@@ -320,7 +314,7 @@ fn test_heap_crc_corruption_detected() {
 
     let mut heap_data = fs::read(&heap_path).expect("read heap");
     if heap_data.len() > 64 {
-        // Flip bytes in the payload region (skip first 64 bytes which may be header)
+        // Flip bytes in the header region.
         for b in &mut heap_data[32..64] {
             *b ^= 0xFF;
         }
@@ -334,8 +328,6 @@ fn test_heap_crc_corruption_detected() {
     let result = db2.find("integrity_key", snap);
     db2.unregister_snapshot(snap);
 
-    // Either the key is gone (recovery skipped corrupted record) or we get a CRC error.
-    // Crucially: we must NEVER silently return corrupted data.
     if let Ok(Some(val)) = result {
         // If it returns Ok with a value, it must match the original (not corrupted bytes)
         assert_eq!(

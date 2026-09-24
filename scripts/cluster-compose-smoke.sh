@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Cluster failover smoke (issue #113): the 3-node compose demo must
+# Cluster failover smoke: the 3-node compose demo must
 # elect a leader, replicate a write to every node, survive a hard kill
 # of the leader container, and keep the data on the new leader.
 #
@@ -36,7 +36,7 @@ fi
 cleanup
 docker compose -f "$COMPOSE_FILE" -p "$PROJECT_NAME" up -d
 
-# Mint the JWT the TCP interface requires (issue #117): same flow a real
+# Mint the JWT the TCP interface requires: same flow a real
 # client uses — POST /auth/token with the bootstrap admin key over TLS.
 # The nodes share one secret, so a token from node 1 is valid on all three
 # and survives the later kill (it is only minted once, up front).
@@ -49,7 +49,7 @@ mint_token() {
 }
 
 # One TCP command round trip: AUTH and the command are pipelined on one
-# connection (the server frames by newline), and the reply we want is the
+# connection (the server frames by newline); the wanted reply is the
 # second line — the command's own answer.
 tcp_cmd() {
   local port="$1" cmd="$2"
@@ -58,8 +58,7 @@ tcp_cmd() {
     | timeout 10 bash -c "exec 3<>/dev/tcp/127.0.0.1/$port; cat >&3; head -2 <&3 | tail -1"
 }
 
-# Same wire, deliberately no AUTH: the interface must refuse. Guards the
-# regression this script caught when the AUTH gate landed.
+# Same wire, deliberately no AUTH: the interface must refuse.
 tcp_cmd_unauthenticated() {
   local port="$1" cmd="$2"
   # shellcheck disable=SC2086

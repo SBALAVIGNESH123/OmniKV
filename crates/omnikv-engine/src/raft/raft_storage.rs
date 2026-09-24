@@ -377,7 +377,7 @@ fn storage_read_err(e: impl std::fmt::Display) -> openraft::StorageError<u64> {
 /// that can legitimately exceed one client batch: a follower catch-up
 /// appends many log entries in one call, a purge deletes one key per
 /// purged index, and a snapshot install replays the whole captured
-/// dataset. Committing the whole thing as ONE batch used to trip
+/// dataset. Committing the whole thing as ONE batch would trip
 /// `BatchTooLarge` there and stall replication; the chunk boundaries are
 /// invisible to the engine because every op is idempotent (same-key ops
 /// re-apply in log order) and each chunk gets its own monotonically
@@ -651,15 +651,13 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
         let mut batch = WriteBatch::new();
         let mut last_applied = None;
         let mut new_membership = None;
-        // openraft applies entries in batches, and a follower catch-up
-        // can carry more ops in ONE apply call than a WriteBatch holds —
-        // before the chunking, that tripped BatchTooLarge and stalled
-        // replication forever. The fix is to commit in capped chunks, but
-        // the chunk boundary must never fall INSIDE a Raft entry: one
-        // entry is one atomic client write, and splitting it would let a
-        // reader (or a crash) see only part of it. So we flush only at
-        // ENTRY boundaries — before staging an entry whose ops would not
-        // fit alongside what is already staged.
+        // openraft applies entries in batches, and a follower catch-up can
+        // carry more ops in ONE apply call than a WriteBatch holds, so
+        // commits happen in capped chunks. The chunk boundary must never
+        // fall INSIDE a Raft entry: one entry is one atomic client write,
+        // and splitting it would let a reader (or a crash) see only part
+        // of it. Flush only at ENTRY boundaries — before staging an entry
+        // whose ops would not fit alongside what is already staged.
         //
         // This is safe because a single RaftCommand can never exceed the
         // cap on its own: the engine's WriteBatch rejects the op that
@@ -696,10 +694,9 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
         // clippy's result_large_err quiet.)
         //
         // This is also where a replicated SSI record lands in the node's
-        // own history — the fix for the leader-local history bug (#124).
-        // Recording here, rather than at the COMMIT on the node that ran
-        // it, means a follower promoted after a failover already has
-        // every pre-failover commit in its history when it first leads.
+        // own history: recording at apply (not at the COMMIT on the node
+        // that ran it) means a follower promoted after a failover already
+        // has every pre-failover commit in its history when it first leads.
         let flush_staged = |batch: &mut WriteBatch,
                             slots: &mut Vec<(usize, Option<SsiCommitRecord>)>,
                             res: &mut Vec<String>|

@@ -64,8 +64,8 @@ impl RaftCommand {
     /// Builds a transaction-COMMIT command: the batch plus the SSI record
     /// that every node's apply path records into its own committed
     /// history. Without the record riding along, the history exists only
-    /// on the node that ran the COMMIT — the leader-local hole tracked as
-    /// issue #124.
+    /// on the node that ran the COMMIT, and followers promoted to leader
+    /// cannot detect write-write conflicts.
     pub fn from_batch_with_ssi(
         batch: &WriteBatch,
         ssi: crate::transaction::SsiCommitRecord,

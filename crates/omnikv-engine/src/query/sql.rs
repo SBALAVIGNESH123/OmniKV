@@ -1312,7 +1312,7 @@ mod tests {
 
     #[test]
     fn test_full_lowercase_statement_parses_identically() {
-        // Issue #109: SQL keywords are case-insensitive per the SQL standard.
+        // SQL keywords are case-insensitive per the SQL standard.
         let stmt = parse_sql(
             "create table if not exists users (id integer primary key, name text not null)",
         )

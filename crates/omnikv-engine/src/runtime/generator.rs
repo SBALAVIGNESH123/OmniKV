@@ -1,13 +1,11 @@
-//! Database Generator (Legacy Compatibility)
+//! Database Generator
 //!
-//! Generates sample data for benchmarking and testing.
-//! The modern OmniKV uses WriteBatch for data ingestion,
-//! but this module is retained for standalone binary compatibility.
+//! Generates sample data for benchmarking and testing. Superseded by
+//! WriteBatch ingestion; retained for the standalone binary.
 
 use std::path::Path;
 
 /// Generate a sample database file if it doesn't exist.
-/// In the modern architecture, data is ingested via WriteBatch + commit_batch.
 pub fn generate_structured_db(file_path: &str, _size_bytes: usize) {
     if Path::new(file_path).exists() {
         println!("Database already exists. Skipping generation.");

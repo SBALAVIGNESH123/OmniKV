@@ -93,9 +93,9 @@ impl StorageConfig {
 }
 
 /// Cluster (Raft) configuration. Absent — `raft_addr` and `node_id`
-/// both unset — the server runs as an independent single-node engine,
-/// exactly as it always has. Present, the server boots an openraft node
-/// on `raft_addr` and every write goes through consensus before it is
+/// both unset — the server runs as an
+/// independent single-node engine. Present, the server boots an openraft
+/// node on `raft_addr` and every write goes through consensus before it is
 /// acknowledged.
 ///
 /// `peers` are the OTHER nodes' raft addresses ("host:port"), used only
@@ -497,7 +497,7 @@ impl ServerConfig {
         // Every peer is also dialed exactly as written (boot_cluster_node
         // copies it into openraft::BasicNode.addr and OmniNetwork builds
         // the RPC URL from it), so a malformed, wildcard, or port-zero
-        // peer is not a typo a operator can recover from later — it is a
+        // peer is not a typo an operator can recover from later — it is a
         // member that can never be reached. Validate each one up front,
         // with the same rules as the advertised address.
         if let Some(me) = advertised {

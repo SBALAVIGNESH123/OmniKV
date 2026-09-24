@@ -23,7 +23,7 @@ These are evidence claims for the current implementation and deterministic test
 harness. They are not a claim that OmniKV has completed production-grade,
 multi-process, networked consensus validation.
 
-As of issue #113 the harness boundary extends one step further: real
+The harness boundary extends one step further: real
 multi-process evidence exists for leader election, consensus-gated
 writes, and kill-the-leader failover (three real `omnikv-server`
 processes in CI — see `crates/omnikv-server/tests/cluster_multiprocess.rs`
@@ -31,7 +31,7 @@ and `scripts/cluster-compose-smoke.sh`). That evidence is real but
 narrow; partitions, clock skew, and long soaks remain open, and the
 known cluster-mode limitations (plaintext
 peer traffic, follower read lag) are documented in
-[docs/cluster.md](cluster.md). The SSI committed history now converges
+[docs/cluster.md](cluster.md). The SSI committed history converges
 cluster-wide — the record rides inside the replicated command and every
 node's apply records it — so a transaction spanning a leadership change
 still detects conflicts against pre-failover commits.

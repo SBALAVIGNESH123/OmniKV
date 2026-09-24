@@ -177,7 +177,7 @@ impl SqlExecutor {
     /// the same key replaces an earlier one, a delete removes an earlier
     /// write — the merged batch is exactly what COMMIT must apply and
     /// what reads-in-transaction must see. Autocommit executors commit
-    /// immediately, exactly as before this transaction support existed.
+    /// immediately.
     fn stage_or_commit(&self, batch: WriteBatch) -> Result<(), String> {
         let mut pending_slot = self.pending_batch.borrow_mut();
         match pending_slot.as_mut() {
@@ -501,8 +501,7 @@ impl SqlExecutor {
         // the SSI engine applies it at COMMIT, a ROLLBACK discards it —
         // and the statement's own catalog cache learns the table so
         // later statements in the block see it. Outside one, the
-        // catalog's own autocommit path (which also updates its cache)
-        // handles it exactly as before.
+        // catalog's own autocommit path (which also updates its cache).
         if self.is_transactional() {
             // The staging path must reject a duplicate exactly like the
             // autocommit path (Catalog::create_table checks the cache):
@@ -534,8 +533,7 @@ impl SqlExecutor {
         // delete and the row deletes all land in the pending batch —
         // applied atomically at COMMIT, discarded by ROLLBACK — and the
         // statement's own cache forgets the table for this block's later
-        // statements. Outside one, the catalog's autocommit path handles
-        // rows + entry + cache exactly as before.
+        // statements. Outside one, the catalog's autocommit path handles.
         if self.is_transactional() {
             let table = self
                 .catalog
@@ -891,7 +889,7 @@ impl SqlExecutor {
         }
     }
 
-    /// Legacy execution path — fallback for queries the optimizer can't handle.
+    /// Fallback execution path for queries the optimizer cannot handle.
     /// Fails with the catalog's error when any table in the FROM clause
     /// (or a join's side) is unknown to this statement's catalog view.
     /// The optimizer would happily plan scans over unknown tables and the

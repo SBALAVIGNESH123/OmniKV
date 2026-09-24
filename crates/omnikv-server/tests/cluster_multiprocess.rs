@@ -1,14 +1,14 @@
-//! Multi-process cluster failover test — the issue #113 Definition of
-//! Done evidence: three REAL server processes form a Raft cluster, a
-//! write replicates to every node, and killing the leader (hard-kill,
-//! no graceful shutdown) elects a new leader with zero data loss.
+//! Multi-process cluster failover test: three REAL server processes form
+//! a Raft cluster, a write replicates to every node, and killing the
+//! leader (hard-kill, no graceful shutdown) elects a new leader with
+//! zero data loss.
 //!
 //! Runs anywhere the test suite runs (Linux CI, Windows dev): it spawns
 //! the `omnikv-server` binary three times with distinct ports, data
 //! dirs, and raft node ids, drives writes through the TCP command
-//! interface (AUTH pipelined ahead of each command — see issue #117),
-//! and observes leadership by write-probing (a write succeeds only where
-//! the leader is).
+//! interface (AUTH pipelined ahead of each command), and observes
+//! leadership by write-probing (a write succeeds only where the leader
+//! is).
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -51,9 +51,9 @@ impl Drop for Node {
     }
 }
 
-/// Sign a JWT the TCP interface will accept (issue #117): it refuses all
-/// data commands until a valid token arrives, and the token's role has to
-/// cover the command.
+/// Sign a JWT the TCP interface will accept: it refuses all data commands
+/// until a valid token arrives, and the token's role has to cover the
+/// command.
 fn test_token_role(role: &str) -> String {
     use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
     use serde::Serialize;
@@ -104,7 +104,8 @@ fn tcp_cmd_role(port: u16, role: &str, cmd: &str) -> Result<String, String> {
 }
 
 /// Sends a command with NO auth header — the interface must refuse it.
-/// Used to prove the regression fixed in issue #117 stays fixed.
+/// Drives the interface without a token: every data command must be
+/// refused.
 fn tcp_cmd_unauthenticated(port: u16, cmd: &str) -> Result<String, String> {
     tcp_cmd_raw_lines(port, &format!("{cmd}\n"), 1)
 }
@@ -309,11 +310,11 @@ fn retry_until<T>(deadline: Instant, f: impl Fn() -> Option<T>) -> Option<T> {
     None
 }
 
-/// 16 simultaneous writers against the leader — the PR #127 review's
-/// deadlock finding. Async REST/QUIC handlers park their own runtime's
-/// workers waiting for consensus; before the dedicated consensus
-/// runtime, enough concurrent writes could park every worker and starve
-/// the very openraft tasks that had to finish their proposals to release
+/// 16 simultaneous writers against the leader. Async REST/QUIC handlers
+/// park their own runtime's workers waiting for consensus; without the
+/// dedicated consensus runtime, enough concurrent writes can park every
+/// worker and starve the very openraft tasks that have to finish their
+/// proposals to release
 /// them. 16 writers at once (more than typical CI worker counts) must
 /// all get answers — serialized by the flight lock, but NEVER stuck —
 /// and every write must replicate to every node. Extracted to a helper
@@ -429,9 +430,9 @@ fn cluster_failover_kill_leader_no_data_loss() {
     let nodes = boot_cluster();
     let refs: Vec<&Node> = nodes.iter().collect();
 
-    // ── 0. The command interface refuses work before AUTH (issue #117) ──
-    // Before the fix, anyone who could reach the port had unrestricted
-    // read/write. Now every data command is gated behind a verified JWT.
+    // ── 0. The command interface refuses work before AUTH ──────────
+    // Every data command is gated behind a verified JWT; without one,
+    // anyone who could reach the port would have unrestricted read/write.
     for node in &refs {
         let refused = tcp_cmd_unauthenticated(node.tcp_port(), "GET failover:key");
         assert!(
@@ -492,10 +493,9 @@ fn cluster_failover_kill_leader_no_data_loss() {
     println!("follower correctly rejected a write: {resp}");
 
     // ── 3b. CONCURRENT writers do not deadlock the cluster ──
-    // The PR #127 review's P1: async handlers on the server runtime
-    // park their workers waiting for consensus; before the dedicated
-    // consensus runtime, enough concurrent writes starved the very
-    // openraft tasks that had to complete their proposals.
+    // Async handlers on the server runtime park their workers waiting for
+    // consensus; the dedicated consensus runtime keeps enough workers free
+    // for openraft to complete its proposals.
     concurrent_writers_do_not_deadlock(leader_tcp, &nodes);
 
     // ── 4. Kill the leader — hard kill, no graceful shutdown ──

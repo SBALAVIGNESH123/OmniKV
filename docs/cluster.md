@@ -157,7 +157,7 @@ any electable leader holds everything the old leader acknowledged.
 Writes sent to a follower during a leaderless window fail with
 `no leader elected yet` until the election completes.
 
-## Known limitations (honest, tracked)
+## Known limitations
 
 - **Peer traffic is plaintext HTTP.** The raft listener is a dedicated
   port following etcd's peer-port model: client TLS never terminates
@@ -165,10 +165,10 @@ Writes sent to a follower during a leaderless window fail with
   it on a trusted network — the compose demos publish only the client
   ports to the host and leave the consensus port on the private compose
   network, so nothing off-network can reach it. Mutual TLS for peer
-  traffic is tracked as #125, alongside the client-TLS work.
+  traffic is not implemented yet.
 - **One write in flight cluster-wide.** The flight lock trades write
   throughput for a gap-free serialization point. Pipelined proposals
-  are tracked as #126.
+  are not implemented yet.
 - **Follower reads lag.** See Read semantics above. Read-index
   (linearizable follower reads) is follow-up work.
 - **Membership changes are restart-scoped.** Initial membership comes
