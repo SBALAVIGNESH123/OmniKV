@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════════════════════════════════════
-// Storage Engine Integration Tests — Gaps #15 through #22
+// Storage Engine Integration Tests
 // ═══════════════════════════════════════════════════════════════════════════
 
 use omni_engine::{OmniKV, WriteBatch};
@@ -39,10 +39,10 @@ fn verify_n(db: &OmniKV, prefix: &str, n: usize) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Gap #15: Crash during compaction recovery
+// Crash during compaction recovery
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Gap #15a: Data survives compaction + restart (via `SSTable`)
+/// Data survives compaction + restart (via `SSTable`)
 #[test]
 fn test_compaction_crash_recovery_basic() {
     let dir = tempfile::tempdir().unwrap();
@@ -77,7 +77,7 @@ fn test_compaction_crash_recovery_basic() {
     println!("✅ STORAGE 15a: Keys survived compaction + restart");
 }
 
-/// Gap #15b: Multiple compaction cycles preserve data (single session)
+/// Multiple compaction cycles preserve data (single session)
 #[test]
 fn test_compaction_multiple_cycles() {
     let (db, _dir) = create_temp_db("multi_comp");
@@ -94,7 +94,7 @@ fn test_compaction_multiple_cycles() {
     println!("✅ STORAGE 15b: 3 compaction cycles, all 60 keys preserved");
 }
 
-/// Gap #15c: Compaction with deletes — tombstones handled
+/// Compaction with deletes — tombstones handled
 #[test]
 fn test_compaction_with_deletes() {
     let (db, _dir) = create_temp_db("del_comp");
@@ -121,10 +121,10 @@ fn test_compaction_with_deletes() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Gap #16: Partial SST write recovery
+// Partial SST write recovery
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Gap #16a: Data recoverable via WAL replay after restart
+/// Data recoverable via WAL replay after restart
 #[test]
 fn test_partial_sst_wal_recovery() {
     let dir = tempfile::tempdir().unwrap();
@@ -144,7 +144,7 @@ fn test_partial_sst_wal_recovery() {
     println!("✅ STORAGE 16a: 25 keys recovered from WAL after simulated crash");
 }
 
-/// Gap #16b: Multiple write batches all recovered
+/// Multiple write batches all recovered
 #[test]
 fn test_multiple_batches_wal_recovery() {
     let dir = tempfile::tempdir().unwrap();
@@ -175,10 +175,10 @@ fn test_multiple_batches_wal_recovery() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Gap #17: WAL corruption recovery (beyond CRC)
+// WAL corruption recovery (beyond CRC)
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Gap #17a: Corrupted WAL trailing bytes are detected and ignored
+/// Corrupted WAL trailing bytes are detected and ignored
 #[test]
 fn test_wal_corruption_detection() {
     let dir = tempfile::tempdir().unwrap();
@@ -212,7 +212,7 @@ fn test_wal_corruption_detection() {
     println!("✅ STORAGE 17a: WAL corruption at end detected, valid data recovered");
 }
 
-/// Gap #17b: Empty WAL opens cleanly
+/// Empty WAL opens cleanly
 #[test]
 fn test_wal_empty_recovery() {
     let dir = tempfile::tempdir().unwrap();
@@ -226,10 +226,10 @@ fn test_wal_empty_recovery() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Gap #18: Manifest consistency verification
+// Manifest consistency verification
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Gap #18a: Manifest preserves `SSTable` paths across restarts
+/// Manifest preserves `SSTable` paths across restarts
 #[test]
 fn test_manifest_consistency_across_restart() {
     let dir = tempfile::tempdir().unwrap();
@@ -271,7 +271,7 @@ fn test_manifest_consistency_across_restart() {
     println!("✅ STORAGE 18a: Manifest SSTable count consistent: {sst_count_before}");
 }
 
-/// Gap #18b: Sequence increases across restarts
+/// Sequence increases across restarts
 #[test]
 fn test_manifest_sequence_tracking() {
     let dir = tempfile::tempdir().unwrap();
@@ -297,10 +297,10 @@ fn test_manifest_sequence_tracking() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Gap #19: True MVCC snapshot isolation (memtable level)
+// True MVCC snapshot isolation (memtable level)
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Gap #19a: Read at old snapshot sees old data
+/// Read at old snapshot sees old data
 #[test]
 fn test_mvcc_snapshot_reads_old_data() {
     let (db, _dir) = create_temp_db("mvcc");
@@ -321,7 +321,7 @@ fn test_mvcc_snapshot_reads_old_data() {
     println!("✅ STORAGE 19a: MVCC snapshot isolation — snap1=v1, snap2=v2");
 }
 
-/// Gap #19b: Delete at newer seq, old snapshot still sees value
+/// Delete at newer seq, old snapshot still sees value
 #[test]
 fn test_mvcc_snapshot_survives_delete() {
     let (db, _dir) = create_temp_db("mvdel");
@@ -345,7 +345,7 @@ fn test_mvcc_snapshot_survives_delete() {
     println!("✅ STORAGE 19b: MVCC delete — old snapshot sees value, new sees None");
 }
 
-/// Gap #19c: Multiple versions of same key at different seqs
+/// Multiple versions of same key at different seqs
 #[test]
 fn test_mvcc_multi_version() {
     let (db, _dir) = create_temp_db("mv3");
@@ -370,10 +370,10 @@ fn test_mvcc_multi_version() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Gap #20: Compaction under write pressure
+// Compaction under write pressure
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Gap #20a: Writes during compaction don't lose data
+/// Writes during compaction don't lose data
 #[test]
 fn test_compaction_concurrent_writes() {
     let (db, _dir) = create_temp_db("cw");
@@ -388,7 +388,7 @@ fn test_compaction_concurrent_writes() {
     println!("✅ STORAGE 20a: 100 keys preserved across compaction + new writes");
 }
 
-/// Gap #20b: L0→L1 compaction preserves all data
+/// L0→L1 compaction preserves all data
 #[test]
 fn test_l0_to_l1_compaction() {
     let (db, _dir) = create_temp_db("l0l1");
@@ -606,10 +606,10 @@ fn test_l1_to_base_and_gc_preserve_replica_retention_floor_across_delete() {
     );
 }
 
-// Gap #21: Memory-mapped I/O edge cases
+// Memory-mapped I/O edge cases
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Gap #21a: Large values stored and retrieved correctly
+/// Large values stored and retrieved correctly
 #[test]
 fn test_mmap_large_values() {
     let (db, _dir) = create_temp_db("mmap");
@@ -627,7 +627,7 @@ fn test_mmap_large_values() {
     println!("✅ STORAGE 21a: 10KB value stored and retrieved correctly");
 }
 
-/// Gap #21b: Many small values don't corrupt `SSTable` mmap
+/// Many small values don't corrupt `SSTable` mmap
 #[test]
 fn test_mmap_many_small_values() {
     let (db, _dir) = create_temp_db("mmsm");
@@ -641,10 +641,10 @@ fn test_mmap_many_small_values() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Gap #22: Disk-full handling / backpressure
+// Disk-full handling / backpressure
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Gap #22a: Write stall backpressure
+/// Write stall backpressure
 #[test]
 fn test_write_stall_backpressure() {
     let (db, _dir) = create_temp_db("stall");
@@ -656,7 +656,7 @@ fn test_write_stall_backpressure() {
     println!("✅ STORAGE 22a: Write backpressure mechanism verified");
 }
 
-/// Gap #22b: Batch size limits enforced
+/// Batch size limits enforced
 #[test]
 fn test_batch_size_limits() {
     let mut batch = WriteBatch::new();
@@ -667,7 +667,7 @@ fn test_batch_size_limits() {
     println!("✅ STORAGE 22b: Batch size limits enforced correctly");
 }
 
-/// Gap #22c: Value size limits enforced
+/// Value size limits enforced
 #[test]
 fn test_value_size_limit() {
     let mut batch = WriteBatch::new();

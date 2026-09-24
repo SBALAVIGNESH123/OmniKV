@@ -1,4 +1,4 @@
-# The 3-node cluster failover smoke (issue #113) — scripts/cluster-compose-smoke.sh
+# The 3-node cluster failover smoke — scripts/cluster-compose-smoke.sh
 # drives this: leader election, replication to every node, kill the
 # leader container, new leader, no data loss.
 services:
@@ -7,8 +7,8 @@ services:
     container_name: omni-cluster-smoke-node-1
     ports:
       # HTTPS is published so the harness can mint a JWT through the real
-      # token endpoint (POST /auth/token) — the TCP interface requires it
-      # now (issue #117). Loopback-only, like the TCP ports.
+      # token endpoint (POST /auth/token) — the TCP interface requires
+      # one. Loopback-only, like the TCP ports.
       - "127.0.0.1:${OMNIKV_HTTP_PORT_1:-18443}:8443"
       - "127.0.0.1:${OMNIKV_TCP_PORT_1:-18080}:8080"
     volumes:
@@ -20,7 +20,7 @@ services:
       OMNIKV_TCP_ADDR: "0.0.0.0:8080"
       # Deliberate: this harness drives the failover check over the TCP
       # command interface (host ports are bound to 127.0.0.1 above). The
-      # validator refuses a public TCP bind without this opt-in (#117).
+      # validator refuses a public TCP bind without this opt-in.
       OMNIKV_TCP_BIND_PUBLIC: "true"
       OMNIKV_QUIC_ADDR: "0.0.0.0:4433"
       OMNIKV_MANIFEST_PATH: "/data/manifest.json"

@@ -1,8 +1,7 @@
-//! Volcano Iterator Model — Production-grade streaming executor
+//! Volcano Iterator Model — streaming executor
 //!
-//! Replaces the materialize-all-rows approach with a pull-based iterator
-//! pipeline. Each operator implements `next()` returning one row at a time,
-//! which means:
+//! A pull-based iterator pipeline. Each operator implements `next()`
+//! returning one row at a time, which means:
 //! - O(1) memory for filter, project, limit
 //! - Only sort and hash-join buffer rows (unavoidable)
 //! - Can process tables larger than RAM
@@ -39,12 +38,10 @@ use std::sync::Arc;
 
 /// The core volcano iterator trait. Every operator implements this.
 ///
-/// `next_row` remains the compatibility primitive for custom operators and
-/// complex nodes. Built-in streaming operators also override `next_chunk`, so a
-/// caller can measure and use batch dispatch for scan/filter/project/limit
-/// without closing the operator set. The default SQL path still uses
-/// row-at-a-time dispatch until benchmarks justify a targeted switch, as
-/// documented in
+/// `next_row` is the compatibility primitive for custom operators and
+/// complex nodes. Built-in streaming operators also override `next_chunk`, so
+/// a caller can use batch dispatch for scan/filter/project/limit without
+/// closing the operator set. The SQL dispatch policy is documented in
 /// `docs/volcano-dispatch.md`.
 pub trait RowIterator {
     /// Returns the next row, or None when exhausted.

@@ -1093,7 +1093,6 @@ pub struct OmniKV {
 
     // ── Group commit engine ──
     // Batches concurrent fsyncs: N writers → 1 fsync instead of N fsyncs.
-    // This is the single most impactful performance optimization for writes.
     group_commit: crate::hardening::GroupCommitEngine,
 
     // ── Storage transition barrier ──
@@ -2001,8 +2000,6 @@ impl OmniKV {
 
         result
     }
-
-    // Removed binary_search_records
 
     /// Finds a value by its key, up to the specified read sequence number (MVCC).
     /// Returns `Ok(None)` if the key does not exist or has been deleted.

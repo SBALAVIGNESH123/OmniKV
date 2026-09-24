@@ -85,7 +85,7 @@ cargo test -p omnikv-engine --test crash_consistency -- --test-threads=1 --nocap
 | `test_restore_rejects_path_traversal` | Restore security |
 | `test_failure_point_harness_disarmed_is_noop` | Harness contract |
 
-## Acceptance Criteria (Issue #10)
+## Acceptance Criteria
 
 - [x] Failure-injection harness exists and is documented (`crates/omnikv-engine/src/runtime/failpoints.rs`)
 - [x] WAL tail corruption recovery is tested

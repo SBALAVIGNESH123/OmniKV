@@ -260,13 +260,9 @@ const COMMIT_STRIPE_COUNT: usize = 64;
 /// - the raft state machine's apply path records the SSI commit record
 ///   carried inside each replicated [`crate::raft_command::RaftCommand`].
 ///
-/// This second path is the fix for the leader-local history bug: before
-/// it, only the node that RAN the COMMIT ever recorded the transaction,
-/// so a follower promoted to leader after a failover validated new
-/// transactions against a history missing every pre-failover commit —
-/// and a write-write or rw anti-dependency against one of them slipped
-/// through. Carrying the record in the replicated command and recording
-/// it at apply on every node keeps all nodes' histories converged.
+/// Both paths must land in the same store: carrying the record in the
+/// replicated command keeps every node's history converged across a
+/// failover.
 ///
 /// The `commit_seq` each entry is recorded at is per-node (every node's
 /// sequence counter is its own), so it is stamped by the apply from the
@@ -364,10 +360,9 @@ impl SsiHistory {
         &self,
         txn: &Transaction,
     ) -> (Option<String>, std::sync::MutexGuard<'_, Vec<CommittedTxn>>) {
-        // The only lock SsiHistory takes: rw-edges are no longer kept
-        // (see the note below on the removed pivot check), so there is
-        // no second lock to order against. Poison-tolerant like the
-        // stripes: a panicked holder never leaves the Vec torn.
+        // The only lock SsiHistory takes, so there is no second lock to
+        // order against. Poison-tolerant like the stripes: a panicked
+        // holder never leaves the Vec torn.
         let committed = self
             .committed_txns
             .lock()
@@ -409,17 +404,10 @@ impl SsiHistory {
                     }
                 }
 
-                // Write-read anti-dependency (we wrote a key a committed
-                // txn read) is deliberately NOT an abort here: a single
-                // rw-antidependency is legal in the PostgreSQL SSI model —
-                // the anomaly needs a pivot in a rw-CYCLE. This engine had
-                // a pivot check, and it was unreachable dead code (every
-                // outgoing edge was pushed only immediately before an
-                // aborting break, so the check never ran with
-                // `found.is_none()` and an outgoing edge present); it is
-                // removed rather than left to misfire. The classic
-                // write-skew is still caught by the RW branch above, which
-                // fires for the crossing read/write pair.
+                // Write-read anti-dependency is deliberately NOT an abort: a
+                // single rw-antidependency is legal in the PostgreSQL SSI
+                // model — the anomaly needs a pivot in a rw-CYCLE. Write-skew
+                // is still caught by the RW branch above.
 
                 // ── Range (predicate) conflicts ─────────────────
                 // A write they committed inside one of OUR read
@@ -508,9 +496,8 @@ pub struct TransactionManager {
     /// Monotonically increasing transaction ID counter.
     next_txn_id: AtomicU64,
     /// Striped commit locks — transactions lock only the stripes that cover
-    /// their write keys, allowing non-overlapping transactions to commit
-    /// in parallel. Each stripe is a Mutex guarding a logical key-space
-    /// partition. This replaces the former single global commit lock.
+    /// their write keys, allowing non-overlapping transactions to commit in
+    /// parallel.
     commit_stripes: Vec<Mutex<()>>,
     /// Active transactions, indexed by TxnId.
     active_txns: Mutex<HashMap<TxnId, u64>>,
@@ -773,14 +760,10 @@ impl TransactionManager {
         //
         // The SSI commit record rides INSIDE the replicated command, so
         // every follower's apply path records this transaction in its OWN
-        // history too. Before that, the history existed only on the node
-        // that ran the COMMIT, and a follower promoted after a failover
-        // validated against a history missing every pre-failover commit
-        // — the serializability hole tracked as #124. The leader does NOT
-        // double-record: its own state machine apply records the same
-        // command, and that apply is what the flight lock waits on before
-        // releasing, so the record is in place for the next transaction's
-        // check.
+        // history too. The leader does NOT double-record: its own state
+        // machine apply records the same command, and that apply is what
+        // the flight lock waits on before releasing, so the record is in
+        // place for the next transaction's check.
         // ═══════════════════════════════════════════════════════════════
         if let Some(gateway) = self.db.cluster_gateway() {
             let txn_ref: &Transaction = txn;
@@ -1016,9 +999,7 @@ mod commit_seq_number_space {
     //! depends on. The clustered commit path records `db.get_seq() - 1` —
     //! the commit marker's sequence — so that a transaction started AFTER a
     //! clustered commit (whose `read_seq` is exactly that marker) sees the
-    //! commit as already visible rather than concurrent. Recording the
-    //! unadjusted `get_seq()` made every clustered commit appear one
-    //! sequence too new and aborted such transactions spuriously.
+    //! commit as already visible rather than concurrent.
 
     use super::{CommittedTxn, Transaction, TransactionManager};
     use crate::{OmniKV, WriteBatch};
@@ -1079,11 +1060,8 @@ mod commit_seq_number_space {
         );
     }
 
-    /// The observable symptom of the off-by-one: a committed txn whose
-    /// `commit_seq` EQUALS a later txn's `read_seq` is visible to that
-    /// snapshot and must NOT conflict; one higher must. If the clustered
-    /// path ever records the marker-plus-one again, this turns a
-    /// legitimate commit into a spurious abort.
+    /// A committed txn whose `commit_seq` EQUALS a later txn's `read_seq`
+    /// is visible to that snapshot and must NOT conflict; one higher must.
     #[test]
     fn committed_at_exactly_read_seq_is_visible_not_a_conflict() {
         let mgr = TransactionManager::new(temp_db());

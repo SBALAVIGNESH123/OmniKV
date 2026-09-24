@@ -215,9 +215,7 @@ fn is_valid_token_role(role: &str) -> bool {
 /// Map internal storage errors to stable, sanitized client-facing error codes.
 /// Internal error details are never exposed to clients — they are logged server-side.
 fn sanitize_storage_err(e: &OmniError) -> String {
-    // Log full error server-side for operators
     tracing::error!(error = ?e, "internal storage error");
-    // Return stable, opaque code to client
     match e {
         OmniError::KeyNotFound => "NOT_FOUND".to_string(),
         OmniError::BatchTooLarge(_) => "BATCH_TOO_LARGE".to_string(),
@@ -1506,7 +1504,7 @@ mod tests {
         );
 
         // Everything else stays opaque: paths and lock names never reach a
-        // client (issue #117 — the TCP path leaked these for real).
+        // client.
         let internal = sanitize_storage_err(&OmniError::DatabaseAlreadyOpen {
             lock_path: "/var/lib/omnikv/.lock".into(),
         });

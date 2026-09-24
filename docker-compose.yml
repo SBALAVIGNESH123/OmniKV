@@ -3,7 +3,7 @@ x-omnikv-common-env: &omnikv-common-env
   OMNIKV_QUIC_ADDR: "0.0.0.0:4433"
   OMNIKV_PGWIRE_ADDR: "0.0.0.0:5433"
   # The TCP command interface is a plaintext, unrestricted read/write
-  # path into the whole database (issue #117). It is JWT-gated, but it is
+  # path into the whole database . It is JWT-gated, but it is
   # still not something to publish to the host network: REST (8443) and
   # PgWire (5433) cover every documented use case. It stays loopback-only
   # inside the container, reachable via `docker exec` for debugging.
@@ -16,7 +16,7 @@ x-omnikv-common-env: &omnikv-common-env
   OMNIKV_JWT_SECRET: "${OMNIKV_JWT_SECRET:?set OMNIKV_JWT_SECRET to a strong 32+ character value}"
   OMNIKV_BOOTSTRAP_ADMIN_KEY: "${OMNIKV_BOOTSTRAP_ADMIN_KEY:?set OMNIKV_BOOTSTRAP_ADMIN_KEY to a different strong 32+ character value}"
 
-# Cluster notes (issue #113):
+# Cluster notes:
 # - Each node is a Raft member: OMNIKV_NODE_ID + OMNIKV_RAFT_ADDR must
 #   BOTH be set (the config validator refuses a half-configured cluster).
 # - All nodes use the SAME internal raft port (9090) on the PRIVATE
@@ -31,7 +31,7 @@ x-omnikv-common-env: &omnikv-common-env
 #   (itself + OMNIKV_RAFT_PEERS in order → node ids 2..); nodes 2/3
 #   start blank and join as the leader's replication reaches them.
 # - Consensus traffic is plaintext HTTP on the dedicated raft port
-#   (etcd's peer-port model) — mTLS for peer traffic is issue #125.
+#   (etcd's peer-port model) — mTLS for peer traffic is not implemented yet.
 services:
   omni-node-1:
     build: .

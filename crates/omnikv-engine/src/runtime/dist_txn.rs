@@ -546,36 +546,11 @@ impl TwoPhaseParticipant {
             }
         }
 
-        // ─── Full cross-node SSI validation ───
-        //
-        // Capture the current storage sequence as our prepare snapshot.
-        // For each key we intend to write, check whether any LOCAL
-        // transaction committed a write to that key AFTER the batch was
-        // assembled (i.e. the key's latest write seq exceeds our snapshot).
-        // If so, a concurrent local write has modified data we're about
-        // to overwrite — vote ABORT to maintain serializability across nodes.
-        let prepare_snapshot = self.db.get_seq();
-        for write in writes {
-            let key_seq = self.db.get_seq_for_key(&write.key, prepare_snapshot);
-            if key_seq > 0 {
-                // The key exists. Check if it was written AFTER a reasonable
-                // baseline. We use the key's own seq: if the key was modified
-                // very recently (within the last 2 seqs of the global counter),
-                // a concurrent local transaction likely touched it.
-                // For true cross-node SSI, the coordinator would send its
-                // snapshot_seq and we'd compare against that.
-                let global = self.db.get_seq();
-                if key_seq > prepare_snapshot.saturating_sub(1)
-                    && key_seq >= global.saturating_sub(2)
-                {
-                    // Recent concurrent write detected — but only abort if
-                    // the key was written by a DIFFERENT transaction after
-                    // the distributed txn was assembled. We detect this by
-                    // checking if the key's seq is strictly newer than when
-                    // the prepare started.
-                }
-            }
-        }
+        // NOTE: the participant votes COMMIT on sequence evidence alone. It
+        // does not validate the writes against the coordinator's snapshot,
+        // so a concurrent local write to one of these keys is not detected
+        // here; that check needs the coordinator's snapshot_seq, which the
+        // request does not yet carry.
 
         // Write PREPARE record to WAL (durability guarantee)
         let prepare_key = format!("__2PC_PREPARE__/{}_{}", txn_id.0, txn_id.1);

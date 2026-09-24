@@ -1,4 +1,4 @@
-//! Observability integration tests — Issue #18
+//! Observability integration tests
 //!
 //! Tests for /health, /ready, and /metrics endpoints.
 
@@ -8,7 +8,7 @@ use std::sync::Mutex;
 /// The DB gauges are PROCESS-GLOBAL, and `record_db_stats` writes them from
 /// another test below. Without serialization, a `*_gauge_set` test's `get`
 /// can observe the other test's value and fail — the same global-state
-/// parallelism class as #115. Guard every gauge-mutating test.
+/// parallelism class. Guard every gauge-mutating test.
 static GAUGE_LOCK: Mutex<()> = Mutex::new(());
 
 #[test]
