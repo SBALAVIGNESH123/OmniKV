@@ -29,15 +29,16 @@ mod auth;
 mod quic_server;
 mod raft_node;
 mod raft_routes;
+mod tls;
 
 use std::sync::Arc;
 
 use omni_engine::{OmniKV, config::ServerConfig, hardening::RateLimiter};
 
 fn print_banner(cfg: &ServerConfig, cluster_mode: Option<u64>) {
-    // The honesty rules this banner follows (issue #113): "Distributed"
-    // only when consensus is actually wired (a raft node booted), and
-    // the build credit names openraft instead of claiming every byte.
+    // Honesty rules for this banner: "Distributed" only when consensus is
+    // actually wired (a raft node booted), and the build credit names
+    // openraft instead of claiming every byte.
     let dist_line = match cluster_mode {
         Some(node_id) => format!("Raft cluster (node {node_id})"),
         None => "Single-node".to_string(),
@@ -107,7 +108,6 @@ fn install_rustls_crypto_provider() {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Initialize structured logging
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -118,12 +118,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     install_rustls_crypto_provider();
 
-    // Load the single authoritative server runtime config.
-    //
-    // Precedence is: defaults < config file < environment variables.
-    // `--config <path>` selects the config file ahead of OMNIKV_CONFIG /
-    // legacy OMNI_CONFIG. Production mode then fails closed on invalid or
-    // unsafe settings.
+    // Precedence: defaults < config file < environment variables.
+    // `--config <path>` selects the file ahead of OMNIKV_CONFIG; production
+    // mode fails closed on invalid or unsafe settings.
     let cfg = ServerConfig::load_server_from_args(std::env::args().skip(1))?;
     tracing::info!(
         mode = ?cfg.mode,
@@ -136,24 +133,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let manifest_path = cfg.storage.manifest_path.clone();
     let wal_path = cfg.storage.wal_path.clone();
 
-    // Open the database using configured paths.
+    // Open the database before the paths move into AppState.
     let db = OmniKV::open(&manifest_path, &wal_path)?;
     let _compaction_handle = start_storage_maintenance(&db, &cfg)?;
     log_database_opened(&db, &cfg);
 
-    // ─── Cluster boot (issue #113): a real raft node when configured ──
-    // OMNIKV_RAFT_ADDR + OMNIKV_NODE_ID make this server a cluster
-    // member: every client write routes through consensus before it is
-    // acknowledged, and this node serves consensus RPCs for its peers.
-    // Absent, the process stays a fully independent single-node engine
-    // and none of the cluster machinery runs.
-    //
-    // Called from async main, but the boot hops off the runtime worker
-    // internally (see boot_cluster_node): the openraft node and its
-    // consensus listener are constructed on the gateway's DEDICATED
-    // consensus runtime, never the client-facing server runtime —
-    // concurrent client writes can park server workers, but never
-    // starve openraft's tasks.
+    // OMNIKV_RAFT_ADDR + OMNIKV_NODE_ID make this a cluster member: writes
+    // go through consensus before acknowledgement. The openraft node runs
+    // on the gateway's own runtime (see boot_cluster_node) so client load
+    // can park server workers without starving peer RPCs.
     let cluster = raft_node::boot_cluster_node(&cfg, &db)?;
     let cluster_mode = if cluster.is_some() {
         cfg.raft.node_id
@@ -241,19 +229,30 @@ async fn spawn_protocol_servers(
 > {
     let router = api::build_router(app_state);
 
-    // ─── 1. HTTP/1.1 + HTTP/2 (TLS, ALPN) ──────────────────────
-    let (certs, key) = quic_server::generate_self_signed_cert()?;
-    let tls_config = axum_server::tls_rustls::RustlsConfig::from_der(
-        certs.iter().map(|c| c.as_ref().to_vec()).collect(),
-        key.secret_der().to_vec(),
-    )
-    .await?;
-
     // Clone addr strings before async move closures consume cfg.
     let http_addr_str = cfg.http_addr.clone();
     let quic_addr_str = cfg.quic_addr.clone();
     let pgwire_addr_str = cfg.pgwire_addr.clone();
     let tcp_addr_str = cfg.tcp_addr.clone();
+
+    // ─── TLS identity (shared by the HTTP/2 and QUIC listeners) ────
+    // Operator-supplied certificates are used when configured; the
+    // self-signed fallback needs development mode or an explicit opt-in.
+    // Both listeners present the same identity.
+    let server_tls = tls::resolve_server_tls(cfg)?;
+    tls::log_tls_posture(&server_tls.posture);
+
+    // ─── 1. HTTP/1.1 + HTTP/2 (TLS, ALPN) ──────────────────────
+    let tls_config = axum_server::tls_rustls::RustlsConfig::from_der(
+        server_tls
+            .certs
+            .iter()
+            .map(|c| c.as_ref().to_vec())
+            .collect(),
+        server_tls.key.secret_der().to_vec(),
+    )
+    .await?;
+
     let http_addr: std::net::SocketAddr = http_addr_str.parse()?;
 
     let http_handle = tokio::spawn(async move {
@@ -267,8 +266,9 @@ async fn spawn_protocol_servers(
     });
 
     // ─── 2. QUIC/HTTP3 Binary Protocol ─────────────────────────
-    let (quic_certs, quic_key) = quic_server::generate_self_signed_cert()?;
-    let quic_endpoint = quic_server::create_server_endpoint(&quic_addr_str, quic_certs, quic_key)?;
+    let quic_tls = server_tls.for_second_listener();
+    let quic_endpoint =
+        quic_server::create_server_endpoint(&quic_addr_str, quic_tls.certs, quic_tls.key)?;
     let quic_db = db.clone();
     let quic_rate_limiter = rate_limiter.clone();
     let quic_handle = tokio::spawn(async move {
@@ -392,13 +392,8 @@ async fn run_tcp_server(
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!("TCP command interface on {addr}");
 
-    // Bound concurrent sessions. Each one can buffer up to MAX_TCP_LINE
-    // before authenticating, so without a ceiling the memory an
-    // unauthenticated peer farm can reserve grows with the connection
-    // count. Acquiring before spawn (rather than inside the task) makes a
-    // saturated interface apply backpressure to the accept loop: a peer
-    // that arrives when every permit is out waits, and is served when a
-    // session ends, instead of adding to the pile.
+    // Acquire before spawn so a saturated interface backpressures the
+    // accept loop instead of piling up spawned tasks.
     let session_limit = Arc::new(tokio::sync::Semaphore::new(MAX_TCP_SESSIONS));
     let auth_failures = Arc::new(TcpAuthFailures::new());
 
@@ -544,40 +539,20 @@ async fn handle_tcp_connection(
     let mut session_role = String::new();
     let mut auth_failures = 0u32;
 
-    // The session gets a bounded window to authenticate (a permit is
-    // held the whole time, and the pool is finite). Once authenticated,
-    // the much longer idle timeout governs. Both keep a parked peer from
-    // squatting on a permit that a real client is waiting for.
     let auth_deadline = tokio::time::Instant::now() + TCP_AUTH_DEADLINE;
 
-    // Holds partial input between reads: a client may pipeline several
-    // commands in one segment, and a single command may straddle a read
-    // boundary. Both cases need the leftover preserved, not discarded.
     let mut buffer = Vec::with_capacity(512);
     let mut chunk = [0u8; 8192];
     // How many leading bytes are already known to be newline-free, so a
     // scan covers only what the last read appended — linear, not
     // quadratic, as a single line grows toward the cap.
     let mut scanned = 0usize;
-    // Two clocks, because they protect against different things:
-    // - `idle_deadline` resets whenever any bytes arrive, so a slow but
-    //   working client is never cut.
-    // - `line_deadline` is an absolute backstop on accumulating one
-    //   incomplete line, so a peer dribbling a byte every few minutes —
-    //   active by the idle measure, but never finishing a line — cannot
-    //   hold its permit indefinitely.
     let mut idle_deadline = tokio::time::Instant::now() + TCP_IDLE_TIMEOUT;
     let mut line_deadline = tokio::time::Instant::now() + TCP_LINE_DEADLINE;
 
     loop {
-        // Read until a complete line is buffered. Three bounds apply, and
-        // each protects something different: the length cap stops a
-        // newline-free peer growing the buffer toward OOM (CWE-400), the
-        // auth deadline bounds a loitering stranger, and the idle/line
-        // clocks stop a parked or dribbling peer holding a permit forever
-        // — the pool is finite, and 256 such sessions would drain it.
-        // Unauthenticated, the auth deadline governs and the idle clock
-        // does not: no partial command is worth waiting past AUTH for.
+        // Unauthenticated waits stop at the auth deadline, not the idle
+        // clock: no partial command is worth waiting past AUTH for.
         let absolute = if authenticated {
             line_deadline
         } else {
@@ -793,7 +768,6 @@ async fn read_bounded_line(
     use tokio::io::AsyncReadExt;
 
     loop {
-        // Look only at what the last read appended.
         if buffer[*scanned..].contains(&b'\n') {
             return LineRead::Ready;
         }
@@ -810,16 +784,13 @@ async fn read_bounded_line(
             Ok(Ok(0) | Err(_)) => return LineRead::Closed,
             Ok(Ok(n)) => {
                 buffer.extend_from_slice(&chunk[..n]);
-                // Activity: this is a working client, however slow, and
-                // the idle clock starts over. The absolute line deadline
-                // does not, which is what makes the dribble case finite.
+                // Bytes arrived: reset the idle clock (the line deadline
+                // stays absolute).
                 *idle = tokio::time::Instant::now() + TCP_IDLE_TIMEOUT;
             }
             // The deadline elapsed. Which one is the caller's business.
             Err(_) => return LineRead::Timeout,
         }
-        // The cap sits above max_value_size so a legitimate single-line
-        // SET still fits; a peer past it is dropped, not humored.
         if buffer.len() > MAX_TCP_LINE {
             return LineRead::TooLong;
         }
@@ -1028,9 +999,8 @@ fn dispatch_tcp_command(
 /// Map a storage error to a safe client-facing TCP response line.
 ///
 /// Client-caused errors get a specific, safe message; everything else is
-/// logged server-side and reported as a generic `INTERNAL`. The previous
-/// `{e:?}` formatting leaked engine internals (paths, lock names, batch
-/// state) to anyone who could reach the port.
+/// logged server-side and collapsed to `INTERNAL` so engine internals
+/// never reach the client.
 fn tcp_err_response(e: &omni_engine::OmniError) -> String {
     match e {
         omni_engine::OmniError::KeyNotFound => "ERROR: NOT_FOUND\n".into(),
@@ -1340,16 +1310,11 @@ mod tests {
     async fn tcp_authenticated_session_dribbling_a_line_is_deadlined() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-        // The idle clock resets on any received bytes, so a peer who sends
-        // one byte every few minutes is never idle by that measure — yet
-        // never finishes a line, holding its permit for as long as it
-        // cares to keep dribbling. The absolute line deadline is what
-        // bounds that case, and it does not reset on activity.
-        //
-        // The test has to keep the peer active: one partial write followed
-        // by silence would let the idle clock fire instead, which the old
-        // per-read timeout cuts just as well. Dribbling within each idle
-        // window leaves only the line deadline to do the work.
+        // Bytes reset the idle clock, so a byte-every-few-minutes peer is
+        // never idle yet never finishes a line: only the absolute line
+        // deadline bounds it. The test must dribble within each idle
+        // window, or the idle clock fires first and hides which clock did
+        // the work.
         let secret = "unit-test-secret-0123456789abcdef";
         let db = test_db();
         let mut s = session(db, secret, Arc::new(TcpAuthFailures::new())).await;
@@ -1375,14 +1340,11 @@ mod tests {
             String::from_utf8_lossy(&buf).into_owned()
         });
 
-        // Each gap stays under the idle window, so every dribble resets the
-        // idle clock and it cannot fire; the cumulative time crosses the
-        // absolute line deadline. The byte deliberately never completes a
-        // line, so the clock that must do the cutting is the one that does
-        // not reset on activity. No reads inside the loop: an awaited read
-        // parks this task, and the paused mock clock then auto-advances to
-        // the *idle* deadline — which would fire first and hide which clock
-        // actually did the work.
+        // Each dribble resets the idle clock, so only the cumulative time
+        // can cross the absolute line deadline. No reads inside the loop:
+        // an awaited read parks this task and the paused mock clock
+        // auto-advances to the *idle* deadline, which would fire first and
+        // hide which clock did the work.
         let gap = TCP_IDLE_TIMEOUT / 2;
         // The round count is pinned, not derived from TCP_LINE_DEADLINE:
         // deriving it would scale the wait with any change to the constant,
@@ -1528,7 +1490,7 @@ mod tests {
 
         // Everything else collapses to a generic INTERNAL. The old
         // `{e:?}` formatting handed paths and lock names to any client
-        // who could reach the port (issue #117).
+        // who could reach the port.
         let sensitive = omni_engine::OmniError::DatabaseAlreadyOpen {
             lock_path: "/var/lib/omnikv/.lock".into(),
         };
