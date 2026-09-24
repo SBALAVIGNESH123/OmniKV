@@ -382,7 +382,7 @@ fn test_write_stall_at_l0_threshold() {
             }
         }
     } else {
-        // Compaction kept L0 count low — that's fine, mechanism works
+        // Compaction kept the L0 count below the threshold.
         println!(
             "✅ PERF: Write backpressure active (L0 count managed at {})",
             db.sstable_count()

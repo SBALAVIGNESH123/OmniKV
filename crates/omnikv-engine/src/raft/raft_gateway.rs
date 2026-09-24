@@ -89,14 +89,14 @@ pub struct ClusterGateway {
     /// The DEDICATED consensus runtime. Every openraft task (heartbeats,
     /// elections, replication, the state-machine apply loop), the raft
     /// RPC listener, and every proposal run here — never on the
-    /// client-facing server runtime. This is the deadlock fix: async
-    /// REST/QUIC handlers that call the blocking facades park their own
-    /// runtime's workers on a channel while consensus proceeds on this
-    /// separate runtime, so no number of concurrent client writes can
-    /// starve the tasks that must complete their proposals.
+    /// client-facing server runtime. Async REST/QUIC handlers that call
+    /// the blocking facades park their own runtime's workers on a channel
+    /// while consensus proceeds on this separate runtime, so no number of
+    /// concurrent client writes can starve the tasks that must complete
+    /// their proposals.
     ///
-    /// Larger than the old 2-thread gateway pool: it also carries the
-    /// RPC listener and openraft's replication workers now.
+    /// Carries the RPC listener and openraft's replication workers in
+    /// addition to proposals.
     consensus_rt: tokio::runtime::Runtime,
     /// The consensus runtime's handle — how the server boots the openraft
     /// node (its internal tasks adopt the runtime context current during
@@ -287,11 +287,7 @@ impl ClusterGateway {
     /// records it, on every node, when it stamps the marker — including
     /// on this leader, whose own apply `propose_locked` waits for before
     /// returning. So the record is in place before the flight lock
-    /// releases, and the next transaction's validation sees it. That is
-    /// the fix for the leader-local history: before the record rode in
-    /// the command, only the node that ran the COMMIT ever recorded it,
-    /// and a node promoted after a failover validated against a history
-    /// missing every pre-failover commit.
+    /// releases, and the next transaction's validation sees it.
     pub fn commit_ssi_blocking<F>(
         &self,
         ssi: crate::transaction::SsiCommitRecord,
@@ -334,7 +330,7 @@ impl ClusterGateway {
     /// workers do it at once: consensus (openraft tasks, the raft RPC
     /// listener, the proposal being awaited) runs on the dedicated
     /// consensus runtime, never on the caller's — the parked workers
-    /// cannot starve the very tasks that must finish to unpark them.
+    /// cannot starve the tasks that must finish to unpark them.
     /// (The flight lock does NOT bound parked workers: it is acquired
     /// inside the helper, after the caller is already parked.)
     fn block_on_ctx<F>(&self, fut: F) -> F::Output

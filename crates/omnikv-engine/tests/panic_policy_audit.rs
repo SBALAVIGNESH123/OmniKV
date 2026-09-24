@@ -115,10 +115,7 @@ fn lock_acquires_have_expect_messages() {
 fn panic_policy_doc_exists() {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let doc_path = Path::new(manifest_dir).join("../../docs/PANIC_POLICY.md");
-    assert!(
-        doc_path.exists(),
-        "docs/PANIC_POLICY.md must exist — see issue #46"
-    );
+    assert!(doc_path.exists(), "docs/PANIC_POLICY.md must exist");
     let content = fs::read_to_string(&doc_path).unwrap();
     assert!(
         content.contains("Fatal Invariant"),

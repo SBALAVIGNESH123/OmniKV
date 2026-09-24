@@ -12,8 +12,16 @@ pgwire_addr = "0.0.0.0:5433"
 tcp_addr = "0.0.0.0:8080"
 log_level = "info,omni_engine=debug"
 
-# Local demos use generated self-signed certificates. For a real deployment,
-# provide tls_cert_path and tls_key_path instead of setting this to true.
+# TLS identity. A real deployment mounts its own certificate and key:
+#
+#   tls_cert_path = "/etc/omni/tls/fullchain.pem"   # leaf first, then intermediates
+#   tls_key_path  = "/etc/omni/tls/privkey.pem"
+#
+# Both TLS listeners (HTTP/2 and QUIC) then present that certificate, and
+# clients can verify the server against the signing CA. The two lines below
+# are the demo posture: with no operator certificate configured the server
+# generates an ephemeral self-signed certificate on every boot, which
+# nothing can verify — set tls_insecure_skip to acknowledge that.
 tls_insecure_skip = true
 
 [storage]

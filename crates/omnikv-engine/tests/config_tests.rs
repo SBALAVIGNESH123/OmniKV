@@ -645,7 +645,7 @@ fn test_load_dev_succeeds() {
     });
 }
 
-// ── Cluster advertised-address validation (PR #127 review) ──
+// ── Cluster advertised-address validation ──
 // A wildcard ADVERTISED address must fail closed: peers would dial
 // 0.0.0.0:port, which resolves to the DIALER itself, silently breaking
 // replication/votes toward this node after a failover or rejoin.
@@ -730,7 +730,7 @@ fn test_raft_advertise_env_var_sets_field() {
     );
 }
 
-// ── Peer/address sanity (PR #127 review round 4) ──
+// ── Peer/address sanity ──
 
 #[test]
 fn test_raft_advertise_port_zero_is_refused() {
@@ -806,7 +806,7 @@ fn test_raft_distinct_peers_are_accepted() {
         .unwrap_or_else(|e| panic!("a clean peer list must validate: {e}"));
 }
 
-// ── Peer endpoint shape (PR #127 review round 7) ──
+// ── Peer endpoint shape ──
 // A peer is dialed exactly as written, so the same rules as the
 // advertised address apply to it — a malformed peer is a member that can
 // never be reached, not a typo an operator can fix later.
@@ -886,7 +886,7 @@ fn test_raft_peer_hostname_is_accepted() {
 #[test]
 fn test_tcp_loopback_bind_is_the_default() {
     // Every other listener defaults to loopback; the TCP command
-    // interface must too (issue #117) — it grants full read/write.
+    // interface must too — it grants full read/write.
     let cfg = ServerConfig::default();
     assert_eq!(cfg.tcp_addr, "127.0.0.1:7072");
     cfg.validate_runtime()

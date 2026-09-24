@@ -1,8 +1,7 @@
 //! Prepared Statement & Query Plan Cache Engine
 //!
-//! Provides parameterized query support and an LRU-based plan cache to avoid
-//! re-parsing identical queries. This is how production databases like
-//! PostgreSQL and MySQL eliminate redundant parsing overhead.
+//! Parameterized query support with an LRU-based plan cache to avoid
+//! re-parsing identical queries.
 //!
 //! ## Features
 //!

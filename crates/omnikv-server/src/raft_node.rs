@@ -7,7 +7,7 @@
 //! acknowledging it. Absent → the server stays an independent
 //! single-node engine and none of this runs.
 //!
-//! Bind vs advertised address (PR #127 review): `OMNIKV_RAFT_ADDR` is
+//! Bind vs advertised address: `OMNIKV_RAFT_ADDR` is
 //! what the listener BINDS to (0.0.0.0 is fine there);
 //! `OMNIKV_RAFT_ADVERTISE_ADDR` is what peers DIAL to reach this node
 //! (0.0.0.0 is not — it resolves to the dialer itself). The advertised
@@ -72,25 +72,16 @@ fn raft_config_from(
     ))
 }
 
-/// Boots the cluster node described by `cfg.raft`. Returns `None` when
-/// the config has no raft section — single-node mode, nothing started.
+/// Boots the cluster node described by `cfg.raft`, or returns `None` in
+/// single-node mode.
 ///
-/// Membership bootstrap: node 1 of a FRESH cluster (no prior state)
-/// initializes the cluster with the full initial peer set — the
-/// openraft pattern where blank follower nodes adopt the cluster as the
-/// initialized leader replicates the membership entry to them. A node
-/// with persisted membership (a restart) recognizes it and re-joins;
-/// openraft errors on double-init, which is exactly the guard here.
+/// Node 1 of a fresh cluster initializes membership; other nodes start
+/// blank and join as the leader reaches them (openraft errors on
+/// double-init, which is the guard below).
 ///
-/// Runtime isolation (PR #127 review): the consensus runtime is built
-/// FIRST, the openraft node constructed and the listener bound ON it
-/// (`rt.block_on` from this plain boot thread — no runtime context
-/// here, so openraft's internal tasks adopt the consensus runtime, not
-/// the client-facing server runtime), and the runtime is then ADOPTED
-/// by the gateway ([`ClusterGateway::with_runtime`]) — never dropped in
-/// between, so those tasks keep their home for the process lifetime.
-/// Concurrent client writes may park server-runtime workers on the
-/// gateway's channel hop; they can never starve these tasks.
+/// The node and listener are built ON the consensus runtime and the
+/// runtime is then adopted by the gateway, so openraft's tasks can never
+/// be starved by client load on the server runtime.
 fn boot_rt(
     cfg: &ServerConfig,
     db: &Arc<OmniKV>,
@@ -115,8 +106,6 @@ fn boot_rt(
 
     let config = raft_config_from(cfg)?;
 
-    // One storage instance split by openraft's Adaptor into the
-    // log-store and state-machine roles.
     let storage = OmniRaftStorage::new(db.clone());
     let (log_store, state_machine) = openraft::storage::Adaptor::new(storage);
 
@@ -144,11 +133,8 @@ fn boot_rt(
     if already_initialized {
         tracing::info!("Node {node_id} re-joining existing cluster");
     } else if node_id == 1 {
-        // Node 1 of a fresh cluster carries the complete initial
-        // membership (itself + every peer as voters). Other nodes start
-        // blank: they adopt the cluster as the leader's replication
-        // (heartbeats, votes, the membership log entry) reaches them —
-        // the same path a learner joins through.
+        // Node 1 seeds the full membership; peers start blank and join
+        // here.
         let mut members = BTreeMap::new();
         members.insert(
             node_id,
@@ -179,8 +165,6 @@ fn boot_rt(
     }
 
     // ── Write gateway + engine hooks ──
-    // The gateway ADOPTS the consensus runtime the node was built on
-    // (moved in, never dropped — openraft's tasks keep their home).
     let gateway = Arc::new(ClusterGateway::with_runtime(rt, (*raft).clone()));
     db.set_cluster_gateway(gateway.clone());
 
@@ -200,18 +184,10 @@ fn boot_rt(
     }))
 }
 
-/// The server-facing boot: builds the consensus runtime, then
-/// constructs the openraft node ON it so openraft's internal tasks
-/// adopt that runtime (never the client-facing server runtime).
-///
-/// `main` is `#[tokio::main]`, so this runs inside an async context and
-/// `Runtime::block_on` from a runtime worker would panic ("cannot start
-/// a runtime from within a runtime"). When a runtime context is
-/// present the whole boot hops through a plain OS thread — the same
-/// pattern the gateway's `block_on_ctx` uses — and the caller parks on
-/// a channel until it finishes. The boot is one-shot, so the parked
-/// task costs nothing, and the runtime under construction is moved
-/// into the returned node (never dropped mid-boot).
+/// Builds the consensus runtime, then constructs the node ON it (see
+/// `boot_rt`). Called from an async context, where a nested
+/// `Runtime::block_on` would panic, so the boot hops through a plain OS
+/// thread and the caller parks on a channel until it finishes.
 pub fn boot_cluster_node(
     cfg: &ServerConfig,
     db: &Arc<OmniKV>,

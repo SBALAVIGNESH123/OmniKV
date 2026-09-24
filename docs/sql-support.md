@@ -36,7 +36,7 @@ full PostgreSQL variant set in any case and spacing combination — `BEGIN`,
 WORK`, `COMMIT TRANSACTION`, `END`, `END WORK`, `END TRANSACTION`; `ROLLBACK`,
 `ROLLBACK WORK`, `ROLLBACK TRANSACTION`, `ABORT`, `ABORT WORK`, `ABORT
 TRANSACTION` — because DBAPI drivers implicitly send lowercase `begin
-transaction` when autocommit is off (issue #109). The `AND CHAIN` / `AND NO
+transaction` when autocommit is off. The `AND CHAIN` / `AND NO
 CHAIN` suffix is part of the termination commands' grammar (COMMIT, END,
 ROLLBACK, ABORT): `AND CHAIN` opens a new transaction immediately after the
 commit or rollback, and is a hard error (25P01) when no transaction is open,
@@ -74,7 +74,7 @@ implements with the same positional `$1`..`$n` placeholders. Bound values are
 substituted into the parsed statement AS DATA — never re-parsed as SQL — so
 parameter bytes cannot alter statement structure. An explicitly NULL Bind
 value binds as `NULL`; a placeholder with no bound value is a `08P01` error
-— missing is not NULL (full NULL comparison support is tracked by #111).
+— missing is not NULL (full NULL comparison support is not implemented yet).
 See [protocol-limits.md](protocol-limits.md) for the full extended-protocol
 contract, including named statements, portals, `ParameterDescription`,
 `PortalSuspended` row capping, and the skip-until-Sync error rule.

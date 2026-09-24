@@ -3939,12 +3939,12 @@ fn test_full_cluster_restart() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// Chunked-commit regression tests (PR #127 review): openraft hands the
-// storage adapter MORE entries/ops than one WriteBatch holds — a
-// follower catch-up applying many entries at once, a purge spanning a
-// long log, a big append during catch-up. Before the chunking fix any
-// of these tripped BatchTooLarge (cap: 10_000 ops) and stalled
-// replication; these tests drive each path past the cap.
+// Chunked-commit tests: openraft hands the storage adapter MORE
+// entries/ops than one WriteBatch holds — a follower catch-up applying
+// many entries at once, a purge spanning a long log, a big append during
+// catch-up. Any of these trips BatchTooLarge (cap: 10_000 ops) and
+// stalls replication unless the write path chunks; these tests drive
+// each path past the cap.
 // ═══════════════════════════════════════════════════════════════════════
 
 /// Builds a Normal entry carrying one `RaftCommand` with `ops` sets.
@@ -4324,22 +4324,18 @@ async fn test_snapshot_install_at_exact_batch_cap() {
     );
 }
 
-/// Issue #124: the SSI commit history used to be leader-local.
+/// The SSI commit history must converge across a failover.
 ///
-/// The committed history that powers serializable conflict detection lived
-/// only in the `TransactionManager` of the node that ran the COMMIT. A
-/// follower that applied a replicated write never recorded the transaction,
-/// so once it was promoted its conflict checks validated against a history
-/// missing every pre-failover commit — a write-write or rw-antidependency
-/// against one of them slipped through.
+/// Serializable conflict detection depends on every node recording the
+/// transactions whose writes it applies. The commit record rides inside
+/// the replicated command, and the state machine's apply writes it into
+/// the applying node's own history at the marker those writes became
+/// visible at — otherwise a promoted follower validates against a history
+/// missing every pre-failover commit and lets a conflicting write through.
 ///
-/// The fix carries the SSI commit record INSIDE the replicated command, and
-/// the state machine's apply records it in the applying node's own history
-/// at the marker its writes became visible at. This test reproduces the
-/// scenario directly on a follower: T1 begins BEFORE the replicated commit
-/// applies, the entry lands, and T1's later COMMIT must still see the
-/// conflict. Before the record rode in the command, the history was empty
-/// and the conflict was missed.
+/// This test reproduces that directly on a follower: T1 begins BEFORE the
+/// replicated commit applies, the entry lands, and T1's later COMMIT must
+/// still see the conflict.
 #[tokio::test]
 async fn test_ssi_commit_history_converges_across_a_failover() {
     use omni_engine::raft_command::RaftCommand;
@@ -4405,8 +4401,7 @@ async fn test_ssi_commit_history_converges_across_a_failover() {
     );
 
     // The conflict: T1's snapshot predates T2's marker and both write the
-    // same key. The check must fire — before #124's fix it found no record
-    // to conflict against and T1 would silently commit over T2.
+    // same key, so the check must fire.
     let err = mgr
         .commit(&mut t1)
         .expect_err("T1 must abort: T2's record is in the history");
@@ -4429,7 +4424,7 @@ async fn test_ssi_commit_history_converges_across_a_failover() {
         .expect("T3 commits: T2 is visible to it");
 
     println!(
-        "✅ #124: a replicated SSI record lands in the follower's own history and still catches a write-write conflict after promotion"
+        "a replicated SSI record lands in the follower's own history and still catches a write-write conflict after promotion"
     );
 }
 

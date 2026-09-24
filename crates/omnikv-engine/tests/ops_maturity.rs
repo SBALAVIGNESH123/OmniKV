@@ -17,8 +17,7 @@ use std::time::Instant;
 /// Rust's test harness runs tests on parallel threads, and `std::env` is
 /// process state: `test_config_from_env` setting `OMNI_RATE_LIMIT=500` can
 /// interleave with the invalid-value tests setting `OMNI_RATE_LIMIT=fast` or
-/// removing it mid-run, which made this suite flake between runs (issue
-/// #115). Every env-mutating test must hold this lock from its first
+/// removing it mid-run. Every env-mutating test must hold this lock from its first
 /// `set_var` to its last `remove_var`.
 static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 

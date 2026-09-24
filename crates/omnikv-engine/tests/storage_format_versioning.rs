@@ -1,4 +1,4 @@
-//! Storage format versioning tests — issue #14.
+//! Storage format versioning tests.
 //!
 //! Run with: `cargo test -p omnikv-engine --test storage_format_versioning -- --test-threads=1`
 

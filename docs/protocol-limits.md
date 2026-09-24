@@ -90,7 +90,7 @@ statement after parsing — a value like `x OR 1=1` compares as one plain text
 value and cannot alter the statement structure. An explicitly NULL Bind
 value (length -1) binds as `NULL`; a placeholder with no corresponding Bind
 value is a `08P01` "no value specified for parameter $n" error — missing is
-not NULL (full NULL literal support in comparisons is tracked by #111).
+not NULL (full NULL literal support in comparisons is not implemented yet).
 Parameterized statements require the SQL grammar; the legacy KV grammar
 rejects them with `0A000`.
 

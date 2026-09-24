@@ -9,10 +9,11 @@ use serde::{Deserialize, Serialize};
 /// JWT claims payload.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Claims {
-    pub sub: String,  // Subject (user/service ID)
-    pub role: String, // "read", "write", "backup", "restore", "cluster", or "admin"
-    pub exp: u64,     // Expiration (UNIX timestamp)
-    pub iat: u64,     // Issued at
+    pub sub: String,
+    /// "read", "write", "backup", "restore", "cluster", or "admin"
+    pub role: String,
+    pub exp: u64,
+    pub iat: u64,
 }
 
 /// Generate a signed JWT token.
@@ -92,20 +93,14 @@ impl RequiredRole {
 
 /// Validate a raw API key against the expected key.
 ///
-/// Uses hash-then-compare to prevent timing attacks.
-/// Both inputs are hashed to fixed-length digests before byte comparison,
-/// making the operation constant-time regardless of key length or content.
+/// Hash-then-compare: both sides become fixed 32-byte digests first, so
+/// the comparison time leaks nothing about key length or content.
 pub fn validate_api_key(provided: &str, expected: &str) -> bool {
     use sha2::{Digest, Sha256};
 
-    // Hash both values to fixed 32-byte digests.
-    // Comparing hashes instead of raw strings prevents:
-    // 1. Length-based timing leaks (both digests are always 32 bytes)
-    // 2. Content-based timing leaks (XOR fold over fixed-length arrays)
     let hash_expected = Sha256::digest(expected.as_bytes());
     let hash_provided = Sha256::digest(provided.as_bytes());
 
-    // Constant-time comparison of the two 32-byte digests
     hash_expected
         .as_slice()
         .iter()
