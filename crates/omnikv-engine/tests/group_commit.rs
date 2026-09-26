@@ -36,9 +36,12 @@ fn concurrent_joiners_coalesce_into_one_sync() {
             }
         }));
     }
-    // Hold the first sync open until every joiner is queued.
+    // Hold the first sync open until every joiner is queued as a waiter,
+    // then release. Polling the waiter count keeps this deterministic under
+    // CI load: a joiner that has not reached join_group() yet would find the
+    // engine idle and lead a separate sync of its own.
     all_arrived.wait();
-    thread::sleep(std::time::Duration::from_millis(200));
+    wait_for_pending(&engine, n);
     g1.mark_synced(Ok(()));
 
     for h in handles {
@@ -91,7 +94,7 @@ fn a_failed_leader_sync_fails_its_followers() {
         }));
     }
     all_arrived.wait();
-    thread::sleep(std::time::Duration::from_millis(200));
+    wait_for_pending(&engine, n);
     g1.mark_synced(Err(omni_engine::OmniError::IoError(
         "simulated fsync failure".into(),
     )));
@@ -138,4 +141,19 @@ fn a_successful_sync_releases_followers_cleanly() {
     let (epoch, pending) = engine.stats();
     assert_eq!(epoch, 2);
     assert_eq!(pending, 0);
+}
+
+/// Blocks until exactly `n` writers are queued as waiters. Used instead of a
+/// fixed sleep so the tests do not depend on thread-scheduling timing.
+fn wait_for_pending(engine: &GroupCommitEngine, n: usize) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        match engine.stats().1 {
+            found if found == n => return,
+            found if std::time::Instant::now() > deadline => {
+                panic!("expected {n} waiters queued, found {found}")
+            }
+            _ => std::thread::sleep(std::time::Duration::from_millis(2)),
+        }
+    }
 }

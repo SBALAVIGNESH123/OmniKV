@@ -139,7 +139,9 @@ impl GroupCommitEngine {
                 // epoch this writer needs.
                 let epoch = state.begin_next_sync();
                 debug_assert_eq!(epoch, needed, "epochs are sequential");
-                state.release(needed);
+                // Leaving the queue for an epoch that has not synced yet can
+                // only withdraw this writer's own slot.
+                let _ = state.release(needed);
                 drop(state);
                 return Ok(GroupCommitGuard {
                     engine: self,
