@@ -1884,22 +1884,19 @@ impl OmniKV {
         }
 
         // ── GROUP COMMIT: batch heap + WAL fsyncs ──
-        // Natural batching: leader syncs immediately, no sleep.
-        // While leader fsyncs (~2ms), other writers queue up as followers.
-        // Result: N concurrent writes → 2 fsyncs instead of 2N.
-        {
-            let guard = self.group_commit.join_group();
+        let sync_outcome = {
+            let guard = self.group_commit.join_group()?;
             if guard.is_leader {
-                // Leader: fsync BOTH heap and WAL for all writers in this group
-                if let Ok(heap) = self.heap_file.lock() {
-                    let _ = heap.sync_data();
-                }
-                if let Ok(wal) = self.wal.lock() {
-                    let _ = wal.sync();
-                }
+                let result = self.sync_group_commit_files();
+                // Followers are released with this outcome.
+                guard.mark_synced(result.clone());
+                result
+            } else {
+                Ok(())
             }
-            guard.mark_synced();
-        }
+        };
+        // The batch is not on disk; it must not become visible.
+        sync_outcome?;
 
         // Memtable insertion (SkipMap is lock-free for concurrent inserts)
         let memtable = self.roots.load().memtable.clone();
@@ -1925,6 +1922,26 @@ impl OmniKV {
         metrics_prometheus::COMMIT_RATE.inc();
 
         Ok(current_seq)
+    }
+
+    /// fsyncs the heap then the WAL. The WAL's commit marker must never be
+    /// durable before the heap bytes it refers to.
+    fn sync_group_commit_files(&self) -> Result<(), OmniError> {
+        let heap = self
+            .heap_file
+            .lock()
+            .map_err(|_| OmniError::LockPoisoned("heap_file lock".into()))?;
+        heap.sync_data()
+            .map_err(|e| OmniError::IoError(format!("group commit heap fsync failed: {e}")))?;
+        drop(heap);
+
+        let wal = self
+            .wal
+            .lock()
+            .map_err(|_| OmniError::LockPoisoned("wal lock".into()))?;
+        wal.sync()
+            .map_err(|e| OmniError::IoError(format!("group commit wal fsync failed: {e}")))?;
+        Ok(())
     }
 
     fn read_from_heap(
