@@ -88,6 +88,25 @@
 
 ### Fixed
 
+- Group commit now actually coalesces, and fsync failures can no longer be
+  acknowledged as durable (issues #139, #166, #145): the engine promoted
+  *every* concurrent writer to leader, so N writers performed N sequential
+  fsyncs instead of one per group — the headline throughput feature did not
+  work, and each of those N fsync outcomes was discarded with `let _`, so a
+  failed fsync still acknowledged the write as durable. Writers that arrive
+  while a sync is in flight now queue as followers of the next epoch (the
+  sync guaranteed to start after their append) and are covered by one
+  leader fsync; the leader's fsync result is published to the whole group,
+  so a failed fsync fails the leader and every follower and the batch is
+  never inserted into the memtable or acknowledged. Per-epoch waiter
+  accounting replaced the per-group counter that decremented once per group
+  regardless of joiners (#145).
+- A failed leader fsync now fails every follower it covered, not just the
+  first one to notice (issue #139): the per-epoch failure was consumed by
+  the first released waiter, letting the rest return `Ok` and acknowledge
+  un-durable writes. It is now cloned to each waiter of the epoch and
+  discarded only when the last one withdraws.
+
 - DML inside a `BEGIN` block is now transactional (issue #121):
   `INSERT`/`UPDATE`/`DELETE` (and legacy KV writes) previously committed
   immediately even inside an explicit transaction, so `ROLLBACK` could

@@ -10,57 +10,84 @@
 //!
 //! 3. **Connection Pool Config** — reqwest client tuning for Raft RPC.
 
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-/// ═══════════════════════════════════════════════════════════════════════
-/// GROUP COMMIT ENGINE — v2 (No-Sleep Design)
-/// ═══════════════════════════════════════════════════════════════════════
+use crate::OmniError;
+
+/// Coalesces concurrent fsync calls into one fsync per batch.
 ///
-/// Coalesces concurrent fsync calls into a single fsync per batch.
+/// ## Coverage rule
 ///
-/// ## Design (no sleep, no timed wait):
+/// A leader's fsync covers a writer only if the writer appended to the
+/// heap/WAL *before* that fsync began. Writers append before calling
+/// `join_group`, so the engine never lets a writer piggyback on a sync that
+/// was already in flight when it arrived:
 ///
-/// 1. Each writer appends data to heap + WAL (no fsync yet).
-/// 2. Writer enters `join_group()`.
-/// 3. If no sync is in progress → become leader, sync immediately.
-/// 4. If a sync IS in progress → wait as follower.
-/// 5. When the leader's sync completes, ALL followers are released.
-/// 6. Natural batching: while leader fsyncs (~2ms), new writers queue up.
-///    Next leader syncs for everyone who arrived during those 2ms.
-///
-/// This achieves the same throughput as a timed-wait design without the
-/// latency overhead of sleeping on every single-threaded write.
+/// - A writer that finds the engine **idle** leads a new group; its own
+///   fsync trivially covers its own append.
+/// - A writer that arrives while epoch `E` is syncing cannot be covered by
+///   `E` (the fsync may already have flushed past its append), so it queues
+///   for epoch `E + 1`. That sync is guaranteed to start after the writer
+///   queued, hence after its append.
 pub struct GroupCommitEngine {
-    /// State of the current write group.
     state: Mutex<GroupState>,
-    /// Condition variable for waiting followers.
     cond: Condvar,
-    // Monotonic epoch bookkeeping lives in GroupState::next_epoch.
 }
 
 struct GroupState {
-    /// Number of writers waiting in the current group (including leader).
-    pending_count: usize,
-    /// The epoch that was last committed.
-    committed_epoch: u64,
-    /// The next sync epoch to assign to a leader.
+    /// Followers waiting for a covering sync, keyed by the epoch they need
+    /// completed. A leader is never counted here.
+    waiters: BTreeMap<u64, usize>,
+    /// Epoch of the sync currently in flight; 0 when the engine is idle.
+    current_epoch: u64,
+    /// Highest epoch whose sync finished, on any outcome — failures advance
+    /// it too, so waiters waiting on a failed epoch are released.
+    completed_epoch: u64,
     next_epoch: u64,
-    /// Whether a sync is currently in progress.
-    sync_in_progress: bool,
+    /// fsync failures, keyed by epoch. An entry lives only while that epoch
+    /// still has waiters to deliver the error to.
+    failures: HashMap<u64, OmniError>,
+    /// Set once a sync fails. A later sync would flush the failed batch's
+    /// already-appended WAL bytes and make a rejected write durable.
+    poisoned: Option<OmniError>,
+}
+
+impl GroupState {
+    fn begin_next_sync(&mut self) -> u64 {
+        let epoch = self.next_epoch;
+        self.next_epoch += 1;
+        self.current_epoch = epoch;
+        epoch
+    }
+
+    /// Withdraws one waiter for `epoch` and drops the bucket when it empties.
+    /// The failure is cloned per withdrawal so a failed sync reaches every
+    /// waiter of the epoch, not just the first.
+    fn release(&mut self, epoch: u64) -> Option<OmniError> {
+        let failure = self.failures.get(&epoch).cloned();
+        if let Some(count) = self.waiters.get_mut(&epoch) {
+            *count -= 1;
+            if *count == 0 {
+                self.waiters.remove(&epoch);
+                self.failures.remove(&epoch);
+            }
+        }
+        failure
+    }
 }
 
 impl GroupCommitEngine {
-    /// Creates a new GroupCommitEngine.
     pub fn new(_max_wait_us: u64) -> Self {
         Self {
             state: Mutex::new(GroupState {
-                pending_count: 0,
-                committed_epoch: 0,
+                waiters: BTreeMap::new(),
+                current_epoch: 0,
+                completed_epoch: 0,
                 next_epoch: 1,
-                sync_in_progress: false,
+                failures: HashMap::new(),
+                poisoned: None,
             }),
             cond: Condvar::new(),
         }
@@ -68,85 +95,111 @@ impl GroupCommitEngine {
 
     /// Join the current write group.
     ///
-    /// Returns a guard indicating whether this writer is the leader.
-    /// - Leader: must perform fsync, then call `guard.mark_synced()`.
-    /// - Follower: blocks until the leader's sync completes, then returns.
+    /// - **Leader** (`is_leader == true`): fsync, then call
+    ///   `guard.mark_synced(result)` so the group's followers are released
+    ///   with the same outcome.
+    /// - **Follower** (`is_leader == false`): the covering sync already
+    ///   completed successfully; proceed without fsyncing.
     ///
-    /// No sleep, no timed wait. The leader syncs immediately.
-    /// Natural batching occurs because followers accumulate during the
-    /// ~2ms fsync window.
-    pub fn join_group(&self) -> GroupCommitGuard<'_> {
+    /// Returns `Err` if the covering sync failed, or if the engine is
+    /// poisoned by an earlier failure.
+    pub fn join_group(&self) -> Result<GroupCommitGuard<'_>, OmniError> {
         let mut state = self.state.lock().expect("group state");
-        state.pending_count += 1;
 
-        if !state.sync_in_progress {
-            // No sync running → I'm the leader. Start syncing immediately.
-            let sync_epoch = state.next_epoch;
-            state.next_epoch += 1;
-            state.sync_in_progress = true;
+        if let Some(err) = state.poisoned.clone() {
+            return Err(err);
+        }
+
+        if state.current_epoch == 0 {
+            let epoch = state.begin_next_sync();
             drop(state);
-
-            // No sleep! Leader proceeds directly to fsync.
-            GroupCommitGuard {
+            return Ok(GroupCommitGuard {
                 engine: self,
                 is_leader: true,
-                sync_epoch,
-            }
-        } else {
-            // A sync is already in progress → wait as follower.
-            // The leader will wake us when done.
-            loop {
-                state = self.cond.wait(state).expect("condvar wait");
-                if !state.sync_in_progress {
-                    let sync_epoch = state.next_epoch;
-                    state.next_epoch += 1;
-                    state.sync_in_progress = true;
-                    drop(state);
+                epoch,
+            });
+        }
 
-                    return GroupCommitGuard {
-                        engine: self,
-                        is_leader: true,
-                        sync_epoch,
-                    };
+        // The in-flight sync began before this writer's append, so it may
+        // already have flushed past these bytes. Wait for the next epoch,
+        // which cannot start until this writer is queued.
+        let needed = state.current_epoch + 1;
+        *state.waiters.entry(needed).or_default() += 1;
+
+        loop {
+            state = self.cond.wait(state).expect("condvar wait");
+
+            if state.completed_epoch >= needed {
+                let failure = state.release(needed);
+                drop(state);
+                if let Some(err) = failure {
+                    return Err(err);
                 }
+                return Ok(GroupCommitGuard {
+                    engine: self,
+                    is_leader: false,
+                    epoch: needed,
+                });
+            }
+
+            if state.current_epoch == 0 {
+                // Epochs are handed out in order, so the next one is the
+                // epoch this writer needs.
+                let epoch = state.begin_next_sync();
+                debug_assert_eq!(epoch, needed, "epochs are sequential");
+                // Leaving the queue for an epoch that has not synced yet can
+                // only withdraw this writer's own slot.
+                let _ = state.release(needed);
+                drop(state);
+                return Ok(GroupCommitGuard {
+                    engine: self,
+                    is_leader: true,
+                    epoch: needed,
+                });
             }
         }
     }
 
-    /// Called by the leader after performing the actual fsync.
-    fn complete_sync(&self, sync_epoch: u64) {
+    /// Publishes the leader's fsync outcome so the group's followers are
+    /// released with the same result.
+    fn complete_sync(&self, epoch: u64, result: Result<(), OmniError>) {
         let mut state = self.state.lock().expect("group state");
-        state.committed_epoch = state.committed_epoch.max(sync_epoch);
-        state.sync_in_progress = false;
-        state.pending_count -= 1;
+        state.completed_epoch = state.completed_epoch.max(epoch);
+        state.current_epoch = 0;
+        if let Err(err) = result {
+            state.poisoned = Some(err.clone());
+            if state.waiters.contains_key(&epoch) {
+                state.failures.insert(epoch, err);
+            }
+        }
         drop(state);
 
-        // Wake all waiting followers
         self.cond.notify_all();
     }
 
-    /// Returns (committed_epoch, pending_count).
+    /// Returns (completed_epoch, waiting follower count).
     pub fn stats(&self) -> (u64, usize) {
         let state = self.state.lock().expect("group state");
-        (state.committed_epoch, state.pending_count)
+        (state.completed_epoch, state.waiters.values().sum())
     }
 }
 
 /// Guard returned by `join_group()`.
-/// If `is_leader` is true, perform fsync then call `mark_synced()`.
+/// If `is_leader` is true, perform fsync then call `mark_synced(result)`.
 /// If `is_leader` is false, the sync is already done — just proceed.
 pub struct GroupCommitGuard<'a> {
     engine: &'a GroupCommitEngine,
     /// If true, this writer must perform the fsync.
     pub is_leader: bool,
-    sync_epoch: u64,
+    epoch: u64,
 }
 
 impl GroupCommitGuard<'_> {
-    /// Call after performing fsync (leader only). Wakes all followers.
-    pub fn mark_synced(self) {
+    /// Leader only: publishes the fsync outcome so the group's followers are
+    /// released with the same result.
+    pub fn mark_synced(self, result: Result<(), OmniError>) {
         if self.is_leader {
-            self.engine.complete_sync(self.sync_epoch);
+            self.engine.complete_sync(self.epoch, result);
         }
     }
 }

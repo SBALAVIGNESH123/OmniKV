@@ -1550,11 +1550,11 @@ use omni_engine::hardening::{GroupCommitEngine, RateLimiter};
 fn test_group_commit_single_writer() {
     let engine = GroupCommitEngine::new(100); // 100µs wait
 
-    let guard = engine.join_group();
+    let guard = engine.join_group().unwrap();
     assert!(guard.is_leader, "Single writer should be the leader");
 
     // Simulate fsync
-    guard.mark_synced();
+    guard.mark_synced(Ok(()));
 
     let (committed, pending) = engine.stats();
     assert_eq!(committed, 1);
@@ -1566,14 +1566,14 @@ fn test_group_commit_multiple_epochs() {
     let engine = GroupCommitEngine::new(50);
 
     // First group
-    let g1 = engine.join_group();
+    let g1 = engine.join_group().unwrap();
     assert!(g1.is_leader);
-    g1.mark_synced();
+    g1.mark_synced(Ok(()));
 
     // Second group
-    let g2 = engine.join_group();
+    let g2 = engine.join_group().unwrap();
     assert!(g2.is_leader);
-    g2.mark_synced();
+    g2.mark_synced(Ok(()));
 
     let (committed, _) = engine.stats();
     assert_eq!(committed, 2);
