@@ -49,6 +49,9 @@ struct GroupState {
     /// fsync failures, keyed by epoch. An entry lives only while that epoch
     /// still has waiters to deliver the error to.
     failures: HashMap<u64, OmniError>,
+    /// Set once a sync fails. A later sync would flush the failed batch's
+    /// already-appended WAL bytes and make a rejected write durable.
+    poisoned: Option<OmniError>,
 }
 
 impl GroupState {
@@ -84,6 +87,7 @@ impl GroupCommitEngine {
                 completed_epoch: 0,
                 next_epoch: 1,
                 failures: HashMap::new(),
+                poisoned: None,
             }),
             cond: Condvar::new(),
         }
@@ -97,10 +101,14 @@ impl GroupCommitEngine {
     /// - **Follower** (`is_leader == false`): the covering sync already
     ///   completed successfully; proceed without fsyncing.
     ///
-    /// Returns `Err` if the covering sync failed: the write is not durable
-    /// and must not be acknowledged.
+    /// Returns `Err` if the covering sync failed, or if the engine is
+    /// poisoned by an earlier failure.
     pub fn join_group(&self) -> Result<GroupCommitGuard<'_>, OmniError> {
         let mut state = self.state.lock().expect("group state");
+
+        if let Some(err) = state.poisoned.clone() {
+            return Err(err);
+        }
 
         if state.current_epoch == 0 {
             let epoch = state.begin_next_sync();
@@ -158,10 +166,11 @@ impl GroupCommitEngine {
         let mut state = self.state.lock().expect("group state");
         state.completed_epoch = state.completed_epoch.max(epoch);
         state.current_epoch = 0;
-        if let Err(err) = result
-            && state.waiters.contains_key(&epoch)
-        {
-            state.failures.insert(epoch, err);
+        if let Err(err) = result {
+            state.poisoned = Some(err.clone());
+            if state.waiters.contains_key(&epoch) {
+                state.failures.insert(epoch, err);
+            }
         }
         drop(state);
 

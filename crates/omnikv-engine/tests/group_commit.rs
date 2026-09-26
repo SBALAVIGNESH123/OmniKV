@@ -143,6 +143,26 @@ fn a_successful_sync_releases_followers_cleanly() {
     assert_eq!(pending, 0);
 }
 
+/// A failed sync poisons the engine: no later writer may lead a sync that
+/// would flush the rejected batch's appended bytes.
+#[test]
+fn a_failed_sync_poisons_the_engine() {
+    let engine = Arc::new(GroupCommitEngine::new(100));
+    let g1 = engine.join_group().expect("first leader");
+    g1.mark_synced(Err(omni_engine::OmniError::IoError(
+        "simulated fsync failure".into(),
+    )));
+
+    assert!(
+        engine.join_group().is_err(),
+        "a poisoned engine must not accept a new sync"
+    );
+    assert!(
+        engine.join_group().is_err(),
+        "poison is sticky, not a one-shot"
+    );
+}
+
 /// Blocks until exactly `n` writers are queued as waiters. Used instead of a
 /// fixed sleep so the tests do not depend on thread-scheduling timing.
 fn wait_for_pending(engine: &GroupCommitEngine, n: usize) {

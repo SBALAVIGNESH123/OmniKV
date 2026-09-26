@@ -1924,8 +1924,7 @@ impl OmniKV {
         Ok(current_seq)
     }
 
-    /// fsyncs the heap then the WAL. The WAL's commit marker must never be
-    /// durable before the heap bytes it refers to.
+    /// fsyncs the heap then the WAL, holding the heap lock across both.
     fn sync_group_commit_files(&self) -> Result<(), OmniError> {
         let heap = self
             .heap_file
@@ -1933,7 +1932,6 @@ impl OmniKV {
             .map_err(|_| OmniError::LockPoisoned("heap_file lock".into()))?;
         heap.sync_data()
             .map_err(|e| OmniError::IoError(format!("group commit heap fsync failed: {e}")))?;
-        drop(heap);
 
         let wal = self
             .wal
