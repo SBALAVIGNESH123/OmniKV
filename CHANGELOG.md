@@ -106,6 +106,16 @@
   the first released waiter, letting the rest return `Ok` and acknowledge
   un-durable writes. It is now cloned to each waiter of the epoch and
   discarded only when the last one withdraws.
+- A rejected write can no longer reappear after restart (issue #168):
+  the first fsync failure poisons the group-commit engine for the rest of
+  the process, the commit path refuses to append a WAL batch once poisoned,
+  and the WAL truncates back to its last durable offset and re-fsyncs the
+  truncation, so the batch's bytes are physically gone rather than merely
+  un-fsynced — kernel background writeback could otherwise flush them and
+  `replay()` would restore the write the client was told had failed. The
+  heap lock is also held across the WAL fsync, so no writer can interleave
+  a heap append between the two and end up with a durable commit marker
+  over un-durable heap bytes.
 
 - DML inside a `BEGIN` block is now transactional (issue #121):
   `INSERT`/`UPDATE`/`DELETE` (and legacy KV writes) previously committed
