@@ -49,8 +49,7 @@ struct GroupState {
     /// fsync failures, keyed by epoch. An entry lives only while that epoch
     /// still has waiters to deliver the error to.
     failures: HashMap<u64, OmniError>,
-    /// Set once a sync fails. A later sync would flush the failed batch's
-    /// already-appended WAL bytes and make a rejected write durable.
+    /// Set once a sync fails.
     poisoned: Option<OmniError>,
 }
 
@@ -181,6 +180,16 @@ impl GroupCommitEngine {
     pub fn stats(&self) -> (u64, usize) {
         let state = self.state.lock().expect("group state");
         (state.completed_epoch, state.waiters.values().sum())
+    }
+
+    /// Marks the engine unusable for all future writes.
+    pub fn poison(&self, err: OmniError) {
+        let mut state = self.state.lock().expect("group state");
+        state.poisoned = Some(err);
+    }
+
+    pub fn is_poisoned(&self) -> bool {
+        self.state.lock().expect("group state").poisoned.is_some()
     }
 }
 

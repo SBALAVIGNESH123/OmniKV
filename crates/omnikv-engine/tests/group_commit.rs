@@ -163,6 +163,45 @@ fn a_failed_sync_poisons_the_engine() {
     );
 }
 
+/// After a failed fsync, the undurable WAL bytes must be physically gone, not
+/// merely unf-synced: the kernel's own writeback could otherwise flush them.
+#[test]
+fn discard_undurable_removes_unfsynced_batches() {
+    use omni_engine::wal::WriteAheadLog;
+
+    let dir = tempfile::tempdir().expect("wal tempdir");
+    let path = dir.path().join("wal.bin");
+    let p = path.to_string_lossy().to_string();
+
+    let mut wal = WriteAheadLog::new(&p).expect("open wal");
+    let marker = vec![(make_marker(), None)];
+    wal.append_batch_nosync(&marker).expect("append nosync");
+
+    let len_before = std::fs::metadata(&p).unwrap().len();
+    assert!(len_before > 0, "the batch must have reached the file");
+
+    wal.discard_undurable().expect("truncate");
+
+    let len_after = std::fs::metadata(&p).unwrap().len();
+    assert_eq!(len_after, 0, "undurable bytes must be truncated");
+    assert!(
+        WriteAheadLog::replay(&p, "").unwrap().is_empty(),
+        "replay must not restore a discarded batch"
+    );
+}
+
+fn make_marker() -> omni_engine::OmniRecord {
+    omni_engine::OmniRecord {
+        seq: 1,
+        key: b"__COMMIT_MARKER__".to_vec(),
+        offset: 0,
+        length: 0,
+        crc32: 0,
+        payload_crc32: 0,
+        expiry: 0,
+    }
+}
+
 /// Blocks until exactly `n` writers are queued as waiters. Used instead of a
 /// fixed sleep so the tests do not depend on thread-scheduling timing.
 fn wait_for_pending(engine: &GroupCommitEngine, n: usize) {

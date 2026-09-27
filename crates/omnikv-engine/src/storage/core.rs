@@ -1880,6 +1880,11 @@ impl OmniKV {
                 .wal
                 .lock()
                 .map_err(|_| OmniError::LockPoisoned("wal lock".into()))?;
+            if self.group_commit.is_poisoned() {
+                return Err(OmniError::IoError(
+                    "group commit engine poisoned by an earlier fsync failure".into(),
+                ));
+            }
             wal.append_batch_nosync(&wal_records)?;
         }
 
@@ -1930,16 +1935,24 @@ impl OmniKV {
             .heap_file
             .lock()
             .map_err(|_| OmniError::LockPoisoned("heap_file lock".into()))?;
-        heap.sync_data()
-            .map_err(|e| OmniError::IoError(format!("group commit heap fsync failed: {e}")))?;
-
-        let wal = self
+        let mut wal = self
             .wal
             .lock()
             .map_err(|_| OmniError::LockPoisoned("wal lock".into()))?;
-        wal.sync()
-            .map_err(|e| OmniError::IoError(format!("group commit wal fsync failed: {e}")))?;
-        Ok(())
+
+        let result = heap
+            .sync_data()
+            .map_err(|e| OmniError::IoError(format!("group commit heap fsync failed: {e}")))
+            .and_then(|()| {
+                wal.sync()
+                    .map_err(|e| OmniError::IoError(format!("group commit wal fsync failed: {e}")))
+            });
+
+        if let Err(ref e) = result {
+            self.group_commit.poison(e.clone());
+            let _ = wal.discard_undurable();
+        }
+        result
     }
 
     fn read_from_heap(

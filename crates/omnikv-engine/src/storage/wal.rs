@@ -22,6 +22,7 @@ use std::io::{BufReader, BufWriter, Read, Write};
 pub struct WriteAheadLog {
     path: String,
     writer: BufWriter<File>,
+    durable_offset: u64,
 }
 
 impl WriteAheadLog {
@@ -33,9 +34,13 @@ impl WriteAheadLog {
             .open(path)
             .map_err(|e| OmniError::IoError(format!("WAL open: {}", e)))?;
 
+        // An existing WAL's bytes are already on stable storage.
+        let durable_offset = file.metadata().map(|m| m.len()).unwrap_or(0);
+
         Ok(Self {
             path: path.to_string(),
             writer: BufWriter::new(file),
+            durable_offset,
         })
     }
 
@@ -214,11 +219,37 @@ impl WriteAheadLog {
     /// Fsync the WAL file to stable storage.
     /// Called by group commit leader after all writers in the group have
     /// appended their batches.
-    pub fn sync(&self) -> Result<(), OmniError> {
-        self.writer
+    pub fn sync(&mut self) -> Result<(), OmniError> {
+        let len = self
+            .writer
             .get_ref()
-            .sync_data()
-            .map_err(|e| OmniError::IoError(format!("WAL fsync: {}", e)))
+            .metadata()
+            .map(|m| m.len())
+            .unwrap_or(0);
+        match self.writer.get_ref().sync_data() {
+            Ok(()) => {
+                self.durable_offset = len;
+                Ok(())
+            }
+            Err(e) => Err(OmniError::IoError(format!("WAL fsync: {}", e))),
+        }
+    }
+
+    /// Truncates the WAL to the last offset known to be on stable storage.
+    pub fn discard_undurable(&mut self) -> Result<(), OmniError> {
+        self.writer
+            .flush()
+            .map_err(|e| OmniError::IoError(format!("WAL flush before truncate: {}", e)))?;
+        let file = OpenOptions::new()
+            .write(true)
+            .open(&self.path)
+            .map_err(|e| OmniError::IoError(format!("WAL reopen for truncate: {}", e)))?;
+        file.set_len(self.durable_offset)
+            .map_err(|e| OmniError::IoError(format!("WAL truncate: {}", e)))?;
+        file.sync_all()
+            .map_err(|e| OmniError::IoError(format!("WAL truncate fsync: {}", e)))?;
+        self.writer = BufWriter::new(file);
+        Ok(())
     }
 
     /// Rotate the WAL — truncate the current segment.
@@ -232,6 +263,7 @@ impl WriteAheadLog {
             .map_err(|e| OmniError::IoError(format!("WAL rotate: {}", e)))?;
 
         self.writer = BufWriter::new(file);
+        self.durable_offset = 0;
         Ok(())
     }
 
