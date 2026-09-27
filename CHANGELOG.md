@@ -116,6 +116,16 @@
   heap lock is also held across the WAL fsync, so no writer can interleave
   a heap append between the two and end up with a durable commit marker
   over un-durable heap bytes.
+- The TCP command interface no longer puts the JWT on the wire in
+  cleartext: TLS 1.3 is now the default transport (`OMNIKV_TCP_TLS=true`),
+  with a self-signed certificate generated at boot from the same material
+  QUIC uses and ALPN `omnikv/1`. The interface is JWT-gated, so without
+  encryption `AUTH` handed the credential to anyone on the path to capture
+  and replay; the config validator now refuses a public bind with TLS off,
+  and `OMNIKV_TCP_TLS=false` is only meaningful on loopback, for telnet
+  debugging. A plaintext command sent to a TLS-enabled port gets no
+  protocol reply — only the alert refusing bytes that are not a
+  ClientHello.
 
 - DML inside a `BEGIN` block is now transactional (issue #121):
   `INSERT`/`UPDATE`/`DELETE` (and legacy KV writes) previously committed

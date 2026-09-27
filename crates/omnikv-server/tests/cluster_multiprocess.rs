@@ -192,13 +192,16 @@ fn fresh_node_dir(id: u64) -> std::path::PathBuf {
 /// The command for one cluster node: distinct TCP/HTTP/QUIC/pgwire/
 /// raft ports, a private data dir, fast election timers (the test must
 /// converge in seconds, not minutes).
-fn spawn_node(id: u64, ports: &[(u16, u16, u16, u16, u16)]) -> Node {
+fn spawn_node(id: u64, ports: &[(u16, u16, u16, u16, u16)], tcp_tls: bool) -> Node {
     let idx = usize::try_from(id - 1).expect("node id fits usize");
     let (tcp, http, quic, pgwire, raft) = ports[idx];
     let dir = fresh_node_dir(id);
     let child = Command::new(env!("CARGO_BIN_EXE_omnikv-server"))
         .env("OMNIKV_MODE", "development")
         .env("OMNIKV_TCP_ADDR", format!("127.0.0.1:{tcp}"))
+        // These tests speak the command protocol in the clear over
+        // loopback; they exercise the AUTH gate, not the transport.
+        .env("OMNIKV_TCP_TLS", if tcp_tls { "true" } else { "false" })
         .env("OMNIKV_HTTP_ADDR", format!("127.0.0.1:{http}"))
         .env("OMNIKV_QUIC_ADDR", format!("127.0.0.1:{quic}"))
         .env("OMNIKV_PGWIRE_ADDR", format!("127.0.0.1:{pgwire}"))
@@ -267,7 +270,7 @@ fn boot_cluster() -> Vec<Node> {
             )
         })
         .collect();
-    let nodes: Vec<Node> = (1..=3).map(|id| spawn_node(id, &ports)).collect();
+    let nodes: Vec<Node> = (1..=3).map(|id| spawn_node(id, &ports, false)).collect();
 
     let deadline = Instant::now() + Duration::from_secs(30);
     for node in &nodes {
@@ -568,4 +571,67 @@ fn find_leader_among(nodes: &[(u16, u64)]) -> Option<(u16, u64)> {
         }
     }
     None
+}
+
+/// One node with TLS on the command interface, listening and ready.
+fn boot_tls_node() -> Node {
+    let ports: Vec<(u16, u16, u16, u16, u16)> = (0..5)
+        .map(|_| {
+            (
+                free_port(),
+                free_port(),
+                free_port(),
+                free_port(),
+                free_port(),
+            )
+        })
+        .collect();
+    let node = spawn_node(1, &ports, true);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        assert!(
+            Instant::now() <= deadline,
+            "TLS node listener never came up"
+        );
+        if TcpStream::connect(("127.0.0.1", node.tcp_port())).is_ok() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    node
+}
+
+/// The interface refuses to speak the command protocol in the clear: a
+/// client that sends a plaintext command to a TLS-enabled port gets no
+/// protocol reply at all, because the handshake it never performed is
+/// what would have unlocked one. Without this, the JWT would cross the
+/// wire unencrypted on any bind an operator left TLS off for.
+#[test]
+fn tls_enabled_port_refuses_plaintext_commands() {
+    let node = boot_tls_node();
+    let mut stream =
+        TcpStream::connect(("127.0.0.1", node.tcp_port())).expect("connect to TLS node");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("set read timeout");
+    stream.write_all(b"PING\n").expect("send plaintext probe");
+
+    let mut buf = [0u8; 128];
+    match stream.read(&mut buf) {
+        // The server held the connection until the deadline — nothing was
+        // said in the clear either way.
+        Ok(0) | Err(_) => {}
+        Ok(n) => {
+            let got = &buf[..n];
+            // The right reaction is a TLS alert refusing bytes that are
+            // not a ClientHello — a protocol reply would mean the JWT was
+            // readable off the wire without a handshake. Replies are
+            // newline-terminated; an alert is not.
+            assert!(
+                !got.contains(&b'\n'),
+                "TLS port answered a plaintext command: {:?}",
+                String::from_utf8_lossy(got)
+            );
+        }
+    }
 }

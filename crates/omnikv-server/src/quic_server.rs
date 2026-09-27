@@ -60,6 +60,23 @@ pub fn generate_self_signed_cert()
     Ok((vec![cert_der], key_der))
 }
 
+/// Build a TLS 1.3 acceptor for the TCP command interface from the same
+/// self-signed material QUIC uses.
+pub fn build_tcp_tls_acceptor(
+    certs: Vec<CertificateDer<'static>>,
+    key: PrivateKeyDer<'static>,
+) -> Result<tokio_rustls::TlsAcceptor, String> {
+    // TLS 1.3 only: 1.2 has no reason to exist on a single-vendor interface
+    // and accepting it widens the downgrade surface.
+    let mut config =
+        rustls::ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .map_err(|e| format!("TLS config: {}", e))?;
+    config.alpn_protocols = vec![b"omnikv/1".to_vec()];
+    Ok(tokio_rustls::TlsAcceptor::from(Arc::new(config)))
+}
+
 /// Create a QUIC server endpoint.
 pub fn create_server_endpoint(
     bind_addr: &str,

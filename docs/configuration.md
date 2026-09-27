@@ -52,6 +52,7 @@ cargo run -p omnikv-server -- --config /etc/omnikv/omnikv.toml
 | `OMNIKV_PGWIRE_ADDR` | `127.0.0.1:5432` | PostgreSQL wire protocol address |
 | `OMNIKV_TCP_ADDR` | `127.0.0.1:7072` | TCP command interface address |
 | `OMNIKV_TCP_BIND_PUBLIC` | `false` | Required to set a non-loopback `OMNIKV_TCP_ADDR` |
+| `OMNIKV_TCP_TLS` | `true` | TLS 1.3 on the TCP command interface; plaintext is only safe on loopback |
 | `OMNIKV_JWT_SECRET` | dev default | JWT signing secret (≥ 32 chars required in production) |
 | `OMNIKV_BOOTSTRAP_ADMIN_KEY` | dev default | Bootstrap key for `POST /auth/token` (≥ 32 chars required in production) |
 | `OMNIKV_TLS_CERT_PATH` | _(none)_ | Path to TLS certificate (PEM) |
@@ -138,10 +139,14 @@ Prometheus metrics expose maintenance health:
   and the server refuses to boot otherwise. A public bind still exposes
   an unrestricted read/write path to every host that can reach the port,
   so prefer REST (TLS, scoped roles) or PgWire for off-node access. The
-  interface has no transport encryption: `AUTH` sends the token in
-  cleartext, so on a public bind the credential is readable by anyone on
-  the path — bind it where the network is already trusted, or terminate
-  TLS in a sidecar in front of it.
+  interface encrypts the transport with TLS 1.3 (`OMNIKV_TCP_TLS=true`,
+  the default), so `AUTH` never puts the token on the wire in cleartext.
+  The certificate is self-signed and generated at boot from the same
+  material QUIC uses, so a client must pin it or trust it out of band
+  until operator-supplied certificates are wired in. Setting
+  `OMNIKV_TCP_TLS=false` is refused for a public bind and only makes
+  sense on loopback, where a plaintext session is convenient for telnet
+  debugging — the token is then visible to any process on the host.
 - Tune rate limits for your workload and alert on
   `omnikv_rate_limit_rejections_total{protocol=...}`.
 - Alert on `omnikv_cleanup_delete_failures_total{context=...,error_kind=...}`;

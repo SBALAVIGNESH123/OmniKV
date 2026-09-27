@@ -146,6 +146,12 @@ pub struct ServerConfig {
     /// host that can reach the port, so it never happens by accident.
     #[serde(default)]
     pub tcp_bind_public: bool,
+    /// Whether the TCP command interface requires TLS. On by default: the
+    /// interface is JWT-gated, and without TLS the token crosses the wire in
+    /// cleartext for anyone on the path to capture and replay. Loopback is
+    /// the only place plaintext is tolerated, for local telnet debugging.
+    #[serde(default = "default_tcp_tls")]
+    pub tcp_tls: bool,
     #[serde(default = "default_jwt_secret")]
     pub jwt_secret: String,
     #[serde(default = "default_bootstrap_admin_key")]
@@ -186,6 +192,10 @@ fn default_tcp_addr() -> String {
     "127.0.0.1:7072".into()
 }
 
+fn default_tcp_tls() -> bool {
+    true
+}
+
 fn default_jwt_secret() -> String {
     DEV_JWT_SECRET.into()
 }
@@ -219,6 +229,7 @@ impl Default for ServerConfig {
             pgwire_addr: default_pgwire_addr(),
             tcp_addr: default_tcp_addr(),
             tcp_bind_public: false,
+            tcp_tls: default_tcp_tls(),
             jwt_secret: default_jwt_secret(),
             bootstrap_admin_key: default_bootstrap_admin_key(),
             rate_limit_per_sec: default_rate_limit_per_sec(),
@@ -300,6 +311,9 @@ impl ServerConfig {
         }
         if let Ok(v) = std::env::var("OMNIKV_TCP_BIND_PUBLIC") {
             self.tcp_bind_public = parse_env_value("OMNIKV_TCP_BIND_PUBLIC", &v)?;
+        }
+        if let Ok(v) = std::env::var("OMNIKV_TCP_TLS") {
+            self.tcp_tls = parse_env_value("OMNIKV_TCP_TLS", &v)?;
         }
         if let Ok(v) = std::env::var("OMNIKV_JWT_SECRET") {
             self.jwt_secret = v;
@@ -602,6 +616,16 @@ impl ServerConfig {
                 "tcp_bind_public is set but jwt_secret is the built-in dev \
                  value, which is public — anyone can forge a token. Set \
                  OMNIKV_JWT_SECRET to a strong 32+ character secret"
+                    .into(),
+            ));
+        }
+        // A public bind with TLS off puts the JWT on the wire in cleartext.
+        // Loopback is the only place that is safe to disable.
+        if self.tcp_bind_public && !self.tcp_tls {
+            return Err(ConfigError(
+                "tcp_bind_public is set but tcp_tls is disabled — the JWT \
+                 would cross the network in cleartext. Set OMNIKV_TCP_TLS=true \
+                 or bind to a loopback address"
                     .into(),
             ));
         }

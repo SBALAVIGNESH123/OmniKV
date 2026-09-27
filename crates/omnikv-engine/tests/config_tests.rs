@@ -959,3 +959,55 @@ fn test_tcp_public_bind_env_opt_in_round_trip() {
         },
     );
 }
+
+#[test]
+fn test_tcp_tls_is_on_by_default() {
+    // The interface is JWT-gated, and without TLS the token crosses the
+    // wire in cleartext for anyone on the path to capture and replay.
+    // Encryption has to be the default, not a choice an operator makes
+    // after reading an incident report.
+    let cfg = ServerConfig::default();
+    assert!(cfg.tcp_tls);
+}
+
+#[test]
+fn test_tcp_public_bind_requires_tls() {
+    // Loopback is the only place plaintext is tolerated — for local
+    // telnet debugging. Off the loopback the JWT must never be sent in
+    // the clear, so a public bind with TLS off is a configuration error,
+    // not a warning in a log nobody reads.
+    let mut cfg = ServerConfig {
+        tcp_addr: "0.0.0.0:8080".into(),
+        tcp_bind_public: true,
+        tcp_tls: false,
+        jwt_secret: "a-real-secret-not-the-dev-one-0123456789".into(),
+        ..Default::default()
+    };
+    let err = cfg.validate_runtime().unwrap_err();
+    assert!(
+        err.0.contains("tcp_tls") && err.0.contains("cleartext"),
+        "public bind with TLS off must name the exposed token: {err}"
+    );
+
+    cfg.tcp_tls = true;
+    cfg.validate_runtime()
+        .unwrap_or_else(|e| panic!("public bind with TLS on must validate: {e}"));
+
+    // Loopback keeps the right to go plaintext.
+    cfg.tcp_addr = "127.0.0.1:7072".into();
+    cfg.tcp_bind_public = false;
+    cfg.tcp_tls = false;
+    cfg.validate_runtime()
+        .unwrap_or_else(|e| panic!("loopback without TLS must validate: {e}"));
+}
+
+#[test]
+fn test_tcp_tls_env_switch() {
+    // The debugging escape hatch is an env var, the same way every other
+    // interface knob is turned.
+    with_env(&[("OMNIKV_TCP_TLS", "false")], || {
+        let mut cfg = ServerConfig::default();
+        cfg.apply_env().unwrap();
+        assert!(!cfg.tcp_tls, "OMNIKV_TCP_TLS=false must switch it off");
+    });
+}
