@@ -1950,7 +1950,9 @@ impl OmniKV {
 
         if let Err(ref e) = result {
             self.group_commit.poison(e.clone());
-            let _ = wal.discard_undurable();
+            if let Err(te) = wal.discard_undurable() {
+                eprintln!("[WAL] failed to discard undurable bytes after fsync failure: {te:?}");
+            }
         }
         result
     }

@@ -163,6 +163,40 @@ fn a_failed_sync_poisons_the_engine() {
     );
 }
 
+/// A waiter queued for the next epoch when a sync fails must not be promoted
+/// to leader afterwards: it would sync a truncated WAL and get acknowledged
+/// for bytes that are no longer there.
+#[test]
+fn a_waiter_is_not_promoted_after_a_poisoned_sync() {
+    let engine = Arc::new(GroupCommitEngine::new(100));
+    let g1 = engine.join_group().expect("first leader");
+
+    let engine2 = engine.clone();
+    let handle = thread::spawn(move || {
+        // The guard borrows the engine, so it must be consumed here.
+        engine2.join_group().map(|g| {
+            let was_leader = g.is_leader;
+            g.mark_synced(Ok(()));
+            was_leader
+        })
+    });
+
+    wait_for_pending(&engine, 1);
+    g1.mark_synced(Err(omni_engine::OmniError::IoError(
+        "simulated fsync failure".into(),
+    )));
+
+    let outcome = handle.join().expect("joiner thread");
+    assert!(
+        outcome.is_err(),
+        "a waiter queued before the failure must be failed, not promoted"
+    );
+    assert!(engine.is_poisoned());
+    assert!(engine.join_group().is_err());
+    let (_, pending) = engine.stats();
+    assert_eq!(pending, 0, "the waiter must not be stranded");
+}
+
 /// After a failed fsync, the undurable WAL bytes must be physically gone, not
 /// merely unf-synced: the kernel's own writeback could otherwise flush them.
 #[test]

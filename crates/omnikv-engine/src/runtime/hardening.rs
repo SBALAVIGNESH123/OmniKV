@@ -141,6 +141,11 @@ impl GroupCommitEngine {
                 });
             }
 
+            if let Some(err) = state.poisoned.clone() {
+                let _ = state.release(needed);
+                return Err(err);
+            }
+
             if state.current_epoch == 0 {
                 // Epochs are handed out in order, so the next one is the
                 // epoch this writer needs.
