@@ -405,6 +405,32 @@ const TCP_LINE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60
 /// Commands are framed on newlines, so a client may pipeline several
 /// commands per segment; lines above [`MAX_TCP_LINE`] are rejected and the
 /// connection closed.
+///
+/// The handshake is bounded by [`TCP_AUTH_DEADLINE`]: a peer that opens a
+/// connection and never sends a ClientHello holds a session permit for the
+/// same reason an unauthenticated session does, and the permit pool is
+/// what keeps the interface available to real clients.
+async fn tcp_tls_handshake(
+    acceptor: &tokio_rustls::TlsAcceptor,
+    socket: tokio::net::TcpStream,
+    peer: std::net::SocketAddr,
+) -> Option<tokio_rustls::server::TlsStream<tokio::net::TcpStream>> {
+    match tokio::time::timeout(TCP_AUTH_DEADLINE, acceptor.accept(socket)).await {
+        Ok(Ok(tls)) => Some(tls),
+        Ok(Err(e)) => {
+            tracing::debug!(peer = %peer, "TCP TLS handshake failed: {e}");
+            None
+        }
+        Err(_) => {
+            tracing::warn!(
+                peer = %peer,
+                "dropping TCP session: TLS handshake exceeded the auth deadline"
+            );
+            None
+        }
+    }
+}
+
 async fn run_tcp_server(
     db: Arc<OmniKV>,
     addr: &str,
@@ -449,24 +475,14 @@ async fn run_tcp_server(
         tokio::spawn(async move {
             // Held for the session: released on drop, when the task ends.
             let _permit = permit;
-            // A failed handshake never proved it could speak the interface's
-            // TLS, so there is no session to authenticate or command to read.
             if let Some(acceptor) = acceptor {
-                match acceptor.accept(socket).await {
-                    Ok(tls) => {
-                        handle_tcp_connection(
-                            tls,
-                            peer,
-                            db,
-                            jwt_secret,
-                            rate_limiter,
-                            auth_tracker,
-                        )
+                // A peer that connects and never sends a ClientHello would
+                // otherwise hold this permit until the idle timeout; 256 of
+                // them exhaust every session slot while the accept loop
+                // blocks real clients.
+                if let Some(tls) = tcp_tls_handshake(&acceptor, socket, peer).await {
+                    handle_tcp_connection(tls, peer, db, jwt_secret, rate_limiter, auth_tracker)
                         .await;
-                    }
-                    Err(e) => {
-                        tracing::debug!(peer = %peer, "TCP TLS handshake failed: {e}");
-                    }
                 }
             } else {
                 handle_tcp_connection(socket, peer, db, jwt_secret, rate_limiter, auth_tracker)
@@ -1723,6 +1739,40 @@ mod tests {
             server_tls.get_ref().1.alpn_protocol(),
             Some(&b"omnikv/1"[..]),
             "server negotiated the interface ALPN tag"
+        );
+    }
+
+    /// A peer that connects and never sends a ClientHello must not hold its
+    /// session permit — 256 such peers exhaust the pool and the interface
+    /// stops serving anyone. The auth deadline bounds the handshake for the
+    /// same reason it bounds an unauthenticated session.
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_tls_handshake_releases_the_session() {
+        super::install_rustls_crypto_provider();
+
+        let (certs, key) = quic_server::generate_self_signed_cert().expect("generate cert");
+        let acceptor = quic_server::build_tcp_tls_acceptor(certs, key).expect("acceptor");
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr");
+        // Connected, and deliberately never speaking TLS.
+        let _silent = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        let (server, peer) = listener.accept().await.expect("accept");
+
+        let started = tokio::time::Instant::now();
+        let tls = tcp_tls_handshake(&acceptor, server, peer).await;
+        assert!(
+            tls.is_none(),
+            "a stalled handshake must be dropped, not kept"
+        );
+
+        // The paused clock advances while nothing is runnable, so the
+        // deadline elapsed without sleeping it out.
+        assert!(
+            started.elapsed() >= TCP_AUTH_DEADLINE,
+            "the deadline that fired must be the auth deadline"
         );
     }
 }
