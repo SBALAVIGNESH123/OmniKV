@@ -50,20 +50,33 @@ mint_token() {
 
 # One TCP command round trip: AUTH and the command are pipelined on one
 # connection (the server frames by newline), and the reply we want is the
-# second line — the command's own answer.
+# second line — the command's own answer. The interface requires TLS 1.3
+# (ALPN omnikv/1). QUIT is appended so the server closes the session;
+# without it s_client blocks on the idle timeout and `set -e` aborts.
 tcp_cmd() {
   local port="$1" cmd="$2"
-  # shellcheck disable=SC2086
-  printf 'AUTH %s\n%s\n' "$TOKEN" "$cmd" \
-    | timeout 10 bash -c "exec 3<>/dev/tcp/127.0.0.1/$port; cat >&3; head -2 <&3 | tail -1"
+  printf 'AUTH %s\n%s\nQUIT\n' "$TOKEN" "$cmd" \
+    | timeout 10 openssl s_client -connect "127.0.0.1:$port" -alpn omnikv/1 -quiet 2>/dev/null \
+    | head -2 | tail -1 || true
 }
 
 # Same wire, deliberately no AUTH: the interface must refuse. Guards the
 # regression this script caught when the AUTH gate landed.
 tcp_cmd_unauthenticated() {
   local port="$1" cmd="$2"
-  # shellcheck disable=SC2086
-  printf '%s\n' "$cmd" | timeout 10 bash -c "exec 3<>/dev/tcp/127.0.0.1/$port; cat >&3; head -1 <&3"
+  printf '%s\nQUIT\n' "$cmd" \
+    | timeout 10 openssl s_client -connect "127.0.0.1:$port" -alpn omnikv/1 -quiet 2>/dev/null \
+    | head -1 || true
+}
+
+# Plaintext on a TLS port gets no protocol reply, only the alert refusing
+# bytes that are not a ClientHello — a reply here would mean the JWT was
+# readable off the wire without a handshake.
+plaintext_probe() {
+  local port="$1"
+  printf 'PING\n' \
+    | timeout 5 bash -c "exec 3<>/dev/tcp/127.0.0.1/$port; cat >&3; head -1 <&3" 2>/dev/null \
+    | tr -d '\0' || true
 }
 
 # The leadership oracle: SET succeeds only on the leader (followers
@@ -78,13 +91,15 @@ find_leader_port() {
   return 1
 }
 
-# Wait for all three TCP listeners, then for a leader (election may
-# take a few seconds with the default timers).
+# Wait for all three listeners to answer a command over TLS, then for a
+# leader (election may take a few seconds with the default timers).
 wait_for_cluster() {
   for _ in $(seq 1 60); do
     local up=true
     for port in "${TCP_PORTS[@]}"; do
-      if ! timeout 2 bash -c "exec 3<>/dev/tcp/127.0.0.1/$port" 2>/dev/null; then
+      # QUIT is one of the two commands the gate lets through before AUTH,
+      # so a "Goodbye" reply proves both the TLS handshake and the protocol.
+      if [[ "$(tcp_cmd_unauthenticated "$port" 'QUIT')" != *"Goodbye"* ]]; then
         up=false
         break
       fi
@@ -120,6 +135,17 @@ if [[ -z "$TOKEN" ]]; then
   echo "FAIL: could not mint a review token from https://127.0.0.1:${HTTP_PORT}/auth/token" >&2
   exit 1
 fi
+
+# The transport gate: a client that skips the TLS handshake gets no
+# protocol reply, so the JWT can never be read off the wire in the clear.
+for port in "${TCP_PORTS[@]}"; do
+  reply="$(plaintext_probe "$port")"
+  if [[ "$reply" =~ (Goodbye|ERR|OK|NOT_FOUND) ]]; then
+    echo "FAIL: node on :$port spoke the command protocol in plaintext: ${reply}" >&2
+    exit 1
+  fi
+done
+echo "PASS: all nodes require TLS on the command interface"
 
 # The AUTH gate itself: a command with no token must be refused.
 for port in "${TCP_PORTS[@]}"; do
