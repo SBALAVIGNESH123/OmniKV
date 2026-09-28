@@ -60,8 +60,10 @@ pub fn generate_self_signed_cert()
     Ok((vec![cert_der], key_der))
 }
 
-/// Build a TLS 1.3 acceptor for the TCP command interface from the same
-/// self-signed material QUIC uses.
+/// Build a TLS 1.3 acceptor for the TCP command interface. The caller
+/// supplies its own freshly generated key pair — this is not the QUIC
+/// endpoint's certificate, and a restart mints a new one, so a client that
+/// pins the leaf must re-pin after every boot.
 pub fn build_tcp_tls_acceptor(
     certs: Vec<CertificateDer<'static>>,
     key: PrivateKeyDer<'static>,

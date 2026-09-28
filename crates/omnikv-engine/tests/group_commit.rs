@@ -224,16 +224,93 @@ fn discard_undurable_removes_unfsynced_batches() {
     );
 }
 
+/// The durable offset must cover a batch its own fsync made durable. If it
+/// does not, a later `discard_undurable` truncates away a batch the client
+/// was already told succeeded — an acknowledged write silently disappears.
+#[test]
+fn discard_undurable_keeps_batches_durable_their_own_fsync_landed() {
+    use omni_engine::wal::WriteAheadLog;
+
+    let dir = tempfile::tempdir().expect("wal tempdir");
+    let path = dir.path().join("wal.bin");
+    let p = path.to_string_lossy().to_string();
+
+    let mut wal = WriteAheadLog::new(&p).expect("open wal");
+    let durable = make_batch();
+    wal.append_batch(&durable)
+        .expect("append with its own fsync");
+
+    let durable_len = std::fs::metadata(&p).unwrap().len();
+    assert!(durable_len > 0);
+
+    // An unsynced batch lands after the durable one, then is discarded.
+    wal.append_batch_nosync(&durable).expect("append nosync");
+    assert!(std::fs::metadata(&p).unwrap().len() > durable_len);
+    wal.discard_undurable().expect("truncate");
+
+    assert_eq!(
+        std::fs::metadata(&p).unwrap().len(),
+        durable_len,
+        "only the undurable batch must go; the fsynced one survives"
+    );
+    assert_eq!(
+        WriteAheadLog::replay(&p, "").unwrap().len(),
+        1,
+        "the durable batch must still replay"
+    );
+}
+
+/// A truncate that leaves the writer at offset zero would have the next
+/// append overwrite the retained batches instead of extending past them —
+/// durable data destroyed by the very write meant to follow it.
+#[test]
+fn appending_after_discard_extends_the_retained_batches() {
+    use omni_engine::wal::WriteAheadLog;
+
+    let dir = tempfile::tempdir().expect("wal tempdir");
+    let path = dir.path().join("wal.bin");
+    let p = path.to_string_lossy().to_string();
+
+    let mut wal = WriteAheadLog::new(&p).expect("open wal");
+    let batch = make_batch();
+    wal.append_batch(&batch).expect("append durable");
+    let durable_len = std::fs::metadata(&p).unwrap().len();
+
+    wal.discard_undurable()
+        .expect("truncate to the durable offset");
+    assert_eq!(std::fs::metadata(&p).unwrap().len(), durable_len);
+
+    wal.append_batch_nosync(&batch)
+        .expect("append after truncate");
+
+    assert_eq!(
+        WriteAheadLog::replay(&p, "").unwrap().len(),
+        2,
+        "both data records must survive: the retained one and the new one"
+    );
+    assert!(
+        std::fs::metadata(&p).unwrap().len() > durable_len,
+        "the new batch must extend the file, not overwrite the start"
+    );
+}
+
+/// One data record plus the commit marker replay requires: replay accepts
+/// only a batch that ends with `__COMMIT_MARKER__` and returns everything
+/// before it, so the marker is what makes the batch visible at all.
+fn make_batch() -> Vec<(omni_engine::OmniRecord, Option<Vec<u8>>)> {
+    vec![
+        (
+            omni_engine::OmniRecord::new(1, b"wal-durability-probe".to_vec(), 0, 0, 0, 0),
+            None,
+        ),
+        (make_marker(), None),
+    ]
+}
+
 fn make_marker() -> omni_engine::OmniRecord {
-    omni_engine::OmniRecord {
-        seq: 1,
-        key: b"__COMMIT_MARKER__".to_vec(),
-        offset: 0,
-        length: 0,
-        crc32: 0,
-        payload_crc32: 0,
-        expiry: 0,
-    }
+    // OmniRecord::new signs the record; a hand-rolled one with crc32: 0 is
+    // rejected by replay's own integrity check and proves nothing.
+    omni_engine::OmniRecord::new(1, b"__COMMIT_MARKER__".to_vec(), 0, 0, 0, 0)
 }
 
 /// Blocks until exactly `n` writers are queued as waiters. Used instead of a

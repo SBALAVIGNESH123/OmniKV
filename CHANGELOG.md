@@ -118,14 +118,31 @@
   over un-durable heap bytes.
 - The TCP command interface no longer puts the JWT on the wire in
   cleartext: TLS 1.3 is now the default transport (`OMNIKV_TCP_TLS=true`),
-  with a self-signed certificate generated at boot from the same material
-  QUIC uses and ALPN `omnikv/1`. The interface is JWT-gated, so without
+  with a self-signed certificate freshly generated for the interface on
+  every boot (a new key pair each restart, not the QUIC endpoint's
+  certificate) and ALPN `omnikv/1`. The interface is JWT-gated, so without
   encryption `AUTH` handed the credential to anyone on the path to capture
   and replay; the config validator now refuses a public bind with TLS off,
   and `OMNIKV_TCP_TLS=false` is only meaningful on loopback, for telnet
   debugging. A plaintext command sent to a TLS-enabled port gets no
   protocol reply — only the alert refusing bytes that are not a
-  ClientHello.
+  ClientHello. The TLS handshake is bounded by the auth deadline: a peer
+  that connects and never sends a ClientHello would otherwise hold a
+  session permit until the idle timeout, and 256 such peers exhaust the
+  session pool while the accept loop blocks real clients.
+- The WAL's durable-offset accounting can no longer report durability it
+  does not have. A successful fsync advances the offset by the byte count
+  it flushed instead of by a `metadata()` length that a filesystem error
+  would collapse to zero — the zero path let a later
+  `discard_undurable()` truncate away batches that were already on stable
+  storage, discarding writes the client had been told succeeded. Both
+  fsync entry points (`append_batch` and the group-commit `sync()`) now
+  advance the same counter, and a WAL that cannot report its own length at
+  open fails rather than assuming it is empty. `discard_undurable()` also
+  seeks the reopened writer to the end of the retained bytes, so the next
+  append extends them — the write-mode reopen Windows requires left the
+  cursor at zero, and an append then overwrote the batches the truncation
+  had just preserved.
 
 - DML inside a `BEGIN` block is now transactional (issue #121):
   `INSERT`/`UPDATE`/`DELETE` (and legacy KV writes) previously committed

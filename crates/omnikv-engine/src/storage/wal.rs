@@ -1,6 +1,6 @@
 use crate::{OmniError, OmniRecord};
 use std::fs::{File, OpenOptions};
-use std::io::{BufReader, BufWriter, Read, Write};
+use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 
 // =============================================================
 // WRITE-AHEAD LOG (WAL) — With Per-Batch CRC32 Checksumming
@@ -23,6 +23,10 @@ pub struct WriteAheadLog {
     path: String,
     writer: BufWriter<File>,
     durable_offset: u64,
+    /// Bytes appended since `durable_offset` was last advanced. Tracked
+    /// incrementally so a successful fsync records exactly what it
+    /// flushed, instead of asking the filesystem how big the file is.
+    pending: u64,
 }
 
 impl WriteAheadLog {
@@ -34,13 +38,19 @@ impl WriteAheadLog {
             .open(path)
             .map_err(|e| OmniError::IoError(format!("WAL open: {}", e)))?;
 
-        // An existing WAL's bytes are already on stable storage.
-        let durable_offset = file.metadata().map(|m| m.len()).unwrap_or(0);
+        // An existing WAL's bytes are already on stable storage. A failure
+        // here means the durable offset is unknown, not zero: assuming zero
+        // would let a later truncate discard persisted batches.
+        let durable_offset = file
+            .metadata()
+            .map(|m| m.len())
+            .map_err(|e| OmniError::IoError(format!("WAL length: {}", e)))?;
 
         Ok(Self {
             path: path.to_string(),
             writer: BufWriter::new(file),
             durable_offset,
+            pending: 0,
         })
     }
 
@@ -175,6 +185,10 @@ impl WriteAheadLog {
             .flush()
             .map_err(|e| OmniError::IoError(format!("WAL flush: {}", e)))?;
 
+        // Counted only after the bytes actually landed: a write that failed
+        // partway must not be reported as durable by a later sync.
+        self.pending += batch_buf.len() as u64 + std::mem::size_of::<u32>() as u64;
+
         // sync_data() pushes kernel page cache → stable storage (disk/SSD)
         // Without this, a power loss after flush() can lose committed data.
         // fdatasync is sufficient here — we don't need metadata (sync_all).
@@ -182,6 +196,7 @@ impl WriteAheadLog {
             .get_ref()
             .sync_data()
             .map_err(|e| OmniError::IoError(format!("WAL fsync: {}", e)))?;
+        self.mark_pending_durable();
 
         Ok(())
     }
@@ -213,22 +228,26 @@ impl WriteAheadLog {
         self.writer
             .flush()
             .map_err(|e| OmniError::IoError(format!("WAL flush: {}", e)))?;
+        self.pending += batch_buf.len() as u64 + std::mem::size_of::<u32>() as u64;
         Ok(())
+    }
+
+    /// A fsync that succeeded made every appended byte durable. Advance the
+    /// offset from the byte count rather than re-reading the file length: a
+    /// filesystem that cannot report the length must not be answered with
+    /// zero, which would let a later truncate discard persisted batches.
+    fn mark_pending_durable(&mut self) {
+        self.durable_offset += self.pending;
+        self.pending = 0;
     }
 
     /// Fsync the WAL file to stable storage.
     /// Called by group commit leader after all writers in the group have
     /// appended their batches.
     pub fn sync(&mut self) -> Result<(), OmniError> {
-        let len = self
-            .writer
-            .get_ref()
-            .metadata()
-            .map(|m| m.len())
-            .unwrap_or(0);
         match self.writer.get_ref().sync_data() {
             Ok(()) => {
-                self.durable_offset = len;
+                self.mark_pending_durable();
                 Ok(())
             }
             Err(e) => Err(OmniError::IoError(format!("WAL fsync: {}", e))),
@@ -240,7 +259,12 @@ impl WriteAheadLog {
         self.writer
             .flush()
             .map_err(|e| OmniError::IoError(format!("WAL flush before truncate: {}", e)))?;
-        let file = OpenOptions::new()
+        // Reopened without append mode: on Windows, set_len on an
+        // append-mode handle fails with access denied. That means the new
+        // writer's cursor sits at zero, so it must be moved to the end
+        // before the next append — otherwise the retained batches are
+        // overwritten instead of extended.
+        let mut file = OpenOptions::new()
             .write(true)
             .open(&self.path)
             .map_err(|e| OmniError::IoError(format!("WAL reopen for truncate: {}", e)))?;
@@ -248,7 +272,10 @@ impl WriteAheadLog {
             .map_err(|e| OmniError::IoError(format!("WAL truncate: {}", e)))?;
         file.sync_all()
             .map_err(|e| OmniError::IoError(format!("WAL truncate fsync: {}", e)))?;
+        file.seek(SeekFrom::End(0))
+            .map_err(|e| OmniError::IoError(format!("WAL seek after truncate: {}", e)))?;
         self.writer = BufWriter::new(file);
+        self.pending = 0;
         Ok(())
     }
 
@@ -264,6 +291,7 @@ impl WriteAheadLog {
 
         self.writer = BufWriter::new(file);
         self.durable_offset = 0;
+        self.pending = 0;
         Ok(())
     }
 
