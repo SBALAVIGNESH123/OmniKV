@@ -249,7 +249,8 @@ async fn spawn_protocol_servers(
     let router = api::build_router(app_state);
 
     // ─── 1. HTTP/1.1 + HTTP/2 (TLS, ALPN) ──────────────────────
-    let (certs, key) = quic_server::generate_self_signed_cert()?;
+    let (certs, key) =
+        quic_server::server_identity(cfg.tls_cert_path.as_deref(), cfg.tls_key_path.as_deref())?;
     let tls_config = axum_server::tls_rustls::RustlsConfig::from_der(
         certs.iter().map(|c| c.as_ref().to_vec()).collect(),
         key.secret_der().to_vec(),
@@ -274,7 +275,8 @@ async fn spawn_protocol_servers(
     });
 
     // ─── 2. QUIC/HTTP3 Binary Protocol ─────────────────────────
-    let (quic_certs, quic_key) = quic_server::generate_self_signed_cert()?;
+    let (quic_certs, quic_key) =
+        quic_server::server_identity(cfg.tls_cert_path.as_deref(), cfg.tls_key_path.as_deref())?;
     let quic_endpoint = quic_server::create_server_endpoint(&quic_addr_str, quic_certs, quic_key)?;
     let quic_db = db.clone();
     let quic_rate_limiter = rate_limiter.clone();
@@ -304,7 +306,10 @@ async fn spawn_protocol_servers(
     let tcp_rate_limiter = rate_limiter.clone();
     let tcp_tls = cfg.tcp_tls;
     let tcp_acceptor = if tcp_tls {
-        let (certs, key) = quic_server::generate_self_signed_cert()?;
+        let (certs, key) = quic_server::server_identity(
+            cfg.tls_cert_path.as_deref(),
+            cfg.tls_key_path.as_deref(),
+        )?;
         Some(quic_server::build_tcp_tls_acceptor(certs, key)?)
     } else {
         None

@@ -40,6 +40,54 @@ impl OpCode {
     }
 }
 
+/// The certificate and private key a listener presents. Operator-supplied
+/// PEM takes priority; without it a self-signed pair is minted at boot, so
+/// development binds work with no configuration and production fails closed
+/// unless `OMNIKV_TLS_INSECURE_SKIP` is set (see config validation).
+///
+/// Every caller gets its own key pair — the fallback deliberately does not
+/// share one across listeners, so a compromise of one interface's material
+/// does not forge another's.
+pub fn server_identity(
+    cert_path: Option<&str>,
+    key_path: Option<&str>,
+) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>), String> {
+    match (cert_path, key_path) {
+        (Some(cert_path), Some(key_path)) => {
+            let certs = read_certs(cert_path)?;
+            if certs.is_empty() {
+                return Err(format!("no certificates found in {cert_path}"));
+            }
+            let key = read_key(key_path)?;
+            Ok((certs, key))
+        }
+        // Config validation requires both or neither, so a lone path here
+        // means validation was bypassed — refuse rather than half-encrypt.
+        (Some(_), None) | (None, Some(_)) => {
+            Err("tls_cert_path and tls_key_path must be set together".into())
+        }
+        (None, None) => generate_self_signed_cert(),
+    }
+}
+
+fn read_certs(path: &str) -> Result<Vec<CertificateDer<'static>>, String> {
+    let mut reader = std::io::BufReader::new(
+        std::fs::File::open(path).map_err(|e| format!("open cert {path}: {e}"))?,
+    );
+    rustls_pemfile::certs(&mut reader)
+        .collect::<Result<_, _>>()
+        .map_err(|e| format!("parse cert {path}: {e}"))
+}
+
+fn read_key(path: &str) -> Result<PrivateKeyDer<'static>, String> {
+    let mut reader = std::io::BufReader::new(
+        std::fs::File::open(path).map_err(|e| format!("open key {path}: {e}"))?,
+    );
+    rustls_pemfile::private_key(&mut reader)
+        .map_err(|e| format!("parse key {path}: {e}"))?
+        .ok_or_else(|| format!("no private key found in {path}"))
+}
+
 /// Generate self-signed TLS certificates for QUIC.
 pub fn generate_self_signed_cert()
 -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>), String> {
@@ -369,6 +417,115 @@ mod tests {
         );
         let second = handle_authenticated_request(&db, &frame, secret, &rate_limiter);
         assert!(String::from_utf8_lossy(&second).starts_with("ERR RATE_LIMITED"));
+    }
+
+    /// Write a self-signed pair to `dir` and return the PEM paths.
+    fn write_pem_pair(dir: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
+        let key_pair = rcgen::KeyPair::generate().expect("key");
+        let params = rcgen::CertificateParams::new(vec!["localhost".into()]).expect("params");
+        let cert = params.self_signed(&key_pair).expect("cert");
+        let cert_path = dir.join("cert.pem");
+        let key_path = dir.join("key.pem");
+        std::fs::write(&cert_path, cert.pem()).expect("write cert pem");
+        std::fs::write(&key_path, key_pair.serialize_pem()).expect("write key pem");
+        (cert_path, key_path)
+    }
+
+    #[test]
+    fn operator_pem_is_presented_verbatim() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (cert_path, key_path) = write_pem_pair(dir.path());
+        let (certs, key) = server_identity(
+            Some(cert_path.to_str().expect("path")),
+            Some(key_path.to_str().expect("path")),
+        )
+        .expect("load operator identity");
+
+        assert_eq!(certs.len(), 1, "exactly the operator's leaf, no more");
+
+        // The bytes on disk are the bytes on the wire.
+        let mut reader = std::io::Cursor::new(std::fs::read(&cert_path).expect("read pem"));
+        let reloaded = rustls_pemfile::certs(&mut reader)
+            .collect::<Result<Vec<_>, _>>()
+            .expect("reparse pem");
+        assert_eq!(
+            reloaded, certs,
+            "the listener must present the operator's bytes"
+        );
+
+        assert!(
+            !key.secret_der().is_empty(),
+            "the operator's private key must load alongside it"
+        );
+    }
+
+    #[test]
+    fn rotating_the_pem_files_changes_the_presented_certificate() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (cert_path, key_path) = write_pem_pair(dir.path());
+        let (first, _) = server_identity(
+            Some(cert_path.to_str().expect("path")),
+            Some(key_path.to_str().expect("path")),
+        )
+        .expect("first load");
+        assert_eq!(first.len(), 1);
+
+        let (new_cert, new_key) = write_pem_pair(dir.path());
+        std::fs::write(&cert_path, std::fs::read(&new_cert).unwrap()).unwrap();
+        std::fs::write(&key_path, std::fs::read(&new_key).unwrap()).unwrap();
+
+        let (second, _) = server_identity(
+            Some(cert_path.to_str().expect("path")),
+            Some(key_path.to_str().expect("path")),
+        )
+        .expect("second load");
+        assert_eq!(second.len(), 1);
+        assert_ne!(
+            second[0].as_ref(),
+            first[0].as_ref(),
+            "a rotated cert must replace the old one, not append alongside it"
+        );
+    }
+
+    #[test]
+    fn a_lone_cert_or_key_path_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (cert_path, key_path) = write_pem_pair(dir.path());
+
+        let err = server_identity(Some(cert_path.to_str().unwrap()), None).unwrap_err();
+        assert!(err.contains("together"), "half-configured TLS: {err}");
+
+        let err = server_identity(None, Some(key_path.to_str().unwrap())).unwrap_err();
+        assert!(err.contains("together"), "half-configured TLS: {err}");
+    }
+
+    #[test]
+    fn an_empty_cert_file_is_refused_not_presented_as_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (_, key_path) = write_pem_pair(dir.path());
+        let cert_path = dir.path().join("empty.pem");
+        std::fs::write(&cert_path, "not a certificate").expect("write junk");
+
+        let err = server_identity(
+            Some(cert_path.to_str().expect("path")),
+            Some(key_path.to_str().expect("path")),
+        )
+        .unwrap_err();
+        assert!(
+            !err.is_empty(),
+            "unparseable cert must fail loudly, not fall back"
+        );
+        assert!(
+            err.contains("empty.pem") || err.contains("no certificates"),
+            "err names the file: {err}"
+        );
+    }
+
+    #[test]
+    fn without_operator_pem_a_pair_is_minted() {
+        let (certs, key) = server_identity(None, None).expect("fallback identity");
+        assert_eq!(certs.len(), 1);
+        assert!(!key.secret_der().is_empty());
     }
 }
 
