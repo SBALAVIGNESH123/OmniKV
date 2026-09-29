@@ -118,9 +118,11 @@
   over un-durable heap bytes.
 - The TCP command interface no longer puts the JWT on the wire in
   cleartext: TLS 1.3 is now the default transport (`OMNIKV_TCP_TLS=true`),
-  with a self-signed certificate freshly generated for the interface on
-  every boot (a new key pair each restart, not the QUIC endpoint's
-  certificate) and ALPN `omnikv/1`. The interface is JWT-gated, so without
+  with ALPN `omnikv/1`. The certificate is the operator-supplied pair from
+  `OMNIKV_TLS_CERT_PATH` / `OMNIKV_TLS_KEY_PATH` when both are set — the
+  same material HTTP and QUIC present — and otherwise freshly generated for
+  the interface on every boot (a new key pair each restart, not the QUIC
+  endpoint's certificate). The interface is JWT-gated, so without
   encryption `AUTH` handed the credential to anyone on the path to capture
   and replay; the config validator now refuses a public bind with TLS off,
   and `OMNIKV_TCP_TLS=false` is only meaningful on loopback, for telnet
@@ -130,6 +132,17 @@
   that connects and never sends a ClientHello would otherwise hold a
   session permit until the idle timeout, and 256 such peers exhaust the
   session pool while the accept loop blocks real clients.
+- The PostgreSQL wire protocol no longer puts `OMNI_PGWIRE_PASSWORD` on the
+  wire in cleartext either. A client's SSLRequest is answered with 'S' and
+  the session upgrades to TLS (`OMNIKV_PGWIRE_TLS=true`, the default), so
+  `sslmode=require` clients get the encrypted transport they asked for and
+  the password stays off the wire. TLS 1.2 as well as 1.3 is accepted —
+  PgWire exists for client compatibility and older libpq builds negotiate
+  1.2 only. A client that skips the SSLRequest keeps a plaintext session,
+  which a loopback bind still allows; a non-loopback bind with TLS off is
+  refused at startup, the same rule the TCP command interface enforces for
+  the JWT. The handshake is deadline-bounded so a silent peer releases its
+  connection-thread permit instead of holding it until the idle timeout.
 - The WAL's durable-offset accounting can no longer report durability it
   does not have. A successful fsync advances the offset by the byte count
   it flushed instead of by a `metadata()` length that a filesystem error

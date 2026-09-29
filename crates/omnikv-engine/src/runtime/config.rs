@@ -129,6 +129,7 @@ pub struct RaftConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct ServerConfig {
     #[serde(default)]
     pub mode: ServerMode,
@@ -138,6 +139,12 @@ pub struct ServerConfig {
     pub quic_addr: String,
     #[serde(default = "default_pgwire_addr")]
     pub pgwire_addr: String,
+    /// Whether the PgWire listener upgrades to TLS when a client sends an
+    /// SSLRequest. On by default: the PgWire password is compared in
+    /// cleartext, so without TLS it crosses the wire readable by anyone on
+    /// the path. Loopback is the only place plaintext is tolerated.
+    #[serde(default = "default_pgwire_tls")]
+    pub pgwire_tls: bool,
     #[serde(default = "default_tcp_addr")]
     pub tcp_addr: String,
     /// Explicit opt-in for binding the TCP command interface on a
@@ -196,6 +203,10 @@ fn default_tcp_tls() -> bool {
     true
 }
 
+fn default_pgwire_tls() -> bool {
+    true
+}
+
 fn default_jwt_secret() -> String {
     DEV_JWT_SECRET.into()
 }
@@ -227,6 +238,7 @@ impl Default for ServerConfig {
             http_addr: default_http_addr(),
             quic_addr: default_quic_addr(),
             pgwire_addr: default_pgwire_addr(),
+            pgwire_tls: default_pgwire_tls(),
             tcp_addr: default_tcp_addr(),
             tcp_bind_public: false,
             tcp_tls: default_tcp_tls(),
@@ -314,6 +326,9 @@ impl ServerConfig {
         }
         if let Ok(v) = std::env::var("OMNIKV_TCP_TLS") {
             self.tcp_tls = parse_env_value("OMNIKV_TCP_TLS", &v)?;
+        }
+        if let Ok(v) = std::env::var("OMNIKV_PGWIRE_TLS") {
+            self.pgwire_tls = parse_env_value("OMNIKV_PGWIRE_TLS", &v)?;
         }
         if let Ok(v) = std::env::var("OMNIKV_JWT_SECRET") {
             self.jwt_secret = v;
@@ -626,6 +641,20 @@ impl ServerConfig {
                 "tcp_bind_public is set but tcp_tls is disabled — the JWT \
                  would cross the network in cleartext. Set OMNIKV_TCP_TLS=true \
                  or bind to a loopback address"
+                    .into(),
+            ));
+        }
+        // Same reasoning for PgWire: the password is compared in cleartext,
+        // so off the loopback it must be inside TLS.
+        if !self.pgwire_tls
+            && let Ok(sock) = self.pgwire_addr.parse::<std::net::SocketAddr>()
+            && !sock.ip().is_loopback()
+        {
+            return Err(ConfigError(
+                "pgwire_addr is bound to a non-loopback address but pgwire_tls \
+                 is disabled — the PgWire password would cross the network in \
+                 cleartext. Set OMNIKV_PGWIRE_TLS=true or bind to a loopback \
+                 address"
                     .into(),
             ));
         }

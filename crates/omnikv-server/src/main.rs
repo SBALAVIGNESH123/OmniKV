@@ -287,6 +287,14 @@ async fn spawn_protocol_servers(
     // ─── 3. PostgreSQL Wire Protocol ───────────────────────────
     let pgwire_db = db.clone();
     let pgwire_rate_limiter = rate_limiter.clone();
+    let pgwire_tls = if cfg.pgwire_tls {
+        Some(quic_server::pgwire_tls_config(
+            cfg.tls_cert_path.as_deref(),
+            cfg.tls_key_path.as_deref(),
+        )?)
+    } else {
+        None
+    };
     let _pgwire_handle = std::thread::spawn(move || {
         // Log before moving pgwire_addr_str into PgWireServer::new.
         tracing::info!("PostgreSQL wire protocol starting on {pgwire_addr_str}");
@@ -294,7 +302,8 @@ async fn spawn_protocol_servers(
             pgwire_db,
             &pgwire_addr_str,
             pgwire_rate_limiter,
-        );
+        )
+        .with_tls_config(pgwire_tls);
         if let Err(e) = server.start() {
             tracing::error!("PgWire server error: {e}");
         }

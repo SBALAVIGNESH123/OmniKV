@@ -51,10 +51,12 @@ argon2 = "0.5.3"
 password-hash = "0.6.1"
 regex = "1.11"
 openraft = { version = "0.9.24", features = ["serde"] }
+rustls = { version = "0.23", features = ["ring"] }
 
 [dev-dependencies]
 proptest = "1.9.0"
 tempfile = "3.15"
+rcgen = "0.14.7"
 
 [[bench]]
 name = "omni_bench"

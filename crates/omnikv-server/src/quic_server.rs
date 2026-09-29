@@ -127,6 +127,23 @@ pub fn build_tcp_tls_acceptor(
     Ok(tokio_rustls::TlsAcceptor::from(Arc::new(config)))
 }
 
+/// Build the server-side TLS configuration for the PgWire listener.
+///
+/// Unlike the TCP command interface this accepts TLS 1.2 as well as 1.3:
+/// PgWire exists for client compatibility, and older libpq builds negotiate
+/// 1.2 only. PostgreSQL clients do not use ALPN, so none is advertised.
+pub fn pgwire_tls_config(
+    cert_path: Option<&str>,
+    key_path: Option<&str>,
+) -> Result<Arc<rustls::ServerConfig>, String> {
+    let (certs, key) = server_identity(cert_path, key_path)?;
+    let config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .map_err(|e| format!("TLS config: {}", e))?;
+    Ok(Arc::new(config))
+}
+
 /// Create a QUIC server endpoint.
 pub fn create_server_endpoint(
     bind_addr: &str,

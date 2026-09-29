@@ -1011,3 +1011,53 @@ fn test_tcp_tls_env_switch() {
         assert!(!cfg.tcp_tls, "OMNIKV_TCP_TLS=false must switch it off");
     });
 }
+
+#[test]
+fn test_pgwire_tls_is_on_by_default() {
+    // The PgWire password is compared in cleartext, so without TLS it is
+    // readable by anyone on the path. Encryption is the default rather than
+    // a setting an operator finds in an incident report.
+    let cfg = ServerConfig::default();
+    assert!(cfg.pgwire_tls);
+}
+
+#[test]
+fn test_pgwire_public_bind_requires_tls() {
+    // Loopback is the only place plaintext is tolerated. Off the loopback
+    // the password must never be sent in the clear, so a public bind with
+    // TLS off is a configuration error, not a warning in a log.
+    let mut cfg = ServerConfig {
+        pgwire_addr: "0.0.0.0:5432".into(),
+        pgwire_tls: false,
+        ..Default::default()
+    };
+    let err = cfg.validate_runtime().unwrap_err();
+    assert!(
+        err.0.contains("pgwire_tls") && err.0.contains("cleartext"),
+        "public bind with TLS off must name the exposed password: {err}"
+    );
+
+    cfg.pgwire_tls = true;
+    cfg.validate_runtime()
+        .unwrap_or_else(|e| panic!("public bind with TLS on must validate: {e}"));
+
+    // Loopback keeps the right to go plaintext.
+    cfg.pgwire_addr = "127.0.0.1:5432".into();
+    cfg.pgwire_tls = false;
+    cfg.validate_runtime()
+        .unwrap_or_else(|e| panic!("loopback plaintext must validate: {e}"));
+}
+
+#[test]
+fn test_pgwire_tls_env_switch() {
+    // The debugging escape hatch is an env var, the same way the TCP
+    // interface's is.
+    with_env(&[("OMNIKV_PGWIRE_TLS", "false")], || {
+        let mut cfg = ServerConfig::default();
+        cfg.apply_env().unwrap();
+        assert!(
+            !cfg.pgwire_tls,
+            "OMNIKV_PGWIRE_TLS=false must switch it off"
+        );
+    });
+}

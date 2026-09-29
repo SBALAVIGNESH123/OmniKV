@@ -101,7 +101,7 @@ fn engine_path(base: &Path, file: &str) -> String {
 
 /// Reads one length-prefixed protocol message, returning (type, body).
 /// The length field includes itself but not the type byte.
-fn read_message(stream: &mut TcpStream) -> std::io::Result<(u8, Vec<u8>)> {
+fn read_message<R: Read>(stream: &mut R) -> std::io::Result<(u8, Vec<u8>)> {
     let mut type_buf = [0u8; 1];
     stream.read_exact(&mut type_buf)?;
     let mut len_buf = [0u8; 4];
@@ -113,7 +113,7 @@ fn read_message(stream: &mut TcpStream) -> std::io::Result<(u8, Vec<u8>)> {
     Ok((type_buf[0], body))
 }
 
-fn read_exact(stream: &mut TcpStream, n: usize) -> std::io::Result<Vec<u8>> {
+fn read_exact<R: Read>(stream: &mut R, n: usize) -> std::io::Result<Vec<u8>> {
     let mut buf = vec![0u8; n];
     stream.read_exact(&mut buf)?;
     Ok(buf)
@@ -127,7 +127,7 @@ fn send_negotiation_request(stream: &mut TcpStream, code: u32) -> std::io::Resul
 }
 
 /// Sends a protocol 3.0 `StartupMessage` with the given parameters.
-fn send_startup_message(stream: &mut TcpStream) -> std::io::Result<()> {
+fn send_startup_message<W: Write>(stream: &mut W) -> std::io::Result<()> {
     let mut body: Vec<u8> = Vec::new();
     body.extend_from_slice(&PROTOCOL_VERSION_3_0.to_be_bytes());
     for (k, v) in [
@@ -148,7 +148,7 @@ fn send_startup_message(stream: &mut TcpStream) -> std::io::Result<()> {
 }
 
 /// Sends a `PasswordMessage` ('p') frame with the cleartext password.
-fn send_password_message(stream: &mut TcpStream, password: &str) -> std::io::Result<()> {
+fn send_password_message<W: Write>(stream: &mut W, password: &str) -> std::io::Result<()> {
     let mut body = password.as_bytes().to_vec();
     body.push(0);
     let frame_len = u32::try_from(body.len() + 4).expect("frame length fits u32");
@@ -161,7 +161,7 @@ fn send_password_message(stream: &mut TcpStream, password: &str) -> std::io::Res
 }
 
 /// Sends a simple `Query` ('Q') frame.
-fn send_query(stream: &mut TcpStream, sql: &str) -> std::io::Result<()> {
+fn send_query<W: Write>(stream: &mut W, sql: &str) -> std::io::Result<()> {
     let mut body = sql.as_bytes().to_vec();
     body.push(0);
     let frame_len = u32::try_from(body.len() + 4).expect("frame length fits u32");
@@ -176,7 +176,7 @@ fn send_query(stream: &mut TcpStream, sql: &str) -> std::io::Result<()> {
 /// Completes the full libpq handshake: `StartupMessage`, password, auth ok,
 /// parameter statuses, `ReadyForQuery`('I'). Returns the stream ready for
 /// queries.
-fn complete_handshake(stream: &mut TcpStream) -> std::io::Result<()> {
+fn complete_handshake<S: Read + Write>(stream: &mut S) -> std::io::Result<()> {
     send_startup_message(stream)?;
 
     // AuthenticationCleartextPassword request ('R', code 3).
@@ -224,7 +224,7 @@ fn complete_handshake(stream: &mut TcpStream) -> std::io::Result<()> {
 // ---------------------------------------------------------------------
 
 /// Sends one extended-protocol frame: type byte + body (length is added).
-fn send_extended(stream: &mut TcpStream, msg_type: u8, body: &[u8]) -> std::io::Result<()> {
+fn send_extended<W: Write>(stream: &mut W, msg_type: u8, body: &[u8]) -> std::io::Result<()> {
     let frame_len = u32::try_from(body.len() + 4).expect("frame length fits u32");
     let mut frame = Vec::with_capacity(1 + 4 + body.len());
     frame.push(msg_type);
@@ -290,7 +290,7 @@ fn kind_body(kind: u8, name: &str) -> Vec<u8> {
 
 /// Reads frames, skipping benign `NoticeResponse` ('N') frames, until the
 /// wanted type arrives. Returns its body.
-fn read_until_type(stream: &mut TcpStream, wanted: u8) -> Vec<u8> {
+fn read_until_type<R: Read>(stream: &mut R, wanted: u8) -> Vec<u8> {
     loop {
         let (msg_type, body) = read_message(stream).expect("read frame");
         match msg_type {
@@ -1632,7 +1632,7 @@ fn pgwire_ssl_then_gss_negotiation_then_startup_is_accepted() {
 /// without a transaction, BEGIN inside a transaction). An `ErrorResponse`
 /// ('E') here is a contract violation — DBAPI drivers raise on any 'E'
 /// frame — so it fails the test rather than being tolerated.
-fn read_command_complete(stream: &mut TcpStream) -> String {
+fn read_command_complete<R: Read>(stream: &mut R) -> String {
     loop {
         let (msg_type, body) = read_message(stream).expect("read frame");
         match msg_type {
@@ -1668,7 +1668,7 @@ fn read_select_result(stream: &mut TcpStream) -> String {
 }
 
 /// Reads one `ReadyForQuery` frame and returns its transaction status byte.
-fn read_ready_status(stream: &mut TcpStream) -> u8 {
+fn read_ready_status<R: Read>(stream: &mut R) -> u8 {
     let (msg_type, body) = read_message(stream).expect("read ReadyForQuery");
     assert_eq!(msg_type, b'Z', "expected ReadyForQuery");
     assert_eq!(body.len(), 1);
@@ -2136,4 +2136,184 @@ fn pgwire_wrong_password_is_rejected_over_real_socket() {
         text.contains("28P01"),
         "expected SQLSTATE 28P01 (invalid_password) in {text:?}"
     );
+}
+
+// ---------------------------------------------------------------------
+// TLS negotiation: an SSLRequest upgrades the connection, and the whole
+// session (including the cleartext password) runs inside TLS.
+// ---------------------------------------------------------------------
+
+/// Accepts any server certificate. The tests generate their own self-signed
+/// pair, so pinning it is the assertion itself.
+#[derive(Debug)]
+struct AcceptAnyServerCert;
+
+impl rustls::client::danger::ServerCertVerifier for AcceptAnyServerCert {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        vec![
+            rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
+            rustls::SignatureScheme::ECDSA_NISTP384_SHA384,
+            rustls::SignatureScheme::RSA_PSS_SHA256,
+            rustls::SignatureScheme::RSA_PSS_SHA384,
+            rustls::SignatureScheme::RSA_PSS_SHA512,
+            rustls::SignatureScheme::ED25519,
+        ]
+    }
+}
+
+/// Mints a self-signed pair and returns the server configuration alongside the
+/// leaf DER the client should observe.
+fn test_server_config() -> (Arc<rustls::ServerConfig>, Vec<u8>) {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let key_pair = rcgen::KeyPair::generate().expect("key");
+    let params = rcgen::CertificateParams::new(vec!["localhost".into()]).expect("params");
+    let cert = params.self_signed(&key_pair).expect("cert");
+    let leaf = cert.der().to_vec();
+    let key = rustls::pki_types::PrivateKeyDer::Pkcs8(rustls::pki_types::PrivatePkcs8KeyDer::from(
+        key_pair.serialized_der().to_vec(),
+    ));
+    let config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![rustls::pki_types::CertificateDer::from(leaf.clone())],
+            key,
+        )
+        .expect("server config");
+    (Arc::new(config), leaf)
+}
+
+/// Spawns a `PgWireServer` that answers an `SSLRequest` with 'S'.
+fn spawn_pgwire_tls_server(config: Arc<rustls::ServerConfig>) -> std::io::Result<String> {
+    let dir = TempDir::new().expect("temp dir");
+    let base = dir.keep();
+    let db = OmniKV::open(
+        &engine_path(&base, "manifest.json"),
+        &engine_path(&base, "wal.log"),
+    )
+    .expect("open engine");
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let addr = listener.local_addr()?.to_string();
+    let server =
+        PgWireServer::with_password(db, &addr, TEST_PASSWORD).with_tls_config(Some(config));
+    std::thread::spawn(move || {
+        let _ = server.serve(listener);
+    });
+    Ok(addr)
+}
+
+/// Wraps a connected socket in a TLS client session that trusts anything.
+fn tls_client(stream: TcpStream) -> rustls::StreamOwned<rustls::ClientConnection, TcpStream> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let config = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(AcceptAnyServerCert))
+        .with_no_client_auth();
+    let name =
+        rustls::pki_types::ServerName::try_from("localhost".to_string()).expect("server name");
+    let conn = rustls::ClientConnection::new(Arc::new(config), name).expect("client conn");
+    rustls::StreamOwned::new(conn, stream)
+}
+
+#[test]
+fn pgwire_sslrequest_upgrades_the_session_and_encrypts_the_password() {
+    let (config, leaf) = test_server_config();
+    let addr = spawn_pgwire_tls_server(config).expect("spawn server");
+    let mut raw = TcpStream::connect(&addr).expect("connect");
+
+    // The SSLRequest is the only plaintext message; the reply commits both
+    // sides to TLS for everything that follows, including the password.
+    send_negotiation_request(&mut raw, SSL_REQUEST_CODE).expect("send SSLRequest");
+    assert_eq!(
+        read_exact(&mut raw, 1).expect("read negotiation reply"),
+        vec![b'S'],
+        "a listener with certificate material must accept the upgrade"
+    );
+
+    let mut stream = tls_client(raw);
+    complete_handshake(&mut stream).expect("complete the handshake over TLS");
+
+    // The certificate the client sees is the one the listener was configured
+    // with, so an operator-supplied pair is what gets pinned.
+    let presented = stream
+        .conn
+        .peer_certificates()
+        .expect("the server presented a certificate chain");
+    assert_eq!(presented.len(), 1, "exactly the configured leaf");
+    assert_eq!(
+        presented[0].as_ref(),
+        leaf.as_slice(),
+        "the listener presents the configured certificate"
+    );
+
+    send_query(&mut stream, "SELECT 1").expect("send query");
+    let row = read_until_type(&mut stream, b'D');
+    assert!(
+        String::from_utf8_lossy(&row).contains("OmniKV"),
+        "SELECT 1 must return the version banner over TLS"
+    );
+    assert_eq!(read_command_complete(&mut stream), "SELECT 1");
+    assert_eq!(read_ready_status(&mut stream), b'I');
+}
+
+#[test]
+fn a_tls_enabled_listener_still_serves_a_client_that_skips_the_sslrequest() {
+    let (config, _) = test_server_config();
+    let addr = spawn_pgwire_tls_server(config).expect("spawn server");
+    let mut stream = TcpStream::connect(&addr).expect("connect");
+
+    // No SSLRequest: the client chose plaintext, and on a loopback bind the
+    // listener honors it. The upgrade is offered per connection, never forced.
+    complete_handshake(&mut stream).expect("plaintext handshake");
+    send_query(&mut stream, "SELECT 1").expect("send query");
+    let row = read_until_type(&mut stream, b'D');
+    assert!(
+        String::from_utf8_lossy(&row).contains("OmniKV"),
+        "the plaintext path must still serve queries"
+    );
+}
+
+#[test]
+fn a_tls_enabled_listener_refuses_gss_encryption() {
+    let (config, _) = test_server_config();
+    let addr = spawn_pgwire_tls_server(config).expect("spawn server");
+    let mut stream = TcpStream::connect(&addr).expect("connect");
+
+    send_negotiation_request(&mut stream, GSS_ENC_REQUEST_CODE).expect("send GSSENCRequest");
+    assert_eq!(
+        read_exact(&mut stream, 1).expect("read negotiation reply"),
+        vec![b'N'],
+        "GSSAPI encryption is not supported, even when TLS is configured"
+    );
+
+    // The connection stays plaintext and is still usable.
+    complete_handshake(&mut stream).expect("plaintext handshake after the refusal");
 }
