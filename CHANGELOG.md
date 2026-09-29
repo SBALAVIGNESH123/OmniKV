@@ -139,10 +139,15 @@
   the password stays off the wire. TLS 1.2 as well as 1.3 is accepted —
   PgWire exists for client compatibility and older libpq builds negotiate
   1.2 only. A client that skips the SSLRequest keeps a plaintext session,
-  which a loopback bind still allows; a non-loopback bind with TLS off is
-  refused at startup, the same rule the TCP command interface enforces for
-  the JWT. The handshake is deadline-bounded so a silent peer releases its
-  connection-thread permit instead of holding it until the idle timeout.
+  which a loopback bind still allows. TLS being configured is not enough on
+  its own: on a non-loopback bind a client that skips the SSLRequest would
+  still send the password in the clear, so plaintext startup is answered with
+  a `28000` error and closed. A non-loopback bind with TLS off is refused at
+  startup, the same rule the TCP command interface enforces for the JWT. The
+  handshake runs under one total deadline rather than a per-read timeout, so
+  a peer that trickles a byte every few seconds cannot hold a
+  connection-thread permit the way it could under a bound that resets with
+  every packet.
 - The WAL's durable-offset accounting can no longer report durability it
   does not have. A successful fsync advances the offset by the byte count
   it flushed instead of by a `metadata()` length that a filesystem error

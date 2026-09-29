@@ -8,6 +8,7 @@ use omni_engine::hardening::RateLimiter;
 use omni_engine::metrics_prometheus;
 use omni_engine::{OmniKV, WriteBatch};
 use quinn::{ClientConfig, Endpoint, ServerConfig};
+use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use std::sync::Arc;
 
@@ -71,21 +72,18 @@ pub fn server_identity(
 }
 
 fn read_certs(path: &str) -> Result<Vec<CertificateDer<'static>>, String> {
-    let mut reader = std::io::BufReader::new(
-        std::fs::File::open(path).map_err(|e| format!("open cert {path}: {e}"))?,
-    );
-    rustls_pemfile::certs(&mut reader)
-        .collect::<Result<_, _>>()
-        .map_err(|e| format!("parse cert {path}: {e}"))
+    let certs = CertificateDer::pem_file_iter(path)
+        .map_err(|e| format!("open cert {path}: {e}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("parse cert {path}: {e}"))?;
+    if certs.is_empty() {
+        return Err(format!("no certificates found in {path}"));
+    }
+    Ok(certs)
 }
 
 fn read_key(path: &str) -> Result<PrivateKeyDer<'static>, String> {
-    let mut reader = std::io::BufReader::new(
-        std::fs::File::open(path).map_err(|e| format!("open key {path}: {e}"))?,
-    );
-    rustls_pemfile::private_key(&mut reader)
-        .map_err(|e| format!("parse key {path}: {e}"))?
-        .ok_or_else(|| format!("no private key found in {path}"))
+    PrivateKeyDer::from_pem_file(path).map_err(|e| format!("read key {path}: {e}"))
 }
 
 /// Generate self-signed TLS certificates for QUIC.
@@ -461,10 +459,10 @@ mod tests {
         assert_eq!(certs.len(), 1, "exactly the operator's leaf, no more");
 
         // The bytes on disk are the bytes on the wire.
-        let mut reader = std::io::Cursor::new(std::fs::read(&cert_path).expect("read pem"));
-        let reloaded = rustls_pemfile::certs(&mut reader)
-            .collect::<Result<Vec<_>, _>>()
-            .expect("reparse pem");
+        let reloaded =
+            CertificateDer::pem_slice_iter(&std::fs::read(&cert_path).expect("read pem"))
+                .collect::<Result<Vec<_>, _>>()
+                .expect("reparse pem");
         assert_eq!(
             reloaded, certs,
             "the listener must present the operator's bytes"

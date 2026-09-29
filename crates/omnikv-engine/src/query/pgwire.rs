@@ -297,6 +297,10 @@ impl PgStream {
             PgStream::Tls(s) => s.get_ref().peer_addr(),
         }
     }
+
+    fn is_tls(&self) -> bool {
+        matches!(self, PgStream::Tls(_))
+    }
 }
 
 /// Bound on the TLS handshake: a peer that opens a socket and sends nothing
@@ -305,10 +309,11 @@ const PGWIRE_TLS_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::f
 
 /// Replace a plaintext connection with a TLS session over the same socket.
 ///
-/// [`rustls::ConnectionCommon::complete_io`] returns the moment the handshake
-/// finishes, so the client's StartupMessage is not consumed here: anything
-/// read past the handshake stays in the connection's receive buffer for the
-/// first `read` to hand back.
+/// The handshake is driven one record at a time under a single deadline, so a
+/// peer that trickles a byte every few seconds cannot hold the connection
+/// thread the way it could under a per-read timeout. `read_tls` consumes
+/// exactly one record, so the client's StartupMessage still waiting in the
+/// buffer is left for the first `read` after the handshake to return.
 fn upgrade_to_tls(
     stream: PgStream,
     config: &Arc<rustls::ServerConfig>,
@@ -328,20 +333,37 @@ fn upgrade_to_tls(
 
     let prev_read = sock.read_timeout()?;
     let prev_write = sock.write_timeout()?;
-    let _ = sock.set_read_timeout(Some(PGWIRE_TLS_HANDSHAKE_TIMEOUT));
-    let _ = sock.set_write_timeout(Some(PGWIRE_TLS_HANDSHAKE_TIMEOUT));
+    let deadline = std::time::Instant::now() + PGWIRE_TLS_HANDSHAKE_TIMEOUT;
 
-    let handshake = conn.complete_io(&mut sock);
+    while conn.is_handshaking() {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "tls handshake exceeded the deadline",
+            ));
+        }
+        sock.set_read_timeout(Some(remaining))?;
+        sock.set_write_timeout(Some(remaining))?;
+
+        let read = conn.read_tls(&mut sock)?;
+        if read == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "peer closed the connection during the tls handshake",
+            ));
+        }
+        conn.process_new_packets().map_err(|e| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, format!("tls: {e}"))
+        })?;
+        while conn.wants_write() {
+            conn.write_tls(&mut sock)?;
+        }
+        sock.flush()?;
+    }
 
     let _ = sock.set_read_timeout(prev_read);
     let _ = sock.set_write_timeout(prev_write);
-
-    handshake.map_err(|e| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("tls handshake: {e}"),
-        )
-    })?;
 
     Ok(PgStream::Tls(Box::new(rustls::StreamOwned::new(
         conn, sock,
@@ -562,6 +584,11 @@ impl PgWireServer {
             let _ = permit_tx.send(());
         }
 
+        // TLS being available is not TLS being used: on a bind anyone can
+        // reach, a client that skips the SSLRequest would send the password
+        // in the clear, so plaintext startup is refused there.
+        let require_tls = self.tls_config.is_some() && !is_cleartext_safe_bind(&self.bind_addr);
+
         for stream in listener.incoming() {
             match stream {
                 Ok(stream) => {
@@ -584,6 +611,7 @@ impl PgWireServer {
                             &pgwire_password,
                             txn_manager,
                             tls_config,
+                            require_tls,
                         ) {
                             eprintln!("[OmniKV] Connection error: {}", e);
                         }
@@ -614,6 +642,7 @@ fn handle_connection(
     pgwire_password: &str,
     txn_manager: Arc<TransactionManager>,
     tls_config: Option<Arc<rustls::ServerConfig>>,
+    require_tls: bool,
 ) -> std::io::Result<()> {
     // Phase 1: Startup handshake
     if pgwire_password.is_empty() {
@@ -627,6 +656,7 @@ fn handle_connection(
         PgStream::Plain(stream),
         pgwire_password,
         tls_config.as_ref(),
+        require_tls,
     )?;
 
     // Per-connection session state; the transaction manager is the
@@ -769,6 +799,7 @@ fn handle_startup(
     mut stream: PgStream,
     expected_password: &str,
     tls_config: Option<&Arc<rustls::ServerConfig>>,
+    require_tls: bool,
 ) -> std::io::Result<PgStream> {
     let mut negotiation_packets = 0usize;
     loop {
@@ -830,6 +861,17 @@ fn handle_startup(
                 // the remaining key/value parameters to stay framing-aligned.
                 let mut params = vec![0u8; body_len - 4];
                 stream.read_exact(&mut params)?;
+                if require_tls && !stream.is_tls() {
+                    send_error_response(
+                        &mut stream,
+                        "28000",
+                        "TLS is required on this listener; connect with sslmode=require",
+                    )?;
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "plaintext startup on a bind that requires TLS",
+                    ));
+                }
                 break;
             }
             _ => {

@@ -2243,6 +2243,31 @@ fn tls_client(stream: TcpStream) -> rustls::StreamOwned<rustls::ClientConnection
     rustls::StreamOwned::new(conn, stream)
 }
 
+/// Spawns a TLS-enabled `PgWireServer` on a bind any host can reach, where
+/// plaintext startup must be refused.
+fn spawn_pgwire_tls_server_public(config: Arc<rustls::ServerConfig>) -> std::io::Result<String> {
+    let dir = TempDir::new().expect("temp dir");
+    let base = dir.keep();
+    let db = OmniKV::open(
+        &engine_path(&base, "manifest.json"),
+        &engine_path(&base, "wal.log"),
+    )
+    .expect("open engine");
+    let listener = TcpListener::bind("0.0.0.0:0")?;
+    let port = listener.local_addr()?.port();
+    // The server must see the real non-loopback bind, or its cleartext
+    // policy would treat the listener as private. Connect through loopback
+    // because Windows refuses connect() to 0.0.0.0 even when listening there.
+    let bind_addr = format!("0.0.0.0:{port}");
+    let addr = format!("127.0.0.1:{port}");
+    let server =
+        PgWireServer::with_password(db, &bind_addr, TEST_PASSWORD).with_tls_config(Some(config));
+    std::thread::spawn(move || {
+        let _ = server.serve(listener);
+    });
+    Ok(addr)
+}
+
 #[test]
 fn pgwire_sslrequest_upgrades_the_session_and_encrypts_the_password() {
     let (config, leaf) = test_server_config();
@@ -2316,4 +2341,57 @@ fn a_tls_enabled_listener_refuses_gss_encryption() {
 
     // The connection stays plaintext and is still usable.
     complete_handshake(&mut stream).expect("plaintext handshake after the refusal");
+}
+
+#[test]
+fn a_public_bind_refuses_a_plaintext_client_that_skips_the_sslrequest() {
+    let (config, _) = test_server_config();
+    let addr = spawn_pgwire_tls_server_public(config).expect("spawn server");
+    let mut stream = TcpStream::connect(&addr).expect("connect");
+
+    // No SSLRequest on a bind anyone can reach: the password would leave in
+    // the clear, so the listener answers with an error and closes.
+    send_startup_message(&mut stream).expect("send startup");
+    let (msg_type, body) = read_message(&mut stream).expect("read reply");
+    assert_eq!(
+        msg_type, b'E',
+        "plaintext startup must be refused, not served"
+    );
+    assert!(
+        String::from_utf8_lossy(&body).contains("TLS is required"),
+        "the refusal must say why: {}",
+        String::from_utf8_lossy(&body)
+    );
+}
+
+#[test]
+fn a_public_bind_serves_a_client_that_upgrades_to_tls() {
+    let (config, leaf) = test_server_config();
+    let addr = spawn_pgwire_tls_server_public(config).expect("spawn server");
+    let mut raw = TcpStream::connect(&addr).expect("connect");
+
+    send_negotiation_request(&mut raw, SSL_REQUEST_CODE).expect("send SSLRequest");
+    assert_eq!(
+        read_exact(&mut raw, 1).expect("read negotiation reply"),
+        vec![b'S'],
+        "the upgrade is still offered on a public bind"
+    );
+
+    let mut stream = tls_client(raw);
+    complete_handshake(&mut stream).expect("complete the handshake over TLS");
+
+    let presented = stream
+        .conn
+        .peer_certificates()
+        .expect("the server presented a certificate chain");
+    assert_eq!(presented[0].as_ref(), leaf.as_slice());
+
+    send_query(&mut stream, "SELECT 1").expect("send query");
+    let row = read_until_type(&mut stream, b'D');
+    assert!(
+        String::from_utf8_lossy(&row).contains("OmniKV"),
+        "a client that upgrades still gets its rows"
+    );
+    assert_eq!(read_command_complete(&mut stream), "SELECT 1");
+    assert_eq!(read_ready_status(&mut stream), b'I');
 }

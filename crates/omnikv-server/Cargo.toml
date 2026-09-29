@@ -20,7 +20,6 @@ rustls = { version = "0.23.45", features = ["ring"] }
 tokio-rustls = "0.26"
 webpki-roots = "0.26"
 rcgen = "0.14.7"
-rustls-pemfile = "2.2"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tracing = "0.1.44"
