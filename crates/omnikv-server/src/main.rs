@@ -29,6 +29,7 @@ mod auth;
 mod quic_server;
 mod raft_node;
 mod raft_routes;
+mod tls;
 
 use std::sync::Arc;
 
@@ -143,6 +144,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let manifest_path = cfg.storage.manifest_path.clone();
     let wal_path = cfg.storage.wal_path.clone();
 
+    // Resolve the TLS identity before opening the database: a bad
+    // certificate configuration should fail before files are locked and
+    // maintenance tasks are started.
+    let server_tls = tls::resolve_server_tls(&cfg)?;
+    tls::log_tls_posture(&server_tls.posture);
+
     // Open the database using configured paths.
     let db = OmniKV::open(&manifest_path, &wal_path)?;
     let _compaction_handle = start_storage_maintenance(&db, &cfg)?;
@@ -193,7 +200,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let (http_handle, quic_handle, tcp_handle) =
-        spawn_protocol_servers(db, &cfg, rate_limiter, app_state).await?;
+        spawn_protocol_servers(db, &cfg, rate_limiter, app_state, server_tls).await?;
 
     // ─── 5. Raft consensus listener (cluster mode only) ───────
     // Serves /raft/{append,vote,snapshot} for this node's peers on the
@@ -238,6 +245,7 @@ async fn spawn_protocol_servers(
     cfg: &ServerConfig,
     rate_limiter: Arc<RateLimiter>,
     app_state: api::AppState,
+    server_tls: tls::ServerTls,
 ) -> Result<
     (
         tokio::task::JoinHandle<()>,
@@ -249,11 +257,10 @@ async fn spawn_protocol_servers(
     let router = api::build_router(app_state);
 
     // ─── 1. HTTP/1.1 + HTTP/2 (TLS, ALPN) ──────────────────────
-    let (certs, key) =
-        quic_server::server_identity(cfg.tls_cert_path.as_deref(), cfg.tls_key_path.as_deref())?;
+    let http_tls = server_tls.for_next_listener();
     let tls_config = axum_server::tls_rustls::RustlsConfig::from_der(
-        certs.iter().map(|c| c.as_ref().to_vec()).collect(),
-        key.secret_der().to_vec(),
+        http_tls.certs.iter().map(|c| c.as_ref().to_vec()).collect(),
+        http_tls.key.secret_der().to_vec(),
     )
     .await?;
 
@@ -275,9 +282,9 @@ async fn spawn_protocol_servers(
     });
 
     // ─── 2. QUIC/HTTP3 Binary Protocol ─────────────────────────
-    let (quic_certs, quic_key) =
-        quic_server::server_identity(cfg.tls_cert_path.as_deref(), cfg.tls_key_path.as_deref())?;
-    let quic_endpoint = quic_server::create_server_endpoint(&quic_addr_str, quic_certs, quic_key)?;
+    let quic_tls = server_tls.for_next_listener();
+    let quic_endpoint =
+        quic_server::create_server_endpoint(&quic_addr_str, quic_tls.certs, quic_tls.key)?;
     let quic_db = db.clone();
     let quic_rate_limiter = rate_limiter.clone();
     let quic_handle = tokio::spawn(async move {
@@ -288,10 +295,8 @@ async fn spawn_protocol_servers(
     let pgwire_db = db.clone();
     let pgwire_rate_limiter = rate_limiter.clone();
     let pgwire_tls = if cfg.pgwire_tls {
-        Some(quic_server::pgwire_tls_config(
-            cfg.tls_cert_path.as_deref(),
-            cfg.tls_key_path.as_deref(),
-        )?)
+        let pg_tls = server_tls.for_next_listener();
+        Some(quic_server::pgwire_tls_config(pg_tls.certs, pg_tls.key)?)
     } else {
         None
     };
@@ -315,11 +320,11 @@ async fn spawn_protocol_servers(
     let tcp_rate_limiter = rate_limiter.clone();
     let tcp_tls = cfg.tcp_tls;
     let tcp_acceptor = if tcp_tls {
-        let (certs, key) = quic_server::server_identity(
-            cfg.tls_cert_path.as_deref(),
-            cfg.tls_key_path.as_deref(),
-        )?;
-        Some(quic_server::build_tcp_tls_acceptor(certs, key)?)
+        let tcp_tls_material = server_tls.for_next_listener();
+        Some(quic_server::build_tcp_tls_acceptor(
+            tcp_tls_material.certs,
+            tcp_tls_material.key,
+        )?)
     } else {
         None
     };
@@ -764,7 +769,9 @@ async fn handle_tcp_session<R, W>(
                 }
             }
             "QUIT" | "EXIT" => {
-                let _ = write_half.write_all(b"Goodbye.\n").await;
+                if !write_reply(&mut *write_half, b"Goodbye.\n").await {
+                    return;
+                }
                 return;
             }
             // Everything else requires an authenticated session.
@@ -779,10 +786,23 @@ async fn handle_tcp_session<R, W>(
             ),
         };
 
-        if write_half.write_all(response.as_bytes()).await.is_err() {
+        if !write_reply(&mut *write_half, response.as_bytes()).await {
             return;
         }
     }
+}
+
+/// Send a reply and push it onto the wire. Returns false when the peer is
+/// gone, so the caller drops the session. rustls holds a finished record in
+/// its own buffer until flushed; flushing on every reply, before the next
+/// read, is what keeps a request/response client from waiting on a reply it
+/// would otherwise never see while the session waits for its next command.
+async fn write_reply<W>(write_half: &mut W, reply: &[u8]) -> bool
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::AsyncWriteExt;
+    write_half.write_all(reply).await.is_ok() && write_half.flush().await.is_ok()
 }
 
 /// What an AUTH attempt resolved to: the session was dropped over its
