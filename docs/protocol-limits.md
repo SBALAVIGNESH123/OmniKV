@@ -40,16 +40,22 @@ most 8 negotiation packets are accepted before the StartupMessage; further
 negotiation attempts close the connection to prevent a pre-authentication spin
 loop.
 
-The PgWire listener answers an SSLRequest with 'S' and upgrades the
-connection to TLS (`OMNIKV_PGWIRE_TLS=true`, the default), so a client with
-`sslmode=require` or `sslmode=prefer` gets an encrypted session and the
-password never crosses the wire in the clear. TLS 1.2 and 1.3 are both
-accepted, so older libpq builds connect; a client that skips the SSLRequest
-stays plaintext. The cleartext password means a non-loopback bind still
-needs TLS, and the config validator refuses a public bind with TLS off; the
-production-mode policy in `PgWireServer::validate_security_policy` fails
-closed the same way. Callers can check the policy without binding via
-`PgWireServer::validate_security_policy`.
+Negotiation answers depend on TLS configuration. A GSSENCRequest is always
+answered `'N'`. An SSLRequest is answered `'S'` and the connection upgrades
+to TLS when a TLS identity is configured (`OMNIKV_PGWIRE_TLS=true`, the
+default), accepting TLS 1.2 as well as 1.3 so older libpq builds connect; a
+client using `sslmode=require` or `sslmode=prefer` gets an encrypted session
+and the password never crosses the wire in the clear. With TLS configured off,
+an SSLRequest is answered `'N'` and the session stays plaintext.
+
+A client that skips the SSLRequest stays plaintext. On a loopback bind that is
+allowed; on any other bind with TLS configured, the plaintext StartupMessage is
+rejected with SQLSTATE `28000` ("TLS is required on this listener; connect with
+sslmode=require"), because a private network is a shared segment and the
+cleartext password would be readable by anything else on it. A non-loopback bind
+with TLS off is refused at startup, and the production-mode policy in
+`PgWireServer::validate_security_policy` fails closed the same way. Callers can
+check the policy without binding via `PgWireServer::validate_security_policy`.
 
 ### Extended query protocol
 

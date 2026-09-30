@@ -155,8 +155,11 @@ Prometheus metrics expose maintenance health:
   transport the same way (`OMNIKV_PGWIRE_TLS=true`, the default): a client's
   SSLRequest is answered with 'S' and the entire session, including the
   `OMNI_PGWIRE_PASSWORD`, runs inside TLS. A client that skips the
-  SSLRequest stays plaintext, which a loopback bind allows; a non-loopback
-  bind with TLS off is refused at startup. TLS 1.2 is accepted here rather
+  SSLRequest stays plaintext, which a loopback bind allows; on any other bind
+  with TLS configured, that plaintext StartupMessage is rejected with SQLSTATE
+  `28000` before the password is ever requested — a private network is a shared
+  segment, so it is not exempted. A non-loopback bind with TLS off is refused
+  at startup. TLS 1.2 is accepted here rather
   than only 1.3, so older libpq builds still connect.
 - Tune rate limits for your workload and alert on
   `omnikv_rate_limit_rejections_total{protocol=...}`.

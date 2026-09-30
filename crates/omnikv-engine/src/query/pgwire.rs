@@ -250,6 +250,18 @@ fn is_cleartext_safe_bind(bind_addr: &str) -> bool {
     }
 }
 
+/// Returns true only for a loopback bind. Used when TLS is configured: a
+/// private network is a shared segment too, so plaintext startup is tolerated
+/// there only when no TLS identity exists at all (see [`is_cleartext_safe_bind`]).
+fn is_loopback_bind(bind_addr: &str) -> bool {
+    match bind_addr.parse::<std::net::SocketAddr>() {
+        Ok(addr) => addr.ip().is_loopback(),
+        // Unparseable bind (e.g. a host name to be resolved later) cannot be
+        // proven loopback; treat as non-loopback so TLS is required.
+        Err(_) => false,
+    }
+}
+
 /// A PgWire connection: plaintext, or TLS over the same socket after the
 /// SSLRequest negotiation. The swap happens inside [`handle_startup`], so
 /// every handler after it speaks the same Read/Write contract regardless of
@@ -584,10 +596,11 @@ impl PgWireServer {
             let _ = permit_tx.send(());
         }
 
-        // TLS being available is not TLS being used: on a bind anyone can
-        // reach, a client that skips the SSLRequest would send the password
-        // in the clear, so plaintext startup is refused there.
-        let require_tls = self.tls_config.is_some() && !is_cleartext_safe_bind(&self.bind_addr);
+        // TLS being available is not TLS being used. On anything but
+        // loopback, a client that skips the SSLRequest would send the
+        // password in the clear — including on a private network, which is
+        // a shared segment, so it is not exempted from this rule.
+        let require_tls = self.tls_config.is_some() && !is_loopback_bind(&self.bind_addr);
 
         for stream in listener.incoming() {
             match stream {
@@ -2565,6 +2578,35 @@ mod tests {
             &frame[5..],
             b"SERROR\0VERROR\0C42601\0MParse error: invalid query\0\0"
         );
+    }
+
+    #[test]
+    fn cleartext_is_safe_on_loopback_and_private_binds() {
+        assert!(is_cleartext_safe_bind("127.0.0.1:5432"));
+        assert!(is_cleartext_safe_bind("[::1]:5432"));
+        assert!(is_cleartext_safe_bind("10.0.0.5:5432"));
+        assert!(is_cleartext_safe_bind("192.168.1.1:5432"));
+        assert!(is_cleartext_safe_bind("172.16.0.1:5432"));
+        assert!(is_cleartext_safe_bind("[fc00::1]:5432"));
+        assert!(!is_cleartext_safe_bind("8.8.8.8:5432"));
+        assert!(!is_cleartext_safe_bind("[2001:4860::1]:5432"));
+        // A hostname to be resolved later cannot be classified, so it is
+        // treated as unsafe rather than assumed private.
+        assert!(!is_cleartext_safe_bind("db.internal:5432"));
+    }
+
+    /// TLS being configured tightens the rule to loopback only: a private
+    /// network is a shared segment, and a client that skips the SSLRequest
+    /// there would still send the password in the clear.
+    #[test]
+    fn only_loopback_is_exempt_from_required_tls() {
+        assert!(is_loopback_bind("127.0.0.1:5432"));
+        assert!(is_loopback_bind("[::1]:5432"));
+        assert!(!is_loopback_bind("10.0.0.5:5432"));
+        assert!(!is_loopback_bind("192.168.1.1:5432"));
+        assert!(!is_loopback_bind("0.0.0.0:5432"));
+        assert!(!is_loopback_bind("8.8.8.8:5432"));
+        assert!(!is_loopback_bind("db.internal:5432"));
     }
 
     #[test]

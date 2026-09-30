@@ -212,7 +212,9 @@
   desynchronized the protocol, so every default-configured client failed at
   connection time with `sslmode=prefer` (issue #108). The listener now answers
   negotiation with a single-byte `'N'` and completes the handshake on the same
-  plaintext connection, matching PostgreSQL's fallback behavior.
+  plaintext connection, matching PostgreSQL's fallback behavior. (Superseded
+  for SSLRequest by the TLS entry below: GSSENCRequest is still answered `'N'`,
+  but SSLRequest is answered `'S'` and the session upgrades to TLS.)
 - Startup messages with unknown protocol codes are now rejected with SQLSTATE
   `08P01` instead of producing a framing-dependent failure, and cancel-request
   connections for unknown backend keys are drained and closed.
