@@ -142,10 +142,7 @@ pub struct ServerConfig {
     /// Whether the PgWire listener upgrades to TLS when a client sends an
     /// SSLRequest. On by default: the PgWire password is compared in
     /// cleartext, so without TLS it crosses the wire readable by anyone on
-    /// the path. With TLS configured, plaintext startup is tolerated only on
-    /// loopback — a private network is a shared segment, so a plaintext
-    /// StartupMessage there is refused with SQLSTATE 28000 rather than
-    /// sending the password in the clear.
+    /// the path. Plaintext startup is then allowed on loopback only.
     #[serde(default = "default_pgwire_tls")]
     pub pgwire_tls: bool,
     #[serde(default = "default_tcp_addr")]

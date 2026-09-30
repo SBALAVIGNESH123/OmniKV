@@ -144,9 +144,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let manifest_path = cfg.storage.manifest_path.clone();
     let wal_path = cfg.storage.wal_path.clone();
 
-    // Resolve the TLS identity before opening the database: a bad
-    // certificate configuration should fail before files are locked and
-    // maintenance tasks are started.
+    // TLS first: a bad certificate should fail before the database locks
+    // its files.
     let server_tls = tls::resolve_server_tls(&cfg)?;
     tls::log_tls_posture(&server_tls.posture);
 
@@ -769,9 +768,7 @@ async fn handle_tcp_session<R, W>(
                 }
             }
             "QUIT" | "EXIT" => {
-                if !write_reply(&mut *write_half, b"Goodbye.\n").await {
-                    return;
-                }
+                let _ = write_reply(&mut *write_half, b"Goodbye.\n").await;
                 return;
             }
             // Everything else requires an authenticated session.
@@ -792,11 +789,8 @@ async fn handle_tcp_session<R, W>(
     }
 }
 
-/// Send a reply and push it onto the wire. Returns false when the peer is
-/// gone, so the caller drops the session. rustls holds a finished record in
-/// its own buffer until flushed; flushing on every reply, before the next
-/// read, is what keeps a request/response client from waiting on a reply it
-/// would otherwise never see while the session waits for its next command.
+/// Write a reply and flush it. Without the flush, rustls keeps the record
+/// buffered and a request/response client waits forever for its answer.
 async fn write_reply<W>(write_half: &mut W, reply: &[u8]) -> bool
 where
     W: tokio::io::AsyncWrite + Unpin,

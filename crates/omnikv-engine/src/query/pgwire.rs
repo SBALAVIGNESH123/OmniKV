@@ -250,9 +250,8 @@ fn is_cleartext_safe_bind(bind_addr: &str) -> bool {
     }
 }
 
-/// Returns true only for a loopback bind. Used when TLS is configured: a
-/// private network is a shared segment too, so plaintext startup is tolerated
-/// there only when no TLS identity exists at all (see [`is_cleartext_safe_bind`]).
+/// Loopback only. A private network is shared, so with TLS configured
+/// plaintext startup is refused there too.
 fn is_loopback_bind(bind_addr: &str) -> bool {
     match bind_addr.parse::<std::net::SocketAddr>() {
         Ok(addr) => addr.ip().is_loopback(),
@@ -596,10 +595,9 @@ impl PgWireServer {
             let _ = permit_tx.send(());
         }
 
-        // TLS being available is not TLS being used. On anything but
-        // loopback, a client that skips the SSLRequest would send the
-        // password in the clear — including on a private network, which is
-        // a shared segment, so it is not exempted from this rule.
+        // Anything but loopback gets no plaintext startup, private
+        // networks included: a client that skips the SSLRequest would
+        // send the password in the clear.
         let require_tls = self.tls_config.is_some() && !is_loopback_bind(&self.bind_addr);
 
         for stream in listener.incoming() {
@@ -2595,9 +2593,6 @@ mod tests {
         assert!(!is_cleartext_safe_bind("db.internal:5432"));
     }
 
-    /// TLS being configured tightens the rule to loopback only: a private
-    /// network is a shared segment, and a client that skips the SSLRequest
-    /// there would still send the password in the clear.
     #[test]
     fn only_loopback_is_exempt_from_required_tls() {
         assert!(is_loopback_bind("127.0.0.1:5432"));

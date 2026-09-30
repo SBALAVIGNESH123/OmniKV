@@ -40,22 +40,20 @@ most 8 negotiation packets are accepted before the StartupMessage; further
 negotiation attempts close the connection to prevent a pre-authentication spin
 loop.
 
-Negotiation answers depend on TLS configuration. A GSSENCRequest is always
-answered `'N'`. An SSLRequest is answered `'S'` and the connection upgrades
-to TLS when a TLS identity is configured (`OMNIKV_PGWIRE_TLS=true`, the
-default), accepting TLS 1.2 as well as 1.3 so older libpq builds connect; a
-client using `sslmode=require` or `sslmode=prefer` gets an encrypted session
-and the password never crosses the wire in the clear. With TLS configured off,
-an SSLRequest is answered `'N'` and the session stays plaintext.
+Negotiation depends on TLS configuration. GSSENCRequest is always answered
+`'N'`. SSLRequest is answered `'S'` and the session upgrades to TLS when a
+TLS identity is configured (`OMNIKV_PGWIRE_TLS=true`, the default), accepting
+TLS 1.2 and 1.3 so older libpq builds connect; `sslmode=require` and
+`sslmode=prefer` then get an encrypted session and the password never crosses
+the wire in the clear. With TLS off, SSLRequest is answered `'N'`.
 
-A client that skips the SSLRequest stays plaintext. On a loopback bind that is
-allowed; on any other bind with TLS configured, the plaintext StartupMessage is
-rejected with SQLSTATE `28000` ("TLS is required on this listener; connect with
-sslmode=require"), because a private network is a shared segment and the
-cleartext password would be readable by anything else on it. A non-loopback bind
-with TLS off is refused at startup, and the production-mode policy in
-`PgWireServer::validate_security_policy` fails closed the same way. Callers can
-check the policy without binding via `PgWireServer::validate_security_policy`.
+A client that skips the SSLRequest stays plaintext, which is allowed on
+loopback only. On any other bind with TLS configured, the plaintext
+StartupMessage is rejected with SQLSTATE `28000` ("TLS is required on this
+listener; connect with sslmode=require") — private networks included, since
+they are shared segments. A non-loopback bind with TLS off is refused at
+startup, and `PgWireServer::validate_security_policy` fails closed the same
+way. Callers can check that policy without binding.
 
 ### Extended query protocol
 
