@@ -464,9 +464,15 @@ fn tokenize(input: &str) -> Vec<String> {
     while let Some(ch) = chars.next() {
         if in_string {
             if ch == '\'' {
-                tokens.push(format!("'{}'", current));
-                current.clear();
-                in_string = false;
+                // SQL escapes a quote by doubling it: O''Brien is O'Brien.
+                if chars.peek() == Some(&'\'') {
+                    chars.next();
+                    current.push('\'');
+                } else {
+                    tokens.push(format!("'{}'", current));
+                    current.clear();
+                    in_string = false;
+                }
             } else {
                 current.push(ch);
             }
@@ -494,11 +500,16 @@ fn tokenize(input: &str) -> Vec<String> {
                 tokens.push(current.clone());
                 current.clear();
             }
-            if chars.peek() == Some(&'=') {
-                chars.next();
-                tokens.push(format!("{}=", ch));
-            } else {
-                tokens.push(ch.to_string());
+            match chars.peek() {
+                Some('=') => {
+                    chars.next();
+                    tokens.push(format!("{}=", ch));
+                }
+                Some('>') if ch == '<' => {
+                    chars.next();
+                    tokens.push("<>".to_string());
+                }
+                _ => tokens.push(ch.to_string()),
             }
         } else if ch == '=' {
             if !current.is_empty() {
@@ -1138,7 +1149,7 @@ fn parse_where_atom(tokens: &[String], start: usize) -> Result<(WhereExpr, usize
     } else {
         match tokens[i].as_str() {
             "=" => CmpOp::Eq,
-            "!=" => CmpOp::Ne,
+            "!=" | "<>" => CmpOp::Ne,
             ">" => CmpOp::Gt,
             "<" => CmpOp::Lt,
             ">=" => CmpOp::Gte,

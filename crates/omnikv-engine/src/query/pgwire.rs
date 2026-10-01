@@ -250,6 +250,18 @@ fn is_cleartext_safe_bind(bind_addr: &str) -> bool {
     }
 }
 
+/// `!=` leaks how much of a supplied password matched; this reads every byte.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
 /// Loopback only. A private network is shared, so with TLS configured
 /// plaintext startup is refused there too.
 fn is_loopback_bind(bind_addr: &str) -> bool {
@@ -927,7 +939,7 @@ fn handle_startup(
     let supplied = pw_buf.split(|&b| b == 0).next().unwrap_or(&[]);
     let supplied = std::str::from_utf8(supplied).unwrap_or("");
 
-    if supplied != expected_password {
+    if !constant_time_eq(supplied.as_bytes(), expected_password.as_bytes()) {
         tracing::warn!("PGWire authentication failed — bad password");
         send_error_response(&mut stream, "28P01", "password authentication failed")?;
         return Err(std::io::Error::new(
@@ -2650,6 +2662,16 @@ mod tests {
 
         let too_wide = parse_sql("SELECT * FROM users LIMIT 10000 OFFSET 1").expect("parse");
         assert!(enforce_pgwire_statement_limits(too_wide).is_err());
+    }
+
+    #[test]
+    fn pgwire_password_compare_reads_every_byte() {
+        assert!(constant_time_eq(b"hunter2", b"hunter2"));
+        assert!(!constant_time_eq(b"hunter2", b"hunter3"));
+        assert!(!constant_time_eq(b"hunter2", b"hunter"));
+        assert!(!constant_time_eq(b"hunter2", b"xunter2"));
+        assert!(constant_time_eq(b"", b""));
+        assert!(!constant_time_eq(b"", b"a"));
     }
 
     #[test]

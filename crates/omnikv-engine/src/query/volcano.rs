@@ -29,7 +29,7 @@
 use crate::OmniKV;
 use crate::catalog::{Catalog, TableDef};
 use crate::optimizer::{AccessMethod, PlanNode};
-use crate::sql::{AggFunc, CmpOp, JoinType, OrderByItem, SelectColumn, WhereExpr};
+use crate::sql::{AggFunc, CmpOp, JoinType, OrderByItem, SelectColumn, SqlValue, WhereExpr};
 use crate::sql_exec::Row;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -407,7 +407,13 @@ fn project_row(row: Row, columns: &[SelectColumn]) -> Row {
                     .or_else(|| row.get(n))
                     .cloned()
                     .unwrap_or_default();
-                projected.insert(n.clone(), val);
+                // A Row is keyed by name, so a clash (a.shared, b.shared)
+                // needs the qualified key.
+                if projected.contains_key(n) {
+                    projected.insert(key, val);
+                } else {
+                    projected.insert(n.clone(), val);
+                }
             }
             SelectColumn::Aggregate(func, target) => {
                 let name = format!("{}({})", format!("{:?}", func).to_lowercase(), target);
@@ -525,6 +531,9 @@ pub struct HashJoinIter {
     build_col: String,
     probe_col: String,
     join_type: JoinType,
+    // Probe columns are also stored qualified so a name shared with the
+    // build side survives the merge.
+    probe_prefix: String,
     // Buffer for multiple matches on a single probe row
     current_matches: Vec<Row>,
     match_pos: usize,
@@ -542,6 +551,7 @@ impl HashJoinIter {
         build_col: String,
         probe_col: String,
         join_type: JoinType,
+        probe_table: &str,
     ) -> Self {
         // Build phase: materialize build side into hash table
         let mut hash_table: HashMap<String, Vec<Row>> = HashMap::new();
@@ -555,6 +565,7 @@ impl HashJoinIter {
             build_col,
             probe_col,
             join_type,
+            probe_prefix: format!("{probe_table}."),
             current_matches: Vec::new(),
             match_pos: 0,
             matched_build_keys: std::collections::HashSet::new(),
@@ -617,6 +628,8 @@ impl RowIterator for HashJoinIter {
                             combined.insert(k.clone(), v.clone());
                         }
                         for (k, v) in &probe_row {
+                            // Also store it qualified so a shared name isn't dropped.
+                            combined.insert(format!("{}{k}", self.probe_prefix), v.clone());
                             combined.entry(k.clone()).or_insert_with(|| v.clone());
                         }
                         self.current_matches.push(combined);
@@ -826,6 +839,7 @@ pub fn compile_plan_with_scan(
             join_type,
             on_left_col,
             on_right_col,
+            right_table,
             ..
         } => {
             let left_iter = compile_plan_with_scan(left, db, catalog, scan);
@@ -836,6 +850,7 @@ pub fn compile_plan_with_scan(
                 on_left_col.clone(),
                 on_right_col.clone(),
                 join_type.clone(),
+                right_table,
             ))
         }
         PlanNode::Filter {
@@ -876,18 +891,37 @@ pub fn compile_plan_with_scan(
 
 // ─── Shared helpers ─────────────────────────────────────────────────────────
 
-pub fn eval_where(row: &Row, expr: &WhereExpr) -> bool {
+/// Evaluate a predicate, preserving SQL three-valued logic: `None` is
+/// UNKNOWN, which never selects a row and survives `NOT` unchanged.
+fn eval_tri(row: &Row, expr: &WhereExpr) -> Option<bool> {
     match expr {
         WhereExpr::Comparison { column, op, value } => {
+            // Comparison against NULL is UNKNOWN; the text form of Null
+            // must never be compared as data.
+            if matches!(value, SqlValue::Null) {
+                return None;
+            }
             let row_val = row.get(column).cloned().unwrap_or_default();
+            if row_val == "NULL" {
+                return None;
+            }
             let cmp_val = value.as_string();
-            match op {
-                CmpOp::Eq => row_val == cmp_val,
-                CmpOp::Ne => row_val != cmp_val,
-                CmpOp::Gt => smart_cmp(&row_val, &cmp_val) == std::cmp::Ordering::Greater,
-                CmpOp::Lt => smart_cmp(&row_val, &cmp_val) == std::cmp::Ordering::Less,
-                CmpOp::Gte => smart_cmp(&row_val, &cmp_val) != std::cmp::Ordering::Less,
-                CmpOp::Lte => smart_cmp(&row_val, &cmp_val) != std::cmp::Ordering::Greater,
+            // A quoted literal is text and must compare lexically, so a
+            // product code "1e5" never equals "100000"; an unquoted
+            // number compares numerically.
+            let numeric = matches!(value, SqlValue::Integer(_) | SqlValue::Float(_));
+            let ord = if numeric {
+                smart_cmp(&row_val, &cmp_val)
+            } else {
+                row_val.cmp(&cmp_val)
+            };
+            Some(match op {
+                CmpOp::Eq => ord == std::cmp::Ordering::Equal,
+                CmpOp::Ne => ord != std::cmp::Ordering::Equal,
+                CmpOp::Gt => ord == std::cmp::Ordering::Greater,
+                CmpOp::Lt => ord == std::cmp::Ordering::Less,
+                CmpOp::Gte => ord != std::cmp::Ordering::Less,
+                CmpOp::Lte => ord != std::cmp::Ordering::Greater,
                 CmpOp::Like => {
                     // Escape regex metacharacters FIRST, then convert SQL wildcards
                     let escaped = regex::escape(&cmp_val);
@@ -896,57 +930,108 @@ pub fn eval_where(row: &Row, expr: &WhereExpr) -> bool {
                         .map(|r| r.is_match(&row_val))
                         .unwrap_or(false)
                 }
-            }
+            })
         }
-        WhereExpr::And(a, b) => eval_where(row, a) && eval_where(row, b),
-        WhereExpr::Or(a, b) => eval_where(row, a) || eval_where(row, b),
-        WhereExpr::Not(inner) => !eval_where(row, inner),
-        WhereExpr::IsNull(col) => row
-            .get(col)
-            .map(|v| v == "NULL" || v.is_empty())
-            .unwrap_or(true),
-        WhereExpr::IsNotNull(col) => row
-            .get(col)
-            .map(|v| v != "NULL" && !v.is_empty())
-            .unwrap_or(false),
+        WhereExpr::And(a, b) => and_tri(eval_tri(row, a), eval_tri(row, b)),
+        WhereExpr::Or(a, b) => or_tri(eval_tri(row, a), eval_tri(row, b)),
+        WhereExpr::Not(inner) => eval_tri(row, inner).map(std::ops::Not::not),
+        WhereExpr::IsNull(col) => Some(row.get(col).is_none_or(|v| v == "NULL")),
+        WhereExpr::IsNotNull(col) => Some(row.get(col).is_some_and(|v| v != "NULL")),
         WhereExpr::In(col, vals) => {
             let row_val = row.get(col).cloned().unwrap_or_default();
-            vals.iter().any(|v| v.as_string() == row_val)
+            if row_val == "NULL" {
+                return None;
+            }
+            Some(vals.iter().any(|v| v.as_string() == row_val))
         }
-        WhereExpr::InSubquery(_, _) => false, // Not implemented — reject rather than match everything
+        WhereExpr::InSubquery(_, _) => Some(false),
     }
 }
 
+fn and_tri(a: Option<bool>, b: Option<bool>) -> Option<bool> {
+    match (a, b) {
+        (Some(false), _) | (_, Some(false)) => Some(false),
+        (None, _) | (_, None) => None,
+        _ => Some(true),
+    }
+}
+
+fn or_tri(a: Option<bool>, b: Option<bool>) -> Option<bool> {
+    match (a, b) {
+        (Some(true), _) | (_, Some(true)) => Some(true),
+        (None, _) | (_, None) => None,
+        _ => Some(false),
+    }
+}
+
+pub fn eval_where(row: &Row, expr: &WhereExpr) -> bool {
+    eval_tri(row, expr).unwrap_or(false)
+}
+
+/// Compare numerically when both sides are finite numbers, else lexically.
+/// Rust's f64 parser accepts NaN/inf/1e5, which would let a text column
+/// compare the word "inf" as a number.
 fn smart_cmp(a: &str, b: &str) -> std::cmp::Ordering {
-    if let (Ok(ai), Ok(bi)) = (a.parse::<f64>(), b.parse::<f64>()) {
-        ai.partial_cmp(&bi).unwrap_or(std::cmp::Ordering::Equal)
-    } else {
-        a.cmp(b)
+    match (a.parse::<f64>(), b.parse::<f64>()) {
+        (Ok(x), Ok(y)) if x.is_finite() && y.is_finite() => {
+            x.partial_cmp(&y).unwrap_or(std::cmp::Ordering::Equal)
+        }
+        _ => a.cmp(b),
     }
 }
 
-fn compute_aggregate(func: &AggFunc, target: &str, rows: &[&Row]) -> (String, String) {
+pub fn compute_aggregate(func: &AggFunc, target: &str, rows: &[&Row]) -> (String, String) {
     let name = format!("{}({})", format!("{:?}", func).to_lowercase(), target);
+    // COUNT(*) tallies rows; COUNT(col) skips nulls, per the SQL standard.
+    let values: Vec<&str> = if target == "*" {
+        Vec::new()
+    } else {
+        rows.iter()
+            .filter_map(|r| r.get(target))
+            .filter(|v| *v != "NULL")
+            .map(String::as_str)
+            .collect()
+    };
     match func {
-        AggFunc::Count => (name, rows.len().to_string()),
+        AggFunc::Count => {
+            let n = if target == "*" { rows.len() } else { values.len() };
+            (name, n.to_string())
+        }
         AggFunc::Sum => {
-            let sum: f64 = rows
-                .iter()
-                .filter_map(|r| r.get(target).and_then(|v| v.parse::<f64>().ok()))
-                .sum();
-            (name, sum.to_string())
+            if values.iter().all(|v| v.parse::<i64>().is_ok()) {
+                let sum: i64 = values.iter().map(|v| v.parse::<i64>().unwrap()).sum();
+                (name, sum.to_string())
+            } else {
+                let sum: f64 = values.iter().filter_map(|v| v.parse::<f64>().ok()).sum();
+                (name, sum.to_string())
+            }
         }
         AggFunc::Avg => {
-            let vals: Vec<f64> = rows
-                .iter()
-                .filter_map(|r| r.get(target).and_then(|v| v.parse::<f64>().ok()))
-                .collect();
-            let avg = if vals.is_empty() {
-                0.0
+            if values.iter().all(|v| v.parse::<i64>().is_ok()) && !values.is_empty() {
+                let sum: i128 = values.iter().map(|v| v.parse::<i64>().unwrap() as i128).sum();
+                let n = values.len() as i128;
+                let avg = sum / n;
+                let rem = sum % n;
+                if rem == 0 {
+                    (name, avg.to_string())
+                } else {
+                    // Exact when the fraction is short; the fallback keeps
+                    // six places without the trailing zeros f64 prints.
+                    let q = (sum * 1_000_000) / n;
+                    let whole = q / 1_000_000;
+                    let frac = q % 1_000_000;
+                    let s = frac.abs().to_string();
+                    (name, format!("{}.{}", whole, s.trim_end_matches('0')))
+                }
             } else {
-                vals.iter().sum::<f64>() / vals.len() as f64
-            };
-            (name, format!("{:.2}", avg))
+                let avg = if values.is_empty() {
+                    0.0
+                } else {
+                    values.iter().filter_map(|v| v.parse::<f64>().ok()).sum::<f64>()
+                        / values.len() as f64
+                };
+                (name, avg.to_string())
+            }
         }
         AggFunc::Min => {
             let min = rows

@@ -320,6 +320,257 @@ fn test_is_null() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// Comparison semantics (#149)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// `=` and `>` must agree: both compare numerically on a numeric column.
+#[test]
+fn test_equality_and_ordering_agree_on_numbers() {
+    let (_db, exec) = create_sql_env("cmpagree");
+
+    exec_sql(&exec, "CREATE TABLE nums (id INTEGER PRIMARY KEY, v INTEGER)");
+    exec_sql(&exec, "INSERT INTO nums (id, v) VALUES (1, 1)");
+    exec_sql(&exec, "INSERT INTO nums (id, v) VALUES (2, 10)");
+
+    let (_cols, rows) = exec_rows(&exec, "SELECT id FROM nums WHERE v = 1.0");
+    assert_eq!(rows, vec![vec!["1".to_string()]]);
+
+    let (_cols, rows) = exec_rows(&exec, "SELECT id FROM nums WHERE v > 2");
+    assert_eq!(rows, vec![vec!["2".to_string()]]);
+}
+
+/// A text literal compares lexically, so the f64 specials are not numbers here.
+#[test]
+fn test_text_literals_compare_lexically() {
+    let (_db, exec) = create_sql_env("lex");
+
+    exec_sql(&exec, "CREATE TABLE words (id INTEGER PRIMARY KEY, w TEXT)");
+    exec_sql(&exec, "INSERT INTO words (id, w) VALUES (1, 'NaN')");
+    exec_sql(&exec, "INSERT INTO words (id, w) VALUES (2, 'apple')");
+
+    let (_cols, rows) = exec_rows(&exec, "SELECT id FROM words WHERE w = 'NaN'");
+    assert_eq!(rows, vec![vec!["1".to_string()]]);
+
+    let (_cols, rows) = exec_rows(&exec, "SELECT id FROM words WHERE w > 'NaN'");
+    assert_eq!(rows, vec![vec!["2".to_string()]]);
+}
+
+/// `= NULL` is UNKNOWN and matches nothing; only IS NULL finds nulls.
+#[test]
+fn test_null_comparison_is_unknown() {
+    let (_db, exec) = create_sql_env("nullcmp");
+
+    exec_sql(&exec, "CREATE TABLE n (id INTEGER PRIMARY KEY, name TEXT)");
+    exec_sql(&exec, "INSERT INTO n (id, name) VALUES (1, 'alice')");
+    exec_sql(&exec, "INSERT INTO n (id, name) VALUES (2, NULL)");
+
+    let (_cols, rows) = exec_rows(&exec, "SELECT id FROM n WHERE name = NULL");
+    assert!(rows.is_empty());
+
+    let (_cols, rows) = exec_rows(&exec, "SELECT id FROM n WHERE name <> NULL");
+    assert!(rows.is_empty());
+
+    let (_cols, rows) = exec_rows(&exec, "SELECT id FROM n WHERE name IS NULL");
+    assert_eq!(rows, vec![vec!["2".to_string()]]);
+}
+
+/// An empty string is data, not a null.
+#[test]
+fn test_empty_string_is_not_null() {
+    let (_db, exec) = create_sql_env("empty");
+
+    exec_sql(&exec, "CREATE TABLE e (id INTEGER PRIMARY KEY, name TEXT)");
+    exec_sql(&exec, "INSERT INTO e (id, name) VALUES (1, '')");
+    exec_sql(&exec, "INSERT INTO e (id, name) VALUES (2, NULL)");
+
+    let (_cols, rows) = exec_rows(&exec, "SELECT id FROM e WHERE name IS NULL");
+    assert_eq!(rows, vec![vec!["2".to_string()]]);
+
+    let (_cols, rows) = exec_rows(&exec, "SELECT id FROM e WHERE name = ''");
+    assert_eq!(rows, vec![vec!["1".to_string()]]);
+}
+
+/// A column the table does not have is an error, not an empty result.
+#[test]
+fn test_unknown_column_errors() {
+    let (_db, exec) = create_sql_env("unknowncol");
+
+    exec_sql(&exec, "CREATE TABLE k (id INTEGER PRIMARY KEY, name TEXT)");
+    exec_sql(&exec, "INSERT INTO k (id, name) VALUES (1, 'a')");
+
+    let stmt = parse_sql("SELECT id FROM k WHERE no_such_col = 5").unwrap();
+    let err = match exec.execute(&stmt) {
+        Ok(_) => panic!("unknown column must error, not return rows"),
+        Err(e) => e,
+    };
+    assert!(
+        err.contains("does not exist"),
+        "error should name the missing column: {err}"
+    );
+}
+
+/// COUNT(*) tallies rows, COUNT(col) skips nulls, and SUM/AVG stay exact.
+#[test]
+fn test_aggregate_null_and_integer_semantics() {
+    let (_db, exec) = create_sql_env("aggsem");
+
+    exec_sql(&exec, "CREATE TABLE agg (id INTEGER PRIMARY KEY, n INTEGER)");
+    exec_sql(&exec, "INSERT INTO agg (id, n) VALUES (1, 10)");
+    exec_sql(&exec, "INSERT INTO agg (id, n) VALUES (2, 5)");
+    exec_sql(&exec, "INSERT INTO agg (id, n) VALUES (3, NULL)");
+
+    let (_cols, rows) = exec_rows(&exec, "SELECT COUNT(*) FROM agg");
+    assert_eq!(rows, vec![vec!["3".to_string()]]);
+
+    let (_cols, rows) = exec_rows(&exec, "SELECT COUNT(n) FROM agg");
+    assert_eq!(rows, vec![vec!["2".to_string()]]);
+
+    let (_cols, rows) = exec_rows(&exec, "SELECT SUM(n) FROM agg");
+    assert_eq!(rows, vec![vec!["15".to_string()]]);
+
+    let (_cols, rows) = exec_rows(&exec, "SELECT AVG(n) FROM agg");
+    assert_eq!(rows, vec![vec!["7.5".to_string()]]);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Three-valued logic and column resolution
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// UNKNOWN survives NOT: `NOT (col = NULL)` must not flip to true.
+#[test]
+fn test_unknown_survives_not() {
+    let (_db, exec) = create_sql_env("notnull");
+
+    exec_sql(&exec, "CREATE TABLE nn (id INTEGER PRIMARY KEY, v TEXT)");
+    exec_sql(&exec, "INSERT INTO nn (id, v) VALUES (1, 'x')");
+    exec_sql(&exec, "INSERT INTO nn (id, v) VALUES (2, NULL)");
+
+    let (_cols, rows) = exec_rows(&exec, "SELECT id FROM nn WHERE NOT (v = NULL)");
+    assert!(rows.is_empty(), "NOT of UNKNOWN stays UNKNOWN");
+
+    let (_cols, rows) = exec_rows(&exec, "SELECT id FROM nn WHERE v = NULL OR id = 1");
+    assert_eq!(rows, vec![vec!["1".to_string()]]);
+}
+
+/// Column names are exact-case; a wrong case is an error, not silence.
+#[test]
+fn test_column_case_is_significant() {
+    let (_db, exec) = create_sql_env("colcase");
+
+    exec_sql(&exec, "CREATE TABLE cc (id INTEGER PRIMARY KEY, Name TEXT)");
+    exec_sql(&exec, "INSERT INTO cc (id, Name) VALUES (1, 'a')");
+
+    let (_cols, rows) = exec_rows(&exec, "SELECT id FROM cc WHERE Name = 'a'");
+    assert_eq!(rows, vec![vec!["1".to_string()]]);
+
+    let stmt = parse_sql("SELECT id FROM cc WHERE name = 'a'").unwrap();
+    let err = match exec.execute(&stmt) {
+        Ok(_) => panic!("wrong-case column must error"),
+        Err(e) => e,
+    };
+    assert!(err.contains("does not exist"), "error names the column: {err}");
+}
+
+/// UPDATE and DELETE validate WHERE columns too, not just SELECT.
+#[test]
+fn test_update_delete_validate_columns() {
+    let (_db, exec) = create_sql_env("d4ud");
+
+    exec_sql(&exec, "CREATE TABLE d (id INTEGER PRIMARY KEY, v TEXT)");
+    exec_sql(&exec, "INSERT INTO d (id, v) VALUES (1, 'a')");
+
+    let stmt = parse_sql("DELETE FROM d WHERE no_such_col = 5").unwrap();
+    let err = match exec.execute(&stmt) {
+        Ok(_) => panic!("DELETE with unknown column must error"),
+        Err(e) => e,
+    };
+    assert!(err.contains("does not exist"), "DELETE error: {err}");
+
+    let stmt = parse_sql("UPDATE d SET v = 'b' WHERE no_such_col = 5").unwrap();
+    let err = match exec.execute(&stmt) {
+        Ok(_) => panic!("UPDATE with unknown column must error"),
+        Err(e) => e,
+    };
+    assert!(err.contains("does not exist"), "UPDATE error: {err}");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Tokenizer, operator, and join regressions
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// A doubled quote inside a string literal is one literal quote, not the end
+/// of the string.
+#[test]
+fn test_escaped_quote_in_string_literal() {
+    let (_db, exec) = create_sql_env("escq");
+
+    exec_sql(&exec, "CREATE TABLE esc (id INTEGER PRIMARY KEY, name TEXT)");
+    exec_sql(&exec, "INSERT INTO esc (id, name) VALUES (1, 'O''Brien')");
+
+    let (_cols, rows) = exec_rows(&exec, "SELECT name FROM esc WHERE id = 1");
+    assert_eq!(rows, vec![vec!["O'Brien".to_string()]]);
+
+    let (_cols, rows) = exec_rows(&exec, "SELECT name FROM esc WHERE name = 'O''Brien'");
+    assert_eq!(rows, vec![vec!["O'Brien".to_string()]]);
+}
+
+/// `<>` is the SQL standard spelling of `!=` and must exclude the matching row.
+#[test]
+fn test_not_equal_operator() {
+    let (_db, exec) = create_sql_env("neop");
+
+    exec_sql(&exec, "CREATE TABLE ne (id INTEGER PRIMARY KEY, name TEXT)");
+    exec_sql(&exec, "INSERT INTO ne (id, name) VALUES (1, 'alice')");
+    exec_sql(&exec, "INSERT INTO ne (id, name) VALUES (2, 'bob')");
+    exec_sql(&exec, "INSERT INTO ne (id, name) VALUES (3, 'carol')");
+
+    let ids = |sql: &str| {
+        let (_cols, rows) = exec_rows(&exec, sql);
+        let mut v: Vec<String> = rows.into_iter().flatten().collect();
+        v.sort();
+        v
+    };
+
+    assert_eq!(ids("SELECT id FROM ne WHERE id <> 2"), vec!["1", "3"]);
+    assert_eq!(ids("SELECT id FROM ne WHERE id != 2"), vec!["1", "3"]);
+    assert_eq!(ids("SELECT id FROM ne WHERE name <> 'bob'"), vec!["1", "3"]);
+}
+
+/// LIKE metacharacters are literal; only `%` and `_` are wildcards.
+#[test]
+fn test_like_metacharacters_are_literal() {
+    let (_db, exec) = create_sql_env("likemeta");
+
+    exec_sql(&exec, "CREATE TABLE lm (id INTEGER PRIMARY KEY, name TEXT)");
+    exec_sql(&exec, "INSERT INTO lm (id, name) VALUES (1, 'a.b')");
+    exec_sql(&exec, "INSERT INTO lm (id, name) VALUES (2, 'axb')");
+
+    let (_cols, rows) = exec_rows(&exec, "SELECT id FROM lm WHERE name LIKE 'a.b'");
+    assert_eq!(rows, vec![vec!["1".to_string()]]);
+
+    exec_sql(&exec, "DELETE FROM lm WHERE name LIKE 'a.b'");
+    let (_cols, rows) = exec_rows(&exec, "SELECT id FROM lm");
+    assert_eq!(rows, vec![vec!["2".to_string()]]);
+}
+
+/// Two tables sharing a column name must each contribute their own value.
+#[test]
+fn test_join_shared_column_name() {
+    let (_db, exec) = create_sql_env("jshare");
+
+    exec_sql(&exec, "CREATE TABLE js_a (id INTEGER PRIMARY KEY, shared TEXT)");
+    exec_sql(&exec, "CREATE TABLE js_b (id INTEGER PRIMARY KEY, shared TEXT)");
+    exec_sql(&exec, "INSERT INTO js_a (id, shared) VALUES (1, 'A1')");
+    exec_sql(&exec, "INSERT INTO js_b (id, shared) VALUES (1, 'B1')");
+
+    let (_cols, rows) = exec_rows(
+        &exec,
+        "SELECT js_a.shared, js_b.shared FROM js_a JOIN js_b ON js_a.id = js_b.id",
+    );
+    assert_eq!(rows, vec![vec!["A1".to_string(), "B1".to_string()]]);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // UNION/INTERSECT (via multiple queries)
 // ═══════════════════════════════════════════════════════════════════════════
 
