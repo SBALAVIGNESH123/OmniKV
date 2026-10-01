@@ -1,8 +1,7 @@
 //! Online Schema Evolution Engine
 //!
-//! Provides zero-downtime schema changes for OmniKV. Unlike traditional
-//! databases that lock tables during ALTER, this system applies changes
-//! incrementally while the database continues serving reads and writes.
+//! Applies schema changes incrementally while the database continues to
+//! serve reads and writes.
 //!
 //! ## Features
 //!

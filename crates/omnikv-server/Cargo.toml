@@ -17,6 +17,7 @@ quinn = "0.11.9"
 # >=0.23.45: RUSTSEC-2026-0285 (TLS 1.3 handshake messages accepted
 # across encryption level boundaries).
 rustls = { version = "0.23.45", features = ["ring"] }
+tokio-rustls = "0.26"
 webpki-roots = "0.26"
 rcgen = "0.14.7"
 serde = { version = "1.0", features = ["derive"] }

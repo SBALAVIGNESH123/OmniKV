@@ -52,6 +52,8 @@ cargo run -p omnikv-server -- --config /etc/omnikv/omnikv.toml
 | `OMNIKV_PGWIRE_ADDR` | `127.0.0.1:5432` | PostgreSQL wire protocol address |
 | `OMNIKV_TCP_ADDR` | `127.0.0.1:7072` | TCP command interface address |
 | `OMNIKV_TCP_BIND_PUBLIC` | `false` | Required to set a non-loopback `OMNIKV_TCP_ADDR` |
+| `OMNIKV_TCP_TLS` | `true` | TLS 1.3 on the TCP command interface; plaintext is only safe on loopback |
+| `OMNIKV_PGWIRE_TLS` | `true` | Upgrades a PgWire session to TLS when the client sends an SSLRequest |
 | `OMNIKV_JWT_SECRET` | dev default | JWT signing secret (≥ 32 chars required in production) |
 | `OMNIKV_BOOTSTRAP_ADMIN_KEY` | dev default | Bootstrap key for `POST /auth/token` (≥ 32 chars required in production) |
 | `OMNIKV_TLS_CERT_PATH` | _(none)_ | Path to TLS certificate (PEM) |
@@ -138,10 +140,25 @@ Prometheus metrics expose maintenance health:
   and the server refuses to boot otherwise. A public bind still exposes
   an unrestricted read/write path to every host that can reach the port,
   so prefer REST (TLS, scoped roles) or PgWire for off-node access. The
-  interface has no transport encryption: `AUTH` sends the token in
-  cleartext, so on a public bind the credential is readable by anyone on
-  the path — bind it where the network is already trusted, or terminate
-  TLS in a sidecar in front of it.
+  interface encrypts the transport with TLS 1.3 (`OMNIKV_TCP_TLS=true`,
+  the default), so `AUTH` never puts the token on the wire in cleartext.
+  The certificate is the operator-supplied pair from `OMNIKV_TLS_CERT_PATH`
+  / `OMNIKV_TLS_KEY_PATH` when both are set, and otherwise self-signed and
+  freshly generated for this interface on every boot — in the fallback case
+  a new key pair is minted on each restart, so a client that pins it must
+  re-pin after every restart or trust it out of band.
+  Setting `OMNIKV_TCP_TLS=false` is refused for a public bind
+  and only makes sense on loopback, where a plaintext session is
+  convenient for telnet debugging — the token is then visible to any
+  process on the host.
+- Prefer the PostgreSQL wire protocol for off-node access. It encrypts the
+  transport the same way (`OMNIKV_PGWIRE_TLS=true`, the default): a client's
+  SSLRequest is answered with 'S' and the entire session, including the
+  `OMNI_PGWIRE_PASSWORD`, runs inside TLS. Plaintext startup is allowed on
+  loopback only; on any other bind it is rejected with SQLSTATE `28000`
+  before the password is requested. A non-loopback bind with TLS off is
+  refused at startup. TLS 1.2 is accepted here, not just 1.3, so older
+  libpq builds still connect.
 - Tune rate limits for your workload and alert on
   `omnikv_rate_limit_rejections_total{protocol=...}`.
 - Alert on `omnikv_cleanup_delete_failures_total{context=...,error_kind=...}`;

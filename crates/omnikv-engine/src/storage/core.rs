@@ -1093,7 +1093,6 @@ pub struct OmniKV {
 
     // ── Group commit engine ──
     // Batches concurrent fsyncs: N writers → 1 fsync instead of N fsyncs.
-    // This is the single most impactful performance optimization for writes.
     group_commit: crate::hardening::GroupCommitEngine,
 
     // ── Storage transition barrier ──
@@ -1880,26 +1879,28 @@ impl OmniKV {
                 .wal
                 .lock()
                 .map_err(|_| OmniError::LockPoisoned("wal lock".into()))?;
+            if self.group_commit.is_poisoned() {
+                return Err(OmniError::IoError(
+                    "group commit engine poisoned by an earlier fsync failure".into(),
+                ));
+            }
             wal.append_batch_nosync(&wal_records)?;
         }
 
         // ── GROUP COMMIT: batch heap + WAL fsyncs ──
-        // Natural batching: leader syncs immediately, no sleep.
-        // While leader fsyncs (~2ms), other writers queue up as followers.
-        // Result: N concurrent writes → 2 fsyncs instead of 2N.
-        {
-            let guard = self.group_commit.join_group();
+        let sync_outcome = {
+            let guard = self.group_commit.join_group()?;
             if guard.is_leader {
-                // Leader: fsync BOTH heap and WAL for all writers in this group
-                if let Ok(heap) = self.heap_file.lock() {
-                    let _ = heap.sync_data();
-                }
-                if let Ok(wal) = self.wal.lock() {
-                    let _ = wal.sync();
-                }
+                let result = self.sync_group_commit_files();
+                // Followers are released with this outcome.
+                guard.mark_synced(result.clone());
+                result
+            } else {
+                Ok(())
             }
-            guard.mark_synced();
-        }
+        };
+        // The batch is not on disk; it must not become visible.
+        sync_outcome?;
 
         // Memtable insertion (SkipMap is lock-free for concurrent inserts)
         let memtable = self.roots.load().memtable.clone();
@@ -1925,6 +1926,34 @@ impl OmniKV {
         metrics_prometheus::COMMIT_RATE.inc();
 
         Ok(current_seq)
+    }
+
+    /// fsyncs the heap then the WAL, holding the heap lock across both.
+    fn sync_group_commit_files(&self) -> Result<(), OmniError> {
+        let heap = self
+            .heap_file
+            .lock()
+            .map_err(|_| OmniError::LockPoisoned("heap_file lock".into()))?;
+        let mut wal = self
+            .wal
+            .lock()
+            .map_err(|_| OmniError::LockPoisoned("wal lock".into()))?;
+
+        let result = heap
+            .sync_data()
+            .map_err(|e| OmniError::IoError(format!("group commit heap fsync failed: {e}")))
+            .and_then(|()| {
+                wal.sync()
+                    .map_err(|e| OmniError::IoError(format!("group commit wal fsync failed: {e}")))
+            });
+
+        if let Err(ref e) = result {
+            self.group_commit.poison(e.clone());
+            if let Err(te) = wal.discard_undurable() {
+                eprintln!("[WAL] failed to discard undurable bytes after fsync failure: {te:?}");
+            }
+        }
+        result
     }
 
     fn read_from_heap(
@@ -2001,8 +2030,6 @@ impl OmniKV {
 
         result
     }
-
-    // Removed binary_search_records
 
     /// Finds a value by its key, up to the specified read sequence number (MVCC).
     /// Returns `Ok(None)` if the key does not exist or has been deleted.

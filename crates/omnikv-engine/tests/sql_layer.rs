@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════════════════════════════════════
-// SQL Layer Integration Tests — Gaps #23 through #31
+// SQL Layer Integration Tests
 // ═══════════════════════════════════════════════════════════════════════════
 
 use omni_engine::OmniKV;
@@ -35,10 +35,10 @@ fn exec_rows(executor: &SqlExecutor, sql: &str) -> (Vec<String>, Vec<Vec<String>
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Gap #23: Subqueries (WHERE x IN (SELECT ...))
+// Subqueries (WHERE x IN (SELECT ...))
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Gap #23a: Parse subquery in WHERE clause
+/// Parse subquery in WHERE clause
 #[test]
 fn test_subquery_parse() {
     let stmt = parse_sql("SELECT * FROM orders WHERE customer_id IN (SELECT id FROM customers)");
@@ -55,7 +55,7 @@ fn test_subquery_parse() {
     println!("✅ SQL 23a: Subquery WHERE x IN (SELECT ...) parsed correctly");
 }
 
-/// Gap #23b: Parse regular IN still works
+/// Parse regular IN still works
 #[test]
 fn test_regular_in_still_works() {
     let stmt = parse_sql("SELECT * FROM users WHERE id IN (1, 2, 3)").unwrap();
@@ -67,10 +67,10 @@ fn test_regular_in_still_works() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Gap #24: Window functions (ROW_NUMBER, RANK, DENSE_RANK)
+// Window functions (ROW_NUMBER, RANK, DENSE_RANK)
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Gap #24a: Parse `ROW_NUMBER()` OVER (ORDER BY col)
+/// Parse `ROW_NUMBER()` OVER (ORDER BY col)
 #[test]
 fn test_window_func_parse_row_number() {
     let stmt =
@@ -89,7 +89,7 @@ fn test_window_func_parse_row_number() {
     println!("✅ SQL 24a: ROW_NUMBER() OVER (ORDER BY score DESC) parsed");
 }
 
-/// Gap #24b: Parse RANK and `DENSE_RANK`
+/// Parse RANK and `DENSE_RANK`
 #[test]
 fn test_window_func_parse_rank() {
     let stmt = parse_sql("SELECT RANK() OVER (ORDER BY score) FROM t").unwrap();
@@ -117,7 +117,7 @@ fn test_window_func_parse_rank() {
     println!("✅ SQL 24b: RANK() and DENSE_RANK() parsed correctly");
 }
 
-/// Gap #24c: Window function execution with real data
+/// Window function execution with real data
 #[test]
 fn test_window_func_execution() {
     let (_db, exec) = create_sql_env("wf");
@@ -160,10 +160,10 @@ fn test_window_func_execution() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Gap #25: HAVING clause (parsed as part of GROUP BY)
+// HAVING clause (parsed as part of GROUP BY)
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Gap #25a: GROUP BY with aggregate
+/// GROUP BY with aggregate
 #[test]
 fn test_group_by_aggregate() {
     let (_db, exec) = create_sql_env("gb");
@@ -196,10 +196,10 @@ fn test_group_by_aggregate() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Gap #26: Multi-table UPDATE and DELETE
+// Multi-table UPDATE and DELETE
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Gap #26a: UPDATE with WHERE condition
+/// UPDATE with WHERE condition
 #[test]
 fn test_update_with_where() {
     let (_db, exec) = create_sql_env("upd");
@@ -225,7 +225,7 @@ fn test_update_with_where() {
     println!("✅ SQL 26a: UPDATE with WHERE correctly modified price");
 }
 
-/// Gap #26b: DELETE with WHERE condition
+/// DELETE with WHERE condition
 #[test]
 fn test_delete_with_where() {
     let (_db, exec) = create_sql_env("del");
@@ -246,10 +246,10 @@ fn test_delete_with_where() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Gap #27: ALTER TABLE (simulated via catalog)
+// ALTER TABLE (simulated via catalog)
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Gap #27a: CREATE TABLE IF NOT EXISTS (idempotent)
+/// CREATE TABLE IF NOT EXISTS (idempotent)
 #[test]
 fn test_create_table_if_not_exists() {
     let (_db, exec) = create_sql_env("ine");
@@ -264,7 +264,7 @@ fn test_create_table_if_not_exists() {
     println!("✅ SQL 27a: CREATE TABLE IF NOT EXISTS is idempotent");
 }
 
-/// Gap #27b: DROP TABLE IF EXISTS
+/// DROP TABLE IF EXISTS
 #[test]
 fn test_drop_table_if_exists() {
     let (_db, exec) = create_sql_env("die");
@@ -278,10 +278,10 @@ fn test_drop_table_if_exists() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Gap #28: CASE/WHEN expressions (parsed as values)
+// CASE/WHEN expressions (parsed as values)
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Gap #28a: LIKE operator in WHERE clause
+/// LIKE operator in WHERE clause
 #[test]
 fn test_like_operator() {
     let (_db, exec) = create_sql_env("like");
@@ -300,7 +300,7 @@ fn test_like_operator() {
     println!("✅ SQL 28a: LIKE 'Al%' matched Alice and Alex");
 }
 
-/// Gap #28b: IS NULL / IS NOT NULL
+/// IS NULL / IS NOT NULL
 #[test]
 fn test_is_null() {
     let (_db, exec) = create_sql_env("isn");
@@ -320,10 +320,10 @@ fn test_is_null() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Gap #29: UNION/INTERSECT (via multiple queries)
+// UNION/INTERSECT (via multiple queries)
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Gap #29a: Multiple INSERT batches
+/// Multiple INSERT batches
 #[test]
 fn test_multi_value_insert() {
     let (_db, exec) = create_sql_env("mvi");
@@ -344,10 +344,10 @@ fn test_multi_value_insert() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Gap #30: Nested JOINs (3+ tables)
+// Nested JOINs (3+ tables)
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Gap #30a: INNER JOIN between two tables
+/// INNER JOIN between two tables
 #[test]
 fn test_inner_join() {
     let (_db, exec) = create_sql_env("join");
@@ -381,7 +381,7 @@ fn test_inner_join() {
     println!("✅ SQL 30a: INNER JOIN returned 2 matched rows");
 }
 
-/// Gap #30b: LEFT JOIN preserves unmatched left rows
+/// LEFT JOIN preserves unmatched left rows
 #[test]
 fn test_left_join() {
     let (_db, exec) = create_sql_env("lj");
@@ -412,10 +412,10 @@ fn test_left_join() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Gap #31: Type coercion and comparison operators
+// Type coercion and comparison operators
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Gap #31a: Numeric comparison in WHERE
+/// Numeric comparison in WHERE
 #[test]
 fn test_numeric_comparison() {
     let (_db, exec) = create_sql_env("ncmp");
@@ -437,7 +437,7 @@ fn test_numeric_comparison() {
     println!("✅ SQL 31a: Numeric >, <=, comparisons correct");
 }
 
-/// Gap #31b: ORDER BY with LIMIT
+/// ORDER BY with LIMIT
 #[test]
 fn test_order_by_limit() {
     let (_db, exec) = create_sql_env("obl");
@@ -461,7 +461,7 @@ fn test_order_by_limit() {
     println!("✅ SQL 31b: ORDER BY score DESC LIMIT 2 → [90, 70]");
 }
 
-/// Gap #31c: EXPLAIN query plan
+/// EXPLAIN query plan
 #[test]
 fn test_explain() {
     let (_db, exec) = create_sql_env("expl");

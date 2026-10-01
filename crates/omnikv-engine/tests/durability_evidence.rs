@@ -10,8 +10,6 @@
 ///   - Concurrent crash during write
 ///   - Compaction + crash + recovery + verify cycle
 ///
-/// A database that passes all these tests has earned durability trust.
-/// A database that fails any of them should not be used in production.
 use omni_engine::{OmniKV, WriteBatch};
 use std::fs;
 use std::io::Write;
@@ -93,19 +91,11 @@ fn verify_all_keys(db: &OmniKV, n: u64, prefix: &str) {
 // ═══════════════════════════════════════════════════════════════════════
 // TEST 1: Recovery after crash during compaction
 //
-// This is the #1 failure mode for LSM-tree engines.
-// Steps:
-//   1. Write enough data to produce L0 SSTables
-//   2. Trigger compaction
-//   3. Simulate crash by dropping the engine mid-state
-//   4. Reopen and verify ALL data is present
-//   5. Verify compaction can complete on the reopened engine
 // ═══════════════════════════════════════════════════════════════════════
 #[test]
 fn test_recovery_after_crash_during_compaction() {
     let (dir, db) = open_fresh();
 
-    // Phase 1: Write enough data to fill the memtable and produce SSTables
     for i in 0u64..500 {
         put(&db, &format!("cmpct:{i:06}"), &format!("val_{i}"));
     }
@@ -118,7 +108,6 @@ fn test_recovery_after_crash_during_compaction() {
         put(&db, &format!("cmpct:{i:06}"), &format!("val_{i}"));
     }
 
-    // Trigger another compaction — then "crash" by dropping without clean shutdown
     let _ = db.compact_sstables(); // may or may not complete
     drop(db); // simulate crash: no graceful shutdown
 
@@ -138,9 +127,6 @@ fn test_recovery_after_crash_during_compaction() {
 // ═══════════════════════════════════════════════════════════════════════
 // TEST 2: 1000 crash-recovery cycles
 //
-// The single most important durability test.
-// If any key is ever lost after any of the 1000 cycles, the engine
-// has a durability bug.
 // ═══════════════════════════════════════════════════════════════════════
 #[test]
 fn test_1000_crash_recovery_cycles() {
@@ -379,7 +365,7 @@ fn test_sstable_corruption_detected_on_read() {
                 corruption_detected = true;
             }
             Err(_) => {
-                // CRC error surfaced — this is the ideal behavior
+                // CRC error surfaced
                 corruption_detected = true;
             }
         }
@@ -594,11 +580,7 @@ fn test_large_batch_atomicity_across_crash() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// TEST 10: GC does NOT lose in-flight data (regression test)
-//
-// This directly tests the bug we fixed in Phase 1:
-// the old code called shard.clear() during GC, which would discard
-// any writes that arrived between GC start and GC completion.
+// GC must not discard writes that arrive while it is running.
 // ═══════════════════════════════════════════════════════════════════════
 #[test]
 fn test_gc_does_not_lose_inflight_data() {
@@ -615,7 +597,7 @@ fn test_gc_does_not_lose_inflight_data() {
     // Run GC
     let _ = db.run_garbage_collection();
 
-    // Write NEW data AFTER GC started (this is what the old bug lost)
+    // These writes race with GC and must survive.
     for i in 100u64..200 {
         put(&db, &format!("gc:{i:06}"), &format!("val_{i}"));
     }
@@ -650,7 +632,6 @@ fn test_full_lsm_lifecycle_with_restarts() {
 
     let mut total_keys: u64 = 0;
 
-    // Phase 1: Fill memtable → flush to L0
     {
         let db = OmniKV::open(&manifest, &wal).expect("phase1");
         for i in 0u64..300 {

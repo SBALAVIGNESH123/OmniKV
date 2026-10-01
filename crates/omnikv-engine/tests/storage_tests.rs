@@ -219,11 +219,7 @@ fn test_mvcc_snapshot_isolation() {
     b1.set("mvcc_key", "version1".to_string()).unwrap();
     let seq_after_v1 = db.commit_batch(&b1).unwrap();
 
-    // Snapshot BEFORE the second write: use the seq from the first commit
-    // The commit returns the last seq used (the commit marker), so the actual
-    // data seq is seq_after_v1 - 1 for the single record, but we need a
-    // read_seq that sees v1 but not v2. We use seq_after_v1 since that's
-    // the commit marker seq, and v1's seq is less than that.
+    // commit_batch returns the commit-marker seq, which sees v1 but not v2.
     let snap = seq_after_v1;
 
     let mut b2 = WriteBatch::new();
@@ -1550,11 +1546,11 @@ use omni_engine::hardening::{GroupCommitEngine, RateLimiter};
 fn test_group_commit_single_writer() {
     let engine = GroupCommitEngine::new(100); // 100µs wait
 
-    let guard = engine.join_group();
+    let guard = engine.join_group().unwrap();
     assert!(guard.is_leader, "Single writer should be the leader");
 
     // Simulate fsync
-    guard.mark_synced();
+    guard.mark_synced(Ok(()));
 
     let (committed, pending) = engine.stats();
     assert_eq!(committed, 1);
@@ -1566,14 +1562,14 @@ fn test_group_commit_multiple_epochs() {
     let engine = GroupCommitEngine::new(50);
 
     // First group
-    let g1 = engine.join_group();
+    let g1 = engine.join_group().unwrap();
     assert!(g1.is_leader);
-    g1.mark_synced();
+    g1.mark_synced(Ok(()));
 
     // Second group
-    let g2 = engine.join_group();
+    let g2 = engine.join_group().unwrap();
     assert!(g2.is_leader);
-    g2.mark_synced();
+    g2.mark_synced(Ok(()));
 
     let (committed, _) = engine.stats();
     assert_eq!(committed, 2);
@@ -1931,7 +1927,7 @@ fn test_2pc_participant_abort() {
     coord
         .add_write(txn_id, 2, "abort_key1".into(), Some("v1".into()), 0)
         .unwrap();
-    // Intentionally add a write with value too large to trigger batch error
+    // A second write on a different key
     coord
         .add_write(txn_id, 3, "abort_key2".into(), Some("v2".into()), 0)
         .unwrap();
@@ -1991,10 +1987,8 @@ fn test_2pc_timeout_detection() {
     std::thread::sleep(std::time::Duration::from_millis(50));
 
     let _timed_out = coord.check_timeouts();
-    // Note: timeout detection depends on second-level granularity,
-    // so with 1ms timeout and 50ms sleep, it should timeout
-    // (but since created_at is in seconds, this may not trigger)
-    // The function itself works correctly regardless
+    // created_at is second-granular, so assert only that the txn stays
+    // active until explicitly aborted.
     assert_eq!(coord.active_count(), 1); // still active until explicitly aborted
 }
 

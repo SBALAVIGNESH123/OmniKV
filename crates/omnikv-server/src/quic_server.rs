@@ -40,6 +40,7 @@ impl OpCode {
     }
 }
 
+/// The certificate and private key a listener presents. Operator-supplied
 /// Generate self-signed TLS certificates for QUIC.
 pub fn generate_self_signed_cert()
 -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>), String> {
@@ -58,6 +59,41 @@ pub fn generate_self_signed_cert()
         PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_pair.serialized_der().to_vec()));
 
     Ok((vec![cert_der], key_der))
+}
+
+/// Build a TLS 1.3 acceptor for the TCP command interface. The caller
+/// supplies its own freshly generated key pair — this is not the QUIC
+/// endpoint's certificate, and a restart mints a new one, so a client that
+/// pins the leaf must re-pin after every boot.
+pub fn build_tcp_tls_acceptor(
+    certs: Vec<CertificateDer<'static>>,
+    key: PrivateKeyDer<'static>,
+) -> Result<tokio_rustls::TlsAcceptor, String> {
+    // TLS 1.3 only: 1.2 has no reason to exist on a single-vendor interface
+    // and accepting it widens the downgrade surface.
+    let mut config =
+        rustls::ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .map_err(|e| format!("TLS config: {}", e))?;
+    config.alpn_protocols = vec![b"omnikv/1".to_vec()];
+    Ok(tokio_rustls::TlsAcceptor::from(Arc::new(config)))
+}
+
+/// Build the server-side TLS configuration for the PgWire listener.
+///
+/// Unlike the TCP command interface this accepts TLS 1.2 as well as 1.3:
+/// PgWire exists for client compatibility, and older libpq builds negotiate
+/// 1.2 only. PostgreSQL clients do not use ALPN, so none is advertised.
+pub fn pgwire_tls_config(
+    certs: Vec<CertificateDer<'static>>,
+    key: PrivateKeyDer<'static>,
+) -> Result<Arc<rustls::ServerConfig>, String> {
+    let config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .map_err(|e| format!("TLS config: {}", e))?;
+    Ok(Arc::new(config))
 }
 
 /// Create a QUIC server endpoint.

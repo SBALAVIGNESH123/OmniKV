@@ -122,7 +122,7 @@ reader objects and prevents references into mapped pages from escaping their
 owning storage handle.
 
 `scan_iter` still performs candidate collection and newest-version
-deduplication before lazy heap reads, but the heap-read scratch buffer is now
+deduplication before lazy heap reads; the heap-read scratch buffer is
 borrowed from a small per-database pool. A range scan reuses one `Vec<u8>`
 across all yielded values, then returns it to the pool when the iterator is
 dropped. This removes repeated per-row heap-read buffer allocation from the

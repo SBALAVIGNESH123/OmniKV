@@ -40,16 +40,20 @@ most 8 negotiation packets are accepted before the StartupMessage; further
 negotiation attempts close the connection to prevent a pre-authentication spin
 loop.
 
-The PgWire listener therefore works with default client configurations
-(`sslmode=prefer` included) even though it does not offer TLS yet. Cleartext
-passwords still cross the wire, so the listener ships with a fail-closed
-exposure policy: in production mode (`OMNIKV_MODE=production`) the PgWire
-server refuses to start unless the bind address is loopback or a private
-network address (RFC 1918 / ULA). Development mode allows any bind for local
-experiments. Callers can check the policy without binding via
-`PgWireServer::validate_security_policy`. Until PgWire TLS support lands,
-production deployments that must expose PgWire off-host should terminate TLS
-in front of the listener (for example a local `stunnel`/`socat` hop).
+Negotiation depends on TLS configuration. GSSENCRequest is always answered
+`'N'`. SSLRequest is answered `'S'` and the session upgrades to TLS when a
+TLS identity is configured (`OMNIKV_PGWIRE_TLS=true`, the default), accepting
+TLS 1.2 and 1.3 so older libpq builds connect; `sslmode=require` and
+`sslmode=prefer` then get an encrypted session and the password never crosses
+the wire in the clear. With TLS off, SSLRequest is answered `'N'`.
+
+A client that skips the SSLRequest stays plaintext, which is allowed on
+loopback only. On any other bind with TLS configured, the plaintext
+StartupMessage is rejected with SQLSTATE `28000` ("TLS is required on this
+listener; connect with sslmode=require") — private networks included, since
+they are shared segments. A non-loopback bind with TLS off is refused at
+startup, and `PgWireServer::validate_security_policy` fails closed the same
+way. Callers can check that policy without binding.
 
 ### Extended query protocol
 
@@ -90,7 +94,7 @@ statement after parsing — a value like `x OR 1=1` compares as one plain text
 value and cannot alter the statement structure. An explicitly NULL Bind
 value (length -1) binds as `NULL`; a placeholder with no corresponding Bind
 value is a `08P01` "no value specified for parameter $n" error — missing is
-not NULL (full NULL literal support in comparisons is tracked by #111).
+not NULL (full NULL literal support in comparisons is not implemented yet).
 Parameterized statements require the SQL grammar; the legacy KV grammar
 rejects them with `0A000`.
 

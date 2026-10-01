@@ -93,9 +93,9 @@ impl StorageConfig {
 }
 
 /// Cluster (Raft) configuration. Absent — `raft_addr` and `node_id`
-/// both unset — the server runs as an independent single-node engine,
-/// exactly as it always has. Present, the server boots an openraft node
-/// on `raft_addr` and every write goes through consensus before it is
+/// both unset — the server runs as an
+/// independent single-node engine. Present, the server boots an openraft
+/// node on `raft_addr` and every write goes through consensus before it is
 /// acknowledged.
 ///
 /// `peers` are the OTHER nodes' raft addresses ("host:port"), used only
@@ -129,6 +129,7 @@ pub struct RaftConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct ServerConfig {
     #[serde(default)]
     pub mode: ServerMode,
@@ -138,6 +139,12 @@ pub struct ServerConfig {
     pub quic_addr: String,
     #[serde(default = "default_pgwire_addr")]
     pub pgwire_addr: String,
+    /// Whether the PgWire listener upgrades to TLS when a client sends an
+    /// SSLRequest. On by default: the PgWire password is compared in
+    /// cleartext, so without TLS it crosses the wire readable by anyone on
+    /// the path. Plaintext startup is then allowed on loopback only.
+    #[serde(default = "default_pgwire_tls")]
+    pub pgwire_tls: bool,
     #[serde(default = "default_tcp_addr")]
     pub tcp_addr: String,
     /// Explicit opt-in for binding the TCP command interface on a
@@ -146,6 +153,12 @@ pub struct ServerConfig {
     /// host that can reach the port, so it never happens by accident.
     #[serde(default)]
     pub tcp_bind_public: bool,
+    /// Whether the TCP command interface requires TLS. On by default: the
+    /// interface is JWT-gated, and without TLS the token crosses the wire in
+    /// cleartext for anyone on the path to capture and replay. Loopback is
+    /// the only place plaintext is tolerated, for local telnet debugging.
+    #[serde(default = "default_tcp_tls")]
+    pub tcp_tls: bool,
     #[serde(default = "default_jwt_secret")]
     pub jwt_secret: String,
     #[serde(default = "default_bootstrap_admin_key")]
@@ -186,6 +199,14 @@ fn default_tcp_addr() -> String {
     "127.0.0.1:7072".into()
 }
 
+fn default_tcp_tls() -> bool {
+    true
+}
+
+fn default_pgwire_tls() -> bool {
+    true
+}
+
 fn default_jwt_secret() -> String {
     DEV_JWT_SECRET.into()
 }
@@ -217,8 +238,10 @@ impl Default for ServerConfig {
             http_addr: default_http_addr(),
             quic_addr: default_quic_addr(),
             pgwire_addr: default_pgwire_addr(),
+            pgwire_tls: default_pgwire_tls(),
             tcp_addr: default_tcp_addr(),
             tcp_bind_public: false,
+            tcp_tls: default_tcp_tls(),
             jwt_secret: default_jwt_secret(),
             bootstrap_admin_key: default_bootstrap_admin_key(),
             rate_limit_per_sec: default_rate_limit_per_sec(),
@@ -300,6 +323,12 @@ impl ServerConfig {
         }
         if let Ok(v) = std::env::var("OMNIKV_TCP_BIND_PUBLIC") {
             self.tcp_bind_public = parse_env_value("OMNIKV_TCP_BIND_PUBLIC", &v)?;
+        }
+        if let Ok(v) = std::env::var("OMNIKV_TCP_TLS") {
+            self.tcp_tls = parse_env_value("OMNIKV_TCP_TLS", &v)?;
+        }
+        if let Ok(v) = std::env::var("OMNIKV_PGWIRE_TLS") {
+            self.pgwire_tls = parse_env_value("OMNIKV_PGWIRE_TLS", &v)?;
         }
         if let Ok(v) = std::env::var("OMNIKV_JWT_SECRET") {
             self.jwt_secret = v;
@@ -497,7 +526,7 @@ impl ServerConfig {
         // Every peer is also dialed exactly as written (boot_cluster_node
         // copies it into openraft::BasicNode.addr and OmniNetwork builds
         // the RPC URL from it), so a malformed, wildcard, or port-zero
-        // peer is not a typo a operator can recover from later — it is a
+        // peer is not a typo an operator can recover from later — it is a
         // member that can never be reached. Validate each one up front,
         // with the same rules as the advertised address.
         if let Some(me) = advertised {
@@ -602,6 +631,30 @@ impl ServerConfig {
                 "tcp_bind_public is set but jwt_secret is the built-in dev \
                  value, which is public — anyone can forge a token. Set \
                  OMNIKV_JWT_SECRET to a strong 32+ character secret"
+                    .into(),
+            ));
+        }
+        // A public bind with TLS off puts the JWT on the wire in cleartext.
+        // Loopback is the only place that is safe to disable.
+        if self.tcp_bind_public && !self.tcp_tls {
+            return Err(ConfigError(
+                "tcp_bind_public is set but tcp_tls is disabled — the JWT \
+                 would cross the network in cleartext. Set OMNIKV_TCP_TLS=true \
+                 or bind to a loopback address"
+                    .into(),
+            ));
+        }
+        // Same reasoning for PgWire: the password is compared in cleartext,
+        // so off the loopback it must be inside TLS.
+        if !self.pgwire_tls
+            && let Ok(sock) = self.pgwire_addr.parse::<std::net::SocketAddr>()
+            && !sock.ip().is_loopback()
+        {
+            return Err(ConfigError(
+                "pgwire_addr is bound to a non-loopback address but pgwire_tls \
+                 is disabled — the PgWire password would cross the network in \
+                 cleartext. Set OMNIKV_PGWIRE_TLS=true or bind to a loopback \
+                 address"
                     .into(),
             ));
         }

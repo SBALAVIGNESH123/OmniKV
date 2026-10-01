@@ -17,8 +17,7 @@ use std::time::Instant;
 /// Rust's test harness runs tests on parallel threads, and `std::env` is
 /// process state: `test_config_from_env` setting `OMNI_RATE_LIMIT=500` can
 /// interleave with the invalid-value tests setting `OMNI_RATE_LIMIT=fast` or
-/// removing it mid-run, which made this suite flake between runs (issue
-/// #115). Every env-mutating test must hold this lock from its first
+/// removing it mid-run. Every env-mutating test must hold this lock from its first
 /// `set_var` to its last `remove_var`.
 static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
@@ -299,9 +298,9 @@ fn test_rate_limiter_reset() {
 #[test]
 fn test_group_commit_single_leader() {
     let gc = GroupCommitEngine::new(100);
-    let guard = gc.join_group();
+    let guard = gc.join_group().unwrap();
     assert!(guard.is_leader);
-    guard.mark_synced();
+    guard.mark_synced(Ok(()));
     let (epoch, pending) = gc.stats();
     assert!(epoch > 0);
     assert_eq!(pending, 0);
@@ -313,8 +312,8 @@ fn test_group_commit_stats() {
     let gc = GroupCommitEngine::new(50);
     let (epoch_before, _) = gc.stats();
 
-    let guard = gc.join_group();
-    guard.mark_synced();
+    let guard = gc.join_group().unwrap();
+    guard.mark_synced(Ok(()));
 
     let (epoch_after, _) = gc.stats();
     assert!(epoch_after > epoch_before);
@@ -330,16 +329,16 @@ fn test_group_commit_late_joiner_waits_for_next_epoch() {
     use std::time::Duration;
 
     let gc = Arc::new(GroupCommitEngine::new(50));
-    let first = gc.join_group();
+    let first = gc.join_group().unwrap();
     assert!(first.is_leader);
 
     let (tx, rx) = mpsc::channel();
     let gc_late = Arc::clone(&gc);
     let handle = std::thread::spawn(move || {
-        let late = gc_late.join_group();
+        let late = gc_late.join_group().unwrap();
         let was_leader = late.is_leader;
         if was_leader {
-            late.mark_synced();
+            late.mark_synced(Ok(()));
         }
         tx.send(was_leader).expect("send late joiner result");
     });
@@ -350,7 +349,7 @@ fn test_group_commit_late_joiner_waits_for_next_epoch() {
         "late joiner must not be released by the in-flight sync"
     );
 
-    first.mark_synced();
+    first.mark_synced(Ok(()));
 
     let late_was_leader = rx
         .recv_timeout(Duration::from_secs(2))

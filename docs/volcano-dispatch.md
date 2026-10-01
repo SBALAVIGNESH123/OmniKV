@@ -28,7 +28,7 @@ Initial smoke and local measurements showed mixed results: chunking can help
 some filter/projection-heavy pipelines, but it can also regress scan-only,
 limit-heavy, and aggregate-shaped pipelines with the current `HashMap` row
 representation. The extra scratch-buffer movement can dominate the saved vtable
-calls. That supports the reviewer guidance: the dynamic call itself is not
+calls. The dynamic call itself is not
 necessarily the bottleneck when the work behind each call is larger than a few
 cycles.
 

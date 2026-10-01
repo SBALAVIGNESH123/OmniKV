@@ -44,7 +44,6 @@ fn demo_write_skew_prevention() {
     let bob_status = tm.get(&mut t_alice, "doctor:bob:oncall").unwrap();
     assert_eq!(alice_status, Some("true".to_string()));
     assert_eq!(bob_status, Some("true".to_string()));
-    // "Bob is on-call, safe for me to leave"
     tm.set(&mut t_alice, "doctor:alice:oncall", "false".to_string())
         .unwrap();
 
@@ -54,7 +53,6 @@ fn demo_write_skew_prevention() {
     let bob_status2 = tm.get(&mut t_bob, "doctor:bob:oncall").unwrap();
     assert_eq!(alice_status2, Some("true".to_string())); // snapshot: Alice still on-call
     assert_eq!(bob_status2, Some("true".to_string()));
-    // "Alice is on-call, safe for me to leave"
     tm.set(&mut t_bob, "doctor:bob:oncall", "false".to_string())
         .unwrap();
 
@@ -129,7 +127,7 @@ fn demo_lost_update_prevention() {
         "LOST UPDATE DETECTED: T2 must abort because account:checking was modified by T1"
     );
 
-    // Verify: balance is $1100 (T1's write), not $1100 (T2 lost)
+    // Only T1 committed, so its $1100 write is what survives.
     let seq = db.get_seq();
     let final_bal = db.find("account:checking", seq).unwrap().unwrap();
     assert_eq!(final_bal, "1100", "Balance should be 1100 after T1 only");
@@ -215,8 +213,6 @@ fn demo_concurrent_counter() {
     setup.set("counter", "0".to_string()).unwrap();
     db.commit_batch(&setup).unwrap();
 
-    // Use a single-threaded approach with SSI to prove correctness,
-    // then verify the final result is exact.
     let total_increments = 200i64;
     let retry_count = std::sync::atomic::AtomicU64::new(0);
 

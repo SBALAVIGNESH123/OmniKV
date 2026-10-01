@@ -645,7 +645,7 @@ fn test_load_dev_succeeds() {
     });
 }
 
-// ── Cluster advertised-address validation (PR #127 review) ──
+// ── Cluster advertised-address validation ──
 // A wildcard ADVERTISED address must fail closed: peers would dial
 // 0.0.0.0:port, which resolves to the DIALER itself, silently breaking
 // replication/votes toward this node after a failover or rejoin.
@@ -730,7 +730,7 @@ fn test_raft_advertise_env_var_sets_field() {
     );
 }
 
-// ── Peer/address sanity (PR #127 review round 4) ──
+// ── Peer/address sanity ──
 
 #[test]
 fn test_raft_advertise_port_zero_is_refused() {
@@ -806,7 +806,7 @@ fn test_raft_distinct_peers_are_accepted() {
         .unwrap_or_else(|e| panic!("a clean peer list must validate: {e}"));
 }
 
-// ── Peer endpoint shape (PR #127 review round 7) ──
+// ── Peer endpoint shape ──
 // A peer is dialed exactly as written, so the same rules as the
 // advertised address apply to it — a malformed peer is a member that can
 // never be reached, not a typo an operator can fix later.
@@ -886,7 +886,7 @@ fn test_raft_peer_hostname_is_accepted() {
 #[test]
 fn test_tcp_loopback_bind_is_the_default() {
     // Every other listener defaults to loopback; the TCP command
-    // interface must too (issue #117) — it grants full read/write.
+    // interface must too — it grants full read/write.
     let cfg = ServerConfig::default();
     assert_eq!(cfg.tcp_addr, "127.0.0.1:7072");
     cfg.validate_runtime()
@@ -958,4 +958,106 @@ fn test_tcp_public_bind_env_opt_in_round_trip() {
                 .unwrap_or_else(|e| panic!("env opt-in must validate: {e}"));
         },
     );
+}
+
+#[test]
+fn test_tcp_tls_is_on_by_default() {
+    // The interface is JWT-gated, and without TLS the token crosses the
+    // wire in cleartext for anyone on the path to capture and replay.
+    // Encryption has to be the default, not a choice an operator makes
+    // after reading an incident report.
+    let cfg = ServerConfig::default();
+    assert!(cfg.tcp_tls);
+}
+
+#[test]
+fn test_tcp_public_bind_requires_tls() {
+    // Loopback is the only place plaintext is tolerated — for local
+    // telnet debugging. Off the loopback the JWT must never be sent in
+    // the clear, so a public bind with TLS off is a configuration error,
+    // not a warning in a log nobody reads.
+    let mut cfg = ServerConfig {
+        tcp_addr: "0.0.0.0:8080".into(),
+        tcp_bind_public: true,
+        tcp_tls: false,
+        jwt_secret: "a-real-secret-not-the-dev-one-0123456789".into(),
+        ..Default::default()
+    };
+    let err = cfg.validate_runtime().unwrap_err();
+    assert!(
+        err.0.contains("tcp_tls") && err.0.contains("cleartext"),
+        "public bind with TLS off must name the exposed token: {err}"
+    );
+
+    cfg.tcp_tls = true;
+    cfg.validate_runtime()
+        .unwrap_or_else(|e| panic!("public bind with TLS on must validate: {e}"));
+
+    // Loopback keeps the right to go plaintext.
+    cfg.tcp_addr = "127.0.0.1:7072".into();
+    cfg.tcp_bind_public = false;
+    cfg.tcp_tls = false;
+    cfg.validate_runtime()
+        .unwrap_or_else(|e| panic!("loopback without TLS must validate: {e}"));
+}
+
+#[test]
+fn test_tcp_tls_env_switch() {
+    // The debugging escape hatch is an env var, the same way every other
+    // interface knob is turned.
+    with_env(&[("OMNIKV_TCP_TLS", "false")], || {
+        let mut cfg = ServerConfig::default();
+        cfg.apply_env().unwrap();
+        assert!(!cfg.tcp_tls, "OMNIKV_TCP_TLS=false must switch it off");
+    });
+}
+
+#[test]
+fn test_pgwire_tls_is_on_by_default() {
+    // The PgWire password is compared in cleartext, so without TLS it is
+    // readable by anyone on the path. Encryption is the default rather than
+    // a setting an operator finds in an incident report.
+    let cfg = ServerConfig::default();
+    assert!(cfg.pgwire_tls);
+}
+
+#[test]
+fn test_pgwire_public_bind_requires_tls() {
+    // Loopback is the only place plaintext is tolerated. Off the loopback
+    // the password must never be sent in the clear, so a public bind with
+    // TLS off is a configuration error, not a warning in a log.
+    let mut cfg = ServerConfig {
+        pgwire_addr: "0.0.0.0:5432".into(),
+        pgwire_tls: false,
+        ..Default::default()
+    };
+    let err = cfg.validate_runtime().unwrap_err();
+    assert!(
+        err.0.contains("pgwire_tls") && err.0.contains("cleartext"),
+        "public bind with TLS off must name the exposed password: {err}"
+    );
+
+    cfg.pgwire_tls = true;
+    cfg.validate_runtime()
+        .unwrap_or_else(|e| panic!("public bind with TLS on must validate: {e}"));
+
+    // Loopback keeps the right to go plaintext.
+    cfg.pgwire_addr = "127.0.0.1:5432".into();
+    cfg.pgwire_tls = false;
+    cfg.validate_runtime()
+        .unwrap_or_else(|e| panic!("loopback plaintext must validate: {e}"));
+}
+
+#[test]
+fn test_pgwire_tls_env_switch() {
+    // The debugging escape hatch is an env var, the same way the TCP
+    // interface's is.
+    with_env(&[("OMNIKV_PGWIRE_TLS", "false")], || {
+        let mut cfg = ServerConfig::default();
+        cfg.apply_env().unwrap();
+        assert!(
+            !cfg.pgwire_tls,
+            "OMNIKV_PGWIRE_TLS=false must switch it off"
+        );
+    });
 }

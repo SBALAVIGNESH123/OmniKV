@@ -29,6 +29,7 @@ mod auth;
 mod quic_server;
 mod raft_node;
 mod raft_routes;
+mod tls;
 
 use std::sync::Arc;
 
@@ -64,7 +65,14 @@ fn print_banner(cfg: &ServerConfig, cluster_mode: Option<u64>) {
         cfg.pgwire_addr
     );
     println!(
-        "  ║  TCP Command Interface    → {}           ║",
+        "  ║  TCP Command ({}) → {}           ║",
+        if cfg.tcp_tls {
+            "TLS 1.3"
+        } else {
+            // Validation allows this only on loopback, for telnet
+            // debugging; the banner names what that costs.
+            "PLAINTEXT — token in cleartext"
+        },
         cfg.tcp_addr
     );
     println!("  ╠════════════════════════════════════════════════════╣");
@@ -136,6 +144,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let manifest_path = cfg.storage.manifest_path.clone();
     let wal_path = cfg.storage.wal_path.clone();
 
+    // TLS first: a bad certificate should fail before the database locks
+    // its files.
+    let server_tls = tls::resolve_server_tls(&cfg)?;
+    tls::log_tls_posture(&server_tls.posture);
+
     // Open the database using configured paths.
     let db = OmniKV::open(&manifest_path, &wal_path)?;
     let _compaction_handle = start_storage_maintenance(&db, &cfg)?;
@@ -186,7 +199,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let (http_handle, quic_handle, tcp_handle) =
-        spawn_protocol_servers(db, &cfg, rate_limiter, app_state).await?;
+        spawn_protocol_servers(db, &cfg, rate_limiter, app_state, server_tls).await?;
 
     // ─── 5. Raft consensus listener (cluster mode only) ───────
     // Serves /raft/{append,vote,snapshot} for this node's peers on the
@@ -231,6 +244,7 @@ async fn spawn_protocol_servers(
     cfg: &ServerConfig,
     rate_limiter: Arc<RateLimiter>,
     app_state: api::AppState,
+    server_tls: tls::ServerTls,
 ) -> Result<
     (
         tokio::task::JoinHandle<()>,
@@ -242,10 +256,10 @@ async fn spawn_protocol_servers(
     let router = api::build_router(app_state);
 
     // ─── 1. HTTP/1.1 + HTTP/2 (TLS, ALPN) ──────────────────────
-    let (certs, key) = quic_server::generate_self_signed_cert()?;
+    let http_tls = server_tls.for_next_listener();
     let tls_config = axum_server::tls_rustls::RustlsConfig::from_der(
-        certs.iter().map(|c| c.as_ref().to_vec()).collect(),
-        key.secret_der().to_vec(),
+        http_tls.certs.iter().map(|c| c.as_ref().to_vec()).collect(),
+        http_tls.key.secret_der().to_vec(),
     )
     .await?;
 
@@ -267,8 +281,9 @@ async fn spawn_protocol_servers(
     });
 
     // ─── 2. QUIC/HTTP3 Binary Protocol ─────────────────────────
-    let (quic_certs, quic_key) = quic_server::generate_self_signed_cert()?;
-    let quic_endpoint = quic_server::create_server_endpoint(&quic_addr_str, quic_certs, quic_key)?;
+    let quic_tls = server_tls.for_next_listener();
+    let quic_endpoint =
+        quic_server::create_server_endpoint(&quic_addr_str, quic_tls.certs, quic_tls.key)?;
     let quic_db = db.clone();
     let quic_rate_limiter = rate_limiter.clone();
     let quic_handle = tokio::spawn(async move {
@@ -278,6 +293,12 @@ async fn spawn_protocol_servers(
     // ─── 3. PostgreSQL Wire Protocol ───────────────────────────
     let pgwire_db = db.clone();
     let pgwire_rate_limiter = rate_limiter.clone();
+    let pgwire_tls = if cfg.pgwire_tls {
+        let pg_tls = server_tls.for_next_listener();
+        Some(quic_server::pgwire_tls_config(pg_tls.certs, pg_tls.key)?)
+    } else {
+        None
+    };
     let _pgwire_handle = std::thread::spawn(move || {
         // Log before moving pgwire_addr_str into PgWireServer::new.
         tracing::info!("PostgreSQL wire protocol starting on {pgwire_addr_str}");
@@ -285,7 +306,8 @@ async fn spawn_protocol_servers(
             pgwire_db,
             &pgwire_addr_str,
             pgwire_rate_limiter,
-        );
+        )
+        .with_tls_config(pgwire_tls);
         if let Err(e) = server.start() {
             tracing::error!("PgWire server error: {e}");
         }
@@ -295,8 +317,26 @@ async fn spawn_protocol_servers(
     let tcp_db = db.clone();
     let tcp_secret = cfg.jwt_secret.clone();
     let tcp_rate_limiter = rate_limiter.clone();
+    let tcp_tls = cfg.tcp_tls;
+    let tcp_acceptor = if tcp_tls {
+        let tcp_tls_material = server_tls.for_next_listener();
+        Some(quic_server::build_tcp_tls_acceptor(
+            tcp_tls_material.certs,
+            tcp_tls_material.key,
+        )?)
+    } else {
+        None
+    };
     let tcp_handle = tokio::spawn(async move {
-        if let Err(e) = run_tcp_server(tcp_db, &tcp_addr_str, tcp_secret, tcp_rate_limiter).await {
+        if let Err(e) = run_tcp_server(
+            tcp_db,
+            &tcp_addr_str,
+            tcp_secret,
+            tcp_rate_limiter,
+            tcp_acceptor,
+        )
+        .await
+        {
             tracing::error!("TCP server error: {e}");
         }
     });
@@ -383,14 +423,47 @@ const TCP_LINE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60
 /// Commands are framed on newlines, so a client may pipeline several
 /// commands per segment; lines above [`MAX_TCP_LINE`] are rejected and the
 /// connection closed.
+///
+/// The handshake is bounded by [`TCP_AUTH_DEADLINE`]: a peer that opens a
+/// connection and never sends a ClientHello holds a session permit for the
+/// same reason an unauthenticated session does, and the permit pool is
+/// what keeps the interface available to real clients.
+async fn tcp_tls_handshake(
+    acceptor: &tokio_rustls::TlsAcceptor,
+    socket: tokio::net::TcpStream,
+    peer: std::net::SocketAddr,
+) -> Option<tokio_rustls::server::TlsStream<tokio::net::TcpStream>> {
+    match tokio::time::timeout(TCP_AUTH_DEADLINE, acceptor.accept(socket)).await {
+        Ok(Ok(tls)) => Some(tls),
+        Ok(Err(e)) => {
+            tracing::debug!(peer = %peer, "TCP TLS handshake failed: {e}");
+            None
+        }
+        Err(_) => {
+            tracing::warn!(
+                peer = %peer,
+                "dropping TCP session: TLS handshake exceeded the auth deadline"
+            );
+            None
+        }
+    }
+}
+
 async fn run_tcp_server(
     db: Arc<OmniKV>,
     addr: &str,
     jwt_secret: String,
     rate_limiter: Arc<RateLimiter>,
+    acceptor: Option<tokio_rustls::TlsAcceptor>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    tracing::info!("TCP command interface on {addr}");
+    match &acceptor {
+        Some(_) => tracing::info!("TCP command interface on {addr} (TLS 1.3)"),
+        None => tracing::warn!(
+            "TCP command interface on {addr} (PLAINTEXT — the JWT crosses the wire unencrypted; \
+             loopback only"
+        ),
+    }
 
     // Bound concurrent sessions. Each one can buffer up to MAX_TCP_LINE
     // before authenticating, so without a ceiling the memory an
@@ -416,10 +489,23 @@ async fn run_tcp_server(
         let jwt_secret = jwt_secret.clone();
         let rate_limiter = rate_limiter.clone();
         let auth_tracker = auth_failures.clone();
+        let acceptor = acceptor.clone();
         tokio::spawn(async move {
             // Held for the session: released on drop, when the task ends.
             let _permit = permit;
-            handle_tcp_connection(socket, peer, db, jwt_secret, rate_limiter, auth_tracker).await;
+            if let Some(acceptor) = acceptor {
+                // A peer that connects and never sends a ClientHello would
+                // otherwise hold this permit until the idle timeout; 256 of
+                // them exhaust every session slot while the accept loop
+                // blocks real clients.
+                if let Some(tls) = tcp_tls_handshake(&acceptor, socket, peer).await {
+                    handle_tcp_connection(tls, peer, db, jwt_secret, rate_limiter, auth_tracker)
+                        .await;
+                }
+            } else {
+                handle_tcp_connection(socket, peer, db, jwt_secret, rate_limiter, auth_tracker)
+                    .await;
+            }
         });
     }
     Ok(())
@@ -510,22 +596,53 @@ impl TcpAuthFailures {
 
 /// One authenticated client session. See [`run_tcp_server`] for the
 /// protocol's security model; this is the per-connection state machine.
-async fn handle_tcp_connection(
-    socket: tokio::net::TcpStream,
+async fn handle_tcp_connection<S>(
+    socket: S,
     peer: std::net::SocketAddr,
     db: Arc<OmniKV>,
     jwt_secret: String,
     rate_limiter: Arc<RateLimiter>,
     auth_tracker: Arc<TcpAuthFailures>,
-) {
+) where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
+{
     use tokio::io::AsyncWriteExt;
 
-    // Frame on newlines: a client may pipeline several commands in
-    // one segment, and a single command may straddle a read
-    // boundary. Buffering by line (instead of consuming one command
-    // per 4096-byte read) keeps both cases intact.
-    let (read_half, mut write_half) = socket.into_split();
+    let mut socket = socket;
+    let (read_half, mut write_half) = tokio::io::split(&mut socket);
     let mut reader = tokio::io::BufReader::new(read_half);
+    handle_tcp_session(
+        &mut reader,
+        &mut write_half,
+        peer,
+        db,
+        jwt_secret,
+        rate_limiter,
+        auth_tracker,
+    )
+    .await;
+    // The session ends on the server's terms, not the peer's: half-closing
+    // the write side first lets a client that was mid-write land its
+    // segment, instead of taking a reset off a socket closed with bytes
+    // still unread.
+    let _ = write_half.shutdown().await;
+}
+
+/// One authenticated client session. See [`run_tcp_server`] for the
+/// protocol's security model; this is the per-connection state machine.
+async fn handle_tcp_session<R, W>(
+    reader: &mut tokio::io::BufReader<R>,
+    write_half: &mut W,
+    peer: std::net::SocketAddr,
+    db: Arc<OmniKV>,
+    jwt_secret: String,
+    rate_limiter: Arc<RateLimiter>,
+    auth_tracker: Arc<TcpAuthFailures>,
+) where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::AsyncWriteExt;
 
     // An address that already burned its AUTH budget does not get another
     // session — checking at entry is what makes the per-peer budget mean
@@ -584,7 +701,7 @@ async fn handle_tcp_connection(
             auth_deadline
         };
         match read_bounded_line(
-            &mut reader,
+            &mut *reader,
             &mut buffer,
             &mut chunk,
             &mut scanned,
@@ -596,7 +713,7 @@ async fn handle_tcp_connection(
             LineRead::Ready => {}
             LineRead::Closed => return,
             LineRead::Timeout => {
-                write_timeout_reply(&mut write_half, authenticated, peer).await;
+                write_timeout_reply(&mut *write_half, authenticated, peer).await;
                 return;
             }
             LineRead::TooLong => {
@@ -630,7 +747,7 @@ async fn handle_tcp_connection(
                     peer,
                     &auth_tracker,
                     &mut auth_failures,
-                    &mut write_half,
+                    &mut *write_half,
                 )
                 .await
                 {
@@ -651,7 +768,7 @@ async fn handle_tcp_connection(
                 }
             }
             "QUIT" | "EXIT" => {
-                let _ = write_half.write_all(b"Goodbye.\n").await;
+                let _ = write_reply(&mut *write_half, b"Goodbye.\n").await;
                 return;
             }
             // Everything else requires an authenticated session.
@@ -666,10 +783,20 @@ async fn handle_tcp_connection(
             ),
         };
 
-        if write_half.write_all(response.as_bytes()).await.is_err() {
+        if !write_reply(&mut *write_half, response.as_bytes()).await {
             return;
         }
     }
+}
+
+/// Write a reply and flush it. Without the flush, rustls keeps the record
+/// buffered and a request/response client waits forever for its answer.
+async fn write_reply<W>(write_half: &mut W, reply: &[u8]) -> bool
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::AsyncWriteExt;
+    write_half.write_all(reply).await.is_ok() && write_half.flush().await.is_ok()
 }
 
 /// What an AUTH attempt resolved to: the session was dropped over its
@@ -700,7 +827,7 @@ async fn handle_tcp_auth_outcome(
     peer: std::net::SocketAddr,
     auth_tracker: &Arc<TcpAuthFailures>,
     auth_failures: &mut u32,
-    write_half: &mut tokio::net::tcp::OwnedWriteHalf,
+    write_half: &mut (impl tokio::io::AsyncWrite + Unpin),
 ) -> AuthResolution {
     use tokio::io::AsyncWriteExt;
     match handle_tcp_auth(parts, jwt_secret, peer) {
@@ -752,7 +879,7 @@ enum LineRead {
 /// reply does not leak — either way the session is being cut for stalling,
 /// and the peer's remedy is the same.
 async fn write_timeout_reply(
-    write_half: &mut tokio::net::tcp::OwnedWriteHalf,
+    write_half: &mut (impl tokio::io::AsyncWrite + Unpin),
     authenticated: bool,
     peer: std::net::SocketAddr,
 ) {
@@ -783,7 +910,7 @@ async fn write_timeout_reply(
 /// re-scanning the whole buffer after every read, which keeps a maxed-out
 /// 12 MiB line linear rather than quadratic in CPU.
 async fn read_bounded_line(
-    reader: &mut tokio::io::BufReader<tokio::net::tcp::OwnedReadHalf>,
+    reader: &mut tokio::io::BufReader<impl tokio::io::AsyncRead + Unpin>,
     buffer: &mut Vec<u8>,
     chunk: &mut [u8],
     scanned: &mut usize,
@@ -1536,5 +1663,144 @@ mod tests {
         assert_eq!(resp, "ERROR: INTERNAL\n");
         assert!(!resp.contains("/var/lib"), "leaked a path: {resp}");
         assert!(!resp.contains("lock"), "leaked a lock name: {resp}");
+    }
+
+    /// Accepts exactly one certificate, by DER byte equality. The test
+    /// generated that certificate itself, so this is a real check that the
+    /// server presented it — not a blanket skip of verification.
+    #[derive(Debug)]
+    struct PinnedServerCert(rustls::pki_types::CertificateDer<'static>);
+
+    impl rustls::client::danger::ServerCertVerifier for PinnedServerCert {
+        fn verify_server_cert(
+            &self,
+            end_entity: &rustls::pki_types::CertificateDer<'_>,
+            _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+            _server_name: &rustls::pki_types::ServerName<'_>,
+            _ocsp_response: &[u8],
+            _now: rustls::pki_types::UnixTime,
+        ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+            if end_entity.as_ref() == self.0.as_ref() {
+                Ok(rustls::client::danger::ServerCertVerified::assertion())
+            } else {
+                Err(rustls::Error::General(
+                    "server presented an unexpected certificate".into(),
+                ))
+            }
+        }
+
+        // The acceptor offers TLS 1.3 only, so this is never called; a
+        // TLS 1.2 signature reaching it would be a downgrade attempt.
+        fn verify_tls12_signature(
+            &self,
+            _message: &[u8],
+            _cert: &rustls::pki_types::CertificateDer<'_>,
+            _dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            Err(rustls::Error::General("TLS 1.2 is not offered".into()))
+        }
+
+        fn verify_tls13_signature(
+            &self,
+            _message: &[u8],
+            _cert: &rustls::pki_types::CertificateDer<'_>,
+            _dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        }
+
+        fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+            vec![
+                rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
+                rustls::SignatureScheme::RSA_PSS_SHA256,
+                rustls::SignatureScheme::ED25519,
+            ]
+        }
+    }
+
+    /// The acceptor built from the QUIC self-signed material must complete
+    /// a TLS 1.3 handshake and negotiate the interface's ALPN tag — the
+    /// handshake is the only thing standing between the JWT and the wire.
+    #[tokio::test]
+    async fn tcp_tls_acceptor_completes_a_tls13_handshake() {
+        // The binary installs the provider in main(); these tests never
+        // go through main, so the handshake would have nothing to sign with.
+        super::install_rustls_crypto_provider();
+
+        let (certs, key) = quic_server::generate_self_signed_cert().expect("generate cert");
+        let acceptor = quic_server::build_tcp_tls_acceptor(certs.clone(), key).expect("acceptor");
+
+        let (client_io, server_io) = tokio::io::duplex(8 * 1024);
+        let server = tokio::spawn(async move { acceptor.accept(server_io).await });
+
+        let mut client_config = rustls::client::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(std::sync::Arc::new(PinnedServerCert(
+                certs[0].clone(),
+            )))
+            .with_no_client_auth();
+        client_config.alpn_protocols = vec![b"omnikv/1".to_vec()];
+        let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(client_config));
+        let domain =
+            rustls::pki_types::ServerName::try_from("localhost").expect("server name from literal");
+
+        let client_tls = connector
+            .connect(domain, client_io)
+            .await
+            .expect("client handshake");
+        let server_tls = server
+            .await
+            .expect("server task")
+            .expect("server handshake");
+
+        assert_eq!(
+            client_tls.get_ref().1.protocol_version(),
+            Some(rustls::ProtocolVersion::TLSv1_3),
+            "handshake must negotiate TLS 1.3"
+        );
+        assert_eq!(
+            client_tls.get_ref().1.alpn_protocol(),
+            Some(&b"omnikv/1"[..]),
+            "client negotiated the interface ALPN tag"
+        );
+        assert_eq!(
+            server_tls.get_ref().1.alpn_protocol(),
+            Some(&b"omnikv/1"[..]),
+            "server negotiated the interface ALPN tag"
+        );
+    }
+
+    /// A peer that connects and never sends a ClientHello must not hold its
+    /// session permit — 256 such peers exhaust the pool and the interface
+    /// stops serving anyone. The auth deadline bounds the handshake for the
+    /// same reason it bounds an unauthenticated session.
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_tls_handshake_releases_the_session() {
+        super::install_rustls_crypto_provider();
+
+        let (certs, key) = quic_server::generate_self_signed_cert().expect("generate cert");
+        let acceptor = quic_server::build_tcp_tls_acceptor(certs, key).expect("acceptor");
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr");
+        // Connected, and deliberately never speaking TLS.
+        let _silent = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        let (server, peer) = listener.accept().await.expect("accept");
+
+        let started = tokio::time::Instant::now();
+        let tls = tcp_tls_handshake(&acceptor, server, peer).await;
+        assert!(
+            tls.is_none(),
+            "a stalled handshake must be dropped, not kept"
+        );
+
+        // The paused clock advances while nothing is runnable, so the
+        // deadline elapsed without sleeping it out.
+        assert!(
+            started.elapsed() >= TCP_AUTH_DEADLINE,
+            "the deadline that fired must be the auth deadline"
+        );
     }
 }

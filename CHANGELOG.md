@@ -88,6 +88,78 @@
 
 ### Fixed
 
+- Group commit now actually coalesces, and fsync failures can no longer be
+  acknowledged as durable (issues #139, #166, #145): the engine promoted
+  *every* concurrent writer to leader, so N writers performed N sequential
+  fsyncs instead of one per group — the headline throughput feature did not
+  work, and each of those N fsync outcomes was discarded with `let _`, so a
+  failed fsync still acknowledged the write as durable. Writers that arrive
+  while a sync is in flight now queue as followers of the next epoch (the
+  sync guaranteed to start after their append) and are covered by one
+  leader fsync; the leader's fsync result is published to the whole group,
+  so a failed fsync fails the leader and every follower and the batch is
+  never inserted into the memtable or acknowledged. Per-epoch waiter
+  accounting replaced the per-group counter that decremented once per group
+  regardless of joiners (#145).
+- A failed leader fsync now fails every follower it covered, not just the
+  first one to notice (issue #139): the per-epoch failure was consumed by
+  the first released waiter, letting the rest return `Ok` and acknowledge
+  un-durable writes. It is now cloned to each waiter of the epoch and
+  discarded only when the last one withdraws.
+- A rejected write can no longer reappear after restart (issue #168):
+  the first fsync failure poisons the group-commit engine for the rest of
+  the process, the commit path refuses to append a WAL batch once poisoned,
+  and the WAL truncates back to its last durable offset and re-fsyncs the
+  truncation, so the batch's bytes are physically gone rather than merely
+  un-fsynced — kernel background writeback could otherwise flush them and
+  `replay()` would restore the write the client was told had failed. The
+  heap lock is also held across the WAL fsync, so no writer can interleave
+  a heap append between the two and end up with a durable commit marker
+  over un-durable heap bytes.
+- The TCP command interface no longer puts the JWT on the wire in
+  cleartext: TLS 1.3 is now the default transport (`OMNIKV_TCP_TLS=true`),
+  with ALPN `omnikv/1`. The certificate is the operator-supplied pair from
+  `OMNIKV_TLS_CERT_PATH` / `OMNIKV_TLS_KEY_PATH` when both are set — the
+  same material HTTP and QUIC present — and otherwise freshly generated for
+  the interface on every boot (a new key pair each restart, not the QUIC
+  endpoint's certificate). The interface is JWT-gated, so without
+  encryption `AUTH` handed the credential to anyone on the path to capture
+  and replay; the config validator now refuses a public bind with TLS off,
+  and `OMNIKV_TCP_TLS=false` is only meaningful on loopback, for telnet
+  debugging. A plaintext command sent to a TLS-enabled port gets no
+  protocol reply — only the alert refusing bytes that are not a
+  ClientHello. The TLS handshake is bounded by the auth deadline: a peer
+  that connects and never sends a ClientHello would otherwise hold a
+  session permit until the idle timeout, and 256 such peers exhaust the
+  session pool while the accept loop blocks real clients.
+- The PostgreSQL wire protocol no longer puts `OMNI_PGWIRE_PASSWORD` on the
+  wire in cleartext either. A client's SSLRequest is answered with 'S' and
+  the session upgrades to TLS (`OMNIKV_PGWIRE_TLS=true`, the default), so
+  `sslmode=require` clients get the encrypted transport they asked for and
+  the password stays off the wire. TLS 1.2 as well as 1.3 is accepted —
+  PgWire exists for client compatibility and older libpq builds negotiate
+  1.2 only. Plaintext startup is allowed on loopback only; on any other bind
+  it is answered with a `28000` error and closed, private networks included
+  (a private network is a shared segment too). A non-loopback bind with TLS
+  off is refused at startup, the same rule the TCP command interface
+  enforces for the JWT. The handshake runs under one total deadline rather
+  than a per-read timeout, so a peer that trickles a byte every few seconds
+  cannot hold a connection-thread permit the way it could under a bound that
+  resets with every packet.
+- The WAL's durable-offset accounting can no longer report durability it
+  does not have. A successful fsync advances the offset by the byte count
+  it flushed instead of by a `metadata()` length that a filesystem error
+  would collapse to zero — the zero path let a later
+  `discard_undurable()` truncate away batches that were already on stable
+  storage, discarding writes the client had been told succeeded. Both
+  fsync entry points (`append_batch` and the group-commit `sync()`) now
+  advance the same counter, and a WAL that cannot report its own length at
+  open fails rather than assuming it is empty. `discard_undurable()` also
+  seeks the reopened writer to the end of the retained bytes, so the next
+  append extends them — the write-mode reopen Windows requires left the
+  cursor at zero, and an append then overwrote the batches the truncation
+  had just preserved.
+
 - DML inside a `BEGIN` block is now transactional (issue #121):
   `INSERT`/`UPDATE`/`DELETE` (and legacy KV writes) previously committed
   immediately even inside an explicit transaction, so `ROLLBACK` could
@@ -138,7 +210,9 @@
   desynchronized the protocol, so every default-configured client failed at
   connection time with `sslmode=prefer` (issue #108). The listener now answers
   negotiation with a single-byte `'N'` and completes the handshake on the same
-  plaintext connection, matching PostgreSQL's fallback behavior.
+  plaintext connection, matching PostgreSQL's fallback behavior. (Superseded
+  for SSLRequest by the TLS entry below: GSSENCRequest is still answered `'N'`,
+  but SSLRequest is answered `'S'` and the session upgrades to TLS.)
 - Startup messages with unknown protocol codes are now rejected with SQLSTATE
   `08P01` instead of producing a framing-dependent failure, and cancel-request
   connections for unknown backend keys are drained and closed.

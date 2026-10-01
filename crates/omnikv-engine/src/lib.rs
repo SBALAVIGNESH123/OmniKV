@@ -2,7 +2,7 @@
     dead_code,
     unused_imports,
     unused_variables,
-    reason = "Legacy modules still expose staged database features and compatibility shims; issue #64 makes this debt explicit instead of hiding it behind broad allow attributes."
+    reason = "Legacy modules still expose staged database features and compatibility shims; this makes the debt explicit instead of hiding it behind broad allow attributes."
 )]
 #![expect(
     clippy::assigning_clones,

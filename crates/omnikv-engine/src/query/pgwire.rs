@@ -250,6 +250,137 @@ fn is_cleartext_safe_bind(bind_addr: &str) -> bool {
     }
 }
 
+/// Loopback only. A private network is shared, so with TLS configured
+/// plaintext startup is refused there too.
+fn is_loopback_bind(bind_addr: &str) -> bool {
+    match bind_addr.parse::<std::net::SocketAddr>() {
+        Ok(addr) => addr.ip().is_loopback(),
+        // Unparseable bind (e.g. a host name to be resolved later) cannot be
+        // proven loopback; treat as non-loopback so TLS is required.
+        Err(_) => false,
+    }
+}
+
+/// A PgWire connection: plaintext, or TLS over the same socket after the
+/// SSLRequest negotiation. The swap happens inside [`handle_startup`], so
+/// every handler after it speaks the same Read/Write contract regardless of
+/// which transport the client negotiated.
+enum PgStream {
+    Plain(std::net::TcpStream),
+    Tls(Box<rustls::StreamOwned<rustls::ServerConnection, std::net::TcpStream>>),
+}
+
+impl std::io::Read for PgStream {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            PgStream::Plain(s) => s.read(buf),
+            PgStream::Tls(s) => s.read(buf),
+        }
+    }
+}
+
+impl std::io::Write for PgStream {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            PgStream::Plain(s) => s.write(buf),
+            // rustls buffers a partial record; flush on every write so a
+            // short reply reaches the client instead of stalling the session.
+            PgStream::Tls(s) => {
+                let n = s.write(buf)?;
+                s.flush()?;
+                Ok(n)
+            }
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            PgStream::Plain(s) => s.flush(),
+            PgStream::Tls(s) => s.flush(),
+        }
+    }
+}
+
+impl PgStream {
+    fn peer_addr(&self) -> std::io::Result<std::net::SocketAddr> {
+        match self {
+            PgStream::Plain(s) => s.peer_addr(),
+            PgStream::Tls(s) => s.get_ref().peer_addr(),
+        }
+    }
+
+    fn is_tls(&self) -> bool {
+        matches!(self, PgStream::Tls(_))
+    }
+}
+
+/// Bound on the TLS handshake: a peer that opens a socket and sends nothing
+/// must not hold a connection thread forever.
+const PGWIRE_TLS_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Replace a plaintext connection with a TLS session over the same socket.
+///
+/// The handshake is driven one record at a time under a single deadline, so a
+/// peer that trickles a byte every few seconds cannot hold the connection
+/// thread the way it could under a per-read timeout. `read_tls` consumes
+/// exactly one record, so the client's StartupMessage still waiting in the
+/// buffer is left for the first `read` after the handshake to return.
+fn upgrade_to_tls(
+    stream: PgStream,
+    config: &Arc<rustls::ServerConfig>,
+) -> std::io::Result<PgStream> {
+    let mut sock = match stream {
+        PgStream::Plain(sock) => sock,
+        PgStream::Tls(_) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "connection already upgraded to TLS",
+            ));
+        }
+    };
+
+    let mut conn = rustls::ServerConnection::new(Arc::clone(config))
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("tls: {e}")))?;
+
+    let prev_read = sock.read_timeout()?;
+    let prev_write = sock.write_timeout()?;
+    let deadline = std::time::Instant::now() + PGWIRE_TLS_HANDSHAKE_TIMEOUT;
+
+    while conn.is_handshaking() {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "tls handshake exceeded the deadline",
+            ));
+        }
+        sock.set_read_timeout(Some(remaining))?;
+        sock.set_write_timeout(Some(remaining))?;
+
+        let read = conn.read_tls(&mut sock)?;
+        if read == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "peer closed the connection during the tls handshake",
+            ));
+        }
+        conn.process_new_packets().map_err(|e| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, format!("tls: {e}"))
+        })?;
+        while conn.wants_write() {
+            conn.write_tls(&mut sock)?;
+        }
+        sock.flush()?;
+    }
+
+    let _ = sock.set_read_timeout(prev_read);
+    let _ = sock.set_write_timeout(prev_write);
+
+    Ok(PgStream::Tls(Box::new(rustls::StreamOwned::new(
+        conn, sock,
+    ))))
+}
+
 /// Represents a PostgreSQL wire protocol server with connection pooling.
 pub struct PgWireServer {
     db: Arc<OmniKV>,
@@ -268,6 +399,9 @@ pub struct PgWireServer {
     pgwire_password: String,
     /// Whether cleartext auth may be served on non-private binds.
     security_policy: PgWireSecurityPolicy,
+    /// TLS configuration for the SSLRequest negotiation. `None` answers 'N'
+    /// and keeps the connection plaintext.
+    tls_config: Option<Arc<rustls::ServerConfig>>,
 }
 
 /// Reads the PgWire cleartext password from OMNI_PGWIRE_PASSWORD.
@@ -295,6 +429,7 @@ impl PgWireServer {
             pgwire_password: pgwire_password_from_env(),
             security_policy: default_security_policy(),
             txn_manager,
+            tls_config: None,
         }
     }
 
@@ -310,6 +445,7 @@ impl PgWireServer {
             pgwire_password: pgwire_password.to_string(),
             security_policy: default_security_policy(),
             txn_manager,
+            tls_config: None,
         }
     }
 
@@ -330,6 +466,7 @@ impl PgWireServer {
             pgwire_password: pgwire_password.to_string(),
             security_policy,
             txn_manager,
+            tls_config: None,
         }
     }
 
@@ -344,6 +481,7 @@ impl PgWireServer {
             pgwire_password: pgwire_password_from_env(),
             security_policy: default_security_policy(),
             txn_manager,
+            tls_config: None,
         }
     }
 
@@ -362,6 +500,7 @@ impl PgWireServer {
             pgwire_password: pgwire_password_from_env(),
             security_policy: default_security_policy(),
             txn_manager,
+            tls_config: None,
         }
     }
 
@@ -383,7 +522,17 @@ impl PgWireServer {
             pgwire_password: pgwire_password.to_string(),
             security_policy: default_security_policy(),
             txn_manager,
+            tls_config: None,
         }
+    }
+
+    /// Attaches the TLS configuration used to answer an SSLRequest with 'S'.
+    /// Without it the listener answers 'N' and the password crosses the wire
+    /// in cleartext.
+    #[must_use]
+    pub fn with_tls_config(mut self, config: Option<Arc<rustls::ServerConfig>>) -> Self {
+        self.tls_config = config;
+        self
     }
 
     /// Returns the configured max connections.
@@ -401,8 +550,13 @@ impl PgWireServer {
     pub fn start(&self) -> std::io::Result<()> {
         self.validate_security_policy()?;
         let listener = TcpListener::bind(&self.bind_addr)?;
+        let transport = if self.tls_config.is_some() {
+            "TLS"
+        } else {
+            "PLAINTEXT"
+        };
         eprintln!(
-            "[OmniKV] PostgreSQL wire protocol listening on {} (pool: {} max connections)",
+            "[OmniKV] PostgreSQL wire protocol listening on {} (pool: {} max connections, {transport})",
             self.bind_addr, self.max_connections
         );
         self.serve(listener)
@@ -413,13 +567,14 @@ impl PgWireServer {
     /// configuration before startup and tests can exercise the policy.
     pub fn validate_security_policy(&self) -> std::io::Result<()> {
         if self.security_policy == PgWireSecurityPolicy::RequirePrivateBind
+            && self.tls_config.is_none()
             && !is_cleartext_safe_bind(&self.bind_addr)
         {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
                 format!(
                     "PgWire cleartext authentication refused on non-private bind {}; \
-                     bind loopback/private or wait for PgWire TLS support",
+                     enable PgWire TLS or bind loopback/private",
                     self.bind_addr
                 ),
             ));
@@ -440,6 +595,11 @@ impl PgWireServer {
             let _ = permit_tx.send(());
         }
 
+        // Anything but loopback gets no plaintext startup, private
+        // networks included: a client that skips the SSLRequest would
+        // send the password in the clear.
+        let require_tls = self.tls_config.is_some() && !is_loopback_bind(&self.bind_addr);
+
         for stream in listener.incoming() {
             match stream {
                 Ok(stream) => {
@@ -452,6 +612,7 @@ impl PgWireServer {
                     let rate_limiter = self.rate_limiter.clone();
                     let pgwire_password = self.pgwire_password.clone();
                     let txn_manager = self.txn_manager.clone();
+                    let tls_config = self.tls_config.clone();
                     let release_tx = permit_tx.clone();
                     std::thread::spawn(move || {
                         if let Err(e) = handle_connection(
@@ -460,6 +621,8 @@ impl PgWireServer {
                             rate_limiter,
                             &pgwire_password,
                             txn_manager,
+                            tls_config,
+                            require_tls,
                         ) {
                             eprintln!("[OmniKV] Connection error: {}", e);
                         }
@@ -485,10 +648,12 @@ fn default_pgwire_rate_limiter() -> Arc<RateLimiter> {
 /// Handle a single PostgreSQL client connection.
 fn handle_connection(
     db: Arc<OmniKV>,
-    mut stream: std::net::TcpStream,
+    stream: std::net::TcpStream,
     rate_limiter: Arc<RateLimiter>,
     pgwire_password: &str,
     txn_manager: Arc<TransactionManager>,
+    tls_config: Option<Arc<rustls::ServerConfig>>,
+    require_tls: bool,
 ) -> std::io::Result<()> {
     // Phase 1: Startup handshake
     if pgwire_password.is_empty() {
@@ -498,7 +663,12 @@ fn handle_connection(
             "OMNI_PGWIRE_PASSWORD not configured",
         ));
     }
-    handle_startup(&mut stream, pgwire_password)?;
+    let mut stream = handle_startup(
+        PgStream::Plain(stream),
+        pgwire_password,
+        tls_config.as_ref(),
+        require_tls,
+    )?;
 
     // Per-connection session state; the transaction manager is the
     // server-wide shared one (cross-connection SSI history).
@@ -633,13 +803,15 @@ const MAX_STARTUP_NEGOTIATION_MESSAGES: usize = 8;
 /// Clients running libpq defaults (psql, JDBC, psycopg2, pg8000, node-postgres)
 /// send an SSLRequest before the StartupMessage. Per the PostgreSQL protocol,
 /// the reply is a single byte: 'S' to upgrade to TLS, 'N' to stay on the
-/// current (plaintext) connection. OmniKV has no PgWire TLS yet, so the reply
-/// is always 'N', and the handshake then continues with the real
-/// StartupMessage on the same connection.
+/// current (plaintext) connection. An upgrade swaps the stream for a rustls
+/// session over the same socket, and the negotiated stream is returned so the
+/// query loop speaks the transport the client asked for.
 fn handle_startup(
-    stream: &mut std::net::TcpStream,
+    mut stream: PgStream,
     expected_password: &str,
-) -> std::io::Result<()> {
+    tls_config: Option<&Arc<rustls::ServerConfig>>,
+    require_tls: bool,
+) -> std::io::Result<PgStream> {
     let mut negotiation_packets = 0usize;
     loop {
         let mut len_buf = [0u8; 4];
@@ -661,7 +833,7 @@ fn handle_startup(
                 negotiation_packets += 1;
                 if negotiation_packets > MAX_STARTUP_NEGOTIATION_MESSAGES {
                     send_error_response(
-                        stream,
+                        &mut stream,
                         "08P01",
                         "too many negotiation requests before startup",
                     )?;
@@ -670,9 +842,17 @@ fn handle_startup(
                         "too many negotiation requests before startup",
                     ));
                 }
-                // Single-byte 'N': no TLS or GSS upgrade on this listener.
-                // The next message from the client is the real StartupMessage.
-                stream.write_all(b"N")?;
+                if protocol_code == SSL_REQUEST_CODE
+                    && let Some(config) = tls_config
+                {
+                    stream.write_all(b"S")?;
+                    stream = upgrade_to_tls(stream, config)?;
+                } else {
+                    // GSSAPI encryption is not supported, and a listener
+                    // without certificate material has nothing to negotiate
+                    // with. The client falls back to plaintext.
+                    stream.write_all(b"N")?;
+                }
             }
             CANCEL_REQUEST_CODE => {
                 // A dedicated connection carrying a query-cancel request
@@ -692,11 +872,22 @@ fn handle_startup(
                 // the remaining key/value parameters to stay framing-aligned.
                 let mut params = vec![0u8; body_len - 4];
                 stream.read_exact(&mut params)?;
+                if require_tls && !stream.is_tls() {
+                    send_error_response(
+                        &mut stream,
+                        "28000",
+                        "TLS is required on this listener; connect with sslmode=require",
+                    )?;
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "plaintext startup on a bind that requires TLS",
+                    ));
+                }
                 break;
             }
             _ => {
                 send_error_response(
-                    stream,
+                    &mut stream,
                     "08P01",
                     &format!("unsupported protocol version {protocol_code}"),
                 )?;
@@ -720,7 +911,7 @@ fn handle_startup(
     let mut msg_type = [0u8; 1];
     stream.read_exact(&mut msg_type)?;
     if msg_type[0] != b'p' {
-        send_error_response(stream, "28P01", "password message expected")?;
+        send_error_response(&mut stream, "28P01", "password message expected")?;
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
             "password message expected",
@@ -738,7 +929,7 @@ fn handle_startup(
 
     if supplied != expected_password {
         tracing::warn!("PGWire authentication failed — bad password");
-        send_error_response(stream, "28P01", "password authentication failed")?;
+        send_error_response(&mut stream, "28P01", "password authentication failed")?;
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
             "password authentication failed",
@@ -752,21 +943,17 @@ fn handle_startup(
     ok.extend_from_slice(&0u32.to_be_bytes());
     stream.write_all(&ok)?;
 
-    send_parameter_status(stream, "server_version", "15.0 (OmniKV)")?;
-    send_parameter_status(stream, "server_encoding", "UTF8")?;
-    send_parameter_status(stream, "client_encoding", "UTF8")?;
-    send_parameter_status(stream, "DateStyle", "ISO, MDY")?;
-    send_parameter_status(stream, "integer_datetimes", "on")?;
-    send_ready_for_query_status(stream, b'I')?;
-    Ok(())
+    send_parameter_status(&mut stream, "server_version", "15.0 (OmniKV)")?;
+    send_parameter_status(&mut stream, "server_encoding", "UTF8")?;
+    send_parameter_status(&mut stream, "client_encoding", "UTF8")?;
+    send_parameter_status(&mut stream, "DateStyle", "ISO, MDY")?;
+    send_parameter_status(&mut stream, "integer_datetimes", "on")?;
+    send_ready_for_query_status(&mut stream, b'I')?;
+    Ok(stream)
 }
 
 /// Send an ErrorResponse message to the client.
-fn send_error_response(
-    stream: &mut std::net::TcpStream,
-    code: &str,
-    message: &str,
-) -> std::io::Result<()> {
+fn send_error_response(stream: &mut PgStream, code: &str, message: &str) -> std::io::Result<()> {
     // 'E' + int32(len) + 'S' + "ERROR\0" + 'C' + code + '\0' + 'M' + message + '\0' + '\0'
     let mut payload = Vec::new();
     payload.push(b'S');
@@ -787,14 +974,14 @@ fn send_error_response(
 }
 
 /// Read a Query ('Q') message body.
-fn read_query_message(stream: &mut std::net::TcpStream) -> std::io::Result<String> {
+fn read_query_message(stream: &mut PgStream) -> std::io::Result<String> {
     let body = read_message_body(stream)?;
     let end = body.iter().position(|&b| b == 0).unwrap_or(body.len());
     Ok(String::from_utf8_lossy(&body[..end]).to_string())
 }
 
 /// Read a message body (length-prefixed).
-fn read_message_body(stream: &mut std::net::TcpStream) -> std::io::Result<Vec<u8>> {
+fn read_message_body(stream: &mut PgStream) -> std::io::Result<Vec<u8>> {
     let mut len_buf = [0u8; 4];
     stream.read_exact(&mut len_buf)?;
     let len = u32::from_be_bytes(len_buf) as usize;
@@ -908,7 +1095,7 @@ fn statement_is_accepted_by_core(sql_trimmed: &str) -> bool {
 /// but not enforced (parameters bind as text); Describe echoes them.
 fn handle_parse(
     conn: &mut ConnectionState,
-    stream: &mut std::net::TcpStream,
+    stream: &mut PgStream,
     body: &[u8],
     rate_limiter: &RateLimiter,
     client_id: &str,
@@ -1013,7 +1200,7 @@ fn handle_parse(
 /// the pipeline until Sync.
 fn handle_bind(
     conn: &mut ConnectionState,
-    stream: &mut std::net::TcpStream,
+    stream: &mut PgStream,
     body: &[u8],
 ) -> std::io::Result<()> {
     if conn.extended_error_pending {
@@ -1200,7 +1387,7 @@ fn select_column_label(col: &crate::sql::SelectColumn) -> String {
 /// the parsed statement alone.
 fn handle_describe(
     conn: &mut ConnectionState,
-    stream: &mut std::net::TcpStream,
+    stream: &mut PgStream,
     body: &[u8],
 ) -> std::io::Result<()> {
     if conn.extended_error_pending {
@@ -1326,7 +1513,7 @@ fn handle_execute(
     db: &Arc<OmniKV>,
     tm: &Arc<TransactionManager>,
     conn: &mut ConnectionState,
-    stream: &mut std::net::TcpStream,
+    stream: &mut PgStream,
     body: &[u8],
     rate_limiter: &RateLimiter,
     client_id: &str,
@@ -1455,7 +1642,7 @@ fn handle_execute(
 /// PostgreSQL.
 fn handle_close(
     conn: &mut ConnectionState,
-    stream: &mut std::net::TcpStream,
+    stream: &mut PgStream,
     body: &[u8],
 ) -> std::io::Result<()> {
     if conn.extended_error_pending {
@@ -1507,7 +1694,7 @@ fn handle_close(
 /// inside a transaction block also fail the transaction, matching the
 /// simple-protocol behavior.
 fn extended_protocol_error(
-    stream: &mut std::net::TcpStream,
+    stream: &mut PgStream,
     conn: &mut ConnectionState,
     code: &str,
     message: &str,
@@ -1525,7 +1712,7 @@ fn handle_query(
     db: &Arc<OmniKV>,
     tm: &Arc<TransactionManager>,
     conn: &mut ConnectionState,
-    stream: &mut std::net::TcpStream,
+    stream: &mut PgStream,
     sql: &str,
 ) -> std::io::Result<()> {
     write_step_outcome_simple(stream, execute_statement_core(db, tm, conn, sql))?;
@@ -1534,10 +1721,7 @@ fn handle_query(
 
 /// Render one core outcome as simple-protocol frames. A WARNING-severity
 /// ErrorResponse is followed by the completion tag, matching PostgreSQL.
-fn write_step_outcome_simple(
-    stream: &mut std::net::TcpStream,
-    outcome: StepOutcome,
-) -> std::io::Result<()> {
+fn write_step_outcome_simple(stream: &mut PgStream, outcome: StepOutcome) -> std::io::Result<()> {
     match outcome {
         StepOutcome::Complete(tag) => send_command_complete(stream, &tag)?,
         StepOutcome::Rows { columns, rows, tag } => {
@@ -2192,7 +2376,7 @@ fn build_scan_range(conditions: &[query::Condition]) -> (String, String) {
 // Wire Protocol Message Builders
 // ═══════════════════════════════════════════════════════════════════════
 
-fn send_auth_ok(stream: &mut std::net::TcpStream) -> std::io::Result<()> {
+fn send_auth_ok(stream: &mut PgStream) -> std::io::Result<()> {
     let mut buf = Vec::new();
     buf.push(AUTH_OK);
     buf.extend_from_slice(&8i32.to_be_bytes());
@@ -2202,10 +2386,7 @@ fn send_auth_ok(stream: &mut std::net::TcpStream) -> std::io::Result<()> {
 
 /// Send ReadyForQuery with the correct transaction status byte.
 /// 'I' = idle (no transaction), 'T' = in transaction, 'E' = failed transaction
-fn send_ready_for_query_status(
-    stream: &mut std::net::TcpStream,
-    status: u8,
-) -> std::io::Result<()> {
+fn send_ready_for_query_status(stream: &mut PgStream, status: u8) -> std::io::Result<()> {
     stream.write_all(&ready_for_query_bytes(status))
 }
 
@@ -2217,11 +2398,7 @@ fn ready_for_query_bytes(status: u8) -> Vec<u8> {
     buf
 }
 
-fn send_parameter_status(
-    stream: &mut std::net::TcpStream,
-    key: &str,
-    value: &str,
-) -> std::io::Result<()> {
+fn send_parameter_status(stream: &mut PgStream, key: &str, value: &str) -> std::io::Result<()> {
     let mut body = Vec::new();
     body.extend_from_slice(key.as_bytes());
     body.push(0);
@@ -2235,10 +2412,7 @@ fn send_parameter_status(
     stream.write_all(&buf)
 }
 
-fn send_row_description(
-    stream: &mut std::net::TcpStream,
-    columns: &[(&str, i32)],
-) -> std::io::Result<()> {
+fn send_row_description(stream: &mut PgStream, columns: &[(&str, i32)]) -> std::io::Result<()> {
     let mut body = Vec::new();
     body.extend_from_slice(&(columns.len() as i16).to_be_bytes());
 
@@ -2262,10 +2436,7 @@ fn send_row_description(
 
 /// Sends a ParameterDescription ('t') frame: int16 parameter count,
 /// then one int32 type OID per parameter.
-fn send_parameter_description(
-    stream: &mut std::net::TcpStream,
-    oids: &[u32],
-) -> std::io::Result<()> {
+fn send_parameter_description(stream: &mut PgStream, oids: &[u32]) -> std::io::Result<()> {
     let count = i16::try_from(oids.len()).expect("parameter count fits i16");
     let mut body = Vec::with_capacity(2 + oids.len() * 4);
     body.extend_from_slice(&count.to_be_bytes());
@@ -2279,7 +2450,7 @@ fn send_parameter_description(
     stream.write_all(&buf)
 }
 
-fn send_data_row(stream: &mut std::net::TcpStream, values: &[&str]) -> std::io::Result<()> {
+fn send_data_row(stream: &mut PgStream, values: &[&str]) -> std::io::Result<()> {
     let mut body = Vec::new();
     body.extend_from_slice(&(values.len() as i16).to_be_bytes());
 
@@ -2296,7 +2467,7 @@ fn send_data_row(stream: &mut std::net::TcpStream, values: &[&str]) -> std::io::
     stream.write_all(&buf)
 }
 
-fn send_command_complete(stream: &mut std::net::TcpStream, tag: &str) -> std::io::Result<()> {
+fn send_command_complete(stream: &mut PgStream, tag: &str) -> std::io::Result<()> {
     stream.write_all(&command_complete_bytes(tag))
 }
 
@@ -2313,7 +2484,7 @@ fn command_complete_bytes(tag: &str) -> Vec<u8> {
 }
 
 fn send_error(
-    stream: &mut std::net::TcpStream,
+    stream: &mut PgStream,
     severity: &str,
     code: &str,
     message: &str,
@@ -2326,7 +2497,7 @@ fn send_error(
 /// ErrorResponse ('E') is reserved for errors: DBAPI drivers raise on any
 /// ErrorResponse, so a benign COMMIT-outside-transaction warning must never
 /// travel as 'E'.
-fn send_notice(stream: &mut std::net::TcpStream, code: &str, message: &str) -> std::io::Result<()> {
+fn send_notice(stream: &mut PgStream, code: &str, message: &str) -> std::io::Result<()> {
     let mut payload = Vec::new();
     payload.push(b'S');
     payload.extend_from_slice(b"WARNING ");
@@ -2405,6 +2576,32 @@ mod tests {
             &frame[5..],
             b"SERROR\0VERROR\0C42601\0MParse error: invalid query\0\0"
         );
+    }
+
+    #[test]
+    fn cleartext_is_safe_on_loopback_and_private_binds() {
+        assert!(is_cleartext_safe_bind("127.0.0.1:5432"));
+        assert!(is_cleartext_safe_bind("[::1]:5432"));
+        assert!(is_cleartext_safe_bind("10.0.0.5:5432"));
+        assert!(is_cleartext_safe_bind("192.168.1.1:5432"));
+        assert!(is_cleartext_safe_bind("172.16.0.1:5432"));
+        assert!(is_cleartext_safe_bind("[fc00::1]:5432"));
+        assert!(!is_cleartext_safe_bind("8.8.8.8:5432"));
+        assert!(!is_cleartext_safe_bind("[2001:4860::1]:5432"));
+        // A hostname to be resolved later cannot be classified, so it is
+        // treated as unsafe rather than assumed private.
+        assert!(!is_cleartext_safe_bind("db.internal:5432"));
+    }
+
+    #[test]
+    fn only_loopback_is_exempt_from_required_tls() {
+        assert!(is_loopback_bind("127.0.0.1:5432"));
+        assert!(is_loopback_bind("[::1]:5432"));
+        assert!(!is_loopback_bind("10.0.0.5:5432"));
+        assert!(!is_loopback_bind("192.168.1.1:5432"));
+        assert!(!is_loopback_bind("0.0.0.0:5432"));
+        assert!(!is_loopback_bind("8.8.8.8:5432"));
+        assert!(!is_loopback_bind("db.internal:5432"));
     }
 
     #[test]

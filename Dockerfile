@@ -28,8 +28,11 @@ ENV RUST_LOG=info
 ENV OMNIKV_CONFIG=/etc/omni/omni.toml
 ENV OMNI_CONFIG=/etc/omni/omni.toml
 
+# Verify first; fall back to -k for self-signed certs whose SANs do not
+# cover loopback.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-  CMD curl -kfsS https://127.0.0.1:8443/health || exit 1
+  CMD curl -fsS --max-time 2 https://127.0.0.1:8443/health \
+    || curl -kfsS --max-time 3 https://127.0.0.1:8443/health || exit 1
 
 USER omnikv
 ENTRYPOINT ["omnikv-server"]
