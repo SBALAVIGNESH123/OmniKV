@@ -999,7 +999,9 @@ pub fn compute_aggregate(func: &AggFunc, target: &str, rows: &[&Row]) -> (String
         }
         AggFunc::Sum => {
             if values.iter().all(|v| v.parse::<i64>().is_ok()) {
-                let sum: i64 = values.iter().map(|v| v.parse::<i64>().unwrap()).sum();
+                // i128, not i64: a full column of i64 values would otherwise
+                // overflow the accumulator.
+                let sum: i128 = values.iter().map(|v| v.parse::<i64>().unwrap() as i128).sum();
                 (name, sum.to_string())
             } else {
                 let sum: f64 = values.iter().filter_map(|v| v.parse::<f64>().ok()).sum();
@@ -1015,13 +1017,15 @@ pub fn compute_aggregate(func: &AggFunc, target: &str, rows: &[&Row]) -> (String
                 if rem == 0 {
                     (name, avg.to_string())
                 } else {
-                    // Exact when the fraction is short; the fallback keeps
-                    // six places without the trailing zeros f64 prints.
+                    // Fixed point to six places, then trim: the fraction is
+                    // zero-padded so interior zeros survive (0.03125, not
+                    // 0.3125) while trailing zeros do not. The sign rides on
+                    // q itself, because a whole part of 0 would drop it for
+                    // any average between -1 and 0.
                     let q = (sum * 1_000_000) / n;
-                    let whole = q / 1_000_000;
-                    let frac = q % 1_000_000;
-                    let s = frac.abs().to_string();
-                    (name, format!("{}.{}", whole, s.trim_end_matches('0')))
+                    let sign = if q < 0 { "-" } else { "" };
+                    let q = q.abs();
+                    (name, format!("{sign}{}.{:06}", q / 1_000_000, q % 1_000_000).trim_end_matches('0').trim_end_matches('.').to_string())
                 }
             } else {
                 let avg = if values.is_empty() {
@@ -1034,20 +1038,21 @@ pub fn compute_aggregate(func: &AggFunc, target: &str, rows: &[&Row]) -> (String
             }
         }
         AggFunc::Min => {
-            let min = rows
+            // Aggregates skip nulls, so MIN never reports "NULL" as a value.
+            let min = values
                 .iter()
-                .filter_map(|r| r.get(target))
+                .copied()
                 .min_by(|a, b| smart_cmp(a, b))
-                .cloned()
+                .map(str::to_string)
                 .unwrap_or_default();
             (name, min)
         }
         AggFunc::Max => {
-            let max = rows
+            let max = values
                 .iter()
-                .filter_map(|r| r.get(target))
+                .copied()
                 .max_by(|a, b| smart_cmp(a, b))
-                .cloned()
+                .map(str::to_string)
                 .unwrap_or_default();
             (name, max)
         }

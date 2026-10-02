@@ -399,9 +399,8 @@ fn test_unknown_column_errors() {
     exec_sql(&exec, "INSERT INTO k (id, name) VALUES (1, 'a')");
 
     let stmt = parse_sql("SELECT id FROM k WHERE no_such_col = 5").unwrap();
-    let err = match exec.execute(&stmt) {
-        Ok(_) => panic!("unknown column must error, not return rows"),
-        Err(e) => e,
+    let Err(err) = exec.execute(&stmt) else {
+        panic!("unknown column must error, not return rows");
     };
     assert!(
         err.contains("does not exist"),
@@ -430,6 +429,39 @@ fn test_aggregate_null_and_integer_semantics() {
 
     let (_cols, rows) = exec_rows(&exec, "SELECT AVG(n) FROM agg");
     assert_eq!(rows, vec![vec!["7.5".to_string()]]);
+
+    // Aggregates skip nulls: MIN/MAX never report the NULL row as a value.
+    let (_cols, rows) = exec_rows(&exec, "SELECT MIN(n) FROM agg");
+    assert_eq!(rows, vec![vec!["5".to_string()]]);
+
+    let (_cols, rows) = exec_rows(&exec, "SELECT MAX(n) FROM agg");
+    assert_eq!(rows, vec![vec!["10".to_string()]]);
+}
+
+/// The fraction is zero-padded before trimming, so interior zeros survive:
+/// 1/32 is 0.03125, not 0.3125. The sign also survives when the whole part
+/// is zero: -1/32 is -0.03125, not 0.03125.
+#[test]
+fn test_avg_fraction_keeps_interior_zeros_and_sign() {
+    let (_db, exec) = create_sql_env("avgfrac");
+
+    exec_sql(&exec, "CREATE TABLE pos (id INTEGER PRIMARY KEY, n INTEGER)");
+    exec_sql(&exec, "INSERT INTO pos (id, n) VALUES (1, 1)");
+    for i in 2..=32 {
+        exec_sql(&exec, &format!("INSERT INTO pos (id, n) VALUES ({i}, 0)"));
+    }
+
+    let (_cols, rows) = exec_rows(&exec, "SELECT AVG(n) FROM pos");
+    assert_eq!(rows, vec![vec!["0.03125".to_string()]]);
+
+    exec_sql(&exec, "CREATE TABLE neg (id INTEGER PRIMARY KEY, n INTEGER)");
+    exec_sql(&exec, "INSERT INTO neg (id, n) VALUES (1, -1)");
+    for i in 2..=32 {
+        exec_sql(&exec, &format!("INSERT INTO neg (id, n) VALUES ({i}, 0)"));
+    }
+
+    let (_cols, rows) = exec_rows(&exec, "SELECT AVG(n) FROM neg");
+    assert_eq!(rows, vec![vec!["-0.03125".to_string()]]);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -464,9 +496,8 @@ fn test_column_case_is_significant() {
     assert_eq!(rows, vec![vec!["1".to_string()]]);
 
     let stmt = parse_sql("SELECT id FROM cc WHERE name = 'a'").unwrap();
-    let err = match exec.execute(&stmt) {
-        Ok(_) => panic!("wrong-case column must error"),
-        Err(e) => e,
+    let Err(err) = exec.execute(&stmt) else {
+        panic!("wrong-case column must error");
     };
     assert!(err.contains("does not exist"), "error names the column: {err}");
 }
@@ -480,16 +511,14 @@ fn test_update_delete_validate_columns() {
     exec_sql(&exec, "INSERT INTO d (id, v) VALUES (1, 'a')");
 
     let stmt = parse_sql("DELETE FROM d WHERE no_such_col = 5").unwrap();
-    let err = match exec.execute(&stmt) {
-        Ok(_) => panic!("DELETE with unknown column must error"),
-        Err(e) => e,
+    let Err(err) = exec.execute(&stmt) else {
+        panic!("DELETE with unknown column must error");
     };
     assert!(err.contains("does not exist"), "DELETE error: {err}");
 
     let stmt = parse_sql("UPDATE d SET v = 'b' WHERE no_such_col = 5").unwrap();
-    let err = match exec.execute(&stmt) {
-        Ok(_) => panic!("UPDATE with unknown column must error"),
-        Err(e) => e,
+    let Err(err) = exec.execute(&stmt) else {
+        panic!("UPDATE with unknown column must error");
     };
     assert!(err.contains("does not exist"), "UPDATE error: {err}");
 }
