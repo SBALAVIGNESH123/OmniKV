@@ -5,7 +5,7 @@
 use crate::OmniKV;
 use crate::catalog::{Catalog, TableDef};
 use crate::optimizer::{AccessMethod, PlanNode};
-use crate::sql::{AggFunc, CmpOp, JoinType, OrderByItem, SelectColumn, WhereExpr};
+use crate::sql::{AggFunc, JoinType, OrderByItem, SelectColumn, WhereExpr};
 use crate::sql_exec::Row;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -404,42 +404,7 @@ impl PlanExecutor {
 // ─── Shared helpers ─────────────────────────────────────────────────────────
 
 fn eval_where(row: &Row, expr: &WhereExpr) -> bool {
-    match expr {
-        WhereExpr::Comparison { column, op, value } => {
-            let row_val = row.get(column).cloned().unwrap_or_default();
-            let cmp_val = value.as_string();
-            match op {
-                CmpOp::Eq => row_val == cmp_val,
-                CmpOp::Ne => row_val != cmp_val,
-                CmpOp::Gt => smart_cmp(&row_val, &cmp_val) == std::cmp::Ordering::Greater,
-                CmpOp::Lt => smart_cmp(&row_val, &cmp_val) == std::cmp::Ordering::Less,
-                CmpOp::Gte => smart_cmp(&row_val, &cmp_val) != std::cmp::Ordering::Less,
-                CmpOp::Lte => smart_cmp(&row_val, &cmp_val) != std::cmp::Ordering::Greater,
-                CmpOp::Like => {
-                    let pattern = cmp_val.replace('%', ".*").replace('_', ".");
-                    regex::Regex::new(&format!("^{}$", pattern))
-                        .map(|r| r.is_match(&row_val))
-                        .unwrap_or(false)
-                }
-            }
-        }
-        WhereExpr::And(a, b) => eval_where(row, a) && eval_where(row, b),
-        WhereExpr::Or(a, b) => eval_where(row, a) || eval_where(row, b),
-        WhereExpr::Not(inner) => !eval_where(row, inner),
-        WhereExpr::IsNull(col) => row
-            .get(col)
-            .map(|v| v == "NULL" || v.is_empty())
-            .unwrap_or(true),
-        WhereExpr::IsNotNull(col) => row
-            .get(col)
-            .map(|v| v != "NULL" && !v.is_empty())
-            .unwrap_or(false),
-        WhereExpr::In(col, vals) => {
-            let row_val = row.get(col).cloned().unwrap_or_default();
-            vals.iter().any(|v| v.as_string() == row_val)
-        }
-        WhereExpr::InSubquery(_, _) => true,
-    }
+    crate::volcano::eval_where(row, expr)
 }
 
 fn smart_cmp(a: &str, b: &str) -> std::cmp::Ordering {
@@ -451,47 +416,7 @@ fn smart_cmp(a: &str, b: &str) -> std::cmp::Ordering {
 }
 
 fn compute_aggregate(func: &AggFunc, target: &str, rows: &[&Row]) -> (String, String) {
-    let name = format!("{}({})", format!("{:?}", func).to_lowercase(), target);
-    match func {
-        AggFunc::Count => (name, rows.len().to_string()),
-        AggFunc::Sum => {
-            let sum: f64 = rows
-                .iter()
-                .filter_map(|r| r.get(target).and_then(|v| v.parse::<f64>().ok()))
-                .sum();
-            (name, sum.to_string())
-        }
-        AggFunc::Avg => {
-            let vals: Vec<f64> = rows
-                .iter()
-                .filter_map(|r| r.get(target).and_then(|v| v.parse::<f64>().ok()))
-                .collect();
-            let avg = if vals.is_empty() {
-                0.0
-            } else {
-                vals.iter().sum::<f64>() / vals.len() as f64
-            };
-            (name, format!("{:.2}", avg))
-        }
-        AggFunc::Min => {
-            let min = rows
-                .iter()
-                .filter_map(|r| r.get(target))
-                .min_by(|a, b| smart_cmp(a, b))
-                .cloned()
-                .unwrap_or_default();
-            (name, min)
-        }
-        AggFunc::Max => {
-            let max = rows
-                .iter()
-                .filter_map(|r| r.get(target))
-                .max_by(|a, b| smart_cmp(a, b))
-                .cloned()
-                .unwrap_or_default();
-            (name, max)
-        }
-    }
+    crate::volcano::compute_aggregate(func, target, rows)
 }
 
 // ─── Plan Cache (LRU) ───────────────────────────────────────────────────

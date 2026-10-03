@@ -264,7 +264,7 @@ mod tests {
                 panic!("expected ephemeral posture in dev, got {other:?}")
             }
         }
-        assert!(!tls.certs.is_empty());
+        assert_ne!(tls.certs.len(), 0);
     }
 
     /// Production with no cert and no opt-in must fail closed — never

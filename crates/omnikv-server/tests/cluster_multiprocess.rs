@@ -273,8 +273,11 @@ fn boot_cluster() -> Vec<Node> {
         .collect();
     let nodes: Vec<Node> = (1..=3).map(|id| spawn_node(id, &ports, false)).collect();
 
-    let deadline = Instant::now() + Duration::from_secs(30);
+    // Each node gets its own budget: a single deadline shared across the
+    // loop lets a slow first node consume the window the rest need, and
+    // a loaded CI machine times the last node out before it binds.
     for node in &nodes {
+        let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             assert!(
                 Instant::now() <= deadline,

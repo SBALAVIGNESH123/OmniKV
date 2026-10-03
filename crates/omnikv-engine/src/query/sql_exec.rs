@@ -4,8 +4,9 @@
 //! GROUP BY aggregation, and ORDER BY sorting.
 
 use crate::catalog::{Catalog, Column, ColumnType, TableDef};
+use crate::optimizer::extract_where_columns;
 use crate::sql::{
-    AggFunc, CmpOp, FromClause, JoinType, OrderByItem, SelectColumn, SetOpType, SqlColumnDef,
+    AggFunc, FromClause, JoinType, OrderByItem, SelectColumn, SetOpType, SqlColumnDef,
     SqlStatement, SqlValue, WhereExpr, WindowFuncType,
 };
 use crate::{OmniKV, WriteBatch};
@@ -695,6 +696,7 @@ impl SqlExecutor {
         // instead — including tables that were dropped (and not re-created)
         // earlier in this transaction.
         self.validate_from_tables(from)?;
+        self.validate_where_columns(from, where_clause)?;
 
         // When OFFSET is present, fetch limit+offset rows from the pipeline,
         // then skip offset rows in post-processing.
@@ -913,6 +915,61 @@ impl SqlExecutor {
                 Ok(())
             }
         }
+    }
+
+    fn validate_where_columns_of(
+        &self,
+        table_name: &str,
+        where_clause: Option<&WhereExpr>,
+    ) -> Result<(), String> {
+        let table = self
+            .catalog
+            .get_table(table_name)
+            .ok_or_else(|| format!("Table '{}' does not exist", table_name))?;
+        let cols: Vec<String> = table
+            .column_names()
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        for col in extract_where_columns(where_clause) {
+            let bare = col.split('.').next_back().unwrap_or(&col);
+            if !cols.iter().any(|c| c == bare) {
+                return Err(format!("column \"{}\" does not exist", col));
+            }
+        }
+        Ok(())
+    }
+
+    /// A WHERE clause naming a column the table does not have must be an
+    /// error, not an empty result: comparing a missing key yields "" and
+    /// silently matches nothing, which looks like a legitimate answer.
+    fn validate_where_columns(
+        &self,
+        from: &FromClause,
+        where_clause: Option<&WhereExpr>,
+    ) -> Result<(), String> {
+        let tables = match from {
+            FromClause::Table(t) => vec![t.clone()],
+            FromClause::Join { left, right, .. } => vec![left.clone(), right.clone()],
+        };
+        let mut all_columns: Vec<String> = Vec::new();
+        for t in &tables {
+            let table = self
+                .catalog
+                .get_table(t)
+                .ok_or_else(|| format!("Table '{}' does not exist", t))?;
+            all_columns.extend(table.column_names().into_iter().map(str::to_string));
+        }
+        for col in extract_where_columns(where_clause) {
+            let bare = col.split('.').next_back().unwrap_or(&col);
+            // Match the row-map lookup, which is exact-case: a
+            // case-insensitive pass here would let a name through that the
+            // lookup then silently fails to find.
+            if !all_columns.iter().any(|c| c == bare) {
+                return Err(format!("column \"{}\" does not exist", col));
+            }
+        }
+        Ok(())
     }
 
     fn exec_select_legacy(
@@ -1164,7 +1221,7 @@ impl SqlExecutor {
                 SelectColumn::Named(n) => names.push(n.clone()),
                 SelectColumn::Qualified(_, n) => names.push(n.clone()),
                 SelectColumn::Aggregate(f, t) => {
-                    names.push(format!("{:?}({})", f, t).to_lowercase())
+                    names.push(format!("{}({})", format!("{:?}", f).to_lowercase(), t))
                 }
                 SelectColumn::WindowFunc { func, .. } => {
                     let name = match func {
@@ -1188,6 +1245,14 @@ impl SqlExecutor {
                         SelectColumn::Qualified(t, n) => r
                             .get(&format!("{}.{}", t, n))
                             .or_else(|| r.get(n))
+                            .cloned()
+                            .unwrap_or("NULL".into()),
+                        SelectColumn::Aggregate(func, target) => r
+                            .get(&format!(
+                                "{}({})",
+                                format!("{:?}", func).to_lowercase(),
+                                target
+                            ))
                             .cloned()
                             .unwrap_or("NULL".into()),
                         SelectColumn::WindowFunc { func, .. } => {
@@ -1218,6 +1283,7 @@ impl SqlExecutor {
             .get_table(table_name)
             .ok_or_else(|| format!("Table '{}' not found", table_name))?;
         self.record_catalog_read(table_name);
+        self.validate_where_columns_of(table_name, where_clause)?;
         let mut rows = self.load_table_rows(&table);
 
         if let Some(expr) = where_clause {
@@ -1255,6 +1321,7 @@ impl SqlExecutor {
             .get_table(table_name)
             .ok_or_else(|| format!("Table '{}' not found", table_name))?;
         self.record_catalog_read(table_name);
+        self.validate_where_columns_of(table_name, where_clause)?;
         let mut rows = self.load_table_rows(&table);
 
         if let Some(expr) = where_clause {
@@ -1280,46 +1347,7 @@ impl SqlExecutor {
 }
 
 fn eval_where(row: &Row, expr: &WhereExpr) -> bool {
-    match expr {
-        WhereExpr::Comparison { column, op, value } => {
-            let row_val = row.get(column).cloned().unwrap_or_default();
-            let cmp_val = value.as_string();
-            match op {
-                CmpOp::Eq => row_val == cmp_val,
-                CmpOp::Ne => row_val != cmp_val,
-                CmpOp::Gt => smart_cmp(&row_val, &cmp_val) == std::cmp::Ordering::Greater,
-                CmpOp::Lt => smart_cmp(&row_val, &cmp_val) == std::cmp::Ordering::Less,
-                CmpOp::Gte => smart_cmp(&row_val, &cmp_val) != std::cmp::Ordering::Less,
-                CmpOp::Lte => smart_cmp(&row_val, &cmp_val) != std::cmp::Ordering::Greater,
-                CmpOp::Like => {
-                    let pattern = cmp_val.replace('%', ".*").replace('_', ".");
-                    regex::Regex::new(&format!("^{}$", pattern))
-                        .map(|r| r.is_match(&row_val))
-                        .unwrap_or(false)
-                }
-            }
-        }
-        WhereExpr::And(a, b) => eval_where(row, a) && eval_where(row, b),
-        WhereExpr::Or(a, b) => eval_where(row, a) || eval_where(row, b),
-        WhereExpr::Not(inner) => !eval_where(row, inner),
-        WhereExpr::IsNull(col) => row
-            .get(col)
-            .map(|v| v == "NULL" || v.is_empty())
-            .unwrap_or(true),
-        WhereExpr::IsNotNull(col) => row
-            .get(col)
-            .map(|v| v != "NULL" && !v.is_empty())
-            .unwrap_or(false),
-        WhereExpr::In(col, vals) => {
-            let row_val = row.get(col).cloned().unwrap_or_default();
-            vals.iter().any(|v| v.as_string() == row_val)
-        }
-        WhereExpr::InSubquery(_col, _sub) => {
-            // Subquery evaluation requires executor context;
-            // for simple eval_where we return true (handled at exec_select level)
-            true
-        }
-    }
+    crate::volcano::eval_where(row, expr)
 }
 
 fn smart_cmp(a: &str, b: &str) -> std::cmp::Ordering {
@@ -1331,45 +1359,5 @@ fn smart_cmp(a: &str, b: &str) -> std::cmp::Ordering {
 }
 
 fn compute_aggregate(func: &AggFunc, target: &str, rows: &[&Row]) -> (String, String) {
-    let name = format!("{}({})", format!("{:?}", func).to_lowercase(), target);
-    match func {
-        AggFunc::Count => (name, rows.len().to_string()),
-        AggFunc::Sum => {
-            let sum: f64 = rows
-                .iter()
-                .filter_map(|r| r.get(target).and_then(|v| v.parse::<f64>().ok()))
-                .sum();
-            (name, sum.to_string())
-        }
-        AggFunc::Avg => {
-            let vals: Vec<f64> = rows
-                .iter()
-                .filter_map(|r| r.get(target).and_then(|v| v.parse::<f64>().ok()))
-                .collect();
-            let avg = if vals.is_empty() {
-                0.0
-            } else {
-                vals.iter().sum::<f64>() / vals.len() as f64
-            };
-            (name, format!("{:.2}", avg))
-        }
-        AggFunc::Min => {
-            let min = rows
-                .iter()
-                .filter_map(|r| r.get(target))
-                .min_by(|a, b| smart_cmp(a, b))
-                .cloned()
-                .unwrap_or_default();
-            (name, min)
-        }
-        AggFunc::Max => {
-            let max = rows
-                .iter()
-                .filter_map(|r| r.get(target))
-                .max_by(|a, b| smart_cmp(a, b))
-                .cloned()
-                .unwrap_or_default();
-            (name, max)
-        }
-    }
+    crate::volcano::compute_aggregate(func, target, rows)
 }

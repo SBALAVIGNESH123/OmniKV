@@ -179,6 +179,8 @@ pub enum PlanNode {
         join_type: JoinType,
         on_left_col: String,
         on_right_col: String,
+        left_table: String,
+        right_table: String,
         estimated_rows: u64,
         estimated_cost: f64,
     },
@@ -345,7 +347,7 @@ pub fn conjuncts_to_expr(parts: &[WhereExpr]) -> Option<WhereExpr> {
 
 /// Classify which table(s) a predicate references.
 fn predicate_tables(expr: &WhereExpr) -> Vec<String> {
-    let cols = extract_where_columns(expr);
+    let cols = extract_where_columns(Some(expr));
     cols.into_iter()
         .filter_map(|c| {
             if c.contains('.') {
@@ -376,7 +378,7 @@ pub fn pushdown_join_predicates(
 
     for pred in conjuncts {
         let tables = predicate_tables(&pred);
-        let _cols = extract_where_columns(&pred);
+        let _cols = extract_where_columns(Some(&pred));
 
         if tables.iter().all(|t| t.eq_ignore_ascii_case(left_table)) {
             left_preds.push(pred);
@@ -420,7 +422,7 @@ pub fn extract_needed_columns(
     }
 
     if let Some(expr) = where_clause {
-        needed.extend(extract_where_columns(expr));
+        needed.extend(extract_where_columns(Some(expr)));
     }
     for item in order_by {
         needed.push(item.column.clone());
@@ -565,11 +567,25 @@ impl Optimizer {
                 let right_plan = self.plan_table_scan(right, None)?;
 
                 // Cost-based join order: smaller table as build side (hash table)
-                let (build, probe, build_col, probe_col) =
+                let (build, probe, build_col, probe_col, build_table, probe_table) =
                     if left_plan.estimated_rows() <= right_plan.estimated_rows() {
-                        (left_plan, right_plan, on_left.clone(), on_right.clone())
+                        (
+                            left_plan,
+                            right_plan,
+                            on_left.clone(),
+                            on_right.clone(),
+                            left.clone(),
+                            right.clone(),
+                        )
                     } else {
-                        (right_plan, left_plan, on_right.clone(), on_left.clone())
+                        (
+                            right_plan,
+                            left_plan,
+                            on_right.clone(),
+                            on_left.clone(),
+                            right.clone(),
+                            left.clone(),
+                        )
                     };
 
                 let build_rows = build.estimated_rows();
@@ -586,6 +602,8 @@ impl Optimizer {
                     join_type: join_type.clone(),
                     on_left_col: build_col,
                     on_right_col: probe_col,
+                    left_table: build_table,
+                    right_table: probe_table,
                     estimated_rows: est_rows.max(1),
                     estimated_cost: cost,
                 })
@@ -675,7 +693,7 @@ impl Optimizer {
     /// Find the best index for a WHERE predicate.
     fn find_best_index(&self, table_name: &str, expr: &WhereExpr) -> Option<IndexDefinition> {
         let stats = self.stats.get(table_name)?;
-        let columns_used = extract_where_columns(expr);
+        let columns_used = extract_where_columns(Some(expr));
 
         // Score each index by how many of its fields match the WHERE columns
         let mut best: Option<(IndexDefinition, usize)> = None;
@@ -699,15 +717,20 @@ impl Optimizer {
 }
 
 /// Extract column names referenced in a WHERE expression.
-fn extract_where_columns(expr: &WhereExpr) -> Vec<String> {
+pub fn extract_where_columns(expr: Option<&WhereExpr>) -> Vec<String> {
+    let Some(expr) = expr else { return Vec::new() };
+    extract_where_columns_inner(expr)
+}
+
+fn extract_where_columns_inner(expr: &WhereExpr) -> Vec<String> {
     match expr {
         WhereExpr::Comparison { column, .. } => vec![column.clone()],
         WhereExpr::And(a, b) | WhereExpr::Or(a, b) => {
-            let mut cols = extract_where_columns(a);
-            cols.extend(extract_where_columns(b));
+            let mut cols = extract_where_columns_inner(a);
+            cols.extend(extract_where_columns_inner(b));
             cols
         }
-        WhereExpr::Not(inner) => extract_where_columns(inner),
+        WhereExpr::Not(inner) => extract_where_columns_inner(inner),
         WhereExpr::IsNull(c) | WhereExpr::IsNotNull(c) => vec![c.clone()],
         WhereExpr::In(c, _) | WhereExpr::InSubquery(c, _) => vec![c.clone()],
     }
@@ -756,6 +779,8 @@ impl PlanNode {
                 join_type,
                 on_left_col,
                 on_right_col,
+                left_table: _,
+                right_table: _,
                 estimated_rows,
                 estimated_cost,
             } => {

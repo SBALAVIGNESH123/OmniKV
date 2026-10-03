@@ -185,6 +185,27 @@ pub struct OrderByItem {
     pub desc: bool,
 }
 
+/// A bound value carries no parse-time type, so give a *predicate* value
+/// the type an unquoted literal would have: a numeric payload compares
+/// numerically, and the rest is text. Without this a bound `$1 = "9"`
+/// reaches comparison as text, so `WHERE v > $1` orders lexically and
+/// never matches "10". Stored values (INSERT/UPDATE) bypass this and keep
+/// the client's bytes exactly.
+fn coerce_param(v: &str) -> SqlValue {
+    if let Ok(i) = v.parse::<i64>() {
+        SqlValue::Integer(i)
+    } else if let Ok(f) = v.parse::<f64>() {
+        // The f64 parser accepts "NaN"/"inf", which are words here.
+        if f.is_finite() {
+            SqlValue::Float(f)
+        } else {
+            SqlValue::Text(v.to_string())
+        }
+    } else {
+        SqlValue::Text(v.to_string())
+    }
+}
+
 /// Substitutes extended-protocol Bind values into a parsed statement's
 /// `Placeholder(n)` nodes, by position. Values are injected as AST data -
 /// they are never re-parsed as SQL, so a bound value containing operators
@@ -196,8 +217,9 @@ pub fn bind_statement_params(
     stmt: SqlStatement,
     params: &[Option<String>],
 ) -> Result<SqlStatement, String> {
-    let resolve = |n: usize| -> Result<SqlValue, String> {
+    let resolve = |n: usize, predicate: bool| -> Result<SqlValue, String> {
         match params.get(n.checked_sub(1).expect("n >= 1")) {
+            Some(Some(v)) if predicate => Ok(coerce_param(v)),
             Some(Some(v)) => Ok(SqlValue::Text(v.clone())),
             Some(None) => Ok(SqlValue::Null),
             None => Err(format!("no value specified for parameter ${n}")),
@@ -220,7 +242,7 @@ pub fn count_statement_params(sql: &str) -> usize {
         return 0;
     };
     let max_seen = std::cell::Cell::new(0usize);
-    let resolve = |n: usize| {
+    let resolve = |n: usize, _predicate: bool| {
         max_seen.set(max_seen.get().max(n));
         Ok(SqlValue::Null)
     };
@@ -236,11 +258,12 @@ pub fn count_statement_params(sql: &str) -> usize {
 /// resolved to bound data.
 fn bind_walk(
     stmt: SqlStatement,
-    resolve: &dyn Fn(usize) -> Result<SqlValue, String>,
+    resolve: &dyn Fn(usize, bool) -> Result<SqlValue, String>,
 ) -> Result<SqlStatement, String> {
+    // Written values keep the client's bytes exactly, so the flag is false.
     let bind_val = |v: SqlValue| -> Result<SqlValue, String> {
         match v {
-            SqlValue::Placeholder(n) => resolve(n),
+            SqlValue::Placeholder(n) => resolve(n, false),
             other => Ok(other),
         }
     };
@@ -337,12 +360,13 @@ fn bind_walk(
 
 fn bind_where(
     expr: WhereExpr,
-    resolve: &dyn Fn(usize) -> Result<SqlValue, String>,
+    resolve: &dyn Fn(usize, bool) -> Result<SqlValue, String>,
 ) -> Result<WhereExpr, String> {
+    // Predicate values may be coerced to a number so ranges order numerically.
     Ok(match expr {
         WhereExpr::Comparison { column, op, value } => {
             let value = match value {
-                SqlValue::Placeholder(n) => resolve(n)?,
+                SqlValue::Placeholder(n) => resolve(n, true)?,
                 other => other,
             };
             WhereExpr::Comparison { column, op, value }
@@ -360,7 +384,7 @@ fn bind_where(
             let mut bound = Vec::with_capacity(values.len());
             for v in values {
                 bound.push(match v {
-                    SqlValue::Placeholder(n) => resolve(n)?,
+                    SqlValue::Placeholder(n) => resolve(n, true)?,
                     other => other,
                 });
             }
@@ -464,9 +488,15 @@ fn tokenize(input: &str) -> Vec<String> {
     while let Some(ch) = chars.next() {
         if in_string {
             if ch == '\'' {
-                tokens.push(format!("'{}'", current));
-                current.clear();
-                in_string = false;
+                // SQL escapes a quote by doubling it: O''Brien is O'Brien.
+                if chars.peek() == Some(&'\'') {
+                    chars.next();
+                    current.push('\'');
+                } else {
+                    tokens.push(format!("'{}'", current));
+                    current.clear();
+                    in_string = false;
+                }
             } else {
                 current.push(ch);
             }
@@ -494,11 +524,16 @@ fn tokenize(input: &str) -> Vec<String> {
                 tokens.push(current.clone());
                 current.clear();
             }
-            if chars.peek() == Some(&'=') {
-                chars.next();
-                tokens.push(format!("{}=", ch));
-            } else {
-                tokens.push(ch.to_string());
+            match chars.peek() {
+                Some('=') => {
+                    chars.next();
+                    tokens.push(format!("{}=", ch));
+                }
+                Some('>') if ch == '<' => {
+                    chars.next();
+                    tokens.push("<>".to_string());
+                }
+                _ => tokens.push(ch.to_string()),
             }
         } else if ch == '=' {
             if !current.is_empty() {
@@ -1138,7 +1173,7 @@ fn parse_where_atom(tokens: &[String], start: usize) -> Result<(WhereExpr, usize
     } else {
         match tokens[i].as_str() {
             "=" => CmpOp::Eq,
-            "!=" => CmpOp::Ne,
+            "!=" | "<>" => CmpOp::Ne,
             ">" => CmpOp::Gt,
             "<" => CmpOp::Lt,
             ">=" => CmpOp::Gte,
