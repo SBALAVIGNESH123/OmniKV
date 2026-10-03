@@ -252,7 +252,7 @@ fn test_scan_range_correctness() {
     db.unregister_snapshot(snap);
 
     // Should return keys scan:005 through scan:009 (end exclusive in lex order)
-    assert!(!results.is_empty(), "scan should return results");
+    assert_ne!(results.len(), 0, "scan should return results");
     for (k, _) in &results {
         assert!(k.as_str() >= "scan:005", "key {k} below scan start");
         assert!(k.as_str() <= "scan:010", "key {k} above scan end");

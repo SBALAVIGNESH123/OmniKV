@@ -149,7 +149,7 @@ fn test_window_func_execution() {
     );
     assert_eq!(cols.len(), 2);
     assert_eq!(cols[1], "row_number");
-    assert!(!rows.is_empty());
+    assert_ne!(rows.len(), 0);
 
     // Row numbers should be 1,2,3,4
     let row_nums: Vec<&str> = rows.iter().map(|r| r[1].as_str()).collect();
@@ -190,7 +190,7 @@ fn test_group_by_aggregate() {
         "SELECT region, SUM(amount) FROM sales GROUP BY region",
     );
     assert_eq!(cols.len(), 2);
-    assert!(!rows.is_empty());
+    assert_ne!(rows.len(), 0);
 
     println!("✅ SQL 25a: GROUP BY with SUM aggregate executed");
 }
@@ -314,7 +314,7 @@ fn test_is_null() {
 
     let (_cols, rows) = exec_rows(&exec, "SELECT id FROM nullable WHERE val IS NOT NULL");
     // At least 1 row with non-null val
-    assert!(!rows.is_empty());
+    assert_ne!(rows.len(), 0);
 
     println!("✅ SQL 28b: IS NULL / IS NOT NULL filter working");
 }
@@ -368,10 +368,10 @@ fn test_null_comparison_is_unknown() {
     exec_sql(&exec, "INSERT INTO n (id, name) VALUES (2, NULL)");
 
     let (_cols, rows) = exec_rows(&exec, "SELECT id FROM n WHERE name = NULL");
-    assert!(rows.is_empty());
+    assert_eq!(rows.len(), 0);
 
     let (_cols, rows) = exec_rows(&exec, "SELECT id FROM n WHERE name <> NULL");
-    assert!(rows.is_empty());
+    assert_eq!(rows.len(), 0);
 
     let (_cols, rows) = exec_rows(&exec, "SELECT id FROM n WHERE name IS NULL");
     assert_eq!(rows, vec![vec!["2".to_string()]]);
@@ -490,7 +490,7 @@ fn test_unknown_survives_not() {
     exec_sql(&exec, "INSERT INTO nn (id, v) VALUES (2, NULL)");
 
     let (_cols, rows) = exec_rows(&exec, "SELECT id FROM nn WHERE NOT (v = NULL)");
-    assert!(rows.is_empty(), "NOT of UNKNOWN stays UNKNOWN");
+    assert_eq!(rows.len(), 0, "NOT of UNKNOWN stays UNKNOWN");
 
     let (_cols, rows) = exec_rows(&exec, "SELECT id FROM nn WHERE v = NULL OR id = 1");
     assert_eq!(rows, vec![vec!["1".to_string()]]);
@@ -774,7 +774,7 @@ fn test_explain() {
 
     let (cols, rows) = exec_rows(&exec, "EXPLAIN SELECT * FROM expl_t");
     assert_eq!(cols[0], "QUERY PLAN");
-    assert!(!rows.is_empty());
+    assert_ne!(rows.len(), 0);
 
     println!("✅ SQL 31c: EXPLAIN produces query plan output");
 }
