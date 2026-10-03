@@ -926,7 +926,11 @@ impl SqlExecutor {
             .catalog
             .get_table(table_name)
             .ok_or_else(|| format!("Table '{}' does not exist", table_name))?;
-        let cols: Vec<String> = table.column_names().into_iter().map(str::to_string).collect();
+        let cols: Vec<String> = table
+            .column_names()
+            .into_iter()
+            .map(str::to_string)
+            .collect();
         for col in extract_where_columns(where_clause) {
             let bare = col.split('.').next_back().unwrap_or(&col);
             if !cols.iter().any(|c| c == bare) {
@@ -939,7 +943,11 @@ impl SqlExecutor {
     /// A WHERE clause naming a column the table does not have must be an
     /// error, not an empty result: comparing a missing key yields "" and
     /// silently matches nothing, which looks like a legitimate answer.
-    fn validate_where_columns(&self, from: &FromClause, where_clause: Option<&WhereExpr>) -> Result<(), String> {
+    fn validate_where_columns(
+        &self,
+        from: &FromClause,
+        where_clause: Option<&WhereExpr>,
+    ) -> Result<(), String> {
         let tables = match from {
             FromClause::Table(t) => vec![t.clone()],
             FromClause::Join { left, right, .. } => vec![left.clone(), right.clone()],
@@ -1213,7 +1221,7 @@ impl SqlExecutor {
                 SelectColumn::Named(n) => names.push(n.clone()),
                 SelectColumn::Qualified(_, n) => names.push(n.clone()),
                 SelectColumn::Aggregate(f, t) => {
-                    names.push(format!("{:?}({})", f, t).to_lowercase())
+                    names.push(format!("{}({})", format!("{:?}", f).to_lowercase(), t))
                 }
                 SelectColumn::WindowFunc { func, .. } => {
                     let name = match func {
@@ -1239,11 +1247,14 @@ impl SqlExecutor {
                             .or_else(|| r.get(n))
                             .cloned()
                             .unwrap_or("NULL".into()),
-                        SelectColumn::Aggregate(func, target) => {
-                            r.get(&format!("{:?}({})", func, target).to_lowercase())
-                                .cloned()
-                                .unwrap_or("NULL".into())
-                        }
+                        SelectColumn::Aggregate(func, target) => r
+                            .get(&format!(
+                                "{}({})",
+                                format!("{:?}", func).to_lowercase(),
+                                target
+                            ))
+                            .cloned()
+                            .unwrap_or("NULL".into()),
                         SelectColumn::WindowFunc { func, .. } => {
                             let key = match func {
                                 WindowFuncType::RowNumber => "row_number",

@@ -569,9 +569,23 @@ impl Optimizer {
                 // Cost-based join order: smaller table as build side (hash table)
                 let (build, probe, build_col, probe_col, build_table, probe_table) =
                     if left_plan.estimated_rows() <= right_plan.estimated_rows() {
-                        (left_plan, right_plan, on_left.clone(), on_right.clone(), left.clone(), right.clone())
+                        (
+                            left_plan,
+                            right_plan,
+                            on_left.clone(),
+                            on_right.clone(),
+                            left.clone(),
+                            right.clone(),
+                        )
                     } else {
-                        (right_plan, left_plan, on_right.clone(), on_left.clone(), right.clone(), left.clone())
+                        (
+                            right_plan,
+                            left_plan,
+                            on_right.clone(),
+                            on_left.clone(),
+                            right.clone(),
+                            left.clone(),
+                        )
                     };
 
                 let build_rows = build.estimated_rows();

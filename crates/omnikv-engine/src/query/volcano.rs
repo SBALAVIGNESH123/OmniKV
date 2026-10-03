@@ -994,14 +994,21 @@ pub fn compute_aggregate(func: &AggFunc, target: &str, rows: &[&Row]) -> (String
     };
     match func {
         AggFunc::Count => {
-            let n = if target == "*" { rows.len() } else { values.len() };
+            let n = if target == "*" {
+                rows.len()
+            } else {
+                values.len()
+            };
             (name, n.to_string())
         }
         AggFunc::Sum => {
             if values.iter().all(|v| v.parse::<i64>().is_ok()) {
                 // i128, not i64: a full column of i64 values would otherwise
                 // overflow the accumulator.
-                let sum: i128 = values.iter().map(|v| v.parse::<i64>().unwrap() as i128).sum();
+                let sum: i128 = values
+                    .iter()
+                    .map(|v| v.parse::<i64>().unwrap() as i128)
+                    .sum();
                 (name, sum.to_string())
             } else {
                 let sum: f64 = values.iter().filter_map(|v| v.parse::<f64>().ok()).sum();
@@ -1010,7 +1017,10 @@ pub fn compute_aggregate(func: &AggFunc, target: &str, rows: &[&Row]) -> (String
         }
         AggFunc::Avg => {
             if values.iter().all(|v| v.parse::<i64>().is_ok()) && !values.is_empty() {
-                let sum: i128 = values.iter().map(|v| v.parse::<i64>().unwrap() as i128).sum();
+                let sum: i128 = values
+                    .iter()
+                    .map(|v| v.parse::<i64>().unwrap() as i128)
+                    .sum();
                 let n = values.len() as i128;
                 let avg = sum / n;
                 let rem = sum % n;
@@ -1025,13 +1035,22 @@ pub fn compute_aggregate(func: &AggFunc, target: &str, rows: &[&Row]) -> (String
                     let q = (sum * 1_000_000) / n;
                     let sign = if q < 0 { "-" } else { "" };
                     let q = q.abs();
-                    (name, format!("{sign}{}.{:06}", q / 1_000_000, q % 1_000_000).trim_end_matches('0').trim_end_matches('.').to_string())
+                    (
+                        name,
+                        format!("{sign}{}.{:06}", q / 1_000_000, q % 1_000_000)
+                            .trim_end_matches('0')
+                            .trim_end_matches('.')
+                            .to_string(),
+                    )
                 }
             } else {
                 let avg = if values.is_empty() {
                     0.0
                 } else {
-                    values.iter().filter_map(|v| v.parse::<f64>().ok()).sum::<f64>()
+                    values
+                        .iter()
+                        .filter_map(|v| v.parse::<f64>().ok())
+                        .sum::<f64>()
                         / values.len() as f64
                 };
                 (name, avg.to_string())

@@ -328,7 +328,10 @@ fn test_is_null() {
 fn test_equality_and_ordering_agree_on_numbers() {
     let (_db, exec) = create_sql_env("cmpagree");
 
-    exec_sql(&exec, "CREATE TABLE nums (id INTEGER PRIMARY KEY, v INTEGER)");
+    exec_sql(
+        &exec,
+        "CREATE TABLE nums (id INTEGER PRIMARY KEY, v INTEGER)",
+    );
     exec_sql(&exec, "INSERT INTO nums (id, v) VALUES (1, 1)");
     exec_sql(&exec, "INSERT INTO nums (id, v) VALUES (2, 10)");
 
@@ -413,7 +416,10 @@ fn test_unknown_column_errors() {
 fn test_aggregate_null_and_integer_semantics() {
     let (_db, exec) = create_sql_env("aggsem");
 
-    exec_sql(&exec, "CREATE TABLE agg (id INTEGER PRIMARY KEY, n INTEGER)");
+    exec_sql(
+        &exec,
+        "CREATE TABLE agg (id INTEGER PRIMARY KEY, n INTEGER)",
+    );
     exec_sql(&exec, "INSERT INTO agg (id, n) VALUES (1, 10)");
     exec_sql(&exec, "INSERT INTO agg (id, n) VALUES (2, 5)");
     exec_sql(&exec, "INSERT INTO agg (id, n) VALUES (3, NULL)");
@@ -445,7 +451,10 @@ fn test_aggregate_null_and_integer_semantics() {
 fn test_avg_fraction_keeps_interior_zeros_and_sign() {
     let (_db, exec) = create_sql_env("avgfrac");
 
-    exec_sql(&exec, "CREATE TABLE pos (id INTEGER PRIMARY KEY, n INTEGER)");
+    exec_sql(
+        &exec,
+        "CREATE TABLE pos (id INTEGER PRIMARY KEY, n INTEGER)",
+    );
     exec_sql(&exec, "INSERT INTO pos (id, n) VALUES (1, 1)");
     for i in 2..=32 {
         exec_sql(&exec, &format!("INSERT INTO pos (id, n) VALUES ({i}, 0)"));
@@ -454,7 +463,10 @@ fn test_avg_fraction_keeps_interior_zeros_and_sign() {
     let (_cols, rows) = exec_rows(&exec, "SELECT AVG(n) FROM pos");
     assert_eq!(rows, vec![vec!["0.03125".to_string()]]);
 
-    exec_sql(&exec, "CREATE TABLE neg (id INTEGER PRIMARY KEY, n INTEGER)");
+    exec_sql(
+        &exec,
+        "CREATE TABLE neg (id INTEGER PRIMARY KEY, n INTEGER)",
+    );
     exec_sql(&exec, "INSERT INTO neg (id, n) VALUES (1, -1)");
     for i in 2..=32 {
         exec_sql(&exec, &format!("INSERT INTO neg (id, n) VALUES ({i}, 0)"));
@@ -499,7 +511,10 @@ fn test_column_case_is_significant() {
     let Err(err) = exec.execute(&stmt) else {
         panic!("wrong-case column must error");
     };
-    assert!(err.contains("does not exist"), "error names the column: {err}");
+    assert!(
+        err.contains("does not exist"),
+        "error names the column: {err}"
+    );
 }
 
 /// UPDATE and DELETE validate WHERE columns too, not just SELECT.
@@ -533,7 +548,10 @@ fn test_update_delete_validate_columns() {
 fn test_escaped_quote_in_string_literal() {
     let (_db, exec) = create_sql_env("escq");
 
-    exec_sql(&exec, "CREATE TABLE esc (id INTEGER PRIMARY KEY, name TEXT)");
+    exec_sql(
+        &exec,
+        "CREATE TABLE esc (id INTEGER PRIMARY KEY, name TEXT)",
+    );
     exec_sql(&exec, "INSERT INTO esc (id, name) VALUES (1, 'O''Brien')");
 
     let (_cols, rows) = exec_rows(&exec, "SELECT name FROM esc WHERE id = 1");
@@ -587,8 +605,14 @@ fn test_like_metacharacters_are_literal() {
 fn test_join_shared_column_name() {
     let (_db, exec) = create_sql_env("jshare");
 
-    exec_sql(&exec, "CREATE TABLE js_a (id INTEGER PRIMARY KEY, shared TEXT)");
-    exec_sql(&exec, "CREATE TABLE js_b (id INTEGER PRIMARY KEY, shared TEXT)");
+    exec_sql(
+        &exec,
+        "CREATE TABLE js_a (id INTEGER PRIMARY KEY, shared TEXT)",
+    );
+    exec_sql(
+        &exec,
+        "CREATE TABLE js_b (id INTEGER PRIMARY KEY, shared TEXT)",
+    );
     exec_sql(&exec, "INSERT INTO js_a (id, shared) VALUES (1, 'A1')");
     exec_sql(&exec, "INSERT INTO js_b (id, shared) VALUES (1, 'B1')");
 
@@ -753,4 +777,74 @@ fn test_explain() {
     assert!(!rows.is_empty());
 
     println!("✅ SQL 31c: EXPLAIN produces query plan output");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Bound parameters and column case
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// A bound value has no parse-time type, so a numeric payload must be
+/// treated as a number: `WHERE v > $1` with `$1 = "9"` has to match 10,
+/// which a lexical comparison misses ("1" < "9"). Text stays text.
+#[test]
+fn test_bound_parameter_compares_numerically() {
+    let (_db, exec) = create_sql_env("bindnum");
+
+    exec_sql(&exec, "CREATE TABLE bp (id INTEGER PRIMARY KEY, v INTEGER)");
+    exec_sql(&exec, "INSERT INTO bp (id, v) VALUES (1, 5)");
+    exec_sql(&exec, "INSERT INTO bp (id, v) VALUES (2, 10)");
+    exec_sql(&exec, "INSERT INTO bp (id, v) VALUES (3, 20)");
+
+    let stmt = parse_sql("SELECT id FROM bp WHERE v > $1").unwrap();
+    let stmt = bind_statement_params(stmt, &[Some("9".to_string())]).unwrap();
+    let (_cols, rows) = exec_rows_from_stmt(&exec, &stmt);
+    assert_eq!(
+        rows,
+        vec![vec!["2".to_string()], vec!["3".to_string()]],
+        "numeric bound must compare numerically"
+    );
+
+    // A non-numeric payload stays text and compares as text.
+    exec_sql(&exec, "CREATE TABLE bt (id INTEGER PRIMARY KEY, name TEXT)");
+    exec_sql(&exec, "INSERT INTO bt (id, name) VALUES (1, 'abc')");
+
+    let stmt = parse_sql("SELECT id FROM bt WHERE name = $1").unwrap();
+    let stmt = bind_statement_params(stmt, &[Some("abc".to_string())]).unwrap();
+    let (_cols, rows) = exec_rows_from_stmt(&exec, &stmt);
+    assert_eq!(rows, vec![vec!["1".to_string()]]);
+}
+
+/// The aggregate result key keeps the column's case: lowercasing the
+/// whole key made `SUM(MyCol)` look up `sum(mycol)` and print NULL.
+#[test]
+fn test_aggregate_keeps_column_case() {
+    let (_db, exec) = create_sql_env("aggcase");
+
+    exec_sql(
+        &exec,
+        "CREATE TABLE mc (id INTEGER PRIMARY KEY, MyCol INTEGER)",
+    );
+    exec_sql(&exec, "INSERT INTO mc (id, MyCol) VALUES (1, 10)");
+    exec_sql(&exec, "INSERT INTO mc (id, MyCol) VALUES (2, 20)");
+
+    let (cols, rows) = exec_rows(&exec, "SELECT SUM(MyCol) FROM mc");
+    assert_eq!(
+        rows,
+        vec![vec!["30".to_string()]],
+        "mixed-case target is found"
+    );
+    assert_eq!(cols, vec!["sum(MyCol)".to_string()]);
+}
+
+fn exec_rows_from_stmt(
+    executor: &SqlExecutor,
+    stmt: &SqlStatement,
+) -> (Vec<String>, Vec<Vec<String>>) {
+    match executor
+        .execute(stmt)
+        .unwrap_or_else(|e| panic!("Exec error: {e}"))
+    {
+        ExecResult::Rows { columns, rows } => (columns, rows),
+        _ => panic!("Expected Rows result"),
+    }
 }

@@ -185,6 +185,25 @@ pub struct OrderByItem {
     pub desc: bool,
 }
 
+/// A bound value carries no parse-time type, so give it the type an
+/// unquoted literal would have: a numeric payload is a number and the
+/// rest is text. Without this a bound `$1 = "9"` reaches comparison as
+/// text, so `WHERE v > $1` orders lexically and never matches "10".
+fn coerce_param(v: &str) -> SqlValue {
+    if let Ok(i) = v.parse::<i64>() {
+        SqlValue::Integer(i)
+    } else if let Ok(f) = v.parse::<f64>() {
+        // The f64 parser accepts "NaN"/"inf", which are words here.
+        if f.is_finite() {
+            SqlValue::Float(f)
+        } else {
+            SqlValue::Text(v.to_string())
+        }
+    } else {
+        SqlValue::Text(v.to_string())
+    }
+}
+
 /// Substitutes extended-protocol Bind values into a parsed statement's
 /// `Placeholder(n)` nodes, by position. Values are injected as AST data -
 /// they are never re-parsed as SQL, so a bound value containing operators
@@ -198,7 +217,7 @@ pub fn bind_statement_params(
 ) -> Result<SqlStatement, String> {
     let resolve = |n: usize| -> Result<SqlValue, String> {
         match params.get(n.checked_sub(1).expect("n >= 1")) {
-            Some(Some(v)) => Ok(SqlValue::Text(v.clone())),
+            Some(Some(v)) => Ok(coerce_param(v)),
             Some(None) => Ok(SqlValue::Null),
             None => Err(format!("no value specified for parameter ${n}")),
         }
