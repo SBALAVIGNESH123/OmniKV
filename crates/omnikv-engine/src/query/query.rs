@@ -278,7 +278,7 @@ mod tests {
         // Action::Update(key, value) and keeps conditions empty.
         let q = parse_query("update set value = 'x' where key = 5").expect("unwrap failed");
         assert!(matches!(q.action, Action::Update(k, v) if k == "5" && v == "'x'"));
-        assert!(q.conditions.is_empty());
+        assert_eq!(q.conditions.len(), 0);
     }
 
     #[test]

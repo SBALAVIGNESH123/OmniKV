@@ -185,10 +185,12 @@ pub struct OrderByItem {
     pub desc: bool,
 }
 
-/// A bound value carries no parse-time type, so give it the type an
-/// unquoted literal would have: a numeric payload is a number and the
-/// rest is text. Without this a bound `$1 = "9"` reaches comparison as
-/// text, so `WHERE v > $1` orders lexically and never matches "10".
+/// A bound value carries no parse-time type, so give a *predicate* value
+/// the type an unquoted literal would have: a numeric payload compares
+/// numerically, and the rest is text. Without this a bound `$1 = "9"`
+/// reaches comparison as text, so `WHERE v > $1` orders lexically and
+/// never matches "10". Stored values (INSERT/UPDATE) bypass this and keep
+/// the client's bytes exactly.
 fn coerce_param(v: &str) -> SqlValue {
     if let Ok(i) = v.parse::<i64>() {
         SqlValue::Integer(i)
@@ -215,9 +217,10 @@ pub fn bind_statement_params(
     stmt: SqlStatement,
     params: &[Option<String>],
 ) -> Result<SqlStatement, String> {
-    let resolve = |n: usize| -> Result<SqlValue, String> {
+    let resolve = |n: usize, predicate: bool| -> Result<SqlValue, String> {
         match params.get(n.checked_sub(1).expect("n >= 1")) {
-            Some(Some(v)) => Ok(coerce_param(v)),
+            Some(Some(v)) if predicate => Ok(coerce_param(v)),
+            Some(Some(v)) => Ok(SqlValue::Text(v.clone())),
             Some(None) => Ok(SqlValue::Null),
             None => Err(format!("no value specified for parameter ${n}")),
         }
@@ -239,7 +242,7 @@ pub fn count_statement_params(sql: &str) -> usize {
         return 0;
     };
     let max_seen = std::cell::Cell::new(0usize);
-    let resolve = |n: usize| {
+    let resolve = |n: usize, _predicate: bool| {
         max_seen.set(max_seen.get().max(n));
         Ok(SqlValue::Null)
     };
@@ -255,11 +258,12 @@ pub fn count_statement_params(sql: &str) -> usize {
 /// resolved to bound data.
 fn bind_walk(
     stmt: SqlStatement,
-    resolve: &dyn Fn(usize) -> Result<SqlValue, String>,
+    resolve: &dyn Fn(usize, bool) -> Result<SqlValue, String>,
 ) -> Result<SqlStatement, String> {
+    // Written values keep the client's bytes exactly, so the flag is false.
     let bind_val = |v: SqlValue| -> Result<SqlValue, String> {
         match v {
-            SqlValue::Placeholder(n) => resolve(n),
+            SqlValue::Placeholder(n) => resolve(n, false),
             other => Ok(other),
         }
     };
@@ -356,12 +360,13 @@ fn bind_walk(
 
 fn bind_where(
     expr: WhereExpr,
-    resolve: &dyn Fn(usize) -> Result<SqlValue, String>,
+    resolve: &dyn Fn(usize, bool) -> Result<SqlValue, String>,
 ) -> Result<WhereExpr, String> {
+    // Predicate values may be coerced to a number so ranges order numerically.
     Ok(match expr {
         WhereExpr::Comparison { column, op, value } => {
             let value = match value {
-                SqlValue::Placeholder(n) => resolve(n)?,
+                SqlValue::Placeholder(n) => resolve(n, true)?,
                 other => other,
             };
             WhereExpr::Comparison { column, op, value }
@@ -379,7 +384,7 @@ fn bind_where(
             let mut bound = Vec::with_capacity(values.len());
             for v in values {
                 bound.push(match v {
-                    SqlValue::Placeholder(n) => resolve(n)?,
+                    SqlValue::Placeholder(n) => resolve(n, true)?,
                     other => other,
                 });
             }

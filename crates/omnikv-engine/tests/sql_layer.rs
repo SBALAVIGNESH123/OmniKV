@@ -836,6 +836,32 @@ fn test_aggregate_keeps_column_case() {
     assert_eq!(cols, vec!["sum(MyCol)".to_string()]);
 }
 
+/// A bound value written to a table keeps the client's bytes exactly:
+/// numeric coercion applies only to predicate comparison, never to stored
+/// data, so "007" is not rewritten to "7" nor "1.50" to "1.5".
+#[test]
+fn test_bound_value_is_stored_verbatim() {
+    let (_db, exec) = create_sql_env("bindverbatim");
+
+    exec_sql(&exec, "CREATE TABLE bv (id TEXT PRIMARY KEY, v TEXT)");
+
+    let stmt = parse_sql("INSERT INTO bv (id, v) VALUES ($1, $2)").unwrap();
+    let stmt =
+        bind_statement_params(stmt, &[Some("007".to_string()), Some("1.50".to_string())]).unwrap();
+    exec.execute(&stmt).expect("insert must succeed");
+
+    let (_cols, rows) = exec_rows(&exec, "SELECT id, v FROM bv");
+    assert_eq!(rows, vec![vec!["007".to_string(), "1.50".to_string()]]);
+
+    // An UPDATE assignment is stored data too.
+    let stmt = parse_sql("UPDATE bv SET v = $1 WHERE id = '007'").unwrap();
+    let stmt = bind_statement_params(stmt, &[Some("08".to_string())]).unwrap();
+    exec.execute(&stmt).expect("update must succeed");
+
+    let (_cols, rows) = exec_rows(&exec, "SELECT v FROM bv");
+    assert_eq!(rows, vec![vec!["08".to_string()]]);
+}
+
 fn exec_rows_from_stmt(
     executor: &SqlExecutor,
     stmt: &SqlStatement,
