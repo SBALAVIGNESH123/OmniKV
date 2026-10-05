@@ -1119,6 +1119,11 @@ pub struct OmniKV {
     /// [`crate::transaction::SsiHistory`].
     pub(crate) ssi_history: std::sync::Arc<crate::transaction::SsiHistory>,
 
+    // Monotonic per-instance counter for compaction output filenames. The
+    // wall clock alone is not unique: two flushes in the same millisecond
+    // collide, and create_new(true) then fails with EEXIST.
+    file_seq: std::sync::atomic::AtomicU64,
+
     // Must be declared last: Rust drops struct fields in declaration order, so
     // all mmap-bearing roots and files are released before the database LOCK
     // file is unlocked and closed.
@@ -1197,6 +1202,7 @@ impl OmniKV {
             transition_guard: RwLock::new(()),
             cluster_gateway: std::sync::OnceLock::new(),
             ssi_history: std::sync::Arc::new(crate::transaction::SsiHistory::default()),
+            file_seq: std::sync::atomic::AtomicU64::new(0),
             db_lock,
         }))
     }
@@ -1204,6 +1210,14 @@ impl OmniKV {
     // ── Topology accessor helpers ─────────────────────────────────────────────
     // These load a stable root snapshot once. Callers work on Arc handles with no locking.
     // Compaction and reads use these; snapshot install bypasses them and swaps roots directly.
+
+    /// A per-instance token unique across concurrent and back-to-back
+    /// compactions, so two outputs written in the same millisecond never
+    /// collide on `create_new`.
+    fn next_file_token(&self) -> u64 {
+        self.file_seq
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    }
 
     #[inline]
     pub fn load_roots(&self) -> arc_swap::Guard<Arc<StorageRoots>> {
@@ -2475,12 +2489,13 @@ impl OmniKV {
         }
 
         let sst_path = format!(
-            "{}_l0_0_{}.sst",
+            "{}_l0_0_{}_{}.sst",
             self.manifest_path,
             std::time::UNIX_EPOCH
                 .elapsed()
                 .unwrap_or_default()
-                .as_millis()
+                .as_millis(),
+            self.next_file_token()
         );
         let _ = bloom.save(&sst_path.replace(".sst", ".bloom"));
         let file = OpenOptions::new()
@@ -2608,12 +2623,13 @@ impl OmniKV {
         }
 
         let sst_path = format!(
-            "{}_l1_{}.sst",
+            "{}_l1_{}_{}.sst",
             self.manifest_path,
             std::time::UNIX_EPOCH
                 .elapsed()
                 .unwrap_or_default()
-                .as_millis()
+                .as_millis(),
+            self.next_file_token()
         );
         let _ = bloom.save(&sst_path.replace(".sst", ".bloom"));
         let file = OpenOptions::new()
@@ -2738,12 +2754,13 @@ impl OmniKV {
         }
 
         let new_base_path = format!(
-            "{}_base_{}.sst",
+            "{}_base_{}_{}.sst",
             self.manifest_path,
             std::time::UNIX_EPOCH
                 .elapsed()
                 .unwrap_or_default()
-                .as_millis()
+                .as_millis(),
+            self.next_file_token()
         );
         let file = OpenOptions::new()
             .create_new(true)
@@ -2891,20 +2908,22 @@ impl OmniKV {
         }
 
         let new_heap_path = format!(
-            "{}_heap_compacted_{}.bin",
+            "{}_heap_compacted_{}_{}.bin",
             self.manifest_path,
             std::time::UNIX_EPOCH
                 .elapsed()
                 .unwrap_or_default()
-                .as_millis()
+                .as_millis(),
+            self.next_file_token()
         );
         let new_base_path = format!(
-            "{}_database_compacted_{}.bin",
+            "{}_database_compacted_{}_{}.bin",
             self.manifest_path,
             std::time::UNIX_EPOCH
                 .elapsed()
                 .unwrap_or_default()
-                .as_millis()
+                .as_millis(),
+            self.next_file_token()
         );
 
         let new_heap_file = OpenOptions::new()

@@ -5,6 +5,7 @@
 
 use crate::catalog::{Catalog, Column, ColumnType, TableDef};
 use crate::optimizer::extract_where_columns;
+use crate::volcano::{ColumnTypeMap, eval_where_typed};
 use crate::sql::{
     AggFunc, FromClause, JoinType, OrderByItem, SelectColumn, SetOpType, SqlColumnDef,
     SqlStatement, SqlValue, WhereExpr, WindowFuncType,
@@ -729,7 +730,9 @@ impl SqlExecutor {
 
         match optimizer.optimize(&stmt) {
             Ok(plan) => {
-                use crate::volcano::{RowIterator, compile_plan_with_scan, eval_where};
+                use crate::volcano::{
+                    RowIterator, compile_plan_with_scan, eval_where,
+                };
                 // Inside a transaction, scans read at the snapshot and
                 // overlay this transaction's staged writes (read-your-
                 // own-writes); outside one, plain autocommit scans.
@@ -1295,7 +1298,12 @@ impl SqlExecutor {
         let mut rows = self.load_table_rows(&table);
 
         if let Some(expr) = where_clause {
-            rows.retain(|row| eval_where(row, expr));
+            let col_types = table
+                .columns
+                .iter()
+                .map(|c| (c.name.clone(), c.col_type.clone()))
+                .collect::<crate::volcano::ColumnTypeMap>();
+            rows.retain(|row| eval_where_typed(row, expr, &col_types));
         }
 
         let mut batch = WriteBatch::new();
@@ -1339,7 +1347,12 @@ impl SqlExecutor {
         let mut rows = self.load_table_rows(&table);
 
         if let Some(expr) = where_clause {
-            rows.retain(|row| eval_where(row, expr));
+            let col_types = table
+                .columns
+                .iter()
+                .map(|c| (c.name.clone(), c.col_type.clone()))
+                .collect::<crate::volcano::ColumnTypeMap>();
+            rows.retain(|row| eval_where_typed(row, expr, &col_types));
         }
 
         let mut batch = WriteBatch::new();

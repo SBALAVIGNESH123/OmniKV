@@ -820,7 +820,7 @@ pub fn compile_plan_with_scan(
             let col_types = table_def
                 .columns
                 .iter()
-                .map(|c| (c.name.to_lowercase(), c.col_type.clone()))
+                .map(|c| (c.name.clone(), c.col_type.clone()))
                 .collect::<ColumnTypeMap>();
             let base: Box<dyn RowIterator> = match access {
                 AccessMethod::PkLookup { key_value } => {

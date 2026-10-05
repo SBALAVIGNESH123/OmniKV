@@ -1060,3 +1060,68 @@ fn exec_rows_from_stmt(
         _ => panic!("Expected Rows result"),
     }
 }
+
+/// UPDATE and DELETE predicates must compare by the column's declared
+/// affinity, not the literal's: `WHERE Qty = $1` with `$1 = "007"` has to
+/// hit an integer 7 exactly as the equivalent SELECT does. Lexical
+/// comparison reads "7" > "007" and misses. The mixed-case column also
+/// exercises type-map keying by the declared name.
+#[test]
+fn test_update_delete_predicate_uses_column_type() {
+    let (_db, exec) = create_sql_env("updeltyped");
+
+    exec_sql(
+        &exec,
+        "CREATE TABLE ud (id INTEGER PRIMARY KEY, Qty INTEGER)",
+    );
+    exec_sql(&exec, "INSERT INTO ud (id, Qty) VALUES (1, 7)");
+    exec_sql(&exec, "INSERT INTO ud (id, Qty) VALUES (2, 10)");
+    exec_sql(&exec, "INSERT INTO ud (id, Qty) VALUES (3, 20)");
+
+    // SELECT is the reference behaviour: numeric match for a bound "007".
+    let stmt = parse_sql("SELECT id FROM ud WHERE Qty = $1").unwrap();
+    let stmt = bind_statement_params(stmt, &[Some("007".to_string())]).unwrap();
+    let (_cols, rows) = exec_rows_from_stmt(&exec, &stmt);
+    assert_eq!(
+        rows,
+        vec![vec!["1".to_string()]],
+        "SELECT must match integer 7 for bound 007"
+    );
+
+    // UPDATE must agree: only the 7 row flips.
+    let stmt = parse_sql("UPDATE ud SET Qty = 100 WHERE Qty = $1").unwrap();
+    let stmt = bind_statement_params(stmt, &[Some("007".to_string())]).unwrap();
+    match exec.execute(&stmt).unwrap() {
+        ExecResult::Modified { count, .. } => assert_eq!(
+            count, 1,
+            "UPDATE bound 007 must match exactly the integer 7 row"
+        ),
+        _ => panic!("Expected Modified result"),
+    }
+    let (_cols, rows) = exec_rows(&exec, "SELECT id, Qty FROM ud ORDER BY id");
+    assert_eq!(
+        rows,
+        vec![
+            vec!["1".to_string(), "100".to_string()],
+            vec!["2".to_string(), "10".to_string()],
+            vec!["3".to_string(), "20".to_string()],
+        ]
+    );
+
+    // DELETE must agree too: bound "15" is numeric, so 100 and 20 go, 10 stays.
+    let stmt = parse_sql("DELETE FROM ud WHERE Qty > $1").unwrap();
+    let stmt = bind_statement_params(stmt, &[Some("15".to_string())]).unwrap();
+    match exec.execute(&stmt).unwrap() {
+        ExecResult::Modified { count, .. } => assert_eq!(
+            count, 2,
+            "DELETE bound 15 must remove 100 and 20 numerically"
+        ),
+        _ => panic!("Expected Modified result"),
+    }
+    let (_cols, rows) = exec_rows(&exec, "SELECT id, Qty FROM ud");
+    assert_eq!(
+        rows,
+        vec![vec!["2".to_string(), "10".to_string()]],
+        "only the row under 15 survives"
+    );
+}
