@@ -393,6 +393,69 @@ fn test_empty_string_is_not_null() {
     assert_eq!(rows, vec![vec!["1".to_string()]]);
 }
 
+/// A row that omits a column is NULL, so a comparison is UNKNOWN (no match)
+/// and agrees with IS NULL on the same row.
+#[test]
+fn test_missing_column_key_is_null_in_predicate() {
+    let (_db, exec) = create_sql_env("missing");
+
+    exec_sql(
+        &exec,
+        "CREATE TABLE miss (id INTEGER PRIMARY KEY, name TEXT)",
+    );
+    exec_sql(&exec, "INSERT INTO miss (id) VALUES (1)"); // no name key at all
+
+    let (_cols, rows) = exec_rows(&exec, "SELECT id FROM miss WHERE name IS NULL");
+    assert_eq!(rows, vec![vec!["1".to_string()]]);
+
+    let (_cols, rows) = exec_rows(&exec, "SELECT id FROM miss WHERE name = ''");
+    assert!(rows.is_empty(), "a missing key is not an empty string");
+
+    let (_cols, rows) = exec_rows(&exec, "SELECT id FROM miss WHERE name <> 'x'");
+    assert!(rows.is_empty(), "a missing key compares UNKNOWN, not true");
+
+    let (_cols, rows) = exec_rows(&exec, "SELECT id FROM miss WHERE NOT (name = 'x')");
+    assert!(rows.is_empty(), "NOT of UNKNOWN stays UNKNOWN");
+
+    let (_cols, rows) = exec_rows(&exec, "SELECT id FROM miss WHERE name IN ('x', '')");
+    assert!(rows.is_empty(), "IN over a missing key is UNKNOWN");
+}
+
+/// `IN` must use the same comparison as `=`: with non-canonical numeric
+/// text, a lexical IN would disagree with a numeric equality.
+#[test]
+fn test_in_and_equality_agree() {
+    let (_db, exec) = create_sql_env("inagree");
+
+    // A numeric column: "1e3" is stored canonically as 1000, and both `=` and
+    // `IN` compare by value.
+    exec_sql(
+        &exec,
+        "CREATE TABLE num (id INTEGER PRIMARY KEY, v INTEGER)",
+    );
+    exec_sql(&exec, "INSERT INTO num (id, v) VALUES (1, '1e3')");
+
+    let (_cols, eq_rows) = exec_rows(&exec, "SELECT id FROM num WHERE v = 1000");
+    let (_cols, in_rows) = exec_rows(&exec, "SELECT id FROM num WHERE v IN (1000)");
+    assert_eq!(eq_rows, in_rows);
+    assert_eq!(eq_rows, vec![vec!["1".to_string()]]);
+
+    let (_cols, rows) = exec_rows(&exec, "SELECT id FROM num WHERE v IN (1000, 2000)");
+    assert_eq!(rows, vec![vec!["1".to_string()]]);
+
+    // A text column: the same payload is a word, compared lexically.
+    exec_sql(&exec, "CREATE TABLE txt (id INTEGER PRIMARY KEY, v TEXT)");
+    exec_sql(&exec, "INSERT INTO txt (id, v) VALUES (1, '1e3')");
+
+    let (_cols, rows) = exec_rows(&exec, "SELECT id FROM txt WHERE v = 1000");
+    assert!(
+        rows.is_empty(),
+        "a text column does not compare 1e3 as 1000"
+    );
+    let (_cols, rows) = exec_rows(&exec, "SELECT id FROM txt WHERE v = '1e3'");
+    assert_eq!(rows, vec![vec!["1".to_string()]]);
+}
+
 /// A column the table does not have is an error, not an empty result.
 #[test]
 fn test_unknown_column_errors() {
@@ -442,6 +505,32 @@ fn test_aggregate_null_and_integer_semantics() {
 
     let (_cols, rows) = exec_rows(&exec, "SELECT MAX(n) FROM agg");
     assert_eq!(rows, vec![vec!["10".to_string()]]);
+}
+
+/// SUM/AVG/MIN/MAX over no non-null values are NULL, not 0 or "": an
+/// all-NULL column must not look like it contains a zero. COUNT is still 0.
+#[test]
+fn test_aggregates_are_null_on_empty_input() {
+    let (_db, exec) = create_sql_env("aggempty");
+
+    exec_sql(&exec, "CREATE TABLE ae (id INTEGER PRIMARY KEY, n INTEGER)");
+    exec_sql(&exec, "INSERT INTO ae (id, n) VALUES (1, NULL)");
+    exec_sql(&exec, "INSERT INTO ae (id, n) VALUES (2, NULL)");
+
+    let (_cols, rows) = exec_rows(&exec, "SELECT SUM(n) FROM ae");
+    assert_eq!(rows, vec![vec!["NULL".to_string()]]);
+
+    let (_cols, rows) = exec_rows(&exec, "SELECT AVG(n) FROM ae");
+    assert_eq!(rows, vec![vec!["NULL".to_string()]]);
+
+    let (_cols, rows) = exec_rows(&exec, "SELECT MIN(n) FROM ae");
+    assert_eq!(rows, vec![vec!["NULL".to_string()]]);
+
+    let (_cols, rows) = exec_rows(&exec, "SELECT MAX(n) FROM ae");
+    assert_eq!(rows, vec![vec!["NULL".to_string()]]);
+
+    let (_cols, rows) = exec_rows(&exec, "SELECT COUNT(n) FROM ae");
+    assert_eq!(rows, vec![vec!["0".to_string()]]);
 }
 
 /// The fraction is zero-padded before trimming, so interior zeros survive:
@@ -559,6 +648,33 @@ fn test_escaped_quote_in_string_literal() {
 
     let (_cols, rows) = exec_rows(&exec, "SELECT name FROM esc WHERE name = 'O''Brien'");
     assert_eq!(rows, vec![vec!["O'Brien".to_string()]]);
+}
+
+/// UNION/EXPLAIN/subquery paths join tokens back into SQL and re-parse,
+/// so an escaped quote must survive the second pass.
+#[test]
+fn test_escaped_quote_survives_reparse() {
+    let (_db, exec) = create_sql_env("escrp");
+
+    exec_sql(&exec, "CREATE TABLE er (id INTEGER PRIMARY KEY, name TEXT)");
+    exec_sql(&exec, "INSERT INTO er (id, name) VALUES (1, 'O''Brien')");
+    exec_sql(&exec, "INSERT INTO er (id, name) VALUES (2, 'a''b')");
+
+    let (_cols, rows) = exec_rows(
+        &exec,
+        "SELECT name FROM er WHERE name = 'O''Brien' UNION SELECT name FROM er",
+    );
+    assert_eq!(
+        rows,
+        vec![vec!["O'Brien".to_string()], vec!["a'b".to_string()]]
+    );
+
+    // The subquery path re-parses too.
+    let (_cols, rows) = exec_rows(
+        &exec,
+        "SELECT id FROM er WHERE name IN (SELECT name FROM er WHERE name = 'a''b')",
+    );
+    assert_eq!(rows, vec![vec!["2".to_string()]]);
 }
 
 /// `<>` is the SQL standard spelling of `!=` and must exclude the matching row.
@@ -860,6 +976,76 @@ fn test_bound_value_is_stored_verbatim() {
 
     let (_cols, rows) = exec_rows(&exec, "SELECT v FROM bv");
     assert_eq!(rows, vec![vec!["08".to_string()]]);
+}
+
+/// A predicate payload written the way its number does NOT print stays
+/// text, so it finds the row stored under that exact text by every path —
+/// scan, primary-key lookup, and IN. A canonical "7" still compares numerically.
+#[test]
+fn test_bound_predicate_round_trips_non_canonical_text() {
+    let (_db, exec) = create_sql_env("bindrt");
+
+    exec_sql(&exec, "CREATE TABLE rt (id TEXT PRIMARY KEY, v INTEGER)");
+    exec_sql(&exec, "INSERT INTO rt (id, v) VALUES ('007', 9)");
+
+    let stmt = parse_sql("SELECT id FROM rt WHERE id = $1").unwrap();
+    let stmt = bind_statement_params(stmt, &[Some("007".to_string())]).unwrap();
+    let (_cols, rows) = exec_rows_from_stmt(&exec, &stmt);
+    assert_eq!(rows, vec![vec!["007".to_string()]]);
+
+    let stmt = parse_sql("SELECT id FROM rt WHERE id IN ($1)").unwrap();
+    let stmt = bind_statement_params(stmt, &[Some("007".to_string())]).unwrap();
+    let (_cols, rows) = exec_rows_from_stmt(&exec, &stmt);
+    assert_eq!(rows, vec![vec!["007".to_string()]]);
+
+    // A canonical numeric payload still orders numerically.
+    let stmt = parse_sql("SELECT id FROM rt WHERE v > $1").unwrap();
+    let stmt = bind_statement_params(stmt, &[Some("5".to_string())]).unwrap();
+    let (_cols, rows) = exec_rows_from_stmt(&exec, &stmt);
+    assert_eq!(rows, vec![vec!["007".to_string()]]);
+}
+
+/// A numeric column's declared type decides comparison, not the payload's
+/// shape: a bound "007" matches the row stored as "7" by scan, primary-key
+/// lookup, and IN, while a text column keeps the same payload verbatim.
+#[test]
+fn test_numeric_affinity_matches_non_canonical_payload() {
+    let (_db, exec) = create_sql_env("affinity");
+
+    exec_sql(
+        &exec,
+        "CREATE TABLE num (id INTEGER PRIMARY KEY, v INTEGER)",
+    );
+    exec_sql(&exec, "INSERT INTO num (id, v) VALUES (7, 1000)");
+
+    // The stored form is canonical, so an unquoted literal finds it.
+    let (_cols, rows) = exec_rows(&exec, "SELECT id FROM num WHERE id = 7");
+    assert_eq!(rows, vec![vec!["7".to_string()]]);
+
+    // A bound non-canonical payload matches the numeric column by value.
+    let stmt = parse_sql("SELECT id FROM num WHERE id = $1").unwrap();
+    let stmt = bind_statement_params(stmt, &[Some("007".to_string())]).unwrap();
+    let (_cols, rows) = exec_rows_from_stmt(&exec, &stmt);
+    assert_eq!(rows, vec![vec!["7".to_string()]]);
+
+    let stmt = parse_sql("SELECT id FROM num WHERE id IN ($1)").unwrap();
+    let stmt = bind_statement_params(stmt, &[Some("007".to_string())]).unwrap();
+    let (_cols, rows) = exec_rows_from_stmt(&exec, &stmt);
+    assert_eq!(rows, vec![vec!["7".to_string()]]);
+
+    // A text column stores the same payload verbatim and matches only itself.
+    exec_sql(&exec, "CREATE TABLE txt (id TEXT PRIMARY KEY)");
+    exec_sql(&exec, "INSERT INTO txt (id) VALUES ('007')");
+
+    let stmt = parse_sql("SELECT id FROM txt WHERE id = $1").unwrap();
+    let stmt = bind_statement_params(stmt, &[Some("007".to_string())]).unwrap();
+    let (_cols, rows) = exec_rows_from_stmt(&exec, &stmt);
+    assert_eq!(rows, vec![vec!["007".to_string()]]);
+
+    let stmt = parse_sql("SELECT id FROM txt WHERE id = $1").unwrap();
+    let stmt = bind_statement_params(stmt, &[Some("7".to_string())]).unwrap();
+    let (_cols, rows) = exec_rows_from_stmt(&exec, &stmt);
+    assert!(rows.is_empty(), "a text column must not match 7 for 007");
 }
 
 fn exec_rows_from_stmt(

@@ -27,7 +27,7 @@
 )]
 
 use crate::OmniKV;
-use crate::catalog::{Catalog, TableDef};
+use crate::catalog::{Catalog, ColumnType, TableDef};
 use crate::optimizer::{AccessMethod, PlanNode};
 use crate::sql::{AggFunc, CmpOp, JoinType, OrderByItem, SelectColumn, SqlValue, WhereExpr};
 use crate::sql_exec::Row;
@@ -301,14 +301,26 @@ impl RowIterator for PkLookupIter {
 pub struct FilterIter {
     child: Box<dyn RowIterator>,
     predicate: WhereExpr,
+    col_types: ColumnTypeMap,
     scratch: Vec<Row>,
 }
 
 impl FilterIter {
     pub fn new(child: Box<dyn RowIterator>, predicate: WhereExpr) -> Self {
+        Self::with_types(child, predicate, ColumnTypeMap::default())
+    }
+
+    /// Build with the table's declared column types, so ordering follows the
+    /// column's affinity rather than the literal's shape.
+    pub fn with_types(
+        child: Box<dyn RowIterator>,
+        predicate: WhereExpr,
+        col_types: ColumnTypeMap,
+    ) -> Self {
         Self {
             child,
             predicate,
+            col_types,
             scratch: Vec::with_capacity(DEFAULT_ROW_CHUNK_SIZE),
         }
     }
@@ -318,7 +330,7 @@ impl RowIterator for FilterIter {
     fn next_row(&mut self) -> Option<Row> {
         loop {
             let row = self.child.next_row()?;
-            if eval_where(&row, &self.predicate) {
+            if eval_where_typed(&row, &self.predicate, &self.col_types) {
                 return Some(row);
             }
         }
@@ -340,7 +352,7 @@ impl RowIterator for FilterIter {
             out.extend(
                 self.scratch
                     .drain(..)
-                    .filter(|row| eval_where(row, &self.predicate)),
+                    .filter(|row| eval_where_typed(row, &self.predicate, &self.col_types)),
             );
         }
 
@@ -805,18 +817,26 @@ pub fn compile_plan_with_scan(
             let table_def = catalog
                 .get_table(table)
                 .expect("Table not found in catalog");
+            let col_types = table_def
+                .columns
+                .iter()
+                .map(|c| (c.name.to_lowercase(), c.col_type.clone()))
+                .collect::<ColumnTypeMap>();
             let base: Box<dyn RowIterator> = match access {
-                AccessMethod::PkLookup { key_value } => match scan {
-                    Some(ctx) => Box::new(PkLookupIter::with_scan(
-                        db,
-                        &table_def,
-                        key_value,
-                        ctx.scan_seq,
-                        Some(&ctx.overlay),
-                        ctx.reads.as_ref(),
-                    )),
-                    None => Box::new(PkLookupIter::new(db, &table_def, key_value)),
-                },
+                AccessMethod::PkLookup { key_value } => {
+                    let key_value = canonicalize_pk_key(&table_def, key_value);
+                    match scan {
+                        Some(ctx) => Box::new(PkLookupIter::with_scan(
+                            db,
+                            &table_def,
+                            &key_value,
+                            ctx.scan_seq,
+                            Some(&ctx.overlay),
+                            ctx.reads.as_ref(),
+                        )),
+                        None => Box::new(PkLookupIter::new(db, &table_def, &key_value)),
+                    }
+                }
                 AccessMethod::SeqScan | AccessMethod::IndexScan { .. } => match scan {
                     Some(ctx) => Box::new(SeqScanIter::with_scan(
                         db,
@@ -829,7 +849,7 @@ pub fn compile_plan_with_scan(
                 },
             };
             match filter {
-                Some(pred) => Box::new(FilterIter::new(base, pred.clone())),
+                Some(pred) => Box::new(FilterIter::with_types(base, pred.clone(), col_types)),
                 None => base,
             }
         }
@@ -891,9 +911,51 @@ pub fn compile_plan_with_scan(
 
 // ─── Shared helpers ─────────────────────────────────────────────────────────
 
+/// Declared column types, keyed by the name a predicate uses. A miss on a
+/// join-qualified name falls back to the literal's own type.
+pub type ColumnTypeMap = std::collections::HashMap<String, ColumnType>;
+
+/// Ordering by the column's declared affinity, shared by `=` and `IN`. An
+/// unknown type falls back to the literal's own type.
+fn cmp_by_affinity(
+    row_val: &str,
+    value: &SqlValue,
+    cmp_val: &str,
+    col_type: Option<&ColumnType>,
+) -> std::cmp::Ordering {
+    match col_type {
+        Some(t) if t.is_numeric() => smart_cmp(row_val, cmp_val),
+        Some(_) => row_val.cmp(cmp_val),
+        None => cmp_by_literal(row_val, value, cmp_val),
+    }
+}
+
+/// Stored form of a primary-key value: canonical for a numeric key, so a
+/// lookup for "007" reads the row written as "7".
+fn canonicalize_pk_key(table: &TableDef, key_value: &str) -> String {
+    let pk_type = table
+        .columns
+        .iter()
+        .find(|c| c.name.eq_ignore_ascii_case(&table.primary_key))
+        .map(|c| &c.col_type);
+    match pk_type {
+        Some(t) => t.canonicalize(key_value),
+        None => key_value.to_string(),
+    }
+}
+
+/// Ordering by the literal's type — numeric for a number, lexical for text.
+fn cmp_by_literal(row_val: &str, value: &SqlValue, cmp_val: &str) -> std::cmp::Ordering {
+    if matches!(value, SqlValue::Integer(_) | SqlValue::Float(_)) {
+        smart_cmp(row_val, cmp_val)
+    } else {
+        row_val.cmp(cmp_val)
+    }
+}
+
 /// Evaluate a predicate, preserving SQL three-valued logic: `None` is
 /// UNKNOWN, which never selects a row and survives `NOT` unchanged.
-fn eval_tri(row: &Row, expr: &WhereExpr) -> Option<bool> {
+fn eval_tri(row: &Row, expr: &WhereExpr, types: &ColumnTypeMap) -> Option<bool> {
     match expr {
         WhereExpr::Comparison { column, op, value } => {
             // Comparison against NULL is UNKNOWN; the text form of Null
@@ -901,20 +963,14 @@ fn eval_tri(row: &Row, expr: &WhereExpr) -> Option<bool> {
             if matches!(value, SqlValue::Null) {
                 return None;
             }
-            let row_val = row.get(column).cloned().unwrap_or_default();
-            if row_val == "NULL" {
+            // A missing key is NULL, never "".
+            let row_val = row.get(column)?;
+            if row_val.as_str() == "NULL" {
                 return None;
             }
             let cmp_val = value.as_string();
-            // A quoted literal is text and must compare lexically, so a
-            // product code "1e5" never equals "100000"; an unquoted
-            // number compares numerically.
-            let numeric = matches!(value, SqlValue::Integer(_) | SqlValue::Float(_));
-            let ord = if numeric {
-                smart_cmp(&row_val, &cmp_val)
-            } else {
-                row_val.cmp(&cmp_val)
-            };
+            let col_type = types.get(column);
+            let ord = cmp_by_affinity(row_val, value, &cmp_val, col_type);
             Some(match op {
                 CmpOp::Eq => ord == std::cmp::Ordering::Equal,
                 CmpOp::Ne => ord != std::cmp::Ordering::Equal,
@@ -927,22 +983,25 @@ fn eval_tri(row: &Row, expr: &WhereExpr) -> Option<bool> {
                     let escaped = regex::escape(&cmp_val);
                     let pattern = escaped.replace("%", ".*").replace("_", ".");
                     regex::Regex::new(&format!("^{}$", pattern))
-                        .map(|r| r.is_match(&row_val))
+                        .map(|r| r.is_match(row_val))
                         .unwrap_or(false)
                 }
             })
         }
-        WhereExpr::And(a, b) => and_tri(eval_tri(row, a), eval_tri(row, b)),
-        WhereExpr::Or(a, b) => or_tri(eval_tri(row, a), eval_tri(row, b)),
-        WhereExpr::Not(inner) => eval_tri(row, inner).map(std::ops::Not::not),
+        WhereExpr::And(a, b) => and_tri(eval_tri(row, a, types), eval_tri(row, b, types)),
+        WhereExpr::Or(a, b) => or_tri(eval_tri(row, a, types), eval_tri(row, b, types)),
+        WhereExpr::Not(inner) => eval_tri(row, inner, types).map(std::ops::Not::not),
         WhereExpr::IsNull(col) => Some(row.get(col).is_none_or(|v| v == "NULL")),
         WhereExpr::IsNotNull(col) => Some(row.get(col).is_some_and(|v| v != "NULL")),
         WhereExpr::In(col, vals) => {
-            let row_val = row.get(col).cloned().unwrap_or_default();
-            if row_val == "NULL" {
+            let row_val = row.get(col)?;
+            if row_val.as_str() == "NULL" {
                 return None;
             }
-            Some(vals.iter().any(|v| v.as_string() == row_val))
+            let col_type = types.get(col);
+            Some(vals.iter().any(|v| {
+                cmp_by_affinity(row_val, v, &v.as_string(), col_type) == std::cmp::Ordering::Equal
+            }))
         }
         WhereExpr::InSubquery(_, _) => Some(false),
     }
@@ -964,8 +1023,16 @@ fn or_tri(a: Option<bool>, b: Option<bool>) -> Option<bool> {
     }
 }
 
+/// Predicate evaluation without the table's column types; the literal's own
+/// type picks the ordering.
 pub fn eval_where(row: &Row, expr: &WhereExpr) -> bool {
-    eval_tri(row, expr).unwrap_or(false)
+    eval_where_typed(row, expr, &ColumnTypeMap::default())
+}
+
+/// Predicate evaluation with the table's declared column types, so ordering
+/// follows the column's affinity.
+pub fn eval_where_typed(row: &Row, expr: &WhereExpr, types: &ColumnTypeMap) -> bool {
+    eval_tri(row, expr, types).unwrap_or(false)
 }
 
 /// Compare numerically when both sides are finite numbers, else lexically.
@@ -1000,6 +1067,10 @@ pub fn compute_aggregate(func: &AggFunc, target: &str, rows: &[&Row]) -> (String
                 values.len()
             };
             (name, n.to_string())
+        }
+        // SQL: over no non-null values these are NULL, not 0.
+        AggFunc::Sum | AggFunc::Avg | AggFunc::Min | AggFunc::Max if values.is_empty() => {
+            (name, "NULL".to_string())
         }
         AggFunc::Sum => {
             if values.iter().all(|v| v.parse::<i64>().is_ok()) {
@@ -1044,15 +1115,11 @@ pub fn compute_aggregate(func: &AggFunc, target: &str, rows: &[&Row]) -> (String
                     )
                 }
             } else {
-                let avg = if values.is_empty() {
-                    0.0
-                } else {
-                    values
-                        .iter()
-                        .filter_map(|v| v.parse::<f64>().ok())
-                        .sum::<f64>()
-                        / values.len() as f64
-                };
+                let avg = values
+                    .iter()
+                    .filter_map(|v| v.parse::<f64>().ok())
+                    .sum::<f64>()
+                    / values.len() as f64;
                 (name, avg.to_string())
             }
         }

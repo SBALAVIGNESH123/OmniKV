@@ -598,7 +598,15 @@ impl SqlExecutor {
             let mut row_map = HashMap::new();
             let mut pk_val = String::new();
             for (i, col) in columns.iter().enumerate() {
-                let val = row_vals[i].as_string();
+                let col_type = table
+                    .columns
+                    .iter()
+                    .find(|c| c.name.eq_ignore_ascii_case(col))
+                    .map(|c| &c.col_type);
+                let val = match col_type {
+                    Some(t) => t.canonicalize(&row_vals[i].as_string()),
+                    None => row_vals[i].as_string(),
+                };
                 if col.eq_ignore_ascii_case(&table.primary_key) {
                     pk_val = val.clone();
                 }
@@ -1294,7 +1302,13 @@ impl SqlExecutor {
         let count = rows.len();
         for row in &mut rows {
             for (col, val) in assignments {
-                row.insert(col.clone(), val.as_string());
+                let stored = table
+                    .columns
+                    .iter()
+                    .find(|c| c.name.eq_ignore_ascii_case(col))
+                    .map(|c| c.col_type.canonicalize(&val.as_string()))
+                    .unwrap_or_else(|| val.as_string());
+                row.insert(col.clone(), stored);
             }
             let pk = row.get(&table.primary_key).cloned().unwrap_or_default();
             let key = format!("{}{}", table.row_prefix(), pk);

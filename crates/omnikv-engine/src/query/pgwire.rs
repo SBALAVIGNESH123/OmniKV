@@ -250,16 +250,11 @@ fn is_cleartext_safe_bind(bind_addr: &str) -> bool {
     }
 }
 
-/// `!=` leaks how much of a supplied password matched; this reads every byte.
+/// Compared as fixed-size digests, so neither the configured length nor a
+/// matched prefix is readable from the response timing.
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
+    use sha2::{Digest, Sha256};
+    Sha256::digest(a) == Sha256::digest(b)
 }
 
 /// Loopback only. A private network is shared, so with TLS configured

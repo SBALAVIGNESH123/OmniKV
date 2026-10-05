@@ -48,6 +48,27 @@ impl ColumnType {
             Self::Json => 114,       // JSON
         }
     }
+
+    /// A numeric column orders by value, so "7" and "007" are one key.
+    pub fn is_numeric(&self) -> bool {
+        matches!(self, Self::Integer | Self::Float)
+    }
+
+    /// Canonical form for a value of this type: a numeric payload prints as
+    /// its number, anything else is kept verbatim.
+    pub fn canonicalize(&self, value: &str) -> String {
+        match self {
+            Self::Integer => value
+                .parse::<i64>()
+                .map(|n| n.to_string())
+                .unwrap_or_else(|_| value.to_string()),
+            Self::Float => value
+                .parse::<f64>()
+                .map(|f| f.to_string())
+                .unwrap_or_else(|_| value.to_string()),
+            _ => value.to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

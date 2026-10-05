@@ -185,25 +185,23 @@ pub struct OrderByItem {
     pub desc: bool,
 }
 
-/// A bound value carries no parse-time type, so give a *predicate* value
-/// the type an unquoted literal would have: a numeric payload compares
-/// numerically, and the rest is text. Without this a bound `$1 = "9"`
-/// reaches comparison as text, so `WHERE v > $1` orders lexically and
-/// never matches "10". Stored values (INSERT/UPDATE) bypass this and keep
-/// the client's bytes exactly.
+/// A bound value has no parse-time type, so a predicate takes the type an
+/// unquoted literal would have — but only a payload that round-trips through
+/// its own number counts as one.
 fn coerce_param(v: &str) -> SqlValue {
-    if let Ok(i) = v.parse::<i64>() {
-        SqlValue::Integer(i)
-    } else if let Ok(f) = v.parse::<f64>() {
-        // The f64 parser accepts "NaN"/"inf", which are words here.
-        if f.is_finite() {
-            SqlValue::Float(f)
-        } else {
-            SqlValue::Text(v.to_string())
-        }
-    } else {
-        SqlValue::Text(v.to_string())
+    if let Ok(i) = v.parse::<i64>()
+        && i.to_string() == v
+    {
+        return SqlValue::Integer(i);
     }
+    // The f64 parser accepts "NaN"/"inf", which are words here.
+    if let Ok(f) = v.parse::<f64>()
+        && f.is_finite()
+        && f.to_string() == v
+    {
+        return SqlValue::Float(f);
+    }
+    SqlValue::Text(v.to_string())
 }
 
 /// Substitutes extended-protocol Bind values into a parsed statement's
@@ -488,10 +486,11 @@ fn tokenize(input: &str) -> Vec<String> {
     while let Some(ch) = chars.next() {
         if in_string {
             if ch == '\'' {
-                // SQL escapes a quote by doubling it: O''Brien is O'Brien.
                 if chars.peek() == Some(&'\'') {
+                    // Tokens are re-joined into SQL and re-parsed by
+                    // UNION/EXPLAIN, so the escape must round-trip.
                     chars.next();
-                    current.push('\'');
+                    current.push_str("''");
                 } else {
                     tokens.push(format!("'{}'", current));
                     current.clear();
@@ -568,7 +567,8 @@ fn parse_value(token: &str) -> SqlValue {
     }
 
     if token.starts_with('\'') && token.ends_with('\'') {
-        return SqlValue::Text(token[1..token.len() - 1].to_string());
+        // '' is the SQL escape for '.
+        return SqlValue::Text(token[1..token.len() - 1].replace("''", "'"));
     }
     let upper = token.to_uppercase();
     if upper == "NULL" {
