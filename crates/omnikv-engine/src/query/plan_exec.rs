@@ -372,18 +372,20 @@ impl PlanExecutor {
                 for col in columns {
                     match col {
                         SelectColumn::Named(n) => {
-                            if let Some(v) = row.get(n) {
+                            if let Some(v) = crate::volcano::row_lookup(row, n) {
                                 projected.insert(n.clone(), v.clone());
                             }
                         }
                         SelectColumn::Qualified(t, n) => {
                             let key = format!("{}.{}", t, n);
-                            let val = row
-                                .get(&key)
-                                .or_else(|| row.get(n))
+                            // A qualified name binds to the table it names;
+                            // the missing side of an outer join is NULL, not
+                            // the other table's column of the same name.
+                            let val = crate::volcano::row_lookup(row, &key)
                                 .cloned()
-                                .unwrap_or_default();
-                            projected.insert(n.clone(), val);
+                                .unwrap_or_else(|| "NULL".into());
+                            projected.insert(key, val.clone());
+                            projected.entry(n.clone()).or_insert(val);
                         }
                         SelectColumn::Aggregate(func, target) => {
                             let name =

@@ -408,24 +408,24 @@ fn project_row(row: Row, columns: &[SelectColumn]) -> Row {
     for col in columns {
         match col {
             SelectColumn::Named(n) => {
-                if let Some(v) = row.get(n) {
+                if let Some(v) = row_lookup(&row, n) {
                     projected.insert(n.clone(), v.clone());
                 }
             }
             SelectColumn::Qualified(t, n) => {
                 let key = format!("{}.{}", t, n);
-                let val = row
-                    .get(&key)
-                    .or_else(|| row.get(n))
+                // A qualified name binds to the table it names; on the
+                // missing side of an outer join that binding is a NULL, never
+                // the other table's column of the same bare name.
+                let val = row_lookup(&row, &key)
                     .cloned()
-                    .unwrap_or_default();
-                // A Row is keyed by name, so a clash (a.shared, b.shared)
-                // needs the qualified key.
-                if projected.contains_key(n) {
-                    projected.insert(key, val);
-                } else {
-                    projected.insert(n.clone(), val);
-                }
+                    .unwrap_or_else(|| "NULL".into());
+                // Store under the qualified key so a reader resolving by
+                // qualified name still finds it after this projection, and
+                // under the bare name when that slot is free, so a bare
+                // reader (ORDER BY, HAVING) resolves it too.
+                projected.insert(key, val.clone());
+                projected.entry(n.clone()).or_insert(val);
             }
             SelectColumn::Aggregate(func, target) => {
                 let name = format!("{}({})", format!("{:?}", func).to_lowercase(), target);
@@ -984,7 +984,7 @@ fn cmp_by_literal(row_val: &str, value: &SqlValue, cmp_val: &str) -> std::cmp::O
     }
 }
 
-/// Resolve a predicate column to a row value.
+/// Resolve a column reference to a row value.
 ///
 /// Joins store each side under a `table.column` key as well as the bare
 /// name, so a qualified name binds to the table it names even when both
@@ -993,7 +993,12 @@ fn cmp_by_literal(row_val: &str, value: &SqlValue, cmp_val: &str) -> std::cmp::O
 /// back to the bare key, which belongs to the present table. Only a
 /// bare-keyed single-table row falls back. The qualifier is matched
 /// case-insensitively because table names are.
-fn row_lookup<'a>(row: &'a Row, column: &str) -> Option<&'a String> {
+///
+/// Every place a qualified name is read from a row — predicate, projection,
+/// ORDER BY, GROUP BY — goes through this function, so a column resolves
+/// one way everywhere and a projection can never disagree with the
+/// predicate that selected the row.
+pub(crate) fn row_lookup<'a>(row: &'a Row, column: &str) -> Option<&'a String> {
     if let Some(v) = row.get(column) {
         return Some(v);
     }

@@ -706,6 +706,7 @@ impl SqlExecutor {
         // earlier in this transaction.
         self.validate_from_tables(from)?;
         self.validate_where_columns(from, where_clause)?;
+        self.validate_output_columns(from, columns, order_by, group_by)?;
 
         // When OFFSET is present, fetch limit+offset rows from the pipeline,
         // then skip offset rows in post-processing.
@@ -968,49 +969,115 @@ impl SqlExecutor {
         from: &FromClause,
         where_clause: Option<&WhereExpr>,
     ) -> Result<(), String> {
+        let per_table = self.columns_per_table(from)?;
+        for col in extract_where_columns(where_clause) {
+            self.check_column_reference(&per_table, &col)?;
+        }
+        Ok(())
+    }
+
+    /// Reject an unqualified column that exists on both sides of a join.
+    ///
+    /// A bare name resolves to whichever side hashed as the build table, so
+    /// the same query can return a different column when row counts change
+    /// and the planner swaps the join order. Standard SQL calls this
+    /// ambiguous and refuses to guess; doing the same turns a silent,
+    /// plan-dependent read into a message that names both tables.
+    fn check_column_reference(
+        &self,
+        per_table: &[(String, Vec<String>)],
+        col: &str,
+    ) -> Result<(), String> {
+        let Some((qual, bare)) = col.split_once('.') else {
+            let owners: Vec<&str> = per_table
+                .iter()
+                .filter(|(_, cols)| cols.iter().any(|c| c == col))
+                .map(|(t, _)| t.as_str())
+                .collect();
+            if owners.len() > 1 {
+                return Err(format!(
+                    "column \"{}\" is ambiguous — it exists in tables {} and {}; qualify it as \"{}.{}\" or \"{}.{}\"",
+                    col, owners[0], owners[1], owners[0], col, owners[1], col
+                ));
+            }
+            if owners.is_empty() {
+                return Err(format!("column \"{col}\" does not exist"));
+            }
+            return Ok(());
+        };
+        match per_table.iter().find(|(t, _)| t.eq_ignore_ascii_case(qual)) {
+            Some((_, cols)) => {
+                if !cols.iter().any(|c| c == bare) {
+                    return Err(format!("column \"{col}\" does not exist"));
+                }
+                Ok(())
+            }
+            None => Err(format!(
+                "table \"{qual}\" is not in the FROM clause of this statement"
+            )),
+        }
+    }
+
+    /// Column lists per table in FROM order, used to resolve and to
+    /// disambiguate column references.
+    fn columns_per_table(&self, from: &FromClause) -> Result<Vec<(String, Vec<String>)>, String> {
         let tables = match from {
             FromClause::Table(t) => vec![t.clone()],
             FromClause::Join { left, right, .. } => vec![left.clone(), right.clone()],
         };
-        // Columns grouped per table so a qualified name is checked against
-        // the table it actually names.
-        let mut per_table: Vec<(String, Vec<String>)> = Vec::new();
-        let mut all_columns: Vec<String> = Vec::new();
+        let mut per_table = Vec::with_capacity(tables.len());
         for t in &tables {
             let table = self
                 .catalog
                 .get_table(t)
-                .ok_or_else(|| format!("Table '{}' does not exist", t))?;
+                .ok_or_else(|| format!("Table '{t}' does not exist"))?;
             let names: Vec<String> = table
                 .column_names()
                 .into_iter()
                 .map(str::to_string)
                 .collect();
-            all_columns.extend(names.iter().cloned());
             per_table.push((t.clone(), names));
         }
-        for col in extract_where_columns(where_clause) {
-            if let Some((qual, bare)) = col.split_once('.') {
-                match per_table.iter().find(|(t, _)| t.eq_ignore_ascii_case(qual)) {
-                    Some((_, cols)) => {
-                        if !cols.iter().any(|c| c == bare) {
-                            return Err(format!("column \"{col}\" does not exist"));
-                        }
-                    }
-                    None => {
-                        return Err(format!(
-                            "table \"{qual}\" is not in the FROM clause of this statement"
-                        ));
+        Ok(per_table)
+    }
+
+    /// Validate every column the SELECT list, ORDER BY and GROUP BY name, so
+    /// a typo or an ambiguous name is reported rather than quietly producing
+    /// NULLs or reading the wrong table's column.
+    fn validate_output_columns(
+        &self,
+        from: &FromClause,
+        columns: &[SelectColumn],
+        order_by: &[OrderByItem],
+        group_by: &[String],
+    ) -> Result<(), String> {
+        if columns.iter().any(|c| matches!(c, SelectColumn::Star)) {
+            return Ok(());
+        }
+        let per_table = self.columns_per_table(from)?;
+        for col in columns {
+            match col {
+                SelectColumn::Named(n) => self.check_column_reference(&per_table, n)?,
+                SelectColumn::Qualified(t, n) => {
+                    self.check_column_reference(&per_table, &format!("{t}.{n}"))?
+                }
+                SelectColumn::Aggregate(_, target) => {
+                    // COUNT(*) tallies rows and names no column.
+                    if target != "*" {
+                        self.check_column_reference(&per_table, target)?
                     }
                 }
-            } else {
-                // Match the row-map lookup, which is exact-case: a
-                // case-insensitive pass here would let a name through that the
-                // lookup then silently fails to find.
-                if !all_columns.iter().any(|c| c == &col) {
-                    return Err(format!("column \"{col}\" does not exist"));
+                SelectColumn::WindowFunc { order_by: ob, .. } => {
+                    self.check_column_reference(&per_table, ob)?
                 }
+                SelectColumn::Star => {}
             }
+        }
+        for item in order_by {
+            self.check_column_reference(&per_table, &item.column)?;
+        }
+        for g in group_by {
+            self.check_column_reference(&per_table, g)?;
         }
         Ok(())
     }
@@ -1303,11 +1370,11 @@ impl SqlExecutor {
                     .iter()
                     .map(|c| match c {
                         SelectColumn::Named(n) => r.get(n).cloned().unwrap_or("NULL".into()),
-                        SelectColumn::Qualified(t, n) => r
-                            .get(&format!("{}.{}", t, n))
-                            .or_else(|| r.get(n))
-                            .cloned()
-                            .unwrap_or("NULL".into()),
+                        SelectColumn::Qualified(t, n) => {
+                            crate::volcano::row_lookup(r, &format!("{}.{}", t, n))
+                                .cloned()
+                                .unwrap_or("NULL".into())
+                        }
                         SelectColumn::Aggregate(func, target) => r
                             .get(&format!(
                                 "{}({})",

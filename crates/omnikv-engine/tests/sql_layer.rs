@@ -1330,3 +1330,137 @@ fn test_outer_join_preserves_side_after_reorder() {
         "RIGHT JOIN must preserve the right table after operand reorder"
     );
 }
+
+/// A projection of the missing side must read NULL, not the present table's
+/// column of the same name. The predicate layer already resolved this; the
+/// projection and the row formatter were still falling back to the bare key.
+#[test]
+fn test_outer_join_projects_missing_side_as_null() {
+    let (_db, exec) = create_sql_env("ojproj");
+
+    exec_sql(
+        &exec,
+        "CREATE TABLE ojl (id INTEGER PRIMARY KEY, shared INTEGER)",
+    );
+    exec_sql(
+        &exec,
+        "CREATE TABLE ojr (id INTEGER PRIMARY KEY, shared INTEGER)",
+    );
+    exec_sql(&exec, "INSERT INTO ojl (id, shared) VALUES (1, 10)");
+    exec_sql(&exec, "INSERT INTO ojl (id, shared) VALUES (2, 20)");
+    exec_sql(&exec, "INSERT INTO ojr (id, shared) VALUES (1, 30)");
+
+    // Row 1 matches and reads ojr's own 30; row 2 has no ojr side, so it
+    // must be NULL — it used to show ojl's 20.
+    let (_cols, rows) = exec_rows(
+        &exec,
+        "SELECT ojr.shared FROM ojl LEFT JOIN ojr ON ojl.id = ojr.id",
+    );
+    assert_eq!(
+        rows,
+        vec![vec!["30".to_string()], vec!["NULL".to_string()]],
+        "projecting the missing side must yield NULL, not the present side's value"
+    );
+
+    // Same for the join key column, which collides by name with ojl.id.
+    let (_cols, rows) = exec_rows(
+        &exec,
+        "SELECT ojr.id FROM ojl LEFT JOIN ojr ON ojl.id = ojr.id",
+    );
+    assert_eq!(
+        rows,
+        vec![vec!["1".to_string()], vec!["NULL".to_string()]],
+        "the missing side's join key must project to NULL"
+    );
+
+    // The present side is unaffected by the same query.
+    let (_cols, rows) = exec_rows(
+        &exec,
+        "SELECT ojl.shared FROM ojl LEFT JOIN ojr ON ojl.id = ojr.id",
+    );
+    assert_eq!(rows, vec![vec!["10".to_string()], vec!["20".to_string()]]);
+
+    // Both sides projected at once: each keeps its own table's value.
+    let (cols, rows) = exec_rows(
+        &exec,
+        "SELECT ojl.shared, ojr.shared FROM ojl LEFT JOIN ojr ON ojl.id = ojr.id",
+    );
+    assert_eq!(cols, vec!["shared".to_string(), "shared".to_string()]);
+    assert_eq!(
+        rows,
+        vec![
+            vec!["10".to_string(), "30".to_string()],
+            vec!["20".to_string(), "NULL".to_string()]
+        ],
+        "two clashing qualified columns must each bind to its own table"
+    );
+}
+
+/// An unqualified column that exists on both sides of a join is ambiguous:
+/// it used to resolve to whichever side the planner hashed as the build
+/// table, so the same query could read a different column when row counts
+/// changed the join order. Standard SQL rejects it and names both tables.
+#[test]
+fn test_ambiguous_column_is_rejected() {
+    let (_db, exec) = create_sql_env("ambcol");
+
+    exec_sql(
+        &exec,
+        "CREATE TABLE qa (id INTEGER PRIMARY KEY, shared INTEGER)",
+    );
+    exec_sql(
+        &exec,
+        "CREATE TABLE qb (id INTEGER PRIMARY KEY, shared INTEGER)",
+    );
+    exec_sql(&exec, "INSERT INTO qa (id, shared) VALUES (1, 10)");
+    exec_sql(&exec, "INSERT INTO qb (id, shared) VALUES (1, 30)");
+
+    let expect_ambiguous = |sql: &str| {
+        let stmt = parse_sql(sql).expect("parse");
+        match exec.execute(&stmt) {
+            Err(e) => {
+                assert!(
+                    e.contains("is ambiguous"),
+                    "{sql}: expected an ambiguity error, got: {e}"
+                );
+                assert!(
+                    e.contains("qa") && e.contains("qb"),
+                    "{sql}: error should name both tables: {e}"
+                );
+            }
+            Ok(ExecResult::Rows { rows, .. }) => {
+                panic!("{sql}: ambiguous column was accepted, returned {rows:?}")
+            }
+            Ok(_) => panic!("{sql}: unexpected non-rows result"),
+        }
+    };
+
+    // Every clause that resolves a column must reject the ambiguous name.
+    expect_ambiguous("SELECT shared FROM qa JOIN qb ON qa.id = qb.id");
+    expect_ambiguous("SELECT id FROM qa JOIN qb ON qa.id = qb.id");
+    expect_ambiguous("SELECT qa.id FROM qa JOIN qb ON qa.id = qb.id WHERE shared = 10");
+    expect_ambiguous("SELECT qa.id FROM qa JOIN qb ON qa.id = qb.id ORDER BY shared");
+    expect_ambiguous("SELECT qa.id FROM qa JOIN qb ON qa.id = qb.id GROUP BY shared");
+
+    // A qualified name resolves unambiguously and still works.
+    let (_cols, rows) = exec_rows(
+        &exec,
+        "SELECT qa.shared FROM qa JOIN qb ON qa.id = qb.id WHERE qa.shared = 10",
+    );
+    assert_eq!(rows, vec![vec!["10".to_string()]]);
+
+    let (_cols, rows) = exec_rows(
+        &exec,
+        "SELECT qb.shared FROM qa JOIN qb ON qa.id = qb.id WHERE qb.shared = 30",
+    );
+    assert_eq!(rows, vec![vec!["30".to_string()]]);
+
+    // A name that only one table owns is not ambiguous.
+    exec_sql(
+        &exec,
+        "CREATE TABLE qc (id INTEGER PRIMARY KEY, only INTEGER)",
+    );
+    exec_sql(&exec, "INSERT INTO qc (id, only) VALUES (1, 40)");
+    let (_cols, rows) = exec_rows(&exec, "SELECT only FROM qc JOIN qb ON qc.id = qb.id");
+    assert_eq!(rows, vec![vec!["40".to_string()]]);
+}
