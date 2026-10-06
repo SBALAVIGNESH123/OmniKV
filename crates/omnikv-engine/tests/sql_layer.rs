@@ -1237,3 +1237,96 @@ fn test_qualified_where_single_table() {
         ]
     );
 }
+
+/// On an outer join, a qualified name for the unmatched side must read as
+/// NULL, not rebind to the present table's column of the same name —
+/// otherwise `WHERE r.id IS NULL` silently matches every row instead of
+/// acting as an anti-join.
+#[test]
+fn test_outer_join_qualified_null_side() {
+    let (_db, exec) = create_sql_env("ojnull");
+
+    exec_sql(
+        &exec,
+        "CREATE TABLE ojl (id INTEGER PRIMARY KEY, shared INTEGER)",
+    );
+    exec_sql(
+        &exec,
+        "CREATE TABLE ojr (id INTEGER PRIMARY KEY, shared INTEGER)",
+    );
+    exec_sql(&exec, "INSERT INTO ojl (id, shared) VALUES (1, 10)");
+    exec_sql(&exec, "INSERT INTO ojl (id, shared) VALUES (2, 20)");
+    exec_sql(&exec, "INSERT INTO ojr (id, shared) VALUES (1, 30)");
+
+    let (_cols, rows) = exec_rows(
+        &exec,
+        "SELECT ojl.id FROM ojl LEFT JOIN ojr ON ojl.id = ojr.id",
+    );
+    assert_eq!(rows, vec![vec!["1".to_string()], vec!["2".to_string()]]);
+
+    // Row 2 has no ojr partner, so ojr.id is NULL there and only row 2
+    // survives. Before the fix, ojr.id rebound to ojl's bare id and every
+    // row matched, or the predicate was pushed into ojr's scan and deleted
+    // the rows it asked about.
+    let (_cols, rows) = exec_rows(
+        &exec,
+        "SELECT ojl.id FROM ojl LEFT JOIN ojr ON ojl.id = ojr.id WHERE ojr.id IS NULL",
+    );
+    assert_eq!(
+        rows,
+        vec![vec!["2".to_string()]],
+        "qualified name on the missing side must be NULL, not the present side's value"
+    );
+
+    let (_cols, rows) = exec_rows(
+        &exec,
+        "SELECT ojl.id FROM ojl LEFT JOIN ojr ON ojl.id = ojr.id WHERE ojr.shared IS NULL",
+    );
+    assert_eq!(rows, vec![vec!["2".to_string()]]);
+
+    // A value predicate still picks the matched row.
+    let (_cols, rows) = exec_rows(
+        &exec,
+        "SELECT ojl.id FROM ojl LEFT JOIN ojr ON ojl.id = ojr.id WHERE ojr.shared = 30",
+    );
+    assert_eq!(rows, vec![vec!["1".to_string()]]);
+
+    // A predicate on the preserved side is unaffected.
+    let (_cols, rows) = exec_rows(
+        &exec,
+        "SELECT ojl.id FROM ojl LEFT JOIN ojr ON ojl.id = ojr.id WHERE ojl.shared = 20",
+    );
+    assert_eq!(rows, vec![vec!["2".to_string()]]);
+}
+
+/// The optimizer swaps the join operands to build the hash table from the
+/// smaller side. Swapping must keep the preserved table, so `small LEFT
+/// JOIN big` still returns small's rows.
+#[test]
+fn test_outer_join_preserves_side_after_reorder() {
+    let (_db, exec) = create_sql_env("ojorder");
+
+    exec_sql(&exec, "CREATE TABLE os (id INTEGER PRIMARY KEY, v INTEGER)");
+    exec_sql(&exec, "CREATE TABLE ob (id INTEGER PRIMARY KEY, v INTEGER)");
+    exec_sql(&exec, "INSERT INTO os (id, v) VALUES (1, 10)");
+    exec_sql(&exec, "INSERT INTO ob (id, v) VALUES (1, 20)");
+    exec_sql(&exec, "INSERT INTO ob (id, v) VALUES (2, 30)");
+
+    // os has one row, ob has two, so ob becomes the probe side. A LEFT JOIN
+    // must still preserve os, whose only row matches ob row 1.
+    let (_cols, rows) = exec_rows(&exec, "SELECT os.id FROM os LEFT JOIN ob ON os.id = ob.id");
+    assert_eq!(
+        rows,
+        vec![vec!["1".to_string()]],
+        "LEFT JOIN must preserve the left table after operand reorder"
+    );
+
+    // RIGHT JOIN preserves the right table regardless of which side is
+    // smaller. Here ob (2 rows) is the preserved side.
+    let (_cols, rows) = exec_rows(&exec, "SELECT ob.id FROM os RIGHT JOIN ob ON os.id = ob.id");
+    assert_eq!(
+        rows,
+        vec![vec!["1".to_string()], vec!["2".to_string()]],
+        "RIGHT JOIN must preserve the right table after operand reorder"
+    );
+}

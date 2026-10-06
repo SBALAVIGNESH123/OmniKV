@@ -233,7 +233,7 @@ impl PlanNode {
             Self::HashJoin { estimated_cost, .. } => *estimated_cost,
             Self::Filter { estimated_cost, .. } => *estimated_cost,
             Self::Project { child, .. } => child.estimated_cost(),
-            Self::Sort { child, .. } => child.estimated_cost(),
+            Self::Sort { estimated_cost, .. } => *estimated_cost,
             Self::Limit { child, .. } => child.estimated_cost(),
             Self::Aggregate { child, .. } => child.estimated_cost() * 1.2,
         }
@@ -572,14 +572,35 @@ impl Optimizer {
             } => {
                 // Each side only evaluates the conjuncts qualified to it;
                 // the rest ride above the join, where the combined row's
-                // qualified keys resolve them.
-                let left_pred = conjuncts_owned_by(where_clause, left);
-                let right_pred = conjuncts_owned_by(where_clause, right);
+                // qualified keys resolve them. On an outer join only the
+                // preserved side may keep its predicates: the other side's
+                // rows arrive NULL-filled, so a predicate like
+                // `r.x IS NULL` pushed into r's scan would delete the very
+                // rows it is asking about.
+                let (push_left, push_right) = match join_type {
+                    JoinType::Inner => (true, true),
+                    JoinType::Left => (true, false),
+                    JoinType::Right => (false, true),
+                };
+                let left_pred = if push_left {
+                    conjuncts_owned_by(where_clause, left)
+                } else {
+                    None
+                };
+                let right_pred = if push_right {
+                    conjuncts_owned_by(where_clause, right)
+                } else {
+                    None
+                };
                 let left_plan = self.plan_table_scan(left, left_pred.as_ref())?;
                 let right_plan = self.plan_table_scan(right, right_pred.as_ref())?;
 
-                // Cost-based join order: smaller table as build side (hash table)
-                let (build, probe, build_col, probe_col, build_table, probe_table) =
+                // Cost-based join order: smaller table as build side (hash
+                // table). The join iterator preserves the PROBE side's
+                // unmatched rows for a LEFT join and the BUILD side's for a
+                // RIGHT one, so swapping the operands must also swap the
+                // join type or the preserved table silently changes.
+                let (build, probe, build_col, probe_col, build_table, probe_table, join_type) =
                     if left_plan.estimated_rows() <= right_plan.estimated_rows() {
                         (
                             left_plan,
@@ -588,6 +609,7 @@ impl Optimizer {
                             on_right.clone(),
                             left.clone(),
                             right.clone(),
+                            Self::flip_outer_join(join_type),
                         )
                     } else {
                         (
@@ -597,6 +619,7 @@ impl Optimizer {
                             on_left.clone(),
                             right.clone(),
                             left.clone(),
+                            join_type.clone(),
                         )
                     };
 
@@ -611,7 +634,7 @@ impl Optimizer {
                 Ok(PlanNode::HashJoin {
                     left: Box::new(build),
                     right: Box::new(probe),
-                    join_type: join_type.clone(),
+                    join_type,
                     on_left_col: build_col,
                     on_right_col: probe_col,
                     left_table: build_table,
@@ -620,6 +643,16 @@ impl Optimizer {
                     estimated_cost: cost,
                 })
             }
+        }
+    }
+
+    /// Swap the preserved side of an outer join when the operands are
+    /// exchanged; an inner join is unchanged.
+    fn flip_outer_join(join_type: &JoinType) -> JoinType {
+        match join_type {
+            JoinType::Left => JoinType::Right,
+            JoinType::Right => JoinType::Left,
+            JoinType::Inner => JoinType::Inner,
         }
     }
 

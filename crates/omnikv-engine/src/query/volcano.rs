@@ -593,6 +593,21 @@ impl HashJoinIter {
     }
 }
 
+/// Store a row's columns under `table.` as well as the bare name.
+///
+/// An unmatched outer-join row would otherwise carry only bare keys, and a
+/// predicate naming the absent table would rebind to the present table's
+/// column of the same name. Carrying its own qualified keys keeps the
+/// binding and lets the missing side read as NULL.
+fn qualify_row(row: Row, prefix: &str) -> Row {
+    let mut out = Row::new();
+    for (k, v) in &row {
+        out.insert(k.clone(), v.clone());
+        out.insert(format!("{prefix}{k}"), v.clone());
+    }
+    out
+}
+
 impl RowIterator for HashJoinIter {
     fn next_row(&mut self) -> Option<Row> {
         loop {
@@ -622,7 +637,10 @@ impl RowIterator for HashJoinIter {
                     if matches!(self.join_type, JoinType::Right) {
                         for (key, rows) in &self.hash_table {
                             if !self.matched_build_keys.contains(key) {
-                                self.right_unmatched.extend(rows.iter().cloned());
+                                self.right_unmatched.extend(
+                                    rows.iter()
+                                        .map(|r| qualify_row(r.clone(), &self.build_prefix)),
+                                );
                             }
                         }
                     }
@@ -656,7 +674,7 @@ impl RowIterator for HashJoinIter {
                 None => {
                     match self.join_type {
                         JoinType::Left => {
-                            self.current_matches = vec![probe_row];
+                            self.current_matches = vec![qualify_row(probe_row, &self.probe_prefix)];
                             self.match_pos = 0;
                         }
                         _ => continue, // skip non-matching probe rows for INNER/RIGHT join
@@ -970,21 +988,25 @@ fn cmp_by_literal(row_val: &str, value: &SqlValue, cmp_val: &str) -> std::cmp::O
 ///
 /// Joins store each side under a `table.column` key as well as the bare
 /// name, so a qualified name binds to the table it names even when both
-/// sides share the column. A single-table row (or an unmatched outer-join
-/// row) only has the bare key, so that is the fallback. The qualifier is
-/// matched case-insensitively because table names are.
+/// sides share the column. On a join row, a qualified name that matches no
+/// key is the missing outer-join side and reads as NULL — it must not fall
+/// back to the bare key, which belongs to the present table. Only a
+/// bare-keyed single-table row falls back. The qualifier is matched
+/// case-insensitively because table names are.
 fn row_lookup<'a>(row: &'a Row, column: &str) -> Option<&'a String> {
     if let Some(v) = row.get(column) {
         return Some(v);
     }
     let (qual, bare) = column.split_once('.')?;
+    if !row.keys().any(|k| k.contains('.')) {
+        return row.get(bare);
+    }
     row.iter()
         .find(|(k, _)| {
             k.split_once('.')
                 .is_some_and(|(q, b)| q.eq_ignore_ascii_case(qual) && b == bare)
         })
         .map(|(_, v)| v)
-        .or_else(|| row.get(bare))
 }
 
 /// Resolve a predicate column to its declared type, mirroring [`row_lookup`]
@@ -994,6 +1016,9 @@ fn type_lookup<'a>(types: &'a ColumnTypeMap, column: &str) -> Option<&'a ColumnT
         return Some(t);
     }
     let (qual, bare) = column.split_once('.')?;
+    if !types.keys().any(|k| k.contains('.')) {
+        return types.get(bare);
+    }
     types
         .iter()
         .find(|(k, _)| {
@@ -1001,7 +1026,6 @@ fn type_lookup<'a>(types: &'a ColumnTypeMap, column: &str) -> Option<&'a ColumnT
                 .is_some_and(|(q, b)| q.eq_ignore_ascii_case(qual) && b == bare)
         })
         .map(|(_, v)| v)
-        .or_else(|| types.get(bare))
 }
 
 /// Evaluate a predicate, preserving SQL three-valued logic: `None` is
