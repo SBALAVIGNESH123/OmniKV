@@ -1106,9 +1106,10 @@ fn parse_where_atom(tokens: &[String], start: usize) -> Result<(WhereExpr, usize
         }
         (format!("{}({})", func, arg), j)
     } else {
-        let col = tokens[i].clone();
-        let name = col.split('.').next_back().unwrap_or(&col).to_string();
-        (name, i + 1)
+        // Keep a qualified name intact: `orders.id` must reach validation
+        // and evaluation still qualified, so a bogus qualifier is an error
+        // and the name binds to the right table on a column clash.
+        (tokens[i].clone(), i + 1)
     };
 
     if i < tokens.len() && tokens[i].to_uppercase() == "IS" {

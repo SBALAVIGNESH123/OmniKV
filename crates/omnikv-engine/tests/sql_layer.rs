@@ -1125,3 +1125,115 @@ fn test_update_delete_predicate_uses_column_type() {
         "only the row under 15 survives"
     );
 }
+
+/// A qualified WHERE name resolves against the table it names, even when
+/// both sides of a join share the column: `WHERE b.id = 2` must read B's
+/// `id`, not A's. A qualifier naming no FROM table is an error.
+#[test]
+fn test_qualified_where_column_binds_to_its_table() {
+    let (_db, exec) = create_sql_env("qualwhere");
+
+    exec_sql(
+        &exec,
+        "CREATE TABLE qa (id INTEGER PRIMARY KEY, shared INTEGER)",
+    );
+    exec_sql(
+        &exec,
+        "CREATE TABLE qb (id INTEGER PRIMARY KEY, shared INTEGER)",
+    );
+    exec_sql(&exec, "INSERT INTO qa (id, shared) VALUES (1, 10)");
+    exec_sql(&exec, "INSERT INTO qa (id, shared) VALUES (2, 40)");
+    exec_sql(&exec, "INSERT INTO qb (id, shared) VALUES (1, 20)");
+    exec_sql(&exec, "INSERT INTO qb (id, shared) VALUES (2, 30)");
+
+    // Unqualified `shared` resolves to the build side's value (10) — the
+    // reference behaviour the qualified lookups must not disturb.
+    let (_cols, rows) = exec_rows(&exec, "SELECT qb.id FROM qa JOIN qb ON qa.id = qb.id");
+    assert_eq!(
+        rows,
+        vec![vec!["1".to_string()], vec!["2".to_string()]],
+        "join returns both rows"
+    );
+
+    // Qualified predicate binds to the table it names: qb.shared = 30 is
+    // only true for qb row 2, never for the shared-10 build side.
+    let (_cols, rows) = exec_rows(
+        &exec,
+        "SELECT qb.id FROM qa JOIN qb ON qa.id = qb.id WHERE qb.shared = 30",
+    );
+    assert_eq!(
+        rows,
+        vec![vec!["2".to_string()]],
+        "qualified qb.shared must bind to qb, not the build side"
+    );
+
+    // The other side's qualifier works too: qa.shared = 10 matches only
+    // qa row 1, which joins to qb row 1.
+    let (_cols, rows) = exec_rows(
+        &exec,
+        "SELECT qb.id FROM qa JOIN qb ON qa.id = qb.id WHERE qa.shared = 10",
+    );
+    assert_eq!(rows, vec![vec!["1".to_string()]]);
+
+    // A qualifier naming no FROM table is rejected, not silently ignored.
+    let stmt = parse_sql("SELECT qb.id FROM qa JOIN qb ON qa.id = qb.id WHERE nope.shared = 30");
+    assert!(stmt.is_ok());
+    match exec.execute(&stmt.unwrap()) {
+        Err(e) => assert!(
+            e.contains("not in the FROM clause"),
+            "bogus qualifier must error, got: {e}"
+        ),
+        Ok(_) => panic!("bogus qualifier must be an error, not a silent match"),
+    }
+}
+
+/// A qualified name on a single-table statement still works and still
+/// compares by the column's affinity, while a wrong qualifier is rejected.
+#[test]
+fn test_qualified_where_single_table() {
+    let (_db, exec) = create_sql_env("qualsingle");
+
+    exec_sql(
+        &exec,
+        "CREATE TABLE st (id INTEGER PRIMARY KEY, Qty INTEGER)",
+    );
+    exec_sql(&exec, "INSERT INTO st (id, Qty) VALUES (1, 7)");
+    exec_sql(&exec, "INSERT INTO st (id, Qty) VALUES (2, 9)");
+
+    // Qualified name on its own table resolves and compares numerically:
+    // bound "007" equals integer 7.
+    let stmt = parse_sql("SELECT id FROM st WHERE st.Qty = $1").unwrap();
+    let stmt = bind_statement_params(stmt, &[Some("007".to_string())]).unwrap();
+    let (_cols, rows) = exec_rows_from_stmt(&exec, &stmt);
+    assert_eq!(
+        rows,
+        vec![vec!["1".to_string()]],
+        "qualified single-table predicate compares by affinity"
+    );
+
+    // A qualifier naming another table is an error on a single-table statement.
+    let stmt = parse_sql("SELECT id FROM st WHERE other.Qty = 7").unwrap();
+    match exec.execute(&stmt) {
+        Err(e) => assert!(
+            e.contains("not in the FROM clause"),
+            "wrong single-table qualifier must error, got: {e}"
+        ),
+        Ok(_) => panic!("wrong qualifier must be an error"),
+    }
+
+    // UPDATE/DELETE accept the qualified name too.
+    let stmt = parse_sql("UPDATE st SET Qty = 100 WHERE st.Qty = $1").unwrap();
+    let stmt = bind_statement_params(stmt, &[Some("009".to_string())]).unwrap();
+    match exec.execute(&stmt).unwrap() {
+        ExecResult::Modified { count, .. } => assert_eq!(count, 1, "qualified UPDATE matches"),
+        _ => panic!("Expected Modified result"),
+    }
+    let (_cols, rows) = exec_rows(&exec, "SELECT id, Qty FROM st ORDER BY id");
+    assert_eq!(
+        rows,
+        vec![
+            vec!["1".to_string(), "7".to_string()],
+            vec!["2".to_string(), "100".to_string()],
+        ]
+    );
+}

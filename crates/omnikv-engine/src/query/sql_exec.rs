@@ -941,9 +941,20 @@ impl SqlExecutor {
             .map(str::to_string)
             .collect();
         for col in extract_where_columns(where_clause) {
-            let bare = col.split('.').next_back().unwrap_or(&col);
-            if !cols.iter().any(|c| c == bare) {
-                return Err(format!("column \"{}\" does not exist", col));
+            // A qualified name must name THIS table: `WHERE other.col` on a
+            // single-table statement used to be stripped to `col` and
+            // silently accepted.
+            if let Some((qual, bare)) = col.split_once('.') {
+                if !qual.eq_ignore_ascii_case(table_name) {
+                    return Err(format!(
+                        "table \"{qual}\" is not in the FROM clause of this statement"
+                    ));
+                }
+                if !cols.iter().any(|c| c == bare) {
+                    return Err(format!("column \"{col}\" does not exist"));
+                }
+            } else if !cols.iter().any(|c| c == &col) {
+                return Err(format!("column \"{col}\" does not exist"));
             }
         }
         Ok(())
@@ -961,21 +972,44 @@ impl SqlExecutor {
             FromClause::Table(t) => vec![t.clone()],
             FromClause::Join { left, right, .. } => vec![left.clone(), right.clone()],
         };
+        // Columns grouped per table so a qualified name is checked against
+        // the table it actually names.
+        let mut per_table: Vec<(String, Vec<String>)> = Vec::new();
         let mut all_columns: Vec<String> = Vec::new();
         for t in &tables {
             let table = self
                 .catalog
                 .get_table(t)
                 .ok_or_else(|| format!("Table '{}' does not exist", t))?;
-            all_columns.extend(table.column_names().into_iter().map(str::to_string));
+            let names: Vec<String> = table
+                .column_names()
+                .into_iter()
+                .map(str::to_string)
+                .collect();
+            all_columns.extend(names.iter().cloned());
+            per_table.push((t.clone(), names));
         }
         for col in extract_where_columns(where_clause) {
-            let bare = col.split('.').next_back().unwrap_or(&col);
-            // Match the row-map lookup, which is exact-case: a
-            // case-insensitive pass here would let a name through that the
-            // lookup then silently fails to find.
-            if !all_columns.iter().any(|c| c == bare) {
-                return Err(format!("column \"{}\" does not exist", col));
+            if let Some((qual, bare)) = col.split_once('.') {
+                match per_table.iter().find(|(t, _)| t.eq_ignore_ascii_case(qual)) {
+                    Some((_, cols)) => {
+                        if !cols.iter().any(|c| c == bare) {
+                            return Err(format!("column \"{col}\" does not exist"));
+                        }
+                    }
+                    None => {
+                        return Err(format!(
+                            "table \"{qual}\" is not in the FROM clause of this statement"
+                        ));
+                    }
+                }
+            } else {
+                // Match the row-map lookup, which is exact-case: a
+                // case-insensitive pass here would let a name through that the
+                // lookup then silently fails to find.
+                if !all_columns.iter().any(|c| c == &col) {
+                    return Err(format!("column \"{col}\" does not exist"));
+                }
             }
         }
         Ok(())
@@ -1031,7 +1065,25 @@ impl SqlExecutor {
         };
 
         if let Some(expr) = where_clause {
-            rows.retain(|row| eval_where(row, expr));
+            // Predicates compare by the column's affinity, and a qualified
+            // name resolves through the `table.column` key the join stores.
+            let from_tables: Vec<String> = match from {
+                FromClause::Table(t) => vec![t.clone()],
+                FromClause::Join { left, right, .. } => vec![left.clone(), right.clone()],
+            };
+            let mut col_types = crate::volcano::ColumnTypeMap::new();
+            for t in &from_tables {
+                if let Some(table) = self.catalog.get_table(t) {
+                    for c in &table.columns {
+                        // Left wins a bare-key clash, matching execute_join.
+                        col_types
+                            .entry(c.name.clone())
+                            .or_insert(c.col_type.clone());
+                        col_types.insert(format!("{t}.{}", c.name), c.col_type.clone());
+                    }
+                }
+            }
+            rows.retain(|row| eval_where_typed(row, expr, &col_types));
         }
 
         if !group_by.is_empty() {
@@ -1296,11 +1348,7 @@ impl SqlExecutor {
         let mut rows = self.load_table_rows(&table);
 
         if let Some(expr) = where_clause {
-            let col_types = table
-                .columns
-                .iter()
-                .map(|c| (c.name.clone(), c.col_type.clone()))
-                .collect::<crate::volcano::ColumnTypeMap>();
+            let col_types = column_types_of_table(&table);
             rows.retain(|row| eval_where_typed(row, expr, &col_types));
         }
 
@@ -1345,11 +1393,7 @@ impl SqlExecutor {
         let mut rows = self.load_table_rows(&table);
 
         if let Some(expr) = where_clause {
-            let col_types = table
-                .columns
-                .iter()
-                .map(|c| (c.name.clone(), c.col_type.clone()))
-                .collect::<crate::volcano::ColumnTypeMap>();
+            let col_types = column_types_of_table(&table);
             rows.retain(|row| eval_where_typed(row, expr, &col_types));
         }
 
@@ -1369,6 +1413,18 @@ impl SqlExecutor {
             command: format!("DELETE {}", count),
         })
     }
+}
+
+/// A table's column types keyed by both bare and qualified name, so a
+/// `WHERE t.col` predicate compares by the column's affinity rather than
+/// the literal's shape.
+fn column_types_of_table(table: &TableDef) -> crate::volcano::ColumnTypeMap {
+    let mut map = crate::volcano::ColumnTypeMap::new();
+    for c in &table.columns {
+        map.insert(c.name.clone(), c.col_type.clone());
+        map.insert(format!("{}.{}", table.name, c.name), c.col_type.clone());
+    }
+    map
 }
 
 fn eval_where(row: &Row, expr: &WhereExpr) -> bool {

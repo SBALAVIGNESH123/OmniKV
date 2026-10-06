@@ -546,7 +546,10 @@ pub struct HashJoinIter {
     // Probe columns are also stored qualified so a name shared with the
     // build side survives the merge.
     probe_prefix: String,
-    // Buffer for multiple matches on a single probe row
+    // The build side's own qualifier, so it is stored `table.column` too
+    // and a qualified predicate binds to the right table on either side.
+    build_prefix: String,
+    // Buffer for multiple matches on the join
     current_matches: Vec<Row>,
     match_pos: usize,
     // For RIGHT JOIN: track which build keys were matched
@@ -563,6 +566,7 @@ impl HashJoinIter {
         build_col: String,
         probe_col: String,
         join_type: JoinType,
+        build_table: &str,
         probe_table: &str,
     ) -> Self {
         // Build phase: materialize build side into hash table
@@ -578,6 +582,7 @@ impl HashJoinIter {
             probe_col,
             join_type,
             probe_prefix: format!("{probe_table}."),
+            build_prefix: format!("{build_table}."),
             current_matches: Vec::new(),
             match_pos: 0,
             matched_build_keys: std::collections::HashSet::new(),
@@ -638,6 +643,7 @@ impl RowIterator for HashJoinIter {
                         let mut combined = Row::new();
                         for (k, v) in build_row {
                             combined.insert(k.clone(), v.clone());
+                            combined.insert(format!("{}{k}", self.build_prefix), v.clone());
                         }
                         for (k, v) in &probe_row {
                             // Also store it qualified so a shared name isn't dropped.
@@ -859,6 +865,7 @@ pub fn compile_plan_with_scan(
             join_type,
             on_left_col,
             on_right_col,
+            left_table,
             right_table,
             ..
         } => {
@@ -870,6 +877,7 @@ pub fn compile_plan_with_scan(
                 on_left_col.clone(),
                 on_right_col.clone(),
                 join_type.clone(),
+                left_table,
                 right_table,
             ))
         }
@@ -877,7 +885,12 @@ pub fn compile_plan_with_scan(
             child, predicate, ..
         } => {
             let child_iter = compile_plan_with_scan(child, db, catalog, scan);
-            Box::new(FilterIter::new(child_iter, predicate.clone()))
+            let col_types = child.output_types(catalog);
+            Box::new(FilterIter::with_types(
+                child_iter,
+                predicate.clone(),
+                col_types,
+            ))
         }
         PlanNode::Project { child, columns } => {
             let child_iter = compile_plan_with_scan(child, db, catalog, scan);
@@ -953,6 +966,44 @@ fn cmp_by_literal(row_val: &str, value: &SqlValue, cmp_val: &str) -> std::cmp::O
     }
 }
 
+/// Resolve a predicate column to a row value.
+///
+/// Joins store each side under a `table.column` key as well as the bare
+/// name, so a qualified name binds to the table it names even when both
+/// sides share the column. A single-table row (or an unmatched outer-join
+/// row) only has the bare key, so that is the fallback. The qualifier is
+/// matched case-insensitively because table names are.
+fn row_lookup<'a>(row: &'a Row, column: &str) -> Option<&'a String> {
+    if let Some(v) = row.get(column) {
+        return Some(v);
+    }
+    let (qual, bare) = column.split_once('.')?;
+    row.iter()
+        .find(|(k, _)| {
+            k.split_once('.')
+                .is_some_and(|(q, b)| q.eq_ignore_ascii_case(qual) && b == bare)
+        })
+        .map(|(_, v)| v)
+        .or_else(|| row.get(bare))
+}
+
+/// Resolve a predicate column to its declared type, mirroring [`row_lookup`]
+/// so a qualified predicate compares by the named column's affinity.
+fn type_lookup<'a>(types: &'a ColumnTypeMap, column: &str) -> Option<&'a ColumnType> {
+    if let Some(t) = types.get(column) {
+        return Some(t);
+    }
+    let (qual, bare) = column.split_once('.')?;
+    types
+        .iter()
+        .find(|(k, _)| {
+            k.split_once('.')
+                .is_some_and(|(q, b)| q.eq_ignore_ascii_case(qual) && b == bare)
+        })
+        .map(|(_, v)| v)
+        .or_else(|| types.get(bare))
+}
+
 /// Evaluate a predicate, preserving SQL three-valued logic: `None` is
 /// UNKNOWN, which never selects a row and survives `NOT` unchanged.
 fn eval_tri(row: &Row, expr: &WhereExpr, types: &ColumnTypeMap) -> Option<bool> {
@@ -964,12 +1015,12 @@ fn eval_tri(row: &Row, expr: &WhereExpr, types: &ColumnTypeMap) -> Option<bool> 
                 return None;
             }
             // A missing key is NULL, never "".
-            let row_val = row.get(column)?;
+            let row_val = row_lookup(row, column)?;
             if row_val.as_str() == "NULL" {
                 return None;
             }
             let cmp_val = value.as_string();
-            let col_type = types.get(column);
+            let col_type = type_lookup(types, column);
             let ord = cmp_by_affinity(row_val, value, &cmp_val, col_type);
             Some(match op {
                 CmpOp::Eq => ord == std::cmp::Ordering::Equal,
@@ -991,14 +1042,14 @@ fn eval_tri(row: &Row, expr: &WhereExpr, types: &ColumnTypeMap) -> Option<bool> 
         WhereExpr::And(a, b) => and_tri(eval_tri(row, a, types), eval_tri(row, b, types)),
         WhereExpr::Or(a, b) => or_tri(eval_tri(row, a, types), eval_tri(row, b, types)),
         WhereExpr::Not(inner) => eval_tri(row, inner, types).map(std::ops::Not::not),
-        WhereExpr::IsNull(col) => Some(row.get(col).is_none_or(|v| v == "NULL")),
-        WhereExpr::IsNotNull(col) => Some(row.get(col).is_some_and(|v| v != "NULL")),
+        WhereExpr::IsNull(col) => Some(row_lookup(row, col).is_none_or(|v| v == "NULL")),
+        WhereExpr::IsNotNull(col) => Some(row_lookup(row, col).is_some_and(|v| v != "NULL")),
         WhereExpr::In(col, vals) => {
-            let row_val = row.get(col)?;
+            let row_val = row_lookup(row, col)?;
             if row_val.as_str() == "NULL" {
                 return None;
             }
-            let col_type = types.get(col);
+            let col_type = type_lookup(types, col);
             Some(vals.iter().any(|v| {
                 cmp_by_affinity(row_val, v, &v.as_string(), col_type) == std::cmp::Ordering::Equal
             }))

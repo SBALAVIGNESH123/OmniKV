@@ -15,6 +15,7 @@ use crate::sql::{
     CmpOp, FromClause, JoinType, OrderByItem, SelectColumn, SqlStatement, SqlValue, WhereExpr,
     parse_sql,
 };
+use crate::volcano::ColumnTypeMap;
 use std::fmt;
 use std::sync::Arc;
 
@@ -232,9 +233,47 @@ impl PlanNode {
             Self::HashJoin { estimated_cost, .. } => *estimated_cost,
             Self::Filter { estimated_cost, .. } => *estimated_cost,
             Self::Project { child, .. } => child.estimated_cost(),
-            Self::Sort { estimated_cost, .. } => *estimated_cost,
+            Self::Sort { child, .. } => child.estimated_cost(),
             Self::Limit { child, .. } => child.estimated_cost(),
             Self::Aggregate { child, .. } => child.estimated_cost() * 1.2,
+        }
+    }
+
+    /// The column types this plan produces, keyed by both the bare name and
+    /// `table.column`, so a predicate above a join compares by the column's
+    /// affinity and a qualified name resolves to the table it names.
+    pub fn output_types(&self, catalog: &Arc<Catalog>) -> ColumnTypeMap {
+        let mut map = ColumnTypeMap::new();
+        self.collect_types(catalog, &mut map);
+        map
+    }
+
+    fn collect_types(&self, catalog: &Arc<Catalog>, map: &mut ColumnTypeMap) {
+        match self {
+            Self::Scan { table, .. } => {
+                let Some(table) = catalog.get_table(table) else {
+                    return;
+                };
+                for c in &table.columns {
+                    // A bare clash keeps the leftmost (build) table's type,
+                    // matching the row key the bare name resolves to.
+                    map.entry(c.name.clone()).or_insert(c.col_type.clone());
+                    map.insert(format!("{}.{}", table.name, c.name), c.col_type.clone());
+                }
+            }
+            Self::HashJoin { left, right, .. } => {
+                left.collect_types(catalog, map);
+                right.collect_types(catalog, map);
+            }
+            Self::Filter { child, .. }
+            | Self::Project { child, .. }
+            | Self::Sort { child, .. }
+            | Self::Limit { child, .. } => {
+                child.collect_types(catalog, map);
+            }
+            // Aggregates replace the row's shape; a predicate above one is
+            // HAVING and is filtered by the executor, not here.
+            Self::Aggregate { .. } => {}
         }
     }
 }
@@ -262,7 +301,7 @@ pub fn estimate_selectivity_with_stats(expr: &WhereExpr, stats: Option<&TableSta
         WhereExpr::Comparison { column, op, .. } => {
             // Use histogram NDV if available
             if let Some(st) = stats
-                && let Some(ndv) = st.ndv(column)
+                && let Some(ndv) = st.ndv(bare_name(column))
                 && ndv > 0
             {
                 return match op {
@@ -297,7 +336,7 @@ pub fn estimate_selectivity_with_stats(expr: &WhereExpr, stats: Option<&TableSta
                 && let Some(h) = st
                     .histograms
                     .iter()
-                    .find(|h| h.column.eq_ignore_ascii_case(col))
+                    .find(|h| h.column.eq_ignore_ascii_case(bare_name(col)))
             {
                 return h.null_fraction;
             }
@@ -308,7 +347,7 @@ pub fn estimate_selectivity_with_stats(expr: &WhereExpr, stats: Option<&TableSta
                 && let Some(h) = st
                     .histograms
                     .iter()
-                    .find(|h| h.column.eq_ignore_ascii_case(col))
+                    .find(|h| h.column.eq_ignore_ascii_case(bare_name(col)))
             {
                 return 1.0 - h.null_fraction;
             }
@@ -319,10 +358,15 @@ pub fn estimate_selectivity_with_stats(expr: &WhereExpr, stats: Option<&TableSta
     }
 }
 
-// ─── Predicate Pushdown ─────────────────────────────────────────────────────
+// ─── Column Extraction (for pruning) ────────────────────────────────────────
+
+/// The column name without its `table.` qualifier.
+fn bare_name(col: &str) -> &str {
+    col.rsplit('.').next().unwrap_or(col)
+}
 
 /// Split a WHERE clause into conjuncts (AND-separated predicates).
-pub fn split_conjuncts(expr: &WhereExpr) -> Vec<WhereExpr> {
+fn split_conjuncts(expr: &WhereExpr) -> Vec<WhereExpr> {
     match expr {
         WhereExpr::And(a, b) => {
             let mut parts = split_conjuncts(a);
@@ -334,7 +378,7 @@ pub fn split_conjuncts(expr: &WhereExpr) -> Vec<WhereExpr> {
 }
 
 /// Rebuild a WHERE from conjuncts (ANDs them back together).
-pub fn conjuncts_to_expr(parts: &[WhereExpr]) -> Option<WhereExpr> {
+fn conjuncts_to_expr(parts: &[WhereExpr]) -> Option<WhereExpr> {
     if parts.is_empty() {
         return None;
     }
@@ -345,62 +389,25 @@ pub fn conjuncts_to_expr(parts: &[WhereExpr]) -> Option<WhereExpr> {
     Some(result)
 }
 
-/// Classify which table(s) a predicate references.
-fn predicate_tables(expr: &WhereExpr) -> Vec<String> {
-    let cols = extract_where_columns(Some(expr));
-    cols.into_iter()
-        .filter_map(|c| {
-            if c.contains('.') {
-                Some(c.split('.').next().unwrap().to_string())
-            } else {
-                None
-            }
+/// The conjuncts of `where_clause` that a scan of `table` may evaluate
+/// safely: every column is qualified to `table`. Unqualified conjuncts are
+/// ambiguous across the join, so they ride above it and the combined row's
+/// keys pick the binding there.
+fn conjuncts_owned_by(where_clause: Option<&WhereExpr>, table: &str) -> Option<WhereExpr> {
+    let expr = where_clause?;
+    let owned = split_conjuncts(expr)
+        .into_iter()
+        .filter(|pred| {
+            let cols = extract_where_columns(Some(pred));
+            !cols.is_empty()
+                && cols.iter().all(|c| {
+                    c.split_once('.')
+                        .is_some_and(|(qual, _)| qual.eq_ignore_ascii_case(table))
+                })
         })
-        .collect()
+        .collect::<Vec<_>>();
+    conjuncts_to_expr(&owned)
 }
-
-/// Push predicates down into join sides.
-/// Returns (left_preds, right_preds, remaining_preds).
-pub fn pushdown_join_predicates(
-    where_clause: Option<&WhereExpr>,
-    left_table: &str,
-    right_table: &str,
-) -> (Option<WhereExpr>, Option<WhereExpr>, Option<WhereExpr>) {
-    let expr = match where_clause {
-        Some(e) => e,
-        None => return (None, None, None),
-    };
-
-    let conjuncts = split_conjuncts(expr);
-    let mut left_preds = Vec::new();
-    let mut right_preds = Vec::new();
-    let mut remaining = Vec::new();
-
-    for pred in conjuncts {
-        let tables = predicate_tables(&pred);
-        let _cols = extract_where_columns(Some(&pred));
-
-        if tables.iter().all(|t| t.eq_ignore_ascii_case(left_table)) {
-            left_preds.push(pred);
-        } else if tables.iter().all(|t| t.eq_ignore_ascii_case(right_table)) {
-            right_preds.push(pred);
-        } else if tables.is_empty() {
-            // Unqualified column — try to match by checking column names
-            // Push to both sides (will be a no-op on the wrong side)
-            remaining.push(pred);
-        } else {
-            remaining.push(pred);
-        }
-    }
-
-    (
-        conjuncts_to_expr(&left_preds),
-        conjuncts_to_expr(&right_preds),
-        conjuncts_to_expr(&remaining),
-    )
-}
-
-// ─── Column Extraction (for pruning) ────────────────────────────────────────
 
 /// Extract all column names needed by a SELECT query.
 pub fn extract_needed_columns(
@@ -563,8 +570,13 @@ impl Optimizer {
                 on_left,
                 on_right,
             } => {
-                let left_plan = self.plan_table_scan(left, where_clause)?;
-                let right_plan = self.plan_table_scan(right, None)?;
+                // Each side only evaluates the conjuncts qualified to it;
+                // the rest ride above the join, where the combined row's
+                // qualified keys resolve them.
+                let left_pred = conjuncts_owned_by(where_clause, left);
+                let right_pred = conjuncts_owned_by(where_clause, right);
+                let left_plan = self.plan_table_scan(left, left_pred.as_ref())?;
+                let right_plan = self.plan_table_scan(right, right_pred.as_ref())?;
 
                 // Cost-based join order: smaller table as build side (hash table)
                 let (build, probe, build_col, probe_col, build_table, probe_table) =
@@ -676,8 +688,13 @@ impl Optimizer {
                 op: CmpOp::Eq,
                 value,
             } => {
-                // Heuristic: if column is "id" it's likely the PK
-                if column.eq_ignore_ascii_case("id") {
+                // Heuristic: a bare "id" is likely the PK. A qualified name
+                // must name this table to claim the lookup.
+                let qualifies = match column.split_once('.') {
+                    Some((qual, _)) => qual.eq_ignore_ascii_case(_table_name),
+                    None => true,
+                };
+                if qualifies && bare_name(column).eq_ignore_ascii_case("id") {
                     Some(value.as_string())
                 } else {
                     None
@@ -693,7 +710,12 @@ impl Optimizer {
     /// Find the best index for a WHERE predicate.
     fn find_best_index(&self, table_name: &str, expr: &WhereExpr) -> Option<IndexDefinition> {
         let stats = self.stats.get(table_name)?;
-        let columns_used = extract_where_columns(Some(expr));
+        // Index fields are bare column names, so match the predicate's bare
+        // components whether or not they are qualified.
+        let columns_used = extract_where_columns(Some(expr))
+            .into_iter()
+            .map(|c| bare_name(&c).to_string())
+            .collect::<Vec<_>>();
 
         // Score each index by how many of its fields match the WHERE columns
         let mut best: Option<(IndexDefinition, usize)> = None;
