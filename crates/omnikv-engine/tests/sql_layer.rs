@@ -787,6 +787,21 @@ fn test_star_on_join_keeps_both_tables_columns() {
     );
 }
 
+/// `SELECT *` alongside a window function must still emit the window column,
+/// which is written under a bare key after the plan runs.
+#[test]
+fn test_star_with_window_function_keeps_window_column() {
+    let (_db, exec) = create_sql_env("starwin");
+
+    exec_sql(&exec, "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)");
+    exec_sql(&exec, "INSERT INTO t (id, name) VALUES (1, 'a')");
+    exec_sql(&exec, "INSERT INTO t (id, name) VALUES (2, 'b')");
+
+    let (cols, rows) = exec_rows(&exec, "SELECT *, ROW_NUMBER() OVER (ORDER BY id) FROM t");
+    assert_eq!(cols, vec!["id", "name", "row_number"]);
+    assert_eq!(rows, vec![vec!["1", "a", "1"], vec!["2", "b", "2"],]);
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Tokenizer, operator, and join regressions
 // ═══════════════════════════════════════════════════════════════════════════

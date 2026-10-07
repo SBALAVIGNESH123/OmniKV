@@ -1330,20 +1330,32 @@ impl SqlExecutor {
             // instead of collapsing two same-named ones into a single
             // bare key.
             let mut names: Vec<String> = Vec::new();
-            let mut qualified: Vec<String> = Vec::new();
+            let mut keys: Vec<String> = Vec::new();
             for (table, cols) in &self.columns_per_table(from)? {
                 for col in cols {
                     names.push(col.clone());
-                    qualified.push(format!("{table}.{col}"));
+                    keys.push(format!("{table}.{col}"));
+                }
+            }
+            // Window functions write their result under a bare key after the
+            // plan runs, so they follow the table columns.
+            for col in columns {
+                if let SelectColumn::WindowFunc { func, .. } = col {
+                    let name = match func {
+                        WindowFuncType::RowNumber => "row_number",
+                        WindowFuncType::Rank => "rank",
+                        WindowFuncType::DenseRank => "dense_rank",
+                    };
+                    names.push(name.to_string());
+                    keys.push(name.to_string());
                 }
             }
             let result: Vec<Vec<String>> = rows
                 .iter()
                 .map(|r| {
-                    qualified
-                        .iter()
-                        .map(|q| {
-                            crate::volcano::row_lookup(r, q)
+                    keys.iter()
+                        .map(|k| {
+                            crate::volcano::row_lookup(r, k)
                                 .cloned()
                                 .unwrap_or_else(|| "NULL".into())
                         })
