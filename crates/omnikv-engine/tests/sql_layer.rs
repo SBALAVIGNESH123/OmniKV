@@ -666,11 +666,11 @@ fn test_pk_lookup_still_filters_other_predicates() {
         "city predicate must be evaluated: {rows:?}"
     );
 
-    // SELECT * orders columns by key.
+    // SELECT * emits columns in declared order.
     let (_cols, rows) = exec_rows(&exec, "SELECT * FROM users WHERE id = 2");
     assert_eq!(
         rows,
-        vec![vec!["LA".to_string(), "2".to_string(), "Bob".to_string()]]
+        vec![vec!["2".to_string(), "Bob".to_string(), "LA".to_string()]]
     );
 }
 
@@ -693,9 +693,9 @@ fn test_pk_lookup_ignores_column_just_named_id() {
         "a non-key column named 'id' must not trigger a key lookup: {rows:?}"
     );
 
-    // SELECT * orders columns by key.
+    // SELECT * emits columns in declared order.
     let (_cols, rows) = exec_rows(&exec, "SELECT * FROM o WHERE order_no = 'K2'");
-    assert_eq!(rows, vec![vec!["99".to_string(), "K2".to_string()]]);
+    assert_eq!(rows, vec![vec!["K2".to_string(), "99".to_string()]]);
 }
 
 /// Writes store under the column's declared name and reject unknown columns.
@@ -732,6 +732,59 @@ fn test_write_resolves_declared_column_name() {
 
     let (_cols, rows) = exec_rows(&exec, "SELECT * FROM t");
     assert_eq!(rows, vec![vec!["1".to_string(), "Bob".to_string()]]);
+}
+
+/// UPDATE must reject an unknown SET column even when no rows match, so the
+/// error does not depend on the WHERE clause finding a row.
+#[test]
+fn test_update_rejects_unknown_column_without_match() {
+    let (_db, exec) = create_sql_env("updnm");
+
+    exec_sql(&exec, "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)");
+    exec_sql(&exec, "INSERT INTO t (id, name) VALUES (1, 'Alice')");
+
+    let stmt = parse_sql("UPDATE t SET nope = 'x' WHERE id = 999").unwrap();
+    let Err(err) = exec.execute(&stmt) else {
+        panic!("UPDATE with unknown column must error even with no matches");
+    };
+    assert!(err.contains("does not exist"), "UPDATE error: {err}");
+
+    // A known column with no matching rows is still a no-op, not an error.
+    exec_sql(&exec, "UPDATE t SET name = 'Bob' WHERE id = 999");
+    let (_cols, rows) = exec_rows(&exec, "SELECT name FROM t");
+    assert_eq!(rows, vec![vec!["Alice".to_string()]]);
+}
+
+/// `SELECT *` on a join emits every column of both tables in FROM order, so
+/// two same-named columns appear as two columns rather than collapsing into
+/// one bare key.
+#[test]
+fn test_star_on_join_keeps_both_tables_columns() {
+    let (_db, exec) = create_sql_env("starjoin");
+
+    exec_sql(&exec, "CREATE TABLE a (id INTEGER PRIMARY KEY, name TEXT)");
+    exec_sql(
+        &exec,
+        "CREATE TABLE b (id INTEGER PRIMARY KEY, name TEXT, v INTEGER)",
+    );
+    exec_sql(&exec, "INSERT INTO a (id, name) VALUES (1, 'a1')");
+    exec_sql(&exec, "INSERT INTO b (id, name, v) VALUES (1, 'b1', 7)");
+
+    let (cols, rows) = exec_rows(&exec, "SELECT * FROM a JOIN b ON a.id = b.id");
+    assert_eq!(cols, vec!["id", "name", "id", "name", "v"]);
+    assert_eq!(rows, vec![vec!["1", "a1", "1", "b1", "7"]]);
+
+    // A LEFT JOIN keeps the shape, with the missing side read as NULL.
+    exec_sql(&exec, "INSERT INTO a (id, name) VALUES (2, 'a2')");
+    let (cols, rows) = exec_rows(&exec, "SELECT * FROM a LEFT JOIN b ON a.id = b.id");
+    assert_eq!(cols, vec!["id", "name", "id", "name", "v"]);
+    assert_eq!(
+        rows,
+        vec![
+            vec!["1", "a1", "1", "b1", "7"],
+            vec!["2", "a2", "NULL", "NULL", "NULL"],
+        ]
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

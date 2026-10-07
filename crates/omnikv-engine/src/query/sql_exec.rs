@@ -783,7 +783,7 @@ impl SqlExecutor {
                     self.apply_window_functions(&mut rows, columns);
                 }
 
-                let (col_names, mut result_rows) = self.project(&rows, columns)?;
+                let (col_names, mut result_rows) = self.project(&rows, columns, from)?;
 
                 // OFFSET: skip first N rows, then re-apply original LIMIT
                 if let Some(off) = offset {
@@ -1177,7 +1177,7 @@ impl SqlExecutor {
             rows.truncate(lim);
         }
 
-        let (col_names, result_rows) = self.project(&rows, columns)?;
+        let (col_names, result_rows) = self.project(&rows, columns, from)?;
         Ok(ExecResult::Rows {
             columns: col_names,
             rows: result_rows,
@@ -1318,23 +1318,35 @@ impl SqlExecutor {
         &self,
         rows: &[Row],
         columns: &[SelectColumn],
+        from: &FromClause,
     ) -> Result<(Vec<String>, Vec<Vec<String>>), String> {
         if columns.iter().any(|c| matches!(c, SelectColumn::Star)) {
             if rows.is_empty() {
                 return Ok((vec![], vec![]));
             }
-            let mut names: Vec<String> = rows[0]
-                .keys()
-                .filter(|k| !k.contains('.'))
-                .cloned()
-                .collect();
-            names.sort();
+            // Expand per table in FROM order, reading each column by its
+            // qualified key. A join row carries both tables under
+            // `table.column`, so this emits every column of both tables
+            // instead of collapsing two same-named ones into a single
+            // bare key.
+            let mut names: Vec<String> = Vec::new();
+            let mut qualified: Vec<String> = Vec::new();
+            for (table, cols) in &self.columns_per_table(from)? {
+                for col in cols {
+                    names.push(col.clone());
+                    qualified.push(format!("{table}.{col}"));
+                }
+            }
             let result: Vec<Vec<String>> = rows
                 .iter()
                 .map(|r| {
-                    names
+                    qualified
                         .iter()
-                        .map(|n| r.get(n).cloned().unwrap_or("NULL".into()))
+                        .map(|q| {
+                            crate::volcano::row_lookup(r, q)
+                                .cloned()
+                                .unwrap_or_else(|| "NULL".into())
+                        })
                         .collect()
                 })
                 .collect();
@@ -1410,6 +1422,13 @@ impl SqlExecutor {
             .ok_or_else(|| format!("Table '{}' not found", table_name))?;
         self.record_catalog_read(table_name);
         self.validate_where_columns_of(table_name, where_clause)?;
+        // Validate the assignments before filtering: a statement that
+        // matches no rows would otherwise skip the loop and silently accept
+        // an unknown column.
+        let assignments: Vec<(&str, &SqlValue)> = assignments
+            .iter()
+            .map(|(col, val)| Ok((resolve_column_name(&table, col)?, val)))
+            .collect::<Result<_, String>>()?;
         let mut rows = self.load_table_rows(&table);
 
         if let Some(expr) = where_clause {
@@ -1420,16 +1439,14 @@ impl SqlExecutor {
         let mut batch = WriteBatch::new();
         let count = rows.len();
         for row in &mut rows {
-            for (col, val) in assignments {
-                // Store under the declared name; the caller's case may differ.
-                let resolved = resolve_column_name(&table, col)?;
+            for (resolved, val) in &assignments {
                 let stored = table
                     .columns
                     .iter()
-                    .find(|c| c.name == resolved)
+                    .find(|c| c.name == *resolved)
                     .map(|c| c.col_type.canonicalize(&val.as_string()))
                     .unwrap_or_else(|| val.as_string());
-                row.insert(resolved.to_string(), stored);
+                row.insert((*resolved).to_string(), stored);
             }
             let pk = row.get(&table.primary_key).cloned().unwrap_or_default();
             let key = format!("{}{}", table.row_prefix(), pk);

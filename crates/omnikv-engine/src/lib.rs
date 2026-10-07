@@ -40,7 +40,6 @@
     clippy::redundant_clone,
     clippy::redundant_closure_for_method_calls,
     clippy::redundant_else,
-    clippy::self_only_used_in_recursion,
     clippy::semicolon_if_nothing_returned,
     clippy::significant_drop_tightening,
     clippy::single_char_pattern,
