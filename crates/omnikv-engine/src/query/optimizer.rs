@@ -38,6 +38,9 @@ pub struct TableStats {
     pub avg_row_bytes: u64,
     pub indexes: Vec<IndexDefinition>,
     pub histograms: Vec<ColumnHistogram>,
+    /// Declared primary key; decides whether an equality predicate can be
+    /// answered by a single-row key lookup.
+    pub primary_key: String,
 }
 
 impl TableStats {
@@ -142,6 +145,7 @@ pub fn gather_stats(
                     avg_row_bytes,
                     indexes,
                     histograms,
+                    primary_key: table.primary_key.clone(),
                 },
             );
         }
@@ -668,10 +672,12 @@ impl Optimizer {
         // Check for primary key equality lookup
         if let Some(expr) = where_clause {
             if let Some(pk_val) = self.extract_pk_lookup(table_name, expr) {
+                // The fetched row still has to satisfy the rest of the
+                // predicate.
                 return Ok(PlanNode::Scan {
                     table: table_name.to_string(),
                     access: AccessMethod::PkLookup { key_value: pk_val },
-                    filter: None,
+                    filter: Some(expr.clone()),
                     estimated_rows: 1,
                     estimated_cost: PK_LOOKUP_COST,
                 });
@@ -714,28 +720,30 @@ impl Optimizer {
     }
 
     /// Check if WHERE has an equality on the table's primary key.
-    fn extract_pk_lookup(&self, _table_name: &str, expr: &WhereExpr) -> Option<String> {
+    ///
+    /// Only the declared key qualifies — a column named `id` need not be it.
+    fn extract_pk_lookup(&self, table_name: &str, expr: &WhereExpr) -> Option<String> {
+        let pk = self.stats.get(table_name)?.primary_key.clone();
         match expr {
             WhereExpr::Comparison {
                 column,
                 op: CmpOp::Eq,
                 value,
             } => {
-                // Heuristic: a bare "id" is likely the PK. A qualified name
-                // must name this table to claim the lookup.
+                // A qualified name must name this table to claim the lookup.
                 let qualifies = match column.split_once('.') {
-                    Some((qual, _)) => qual.eq_ignore_ascii_case(_table_name),
+                    Some((qual, _)) => qual.eq_ignore_ascii_case(table_name),
                     None => true,
                 };
-                if qualifies && bare_name(column).eq_ignore_ascii_case("id") {
+                if qualifies && bare_name(column).eq_ignore_ascii_case(&pk) {
                     Some(value.as_string())
                 } else {
                     None
                 }
             }
             WhereExpr::And(a, b) => self
-                .extract_pk_lookup(_table_name, a)
-                .or_else(|| self.extract_pk_lookup(_table_name, b)),
+                .extract_pk_lookup(table_name, a)
+                .or_else(|| self.extract_pk_lookup(table_name, b)),
             _ => None,
         }
     }
@@ -930,6 +938,7 @@ mod tests {
                 avg_row_bytes: 256,
                 indexes: vec![],
                 histograms: vec![],
+                primary_key: "id".into(),
             },
         );
         m.insert(
@@ -940,6 +949,7 @@ mod tests {
                 avg_row_bytes: 128,
                 indexes: vec![],
                 histograms: vec![],
+                primary_key: "id".into(),
             },
         );
         m
@@ -963,6 +973,49 @@ mod tests {
         let plan = opt.optimize(&stmt).unwrap();
         let display = format!("{}", plan);
         assert!(display.contains("PK Lookup"));
+    }
+
+    /// A PK lookup keeps the predicates it does not answer as a scan filter.
+    #[test]
+    fn test_pk_lookup_keeps_other_predicates() {
+        let opt = Optimizer::new(empty_stats());
+        let stmt = parse_sql("SELECT * FROM users WHERE id = 42 AND name = 'nobody'").unwrap();
+        let plan = opt.optimize(&stmt).unwrap();
+        let display = format!("{}", plan);
+        assert!(display.contains("PK Lookup"), "plan: {display}");
+        assert!(
+            display.contains("name"),
+            "the remaining predicate must be kept as a filter: {display}"
+        );
+    }
+
+    /// Only the declared primary key gets a lookup, not any column named `id`.
+    #[test]
+    fn test_pk_lookup_requires_real_primary_key() {
+        let mut stats = std::collections::HashMap::new();
+        stats.insert(
+            "orders".into(),
+            TableStats {
+                table_name: "orders".into(),
+                row_count: 100,
+                avg_row_bytes: 64,
+                indexes: vec![],
+                histograms: vec![],
+                primary_key: "order_no".into(),
+            },
+        );
+        let opt = Optimizer::new(stats);
+        // `id` is an ordinary column here, so no PK lookup.
+        let stmt = parse_sql("SELECT * FROM orders WHERE id = 5").unwrap();
+        let plan = opt.optimize(&stmt).unwrap();
+        let display = format!("{}", plan);
+        assert!(!display.contains("PK Lookup"), "plan: {display}");
+
+        // The declared key does get the lookup.
+        let stmt = parse_sql("SELECT * FROM orders WHERE order_no = 'K1'").unwrap();
+        let plan = opt.optimize(&stmt).unwrap();
+        let display = format!("{}", plan);
+        assert!(display.contains("PK Lookup"), "plan: {display}");
     }
 
     #[test]

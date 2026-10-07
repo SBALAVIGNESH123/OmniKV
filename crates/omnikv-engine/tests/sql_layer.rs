@@ -627,6 +627,113 @@ fn test_update_delete_validate_columns() {
     assert!(err.contains("does not exist"), "UPDATE error: {err}");
 }
 
+/// A primary-key lookup must still evaluate the other predicates in WHERE.
+#[test]
+fn test_pk_lookup_still_filters_other_predicates() {
+    let (_db, exec) = create_sql_env("pkfilt");
+
+    exec_sql(
+        &exec,
+        "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, city TEXT)",
+    );
+    exec_sql(
+        &exec,
+        "INSERT INTO users (id, name, city) VALUES (1, 'Alice', 'NYC')",
+    );
+    exec_sql(
+        &exec,
+        "INSERT INTO users (id, name, city) VALUES (2, 'Bob', 'LA')",
+    );
+
+    let (_cols, rows) = exec_rows(
+        &exec,
+        "SELECT * FROM users WHERE id = 1 AND name = 'nobody'",
+    );
+    assert!(
+        rows.is_empty(),
+        "the remaining predicate must be evaluated, not dropped: {rows:?}"
+    );
+
+    let (_cols, rows) = exec_rows(&exec, "SELECT * FROM users WHERE id = 1 AND id = 2");
+    assert!(
+        rows.is_empty(),
+        "contradictory predicates must match nothing: {rows:?}"
+    );
+
+    let (_cols, rows) = exec_rows(&exec, "SELECT * FROM users WHERE id = 1 AND city = 'LA'");
+    assert!(
+        rows.is_empty(),
+        "city predicate must be evaluated: {rows:?}"
+    );
+
+    // SELECT * orders columns by key.
+    let (_cols, rows) = exec_rows(&exec, "SELECT * FROM users WHERE id = 2");
+    assert_eq!(
+        rows,
+        vec![vec!["LA".to_string(), "2".to_string(), "Bob".to_string()]]
+    );
+}
+
+/// A column named `id` that is not the primary key gets no key lookup.
+#[test]
+fn test_pk_lookup_ignores_column_just_named_id() {
+    let (_db, exec) = create_sql_env("pkname");
+
+    exec_sql(
+        &exec,
+        "CREATE TABLE o (order_no TEXT PRIMARY KEY, id INTEGER)",
+    );
+    exec_sql(&exec, "INSERT INTO o (order_no, id) VALUES ('K1', 5)");
+    exec_sql(&exec, "INSERT INTO o (order_no, id) VALUES ('K2', 99)");
+
+    // 'K2' is a key value, not an id.
+    let (_cols, rows) = exec_rows(&exec, "SELECT * FROM o WHERE id = 'K2'");
+    assert!(
+        rows.is_empty(),
+        "a non-key column named 'id' must not trigger a key lookup: {rows:?}"
+    );
+
+    // SELECT * orders columns by key.
+    let (_cols, rows) = exec_rows(&exec, "SELECT * FROM o WHERE order_no = 'K2'");
+    assert_eq!(rows, vec![vec!["99".to_string(), "K2".to_string()]]);
+}
+
+/// Writes store under the column's declared name and reject unknown columns.
+#[test]
+fn test_write_resolves_declared_column_name() {
+    let (_db, exec) = create_sql_env("wrname");
+
+    exec_sql(&exec, "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)");
+    exec_sql(&exec, "INSERT INTO t (ID, NAME) VALUES (1, 'Alice')");
+
+    let (cols, rows) = exec_rows(&exec, "SELECT * FROM t");
+    assert_eq!(cols, vec!["id".to_string(), "name".to_string()]);
+    assert_eq!(rows, vec![vec!["1".to_string(), "Alice".to_string()]]);
+
+    exec_sql(&exec, "UPDATE t SET NAME = 'Bob' WHERE id = 1");
+    let (_cols, rows) = exec_rows(&exec, "SELECT name FROM t");
+    assert_eq!(
+        rows,
+        vec![vec!["Bob".to_string()]],
+        "the case-mismatched assignment must update the declared column: {rows:?}"
+    );
+
+    let stmt = parse_sql("UPDATE t SET nope = 'x' WHERE id = 1").unwrap();
+    let Err(err) = exec.execute(&stmt) else {
+        panic!("UPDATE with unknown column must error");
+    };
+    assert!(err.contains("does not exist"), "UPDATE error: {err}");
+
+    let stmt = parse_sql("INSERT INTO t (id, nope) VALUES (2, 'y')").unwrap();
+    let Err(err) = exec.execute(&stmt) else {
+        panic!("INSERT with unknown column must error");
+    };
+    assert!(err.contains("does not exist"), "INSERT error: {err}");
+
+    let (_cols, rows) = exec_rows(&exec, "SELECT * FROM t");
+    assert_eq!(rows, vec![vec!["1".to_string(), "Bob".to_string()]]);
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Tokenizer, operator, and join regressions
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1264,10 +1371,7 @@ fn test_outer_join_qualified_null_side() {
     );
     assert_eq!(rows, vec![vec!["1".to_string()], vec!["2".to_string()]]);
 
-    // Row 2 has no ojr partner, so ojr.id is NULL there and only row 2
-    // survives. Before the fix, ojr.id rebound to ojl's bare id and every
-    // row matched, or the predicate was pushed into ojr's scan and deleted
-    // the rows it asked about.
+    // Row 2 has no ojr partner, so ojr.id is NULL there and only it survives.
     let (_cols, rows) = exec_rows(
         &exec,
         "SELECT ojl.id FROM ojl LEFT JOIN ojr ON ojl.id = ojr.id WHERE ojr.id IS NULL",
@@ -1331,9 +1435,55 @@ fn test_outer_join_preserves_side_after_reorder() {
     );
 }
 
+/// EXPLAIN ANALYZE's hash join must keep the unmatched build rows of a
+/// Right-typed plan, matching the volcano executor.
+#[test]
+fn test_explain_analyze_right_join_keeps_unmatched_build() {
+    let (_db, exec) = create_sql_env("eajoin");
+
+    exec_sql(
+        &exec,
+        "CREATE TABLE big (id INTEGER PRIMARY KEY, v INTEGER)",
+    );
+    exec_sql(
+        &exec,
+        "CREATE TABLE small (id INTEGER PRIMARY KEY, v INTEGER)",
+    );
+    exec_sql(
+        &exec,
+        "INSERT INTO big (id, v) VALUES (1, 10), (2, 20), (3, 30)",
+    );
+    exec_sql(&exec, "INSERT INTO small (id, v) VALUES (1, 40), (9, 90)");
+
+    // big is the probe side, so the plan is Right-typed; small's row 9
+    // matches nothing and must survive.
+    let (_cols, rows) = exec_rows(
+        &exec,
+        "SELECT small.id FROM big RIGHT JOIN small ON big.id = small.id",
+    );
+    assert_eq!(
+        rows,
+        vec![vec!["1".to_string()], vec!["9".to_string()]],
+        "RIGHT JOIN must preserve the unmatched build row: {rows:?}"
+    );
+
+    let (_cols, plan_rows) = exec_rows(
+        &exec,
+        "EXPLAIN ANALYZE SELECT small.id FROM big RIGHT JOIN small ON big.id = small.id",
+    );
+    let hash_join_line = plan_rows
+        .iter()
+        .map(|r| r.first().cloned().unwrap_or_default())
+        .find(|l| l.contains("Hash Join"))
+        .unwrap_or_else(|| panic!("plan should contain a Hash Join: {plan_rows:?}"));
+    assert!(
+        hash_join_line.contains("actual rows=2"),
+        "EXPLAIN ANALYZE must report both rows: {hash_join_line}"
+    );
+}
+
 /// A projection of the missing side must read NULL, not the present table's
-/// column of the same name. The predicate layer already resolved this; the
-/// projection and the row formatter were still falling back to the bare key.
+/// column of the same name.
 #[test]
 fn test_outer_join_projects_missing_side_as_null() {
     let (_db, exec) = create_sql_env("ojproj");
@@ -1350,8 +1500,7 @@ fn test_outer_join_projects_missing_side_as_null() {
     exec_sql(&exec, "INSERT INTO ojl (id, shared) VALUES (2, 20)");
     exec_sql(&exec, "INSERT INTO ojr (id, shared) VALUES (1, 30)");
 
-    // Row 1 matches and reads ojr's own 30; row 2 has no ojr side, so it
-    // must be NULL — it used to show ojl's 20.
+    // Row 2 has no ojr side.
     let (_cols, rows) = exec_rows(
         &exec,
         "SELECT ojr.shared FROM ojl LEFT JOIN ojr ON ojl.id = ojr.id",
@@ -1362,7 +1511,7 @@ fn test_outer_join_projects_missing_side_as_null() {
         "projecting the missing side must yield NULL, not the present side's value"
     );
 
-    // Same for the join key column, which collides by name with ojl.id.
+    // The join key collides by name with ojl.id.
     let (_cols, rows) = exec_rows(
         &exec,
         "SELECT ojr.id FROM ojl LEFT JOIN ojr ON ojl.id = ojr.id",
@@ -1373,14 +1522,13 @@ fn test_outer_join_projects_missing_side_as_null() {
         "the missing side's join key must project to NULL"
     );
 
-    // The present side is unaffected by the same query.
     let (_cols, rows) = exec_rows(
         &exec,
         "SELECT ojl.shared FROM ojl LEFT JOIN ojr ON ojl.id = ojr.id",
     );
     assert_eq!(rows, vec![vec!["10".to_string()], vec!["20".to_string()]]);
 
-    // Both sides projected at once: each keeps its own table's value.
+    // Both sides at once: each keeps its own table's value.
     let (cols, rows) = exec_rows(
         &exec,
         "SELECT ojl.shared, ojr.shared FROM ojl LEFT JOIN ojr ON ojl.id = ojr.id",
@@ -1396,10 +1544,8 @@ fn test_outer_join_projects_missing_side_as_null() {
     );
 }
 
-/// An unqualified column that exists on both sides of a join is ambiguous:
-/// it used to resolve to whichever side the planner hashed as the build
-/// table, so the same query could read a different column when row counts
-/// changed the join order. Standard SQL rejects it and names both tables.
+/// An unqualified column that exists on both sides of a join is ambiguous;
+/// the error names both tables.
 #[test]
 fn test_ambiguous_column_is_rejected() {
     let (_db, exec) = create_sql_env("ambcol");
@@ -1435,14 +1581,13 @@ fn test_ambiguous_column_is_rejected() {
         }
     };
 
-    // Every clause that resolves a column must reject the ambiguous name.
     expect_ambiguous("SELECT shared FROM qa JOIN qb ON qa.id = qb.id");
     expect_ambiguous("SELECT id FROM qa JOIN qb ON qa.id = qb.id");
     expect_ambiguous("SELECT qa.id FROM qa JOIN qb ON qa.id = qb.id WHERE shared = 10");
     expect_ambiguous("SELECT qa.id FROM qa JOIN qb ON qa.id = qb.id ORDER BY shared");
     expect_ambiguous("SELECT qa.id FROM qa JOIN qb ON qa.id = qb.id GROUP BY shared");
 
-    // A qualified name resolves unambiguously and still works.
+    // A qualified name is unambiguous.
     let (_cols, rows) = exec_rows(
         &exec,
         "SELECT qa.shared FROM qa JOIN qb ON qa.id = qb.id WHERE qa.shared = 10",
@@ -1455,7 +1600,7 @@ fn test_ambiguous_column_is_rejected() {
     );
     assert_eq!(rows, vec![vec!["30".to_string()]]);
 
-    // A name that only one table owns is not ambiguous.
+    // A name only one table owns is not ambiguous.
     exec_sql(
         &exec,
         "CREATE TABLE qc (id INTEGER PRIMARY KEY, only INTEGER)",

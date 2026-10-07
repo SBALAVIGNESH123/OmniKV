@@ -581,7 +581,12 @@ impl SqlExecutor {
                 .map(|s| s.to_string())
                 .collect::<Vec<_>>()
         } else {
-            col_names.to_vec()
+            // Resolve up front so each row is keyed by the real column name.
+            let mut resolved = Vec::with_capacity(col_names.len());
+            for c in col_names {
+                resolved.push(resolve_column_name(&table, c)?.to_string());
+            }
+            resolved
         };
 
         let mut batch = WriteBatch::new();
@@ -942,9 +947,7 @@ impl SqlExecutor {
             .map(str::to_string)
             .collect();
         for col in extract_where_columns(where_clause) {
-            // A qualified name must name THIS table: `WHERE other.col` on a
-            // single-table statement used to be stripped to `col` and
-            // silently accepted.
+            // A qualified name must name THIS table.
             if let Some((qual, bare)) = col.split_once('.') {
                 if !qual.eq_ignore_ascii_case(table_name) {
                     return Err(format!(
@@ -978,11 +981,9 @@ impl SqlExecutor {
 
     /// Reject an unqualified column that exists on both sides of a join.
     ///
-    /// A bare name resolves to whichever side hashed as the build table, so
-    /// the same query can return a different column when row counts change
-    /// and the planner swaps the join order. Standard SQL calls this
-    /// ambiguous and refuses to guess; doing the same turns a silent,
-    /// plan-dependent read into a message that names both tables.
+    /// A bare name binds to whichever side hashed as the build table, so the
+    /// same query can read a different column when the planner swaps the join
+    /// order. Standard SQL calls this ambiguous; the error names both tables.
     fn check_column_reference(
         &self,
         per_table: &[(String, Vec<String>)],
@@ -1018,8 +1019,7 @@ impl SqlExecutor {
         }
     }
 
-    /// Column lists per table in FROM order, used to resolve and to
-    /// disambiguate column references.
+    /// Column lists per table in FROM order.
     fn columns_per_table(&self, from: &FromClause) -> Result<Vec<(String, Vec<String>)>, String> {
         let tables = match from {
             FromClause::Table(t) => vec![t.clone()],
@@ -1041,9 +1041,7 @@ impl SqlExecutor {
         Ok(per_table)
     }
 
-    /// Validate every column the SELECT list, ORDER BY and GROUP BY name, so
-    /// a typo or an ambiguous name is reported rather than quietly producing
-    /// NULLs or reading the wrong table's column.
+    /// Validate the columns named by the SELECT list, ORDER BY and GROUP BY.
     fn validate_output_columns(
         &self,
         from: &FromClause,
@@ -1423,13 +1421,15 @@ impl SqlExecutor {
         let count = rows.len();
         for row in &mut rows {
             for (col, val) in assignments {
+                // Store under the declared name; the caller's case may differ.
+                let resolved = resolve_column_name(&table, col)?;
                 let stored = table
                     .columns
                     .iter()
-                    .find(|c| c.name.eq_ignore_ascii_case(col))
+                    .find(|c| c.name == resolved)
                     .map(|c| c.col_type.canonicalize(&val.as_string()))
                     .unwrap_or_else(|| val.as_string());
-                row.insert(col.clone(), stored);
+                row.insert(resolved.to_string(), stored);
             }
             let pk = row.get(&table.primary_key).cloned().unwrap_or_default();
             let key = format!("{}{}", table.row_prefix(), pk);
@@ -1492,6 +1492,22 @@ fn column_types_of_table(table: &TableDef) -> crate::volcano::ColumnTypeMap {
         map.insert(format!("{}.{}", table.name, c.name), c.col_type.clone());
     }
     map
+}
+
+/// Resolve a user-supplied column name to the table's declared spelling.
+/// Rows are keyed by the declared name; an unknown column is an error.
+fn resolve_column_name<'t>(table: &'t TableDef, col: &str) -> Result<&'t str, String> {
+    table
+        .columns
+        .iter()
+        .find(|c| c.name.eq_ignore_ascii_case(col))
+        .map(|c| c.name.as_str())
+        .ok_or_else(|| {
+            format!(
+                "column \"{}\" does not exist in table \"{}\"",
+                col, table.name
+            )
+        })
 }
 
 fn eval_where(row: &Row, expr: &WhereExpr) -> bool {

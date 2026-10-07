@@ -265,10 +265,15 @@ impl PlanExecutor {
         }
 
         let mut result = Vec::new();
+        // Matched keys, so the unmatched build rows can be emitted below.
+        let mut matched_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
         for probe_row in probe {
             let key = probe_row.get(probe_col).cloned().unwrap_or_default();
             match (hash_table.get(&key), join_type) {
                 (Some(matches), _) => {
+                    if matches!(join_type, JoinType::Right) {
+                        matched_keys.insert(key);
+                    }
                     for build_row in matches {
                         let mut combined = Row::new();
                         for (k, v) in *build_row {
@@ -284,6 +289,18 @@ impl PlanExecutor {
                     result.push(probe_row.clone());
                 }
                 _ => {}
+            }
+        }
+
+        // A RIGHT JOIN preserves build rows that no probe row matched.
+        if matches!(join_type, JoinType::Right) {
+            for (key, rows) in &hash_table {
+                if matched_keys.contains(key) {
+                    continue;
+                }
+                for build_row in rows {
+                    result.push((**build_row).clone());
+                }
             }
         }
         result
@@ -378,9 +395,6 @@ impl PlanExecutor {
                         }
                         SelectColumn::Qualified(t, n) => {
                             let key = format!("{}.{}", t, n);
-                            // A qualified name binds to the table it names;
-                            // the missing side of an outer join is NULL, not
-                            // the other table's column of the same name.
                             let val = crate::volcano::row_lookup(row, &key)
                                 .cloned()
                                 .unwrap_or_else(|| "NULL".into());

@@ -414,16 +414,11 @@ fn project_row(row: Row, columns: &[SelectColumn]) -> Row {
             }
             SelectColumn::Qualified(t, n) => {
                 let key = format!("{}.{}", t, n);
-                // A qualified name binds to the table it names; on the
-                // missing side of an outer join that binding is a NULL, never
-                // the other table's column of the same bare name.
                 let val = row_lookup(&row, &key)
                     .cloned()
                     .unwrap_or_else(|| "NULL".into());
-                // Store under the qualified key so a reader resolving by
-                // qualified name still finds it after this projection, and
-                // under the bare name when that slot is free, so a bare
-                // reader (ORDER BY, HAVING) resolves it too.
+                // Store under both keys: the qualified one for readers that
+                // resolve by name, the bare one when the slot is free.
                 projected.insert(key, val.clone());
                 projected.entry(n.clone()).or_insert(val);
             }
@@ -994,10 +989,8 @@ fn cmp_by_literal(row_val: &str, value: &SqlValue, cmp_val: &str) -> std::cmp::O
 /// bare-keyed single-table row falls back. The qualifier is matched
 /// case-insensitively because table names are.
 ///
-/// Every place a qualified name is read from a row — predicate, projection,
-/// ORDER BY, GROUP BY — goes through this function, so a column resolves
-/// one way everywhere and a projection can never disagree with the
-/// predicate that selected the row.
+/// Every read of a qualified name — predicate, projection, ORDER BY, GROUP
+/// BY — goes through this, so a column resolves one way everywhere.
 pub(crate) fn row_lookup<'a>(row: &'a Row, column: &str) -> Option<&'a String> {
     if let Some(v) = row.get(column) {
         return Some(v);
