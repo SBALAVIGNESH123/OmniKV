@@ -185,9 +185,9 @@ pub struct OrderByItem {
     pub desc: bool,
 }
 
-/// A bound value has no parse-time type, so a predicate takes the type an
-/// unquoted literal would have — but only a payload that round-trips through
-/// its own number counts as one.
+/// A bound value's type when no column affinity is available. Typed columns
+/// never reach here — `cmp_by_affinity` follows the declared `ColumnType` —
+/// so this only governs untyped targets.
 fn coerce_param(v: &str) -> SqlValue {
     if let Ok(i) = v.parse::<i64>()
         && i.to_string() == v
@@ -1270,6 +1270,7 @@ fn parse_delete_sql(tokens: &[String]) -> Result<SqlStatement, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prop_assert_eq;
 
     #[test]
     fn test_create_table() {
@@ -1410,6 +1411,37 @@ mod tests {
                 assert_eq!(offset, Some(2));
             }
             _ => panic!("Expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_negative_number_literal_round_trip() {
+        let tokens = tokenize("SELECT * FROM t WHERE x > -1 AND y < -5");
+        let joined = tokens.join(" ");
+        assert_eq!(
+            joined, "SELECT * FROM t WHERE x > -1 AND y < -5",
+            "negative numbers must re-join verbatim for a UNION/EXPLAIN re-parse"
+        );
+        assert_eq!(parse_value("-5"), SqlValue::Integer(-5));
+    }
+
+    #[test]
+    fn test_quoted_quote_escape_chain() {
+        // Four quotes = an empty string containing one escaped quote -> "'".
+        assert_eq!(parse_value("''''"), SqlValue::Text("'".into()));
+        // O''Brien round-trips through tokenize without losing the escape.
+        let tokens = tokenize("SELECT 'O''Brien'");
+        assert_eq!(tokens, vec!["SELECT", "'O''Brien'"]);
+        assert_eq!(parse_value(&tokens[1]), SqlValue::Text("O'Brien".into()));
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn quoted_string_round_trips(s in ".*") {
+            let escaped = s.replace('\'', "''");
+            let tokens = tokenize(&format!("'{}'", escaped));
+            prop_assert_eq!(tokens.len(), 1);
+            prop_assert_eq!(parse_value(&tokens[0]), SqlValue::Text(s));
         }
     }
 

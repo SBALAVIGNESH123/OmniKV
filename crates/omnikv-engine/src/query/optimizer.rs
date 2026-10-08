@@ -1018,6 +1018,20 @@ mod tests {
         assert!(display.contains("PK Lookup"), "plan: {display}");
     }
 
+    /// A qualified predicate naming another table does not claim this
+    /// table's primary key.
+    #[test]
+    fn test_pk_lookup_ignores_other_tables_column() {
+        let opt = Optimizer::new(empty_stats());
+        let stmt = parse_sql("SELECT * FROM users WHERE orders.id = 5").unwrap();
+        let plan = opt.optimize(&stmt).unwrap();
+        let display = format!("{}", plan);
+        assert!(
+            !display.contains("PK Lookup"),
+            "orders.id must not become a users PK lookup: {display}"
+        );
+    }
+
     #[test]
     fn test_join_order_small_build() {
         let opt = Optimizer::new(empty_stats());

@@ -14,8 +14,8 @@ use crate::{OmniKV, WriteBatch};
 use std::collections::HashMap;
 use std::sync::Arc;
 
-/// Result row: column_name → value
-pub type Row = HashMap<String, String>;
+/// `None` is a SQL NULL; `Some("NULL")` is the literal text.
+pub type Row = HashMap<String, Option<String>>;
 
 /// Execution result
 pub enum ExecResult {
@@ -548,7 +548,11 @@ impl SqlExecutor {
             let rows = self.load_table_rows(&table);
             let mut batch = WriteBatch::new();
             for row in &rows {
-                let pk = row.get(&table.primary_key).cloned().unwrap_or_default();
+                let pk = row
+                    .get(&table.primary_key)
+                    .cloned()
+                    .flatten()
+                    .unwrap_or_default();
                 let key = format!("{}{}", table.row_prefix(), pk);
                 batch.delete(&key).map_err(|e| format!("{:?}", e))?;
             }
@@ -601,20 +605,25 @@ impl SqlExecutor {
                 ));
             }
 
-            let mut row_map = HashMap::new();
+            let mut row_map = Row::new();
             let mut pk_val = String::new();
             for (i, col) in columns.iter().enumerate() {
-                let col_type = table
-                    .columns
-                    .iter()
-                    .find(|c| c.name.eq_ignore_ascii_case(col))
-                    .map(|c| &c.col_type);
-                let val = match col_type {
-                    Some(t) => t.canonicalize(&row_vals[i].as_string()),
-                    None => row_vals[i].as_string(),
+                let val = match &row_vals[i] {
+                    SqlValue::Null => None,
+                    v => {
+                        let col_type = table
+                            .columns
+                            .iter()
+                            .find(|c| c.name.eq_ignore_ascii_case(col))
+                            .map(|c| &c.col_type);
+                        Some(match col_type {
+                            Some(t) => t.canonicalize(&v.as_string()),
+                            None => v.as_string(),
+                        })
+                    }
                 };
                 if col.eq_ignore_ascii_case(&table.primary_key) {
-                    pk_val = val.clone();
+                    pk_val = val.clone().unwrap_or_default();
                 }
                 row_map.insert(col.clone(), val);
             }
@@ -864,9 +873,14 @@ impl SqlExecutor {
             {
                 let ob = ob.clone();
                 rows.sort_by(|a, b| {
-                    let va = a.get(&ob).cloned().unwrap_or_default();
-                    let vb = b.get(&ob).cloned().unwrap_or_default();
-                    let cmp = smart_cmp(&va, &vb);
+                    let va = a.get(&ob).cloned().flatten();
+                    let vb = b.get(&ob).cloned().flatten();
+                    let cmp = match (va.as_deref(), vb.as_deref()) {
+                        (Some(x), Some(y)) => smart_cmp(x, y),
+                        (Some(_), None) => std::cmp::Ordering::Less,
+                        (None, Some(_)) => std::cmp::Ordering::Greater,
+                        (None, None) => std::cmp::Ordering::Equal,
+                    };
                     if *desc { cmp.reverse() } else { cmp }
                 });
                 break;
@@ -877,26 +891,26 @@ impl SqlExecutor {
                 func, order_by: ob, ..
             } = col
             {
-                let mut prev_val = String::new();
+                let mut prev_val: Option<String> = None;
                 let mut rank = 0usize;
                 let mut dense_rank = 0usize;
                 for (i, row) in rows.iter_mut().enumerate() {
-                    let cur_val = row.get(ob).cloned().unwrap_or_default();
+                    let cur_val = row.get(ob).cloned().flatten();
                     match func {
                         WindowFuncType::RowNumber => {
-                            row.insert("row_number".into(), (i + 1).to_string());
+                            row.insert("row_number".into(), Some((i + 1).to_string()));
                         }
                         WindowFuncType::Rank => {
                             if cur_val != prev_val {
                                 rank = i + 1;
                             }
-                            row.insert("rank".into(), rank.to_string());
+                            row.insert("rank".into(), Some(rank.to_string()));
                         }
                         WindowFuncType::DenseRank => {
                             if cur_val != prev_val {
                                 dense_rank += 1;
                             }
-                            row.insert("dense_rank".into(), dense_rank.to_string());
+                            row.insert("dense_rank".into(), Some(dense_rank.to_string()));
                         }
                     }
                     prev_val = cur_val;
@@ -1166,9 +1180,14 @@ impl SqlExecutor {
             let col = item.column.clone();
             let desc = item.desc;
             rows.sort_by(|a, b| {
-                let va = a.get(&col).cloned().unwrap_or_default();
-                let vb = b.get(&col).cloned().unwrap_or_default();
-                let cmp = smart_cmp(&va, &vb);
+                let va = a.get(&col).cloned().flatten();
+                let vb = b.get(&col).cloned().flatten();
+                let cmp = match (va.as_deref(), vb.as_deref()) {
+                    (Some(x), Some(y)) => smart_cmp(x, y),
+                    (Some(_), None) => std::cmp::Ordering::Less,
+                    (None, Some(_)) => std::cmp::Ordering::Greater,
+                    (None, None) => std::cmp::Ordering::Equal,
+                };
                 if desc { cmp.reverse() } else { cmp }
             });
         }
@@ -1203,12 +1222,16 @@ impl SqlExecutor {
         // Build hash index on right table
         let mut right_index: HashMap<String, Vec<&Row>> = HashMap::new();
         for r in right {
-            let key = r.get(on_right).cloned().unwrap_or_default();
+            let Some(key) = r.get(on_right).cloned().flatten() else {
+                continue;
+            };
             right_index.entry(key).or_default().push(r);
         }
 
         for lr in left {
-            let join_key = lr.get(on_left).cloned().unwrap_or_default();
+            let Some(join_key) = lr.get(on_left).cloned().flatten() else {
+                continue;
+            };
             let matches = right_index.get(&join_key);
 
             match (matches, join_type) {
@@ -1254,7 +1277,12 @@ impl SqlExecutor {
         for row in rows {
             let key: String = group_by
                 .iter()
-                .map(|g| row.get(g).cloned().unwrap_or_default())
+                .map(|g| {
+                    row.get(g)
+                        .cloned()
+                        .flatten()
+                        .unwrap_or_else(|| "\u{1}NULL\u{1}".to_string())
+                })
                 .collect::<Vec<_>>()
                 .join("|");
             groups.entry(key).or_default().push(row);
@@ -1269,7 +1297,7 @@ impl SqlExecutor {
                 match col {
                     SelectColumn::Named(name) => {
                         col_names.push(name.clone());
-                        result_row.push(group_rows[0].get(name).cloned().unwrap_or_default());
+                        result_row.push(render(group_rows[0].get(name).and_then(|v| v.as_deref())));
                     }
                     SelectColumn::Aggregate(func, target) => {
                         let (name, val) = compute_aggregate(func, target, group_rows);
@@ -1356,7 +1384,7 @@ impl SqlExecutor {
                     keys.iter()
                         .map(|k| {
                             crate::volcano::row_lookup(r, k)
-                                .cloned()
+                                .map(str::to_string)
                                 .unwrap_or_else(|| "NULL".into())
                         })
                         .collect()
@@ -1391,27 +1419,25 @@ impl SqlExecutor {
                 columns
                     .iter()
                     .map(|c| match c {
-                        SelectColumn::Named(n) => r.get(n).cloned().unwrap_or("NULL".into()),
+                        SelectColumn::Named(n) => render(r.get(n).and_then(|v| v.as_deref())),
                         SelectColumn::Qualified(t, n) => {
-                            crate::volcano::row_lookup(r, &format!("{}.{}", t, n))
-                                .cloned()
-                                .unwrap_or("NULL".into())
+                            render(crate::volcano::row_lookup(r, &format!("{}.{}", t, n)))
                         }
-                        SelectColumn::Aggregate(func, target) => r
-                            .get(&format!(
+                        SelectColumn::Aggregate(func, target) => render(
+                            r.get(&format!(
                                 "{}({})",
                                 format!("{:?}", func).to_lowercase(),
                                 target
                             ))
-                            .cloned()
-                            .unwrap_or("NULL".into()),
+                            .and_then(|v| v.as_deref()),
+                        ),
                         SelectColumn::WindowFunc { func, .. } => {
                             let key = match func {
                                 WindowFuncType::RowNumber => "row_number",
                                 WindowFuncType::Rank => "rank",
                                 WindowFuncType::DenseRank => "dense_rank",
                             };
-                            r.get(key).cloned().unwrap_or("NULL".into())
+                            render(r.get(key).and_then(|v| v.as_deref()))
                         }
                         _ => "NULL".into(),
                     })
@@ -1452,15 +1478,23 @@ impl SqlExecutor {
         let count = rows.len();
         for row in &mut rows {
             for (resolved, val) in &assignments {
-                let stored = table
-                    .columns
-                    .iter()
-                    .find(|c| c.name == *resolved)
-                    .map(|c| c.col_type.canonicalize(&val.as_string()))
-                    .unwrap_or_else(|| val.as_string());
+                let stored = match val {
+                    SqlValue::Null => None,
+                    v => {
+                        let col = table.columns.iter().find(|c| c.name == *resolved);
+                        Some(match col {
+                            Some(c) => c.col_type.canonicalize(&v.as_string()),
+                            None => v.as_string(),
+                        })
+                    }
+                };
                 row.insert((*resolved).to_string(), stored);
             }
-            let pk = row.get(&table.primary_key).cloned().unwrap_or_default();
+            let pk = row
+                .get(&table.primary_key)
+                .cloned()
+                .flatten()
+                .unwrap_or_default();
             let key = format!("{}{}", table.row_prefix(), pk);
             let value = serde_json::to_string(&row).map_err(|e| format!("{}", e))?;
             batch.set(&key, value).map_err(|e| format!("{:?}", e))?;
@@ -1496,7 +1530,11 @@ impl SqlExecutor {
         let mut batch = WriteBatch::new();
         let count = rows.len();
         for row in &rows {
-            let pk = row.get(&table.primary_key).cloned().unwrap_or_default();
+            let pk = row
+                .get(&table.primary_key)
+                .cloned()
+                .flatten()
+                .unwrap_or_default();
             let key = format!("{}{}", table.row_prefix(), pk);
             batch.delete(&key).map_err(|e| format!("{:?}", e))?;
         }
@@ -1539,16 +1577,16 @@ fn resolve_column_name<'t>(table: &'t TableDef, col: &str) -> Result<&'t str, St
         })
 }
 
+fn render(cell: Option<&str>) -> String {
+    cell.unwrap_or("NULL").to_string()
+}
+
 fn eval_where(row: &Row, expr: &WhereExpr) -> bool {
     crate::volcano::eval_where(row, expr)
 }
 
 fn smart_cmp(a: &str, b: &str) -> std::cmp::Ordering {
-    if let (Ok(ai), Ok(bi)) = (a.parse::<f64>(), b.parse::<f64>()) {
-        ai.partial_cmp(&bi).unwrap_or(std::cmp::Ordering::Equal)
-    } else {
-        a.cmp(b)
-    }
+    crate::volcano::smart_cmp(a, b)
 }
 
 fn compute_aggregate(func: &AggFunc, target: &str, rows: &[&Row]) -> (String, String) {

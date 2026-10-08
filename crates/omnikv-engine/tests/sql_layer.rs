@@ -802,6 +802,37 @@ fn test_star_with_window_function_keeps_window_column() {
     assert_eq!(rows, vec![vec!["1", "a", "1"], vec!["2", "b", "2"],]);
 }
 
+/// Two ids above 2^53 are one `f64` apart, so a float comparison treats them
+/// as equal. Predicates and ordering must compare integers exactly.
+#[test]
+fn test_large_integers_do_not_collide_as_floats() {
+    let (_db, exec) = create_sql_env("i64exact");
+
+    exec_sql(&exec, "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)");
+    exec_sql(
+        &exec,
+        "INSERT INTO t (id, name) VALUES (9007199254740992, 'a')",
+    );
+    exec_sql(
+        &exec,
+        "INSERT INTO t (id, name) VALUES (9007199254740993, 'b')",
+    );
+
+    let (_cols, rows) = exec_rows(&exec, "SELECT name FROM t WHERE id = 9007199254740992");
+    assert_eq!(rows, vec![vec!["a".to_string()]]);
+
+    let (_cols, rows) = exec_rows(
+        &exec,
+        "SELECT name FROM t WHERE id > 9007199254740992 ORDER BY id",
+    );
+    assert_eq!(rows, vec![vec!["b".to_string()]]);
+
+    // An UPDATE must not touch the neighbouring row.
+    exec_sql(&exec, "UPDATE t SET name = 'c' WHERE id = 9007199254740992");
+    let (_cols, rows) = exec_rows(&exec, "SELECT name FROM t ORDER BY id");
+    assert_eq!(rows, vec![vec!["c".to_string()], vec!["b".to_string()]]);
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Tokenizer, operator, and join regressions
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1676,4 +1707,83 @@ fn test_ambiguous_column_is_rejected() {
     exec_sql(&exec, "INSERT INTO qc (id, only) VALUES (1, 40)");
     let (_cols, rows) = exec_rows(&exec, "SELECT only FROM qc JOIN qb ON qc.id = qb.id");
     assert_eq!(rows, vec![vec!["40".to_string()]]);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SQL NULL is distinct from the literal text 'NULL'
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// A stored NULL and a stored 'NULL' string are two different rows, and each
+/// predicate matches only its own.
+#[test]
+fn test_null_is_distinct_from_null_text() {
+    let (_db, exec) = create_sql_env("nulldist");
+    exec_sql(&exec, "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)");
+    exec_sql(&exec, "INSERT INTO t (id, v) VALUES (1, NULL)");
+    exec_sql(&exec, "INSERT INTO t (id, v) VALUES (2, 'NULL')");
+
+    let (_cols, rows) = exec_rows(&exec, "SELECT id FROM t WHERE v IS NULL");
+    assert_eq!(rows, vec![vec!["1".to_string()]]);
+
+    let (_cols, rows) = exec_rows(&exec, "SELECT id FROM t WHERE v = 'NULL'");
+    assert_eq!(rows, vec![vec!["2".to_string()]]);
+}
+
+/// COUNT(*) tallies rows; COUNT(col) skips a NULL, and SUM ignores it.
+#[test]
+fn test_aggregates_skip_nulls_but_count_rows() {
+    let (_db, exec) = create_sql_env("aggnull");
+    exec_sql(&exec, "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)");
+    exec_sql(&exec, "INSERT INTO t (id, v) VALUES (1, NULL)");
+    exec_sql(&exec, "INSERT INTO t (id, v) VALUES (2, 10)");
+
+    let (_cols, rows) = exec_rows(&exec, "SELECT COUNT(*) FROM t");
+    assert_eq!(rows, vec![vec!["2".to_string()]]);
+    let (_cols, rows) = exec_rows(&exec, "SELECT COUNT(v) FROM t");
+    assert_eq!(rows, vec![vec!["1".to_string()]]);
+    let (_cols, rows) = exec_rows(&exec, "SELECT SUM(v) FROM t");
+    assert_eq!(rows, vec![vec!["10".to_string()]]);
+}
+
+/// A row whose join key is NULL is preserved by an outer join: NULL never
+/// matches, but the row is not dropped from the preserved side.
+#[test]
+fn test_outer_join_preserves_null_key_row() {
+    let (_db, exec) = create_sql_env("joinnull");
+    exec_sql(&exec, "CREATE TABLE a (id INTEGER PRIMARY KEY, k TEXT)");
+    exec_sql(&exec, "CREATE TABLE b (id INTEGER PRIMARY KEY, k TEXT)");
+    exec_sql(&exec, "INSERT INTO a (id, k) VALUES (1, NULL)");
+    exec_sql(&exec, "INSERT INTO a (id, k) VALUES (2, 'x')");
+    exec_sql(&exec, "INSERT INTO b (id, k) VALUES (1, NULL)");
+    exec_sql(&exec, "INSERT INTO b (id, k) VALUES (2, 'x')");
+
+    let (_cols, rows) = exec_rows(
+        &exec,
+        "SELECT a.id, b.id FROM a JOIN b ON a.k = b.k ORDER BY a.id",
+    );
+    assert_eq!(rows, vec![vec!["2".to_string(), "2".to_string()]]);
+
+    let (_cols, rows) = exec_rows(
+        &exec,
+        "SELECT a.id, b.id FROM a LEFT JOIN b ON a.k = b.k ORDER BY a.id",
+    );
+    assert_eq!(
+        rows,
+        vec![
+            vec!["1".to_string(), "NULL".to_string()],
+            vec!["2".to_string(), "2".to_string()]
+        ]
+    );
+
+    let (_cols, rows) = exec_rows(
+        &exec,
+        "SELECT a.id, b.id FROM a RIGHT JOIN b ON a.k = b.k ORDER BY b.id",
+    );
+    assert_eq!(
+        rows,
+        vec![
+            vec!["NULL".to_string(), "1".to_string()],
+            vec!["2".to_string(), "2".to_string()]
+        ]
+    );
 }

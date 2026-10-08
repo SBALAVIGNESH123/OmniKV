@@ -409,16 +409,12 @@ fn project_row(row: Row, columns: &[SelectColumn]) -> Row {
         match col {
             SelectColumn::Named(n) => {
                 if let Some(v) = row_lookup(&row, n) {
-                    projected.insert(n.clone(), v.clone());
+                    projected.insert(n.clone(), Some(v.to_string()));
                 }
             }
             SelectColumn::Qualified(t, n) => {
                 let key = format!("{}.{}", t, n);
-                let val = row_lookup(&row, &key)
-                    .cloned()
-                    .unwrap_or_else(|| "NULL".into());
-                // Store under both keys: the qualified one for readers that
-                // resolve by name, the bare one when the slot is free.
+                let val = row_lookup(&row, &key).map(str::to_string);
                 projected.insert(key, val.clone());
                 projected.entry(n.clone()).or_insert(val);
             }
@@ -491,9 +487,14 @@ impl SortIter {
             let col = item.column.clone();
             let desc = item.desc;
             rows.sort_by(|a, b| {
-                let va = a.get(&col).cloned().unwrap_or_default();
-                let vb = b.get(&col).cloned().unwrap_or_default();
-                let cmp = smart_cmp(&va, &vb);
+                let va = a.get(&col).cloned().flatten();
+                let vb = b.get(&col).cloned().flatten();
+                let cmp = match (va.as_deref(), vb.as_deref()) {
+                    (Some(x), Some(y)) => smart_cmp(x, y),
+                    (Some(_), None) => std::cmp::Ordering::Less,
+                    (None, Some(_)) => std::cmp::Ordering::Greater,
+                    (None, None) => std::cmp::Ordering::Equal,
+                };
                 if desc { cmp.reverse() } else { cmp }
             });
         }
@@ -549,6 +550,7 @@ pub struct HashJoinIter {
     match_pos: usize,
     // For RIGHT JOIN: track which build keys were matched
     matched_build_keys: std::collections::HashSet<String>,
+    null_key_build_rows: Vec<Row>,
     right_unmatched: Vec<Row>,
     right_unmatched_pos: usize,
     probe_exhausted: bool,
@@ -566,12 +568,17 @@ impl HashJoinIter {
     ) -> Self {
         // Build phase: materialize build side into hash table
         let mut hash_table: HashMap<String, Vec<Row>> = HashMap::new();
+        let mut null_key_build_rows: Vec<Row> = Vec::new();
         while let Some(row) = build.next_row() {
-            let key = row.get(&build_col).cloned().unwrap_or_default();
+            let Some(key) = row.get(&build_col).cloned().flatten() else {
+                null_key_build_rows.push(row);
+                continue;
+            };
             hash_table.entry(key).or_default().push(row);
         }
         Self {
             hash_table,
+            null_key_build_rows,
             probe,
             build_col,
             probe_col,
@@ -638,11 +645,20 @@ impl RowIterator for HashJoinIter {
                                 );
                             }
                         }
+                        self.right_unmatched.extend(
+                            self.null_key_build_rows
+                                .iter()
+                                .map(|r| qualify_row(r.clone(), &self.build_prefix)),
+                        );
                     }
                     continue;
                 }
             };
-            let key = probe_row.get(&self.probe_col).cloned().unwrap_or_default();
+            let key = probe_row
+                .get(&self.probe_col)
+                .cloned()
+                .flatten()
+                .unwrap_or_default();
 
             match self.hash_table.get(&key) {
                 Some(build_rows) => {
@@ -707,7 +723,7 @@ impl AggregateIter {
             for col in &agg_columns {
                 if let SelectColumn::Aggregate(func, target) = col {
                     let (name, val) = compute_aggregate(func, target, &refs);
-                    row.insert(name, val);
+                    row.insert(name, Some(val));
                 }
             }
             return Self {
@@ -720,9 +736,14 @@ impl AggregateIter {
         for row in &all_rows {
             let key: String = group_by
                 .iter()
-                .map(|g| row.get(g).cloned().unwrap_or_default())
+                .map(|g| {
+                    row.get(g)
+                        .cloned()
+                        .flatten()
+                        .unwrap_or_else(|| "\u{1}NULL\u{1}".to_string())
+                })
                 .collect::<Vec<_>>()
-                .join("\x00");
+                .join("\u{0}");
             groups.entry(key).or_default().push(row.clone());
         }
 
@@ -739,7 +760,7 @@ impl AggregateIter {
                     }
                     SelectColumn::Aggregate(func, target) => {
                         let (name, val) = compute_aggregate(func, target, &refs);
-                        row.insert(name, val);
+                        row.insert(name, Some(val));
                     }
                     _ => {}
                 }
@@ -990,21 +1011,22 @@ fn cmp_by_literal(row_val: &str, value: &SqlValue, cmp_val: &str) -> std::cmp::O
 /// case-insensitively because table names are.
 ///
 /// Every read of a qualified name — predicate, projection, ORDER BY, GROUP
-/// BY — goes through this, so a column resolves one way everywhere.
-pub(crate) fn row_lookup<'a>(row: &'a Row, column: &str) -> Option<&'a String> {
-    if let Some(v) = row.get(column) {
-        return Some(v);
+/// BY — goes through this, so a column resolves one way everywhere. A stored
+/// NULL is `None` in the row and reads as absent.
+pub(crate) fn row_lookup<'a>(row: &'a Row, column: &str) -> Option<&'a str> {
+    if let Some(Some(v)) = row.get(column) {
+        return Some(v.as_str());
     }
     let (qual, bare) = column.split_once('.')?;
     if !row.keys().any(|k| k.contains('.')) {
-        return row.get(bare);
+        return row.get(bare).and_then(|v| v.as_deref());
     }
     row.iter()
         .find(|(k, _)| {
             k.split_once('.')
                 .is_some_and(|(q, b)| q.eq_ignore_ascii_case(qual) && b == bare)
         })
-        .map(|(_, v)| v)
+        .and_then(|(_, v)| v.as_deref())
 }
 
 /// Resolve a predicate column to its declared type, mirroring [`row_lookup`]
@@ -1031,16 +1053,10 @@ fn type_lookup<'a>(types: &'a ColumnTypeMap, column: &str) -> Option<&'a ColumnT
 fn eval_tri(row: &Row, expr: &WhereExpr, types: &ColumnTypeMap) -> Option<bool> {
     match expr {
         WhereExpr::Comparison { column, op, value } => {
-            // Comparison against NULL is UNKNOWN; the text form of Null
-            // must never be compared as data.
             if matches!(value, SqlValue::Null) {
                 return None;
             }
-            // A missing key is NULL, never "".
             let row_val = row_lookup(row, column)?;
-            if row_val.as_str() == "NULL" {
-                return None;
-            }
             let cmp_val = value.as_string();
             let col_type = type_lookup(types, column);
             let ord = cmp_by_affinity(row_val, value, &cmp_val, col_type);
@@ -1052,10 +1068,11 @@ fn eval_tri(row: &Row, expr: &WhereExpr, types: &ColumnTypeMap) -> Option<bool> 
                 CmpOp::Gte => ord != std::cmp::Ordering::Less,
                 CmpOp::Lte => ord != std::cmp::Ordering::Greater,
                 CmpOp::Like => {
-                    // Escape regex metacharacters FIRST, then convert SQL wildcards
                     let escaped = regex::escape(&cmp_val);
                     let pattern = escaped.replace("%", ".*").replace("_", ".");
-                    regex::Regex::new(&format!("^{}$", pattern))
+                    regex::RegexBuilder::new(&format!("^{}$", pattern))
+                        .size_limit(1 << 20)
+                        .build()
                         .map(|r| r.is_match(row_val))
                         .unwrap_or(false)
                 }
@@ -1064,13 +1081,10 @@ fn eval_tri(row: &Row, expr: &WhereExpr, types: &ColumnTypeMap) -> Option<bool> 
         WhereExpr::And(a, b) => and_tri(eval_tri(row, a, types), eval_tri(row, b, types)),
         WhereExpr::Or(a, b) => or_tri(eval_tri(row, a, types), eval_tri(row, b, types)),
         WhereExpr::Not(inner) => eval_tri(row, inner, types).map(std::ops::Not::not),
-        WhereExpr::IsNull(col) => Some(row_lookup(row, col).is_none_or(|v| v == "NULL")),
-        WhereExpr::IsNotNull(col) => Some(row_lookup(row, col).is_some_and(|v| v != "NULL")),
+        WhereExpr::IsNull(col) => Some(row_lookup(row, col).is_none()),
+        WhereExpr::IsNotNull(col) => Some(row_lookup(row, col).is_some()),
         WhereExpr::In(col, vals) => {
             let row_val = row_lookup(row, col)?;
-            if row_val.as_str() == "NULL" {
-                return None;
-            }
             let col_type = type_lookup(types, col);
             Some(vals.iter().any(|v| {
                 cmp_by_affinity(row_val, v, &v.as_string(), col_type) == std::cmp::Ordering::Equal
@@ -1108,15 +1122,17 @@ pub fn eval_where_typed(row: &Row, expr: &WhereExpr, types: &ColumnTypeMap) -> b
     eval_tri(row, expr, types).unwrap_or(false)
 }
 
-/// Compare numerically when both sides are finite numbers, else lexically.
-/// Rust's f64 parser accepts NaN/inf/1e5, which would let a text column
-/// compare the word "inf" as a number.
-fn smart_cmp(a: &str, b: &str) -> std::cmp::Ordering {
-    match (a.parse::<f64>(), b.parse::<f64>()) {
-        (Ok(x), Ok(y)) if x.is_finite() && y.is_finite() => {
-            x.partial_cmp(&y).unwrap_or(std::cmp::Ordering::Equal)
-        }
-        _ => a.cmp(b),
+/// Integers compare as `i128`, not `f64`: two distinct ids above 2^53 are
+/// one `f64` apart and would match the wrong row on `WHERE id = ...`.
+pub(crate) fn smart_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    match (a.parse::<i128>(), b.parse::<i128>()) {
+        (Ok(x), Ok(y)) => x.cmp(&y),
+        _ => match (a.parse::<f64>(), b.parse::<f64>()) {
+            (Ok(x), Ok(y)) if x.is_finite() && y.is_finite() => {
+                x.partial_cmp(&y).unwrap_or(std::cmp::Ordering::Equal)
+            }
+            _ => a.cmp(b),
+        },
     }
 }
 
@@ -1127,9 +1143,7 @@ pub fn compute_aggregate(func: &AggFunc, target: &str, rows: &[&Row]) -> (String
         Vec::new()
     } else {
         rows.iter()
-            .filter_map(|r| r.get(target))
-            .filter(|v| *v != "NULL")
-            .map(String::as_str)
+            .filter_map(|r| r.get(target).and_then(|v| v.as_deref()))
             .collect()
     };
     match func {

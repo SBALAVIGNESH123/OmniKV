@@ -132,13 +132,13 @@ fn synthetic_rows(count: usize) -> Vec<Row> {
     (0..count)
         .map(|i| {
             let mut row = Row::new();
-            row.insert("id".into(), i.to_string());
+            row.insert("id".into(), Some(i.to_string()));
             row.insert(
                 "kind".into(),
-                if i % 3 == 0 { "hot" } else { "cold" }.into(),
+                Some(if i % 3 == 0 { "hot" } else { "cold" }.into()),
             );
-            row.insert("bucket".into(), format!("b{}", i % 16));
-            row.insert("payload".into(), format!("payload-{i:08}"));
+            row.insert("bucket".into(), Some(format!("b{}", i % 16)));
+            row.insert("payload".into(), Some(format!("payload-{i:08}")));
             row
         })
         .collect()
@@ -233,5 +233,7 @@ fn consume_chunked(mut iter: Box<dyn RowIterator>) -> ResultStats {
 }
 
 fn row_checksum(row: &Row) -> u64 {
-    row.values().map(|value| value.len() as u64).sum()
+    row.values()
+        .filter_map(|value| value.as_ref().map(|v| v.len() as u64))
+        .sum()
 }

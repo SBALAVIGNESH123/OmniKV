@@ -260,7 +260,9 @@ impl PlanExecutor {
     ) -> Vec<Row> {
         let mut hash_table: HashMap<String, Vec<&Row>> = HashMap::with_capacity(build.len());
         for row in build {
-            let key = row.get(build_col).cloned().unwrap_or_default();
+            let Some(key) = row.get(build_col).cloned().flatten() else {
+                continue;
+            };
             hash_table.entry(key).or_default().push(row);
         }
 
@@ -268,7 +270,9 @@ impl PlanExecutor {
         // Matched keys, so the unmatched build rows can be emitted below.
         let mut matched_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
         for probe_row in probe {
-            let key = probe_row.get(probe_col).cloned().unwrap_or_default();
+            let Some(key) = probe_row.get(probe_col).cloned().flatten() else {
+                continue;
+            };
             match (hash_table.get(&key), join_type) {
                 (Some(matches), _) => {
                     if matches!(join_type, JoinType::Right) {
@@ -313,9 +317,14 @@ impl PlanExecutor {
             let col = item.column.clone();
             let desc = item.desc;
             rows.sort_by(|a, b| {
-                let va = a.get(&col).cloned().unwrap_or_default();
-                let vb = b.get(&col).cloned().unwrap_or_default();
-                let cmp = smart_cmp(&va, &vb);
+                let va = a.get(&col).cloned().flatten();
+                let vb = b.get(&col).cloned().flatten();
+                let cmp = match (va.as_deref(), vb.as_deref()) {
+                    (Some(x), Some(y)) => smart_cmp(x, y),
+                    (Some(_), None) => std::cmp::Ordering::Less,
+                    (None, Some(_)) => std::cmp::Ordering::Greater,
+                    (None, None) => std::cmp::Ordering::Equal,
+                };
                 if desc { cmp.reverse() } else { cmp }
             });
         }
@@ -339,7 +348,7 @@ impl PlanExecutor {
                 if let SelectColumn::Aggregate(func, target) = col {
                     let refs: Vec<&Row> = rows.iter().collect();
                     let (name, val) = compute_aggregate(func, target, &refs);
-                    result.insert(name, val);
+                    result.insert(name, Some(val));
                 }
             }
             return Ok(vec![result]);
@@ -349,7 +358,12 @@ impl PlanExecutor {
         for row in rows {
             let key: String = group_by
                 .iter()
-                .map(|g| row.get(g).cloned().unwrap_or_default())
+                .map(|g| {
+                    row.get(g)
+                        .cloned()
+                        .flatten()
+                        .unwrap_or_else(|| "\x01NULL\x01".to_string())
+                })
                 .collect::<Vec<_>>()
                 .join("|");
             groups.entry(key).or_default().push(row);
@@ -367,7 +381,7 @@ impl PlanExecutor {
                     }
                     SelectColumn::Aggregate(func, target) => {
                         let (name, val) = compute_aggregate(func, target, group_rows);
-                        row.insert(name, val);
+                        row.insert(name, Some(val));
                     }
                     _ => {}
                 }
@@ -390,14 +404,12 @@ impl PlanExecutor {
                     match col {
                         SelectColumn::Named(n) => {
                             if let Some(v) = crate::volcano::row_lookup(row, n) {
-                                projected.insert(n.clone(), v.clone());
+                                projected.insert(n.clone(), Some(v.to_string()));
                             }
                         }
                         SelectColumn::Qualified(t, n) => {
                             let key = format!("{}.{}", t, n);
-                            let val = crate::volcano::row_lookup(row, &key)
-                                .cloned()
-                                .unwrap_or_else(|| "NULL".into());
+                            let val = crate::volcano::row_lookup(row, &key).map(str::to_string);
                             projected.insert(key, val.clone());
                             projected.entry(n.clone()).or_insert(val);
                         }

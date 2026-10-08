@@ -59,7 +59,7 @@ impl ColumnType {
     pub fn canonicalize(&self, value: &str) -> String {
         match self {
             Self::Integer => value
-                .parse::<i64>()
+                .parse::<i128>()
                 .map(|n| n.to_string())
                 .unwrap_or_else(|_| value.to_string()),
             Self::Float => value
