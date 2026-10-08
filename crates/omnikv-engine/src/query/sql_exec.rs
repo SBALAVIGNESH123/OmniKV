@@ -680,7 +680,7 @@ impl SqlExecutor {
 
         results
             .into_iter()
-            .filter_map(|(_key, value)| serde_json::from_str::<Row>(&value).ok())
+            .filter_map(|(_key, value)| crate::plan_exec::PlanExecutor::deserialize_row(&value))
             .collect()
     }
 
@@ -1221,21 +1221,30 @@ impl SqlExecutor {
 
         // Build hash index on right table
         let mut right_index: HashMap<String, Vec<&Row>> = HashMap::new();
+        let mut null_key_right_rows: Vec<&Row> = Vec::new();
         for r in right {
-            let Some(key) = r.get(on_right).cloned().flatten() else {
-                continue;
-            };
-            right_index.entry(key).or_default().push(r);
+            match r.get(on_right).cloned().flatten() {
+                Some(key) => {
+                    right_index.entry(key).or_default().push(r);
+                }
+                None => null_key_right_rows.push(r),
+            }
         }
 
+        let mut matched_right_keys: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+
         for lr in left {
-            let Some(join_key) = lr.get(on_left).cloned().flatten() else {
-                continue;
-            };
-            let matches = right_index.get(&join_key);
+            // A NULL left key matches nothing, but on a LEFT join the row is
+            // still preserved.
+            let join_key = lr.get(on_left).cloned().flatten();
+            let matches = join_key.as_deref().and_then(|k| right_index.get(k));
 
             match (matches, join_type) {
                 (Some(rights), _) => {
+                    if let Some(k) = join_key {
+                        matched_right_keys.insert(k);
+                    }
                     for rr in rights {
                         let mut combined = Row::new();
                         for (k, v) in lr {
@@ -1262,6 +1271,32 @@ impl SqlExecutor {
                 _ => {}
             }
         }
+
+        // A RIGHT JOIN preserves right rows that no left row matched,
+        // including those whose key is NULL.
+        if matches!(join_type, JoinType::Right) {
+            for (key, rows) in &right_index {
+                if matched_right_keys.contains(key) {
+                    continue;
+                }
+                for rr in rows {
+                    let mut combined = Row::new();
+                    for (k, v) in *rr {
+                        combined.insert(format!("{}.{}", right_name, k), v.clone());
+                        combined.insert(k.clone(), v.clone());
+                    }
+                    result.push(combined);
+                }
+            }
+            for rr in &null_key_right_rows {
+                let mut combined = Row::new();
+                for (k, v) in *rr {
+                    combined.insert(format!("{}.{}", right_name, k), v.clone());
+                    combined.insert(k.clone(), v.clone());
+                }
+                result.push(combined);
+            }
+        }
         result
     }
 
@@ -1278,10 +1313,12 @@ impl SqlExecutor {
             let key: String = group_by
                 .iter()
                 .map(|g| {
-                    row.get(g)
+                    let part = row
+                        .get(g)
                         .cloned()
                         .flatten()
-                        .unwrap_or_else(|| "\u{1}NULL\u{1}".to_string())
+                        .unwrap_or_else(|| "\u{1}NULL\u{1}".to_string());
+                    format!("{}:{part}", part.len())
                 })
                 .collect::<Vec<_>>()
                 .join("|");

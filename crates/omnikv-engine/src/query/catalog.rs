@@ -56,6 +56,11 @@ impl ColumnType {
 
     /// Canonical form for a value of this type: a numeric payload prints as
     /// its number, anything else is kept verbatim.
+    ///
+    /// Float canonicalize is lossy by design: `1.50` normalizes to `1.5`,
+    /// and a value too large for the shortest f64 repr falls back to the
+    /// input text. Comparison stays consistent because both sides go through
+    /// the same path, but a FLOAT column does not preserve the typed digits.
     pub fn canonicalize(&self, value: &str) -> String {
         match self {
             Self::Integer => value

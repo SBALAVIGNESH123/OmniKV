@@ -202,7 +202,7 @@ impl PlanExecutor {
                     .scan(&key, &end, seq)
                     .unwrap_or_default()
                     .into_iter()
-                    .filter_map(|(_, value)| serde_json::from_str::<Row>(&value).ok())
+                    .filter_map(|(_, value)| Self::deserialize_row(&value))
                     .collect()
             }
             AccessMethod::IndexScan { .. } | AccessMethod::SeqScan => self.load_table_rows(&table),
@@ -215,6 +215,18 @@ impl PlanExecutor {
         Ok(rows)
     }
 
+    /// Deserialize a stored row, mapping the legacy `"NULL"` sentinel to a
+    /// real NULL. Rows written before the typed-Row change stored SQL NULL as
+    /// the literal string "NULL"; without this they would read back as text.
+    pub fn deserialize_row(value: &str) -> Option<Row> {
+        let row: Row = serde_json::from_str(value).ok()?;
+        Some(
+            row.into_iter()
+                .map(|(k, v)| (k, v.filter(|s| s != "NULL")))
+                .collect(),
+        )
+    }
+
     fn load_table_rows(&self, table: &TableDef) -> Vec<Row> {
         let prefix = table.row_prefix();
         let seq = self.db.get_seq();
@@ -222,7 +234,7 @@ impl PlanExecutor {
             .scan(&prefix, &format!("{}\x7F", prefix), seq)
             .unwrap_or_default()
             .into_iter()
-            .filter_map(|(_, value)| serde_json::from_str::<Row>(&value).ok())
+            .filter_map(|(_, value)| Self::deserialize_row(&value))
             .collect()
     }
 
@@ -235,7 +247,7 @@ impl PlanExecutor {
             .unwrap_or_default()
             .into_iter()
             .filter_map(|(_, value)| {
-                let full: Row = serde_json::from_str(&value).ok()?;
+                let full: Row = Self::deserialize_row(&value)?;
                 if needed_cols.is_empty() {
                     return Some(full);
                 }
@@ -259,24 +271,27 @@ impl PlanExecutor {
         join_type: &JoinType,
     ) -> Vec<Row> {
         let mut hash_table: HashMap<String, Vec<&Row>> = HashMap::with_capacity(build.len());
+        let mut null_key_build_rows: Vec<&Row> = Vec::new();
         for row in build {
-            let Some(key) = row.get(build_col).cloned().flatten() else {
-                continue;
-            };
-            hash_table.entry(key).or_default().push(row);
+            match row.get(build_col).cloned().flatten() {
+                Some(key) => {
+                    hash_table.entry(key).or_default().push(row);
+                }
+                None => null_key_build_rows.push(row),
+            }
         }
 
         let mut result = Vec::new();
         // Matched keys, so the unmatched build rows can be emitted below.
         let mut matched_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
         for probe_row in probe {
-            let Some(key) = probe_row.get(probe_col).cloned().flatten() else {
-                continue;
-            };
-            match (hash_table.get(&key), join_type) {
+            // A NULL probe key matches nothing, but on a LEFT join the probe
+            // row is still preserved.
+            let key = probe_row.get(probe_col).cloned().flatten();
+            match (key.as_deref().and_then(|k| hash_table.get(k)), join_type) {
                 (Some(matches), _) => {
                     if matches!(join_type, JoinType::Right) {
-                        matched_keys.insert(key);
+                        matched_keys.insert(key.unwrap());
                     }
                     for build_row in matches {
                         let mut combined = Row::new();
@@ -296,7 +311,8 @@ impl PlanExecutor {
             }
         }
 
-        // A RIGHT JOIN preserves build rows that no probe row matched.
+        // A RIGHT JOIN preserves build rows that no probe row matched,
+        // including those whose key is NULL.
         if matches!(join_type, JoinType::Right) {
             for (key, rows) in &hash_table {
                 if matched_keys.contains(key) {
@@ -305,6 +321,9 @@ impl PlanExecutor {
                 for build_row in rows {
                     result.push((**build_row).clone());
                 }
+            }
+            for build_row in &null_key_build_rows {
+                result.push((**build_row).clone());
             }
         }
         result
@@ -359,10 +378,12 @@ impl PlanExecutor {
             let key: String = group_by
                 .iter()
                 .map(|g| {
-                    row.get(g)
+                    let part = row
+                        .get(g)
                         .cloned()
                         .flatten()
-                        .unwrap_or_else(|| "\x01NULL\x01".to_string())
+                        .unwrap_or_else(|| "\x01NULL\x01".to_string());
+                    format!("{}:{part}", part.len())
                 })
                 .collect::<Vec<_>>()
                 .join("|");

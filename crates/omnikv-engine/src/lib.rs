@@ -32,7 +32,6 @@
     clippy::missing_panics_doc,
     clippy::must_use_candidate,
     clippy::needless_collect,
-    clippy::needless_continue,
     clippy::needless_pass_by_value,
     clippy::non_std_lazy_statics,
     clippy::option_if_let_else,

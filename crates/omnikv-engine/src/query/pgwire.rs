@@ -1980,6 +1980,8 @@ fn merge_staged_writes_into_txn(
 fn sqlstate_for_exec_error(e: &str) -> &'static str {
     if e.contains("column \"") && e.contains("does not exist") {
         "42703"
+    } else if e.contains("is ambiguous") {
+        "42702"
     } else if e.contains("does not exist") {
         "42P01"
     } else if e.contains("already exists") {
@@ -2589,6 +2591,14 @@ mod tests {
     #[test]
     fn sqlstate_other_is_internal_error() {
         assert_eq!(sqlstate_for_exec_error("disk on fire"), "XX000");
+    }
+
+    #[test]
+    fn sqlstate_ambiguous_column_is_42702() {
+        assert_eq!(
+            sqlstate_for_exec_error("column \"id\" is ambiguous — qualify it"),
+            "42702"
+        );
     }
 
     use crate::sql::{SqlStatement, parse_sql};

@@ -654,17 +654,18 @@ impl RowIterator for HashJoinIter {
                     continue;
                 }
             };
-            let key = probe_row
-                .get(&self.probe_col)
-                .cloned()
-                .flatten()
-                .unwrap_or_default();
+            let key = probe_row.get(&self.probe_col).cloned().flatten();
 
-            match self.hash_table.get(&key) {
-                Some(build_rows) => {
-                    // Track matched keys for RIGHT JOIN
+            // A NULL probe key matches nothing: `NULL = x` is UNKNOWN, so it
+            // must not fall through to a "" lookup and hit a build row whose
+            // key is a real empty string.
+            let matched = key
+                .as_deref()
+                .and_then(|k| self.hash_table.get(k))
+                .map(|build_rows| {
                     if matches!(self.join_type, JoinType::Right) {
-                        self.matched_build_keys.insert(key.clone());
+                        self.matched_build_keys
+                            .insert(key.clone().unwrap_or_default());
                     }
                     self.current_matches.clear();
                     self.match_pos = 0;
@@ -681,16 +682,11 @@ impl RowIterator for HashJoinIter {
                         }
                         self.current_matches.push(combined);
                     }
-                }
-                None => {
-                    match self.join_type {
-                        JoinType::Left => {
-                            self.current_matches = vec![qualify_row(probe_row, &self.probe_prefix)];
-                            self.match_pos = 0;
-                        }
-                        _ => continue, // skip non-matching probe rows for INNER/RIGHT join
-                    }
-                }
+                });
+
+            if matched.is_none() && matches!(self.join_type, JoinType::Left) {
+                self.current_matches = vec![qualify_row(probe_row, &self.probe_prefix)];
+                self.match_pos = 0;
             }
         }
     }

@@ -189,10 +189,16 @@ pub struct OrderByItem {
 /// never reach here — `cmp_by_affinity` follows the declared `ColumnType` —
 /// so this only governs untyped targets.
 fn coerce_param(v: &str) -> SqlValue {
-    if let Ok(i) = v.parse::<i64>()
+    // Parsed as i128 to match smart_cmp, so an integer above the i64 range
+    // is still numeric instead of falling back to text. SqlValue carries
+    // only i64, so an overflowing value keeps its string form there.
+    if let Ok(i) = v.parse::<i128>()
         && i.to_string() == v
     {
-        return SqlValue::Integer(i);
+        return i
+            .try_into()
+            .map(SqlValue::Integer)
+            .unwrap_or_else(|_| SqlValue::Text(v.to_string()));
     }
     // The f64 parser accepts "NaN"/"inf", which are words here.
     if let Ok(f) = v.parse::<f64>()
@@ -1451,5 +1457,25 @@ mod tests {
         parse_sql("delete from users where id = 1").expect("lowercase DELETE");
         parse_sql("show tables").expect("lowercase SHOW TABLES");
         parse_sql("Explain Select * From users").expect("mixed-case EXPLAIN");
+    }
+
+    #[test]
+    fn coerce_param_keeps_exact_digits_past_i64() {
+        // In range: numeric.
+        assert!(matches!(coerce_param("42"), SqlValue::Integer(42)));
+        // i64 max, still Integer.
+        assert!(matches!(
+            coerce_param("9223372036854775807"),
+            SqlValue::Integer(9223372036854775807)
+        ));
+        // One past i64 max: i128 parses it, SqlValue cannot hold it, so the
+        // exact text survives rather than becoming a lossy Float.
+        assert_eq!(
+            coerce_param("9223372036854775808"),
+            SqlValue::Text("9223372036854775808".to_string())
+        );
+        // A round-tripping float stays a float; a word stays text.
+        assert!(matches!(coerce_param("1.5"), SqlValue::Float(_)));
+        assert_eq!(coerce_param("abc"), SqlValue::Text("abc".to_string()));
     }
 }

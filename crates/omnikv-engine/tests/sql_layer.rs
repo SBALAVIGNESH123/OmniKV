@@ -1787,3 +1787,96 @@ fn test_outer_join_preserves_null_key_row() {
         ]
     );
 }
+
+/// A NULL join key is not an empty string: it matches nothing, but the row
+/// is still preserved by an outer join.
+#[test]
+fn test_null_join_key_never_matches_empty_string() {
+    let (_db, exec) = create_sql_env("nullvsempty");
+    exec_sql(&exec, "CREATE TABLE a (id INTEGER PRIMARY KEY, k TEXT)");
+    exec_sql(&exec, "CREATE TABLE b (id INTEGER PRIMARY KEY, k TEXT)");
+    exec_sql(&exec, "INSERT INTO a (id, k) VALUES (1, NULL)");
+    exec_sql(&exec, "INSERT INTO b (id, k) VALUES (2, '')");
+
+    let (_cols, rows) = exec_rows(&exec, "SELECT a.id, b.id FROM a JOIN b ON a.k = b.k");
+    assert!(rows.is_empty(), "NULL must not join to '': {rows:?}");
+
+    let (_cols, rows) = exec_rows(
+        &exec,
+        "SELECT a.id, b.id FROM a LEFT JOIN b ON a.k = b.k ORDER BY a.id",
+    );
+    assert_eq!(rows, vec![vec!["1".to_string(), "NULL".to_string()]]);
+
+    let (_cols, rows) = exec_rows(
+        &exec,
+        "SELECT a.id, b.id FROM a RIGHT JOIN b ON a.k = b.k ORDER BY b.id",
+    );
+    assert_eq!(rows, vec![vec!["NULL".to_string(), "2".to_string()]]);
+}
+
+/// GROUP BY keys containing the join separator must not collide: ("x", "y|z")
+/// and ("x|y", "z") both join to "x|y|z" under a naive separator join but are
+/// different groups.
+#[test]
+fn test_group_by_key_with_separator_does_not_collide() {
+    let (_db, exec) = create_sql_env("gbseps");
+    exec_sql(
+        &exec,
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT, b TEXT)",
+    );
+    exec_sql(&exec, "INSERT INTO t (id, a, b) VALUES (1, 'x', 'y|z')");
+    exec_sql(&exec, "INSERT INTO t (id, a, b) VALUES (2, 'x|y', 'z')");
+    exec_sql(&exec, "INSERT INTO t (id, a, b) VALUES (3, 'x', 'y|z')");
+
+    let (_cols, rows) = exec_rows(
+        &exec,
+        "SELECT a, b, COUNT(*) FROM t GROUP BY a, b ORDER BY a, b",
+    );
+    assert_eq!(
+        rows,
+        vec![
+            vec!["x".to_string(), "y|z".to_string(), "2".to_string()],
+            vec!["x|y".to_string(), "z".to_string(), "1".to_string()],
+        ]
+    );
+}
+
+/// `EXPLAIN ANALYZE` runs the hash join through `PlanExecutor`, which must agree
+/// with the volcano executor when join keys are NULL: a NULL key never
+/// matches, but an outer join still preserves its row. A NULL-key probe row
+/// or build row that silently dropped would make these counts diverge.
+#[test]
+fn test_explain_analyze_null_join_key_matches_volcano() {
+    let (_db, exec) = create_sql_env("eanulljoin");
+
+    exec_sql(&exec, "CREATE TABLE a (id INTEGER PRIMARY KEY, k TEXT)");
+    exec_sql(&exec, "CREATE TABLE b (id INTEGER PRIMARY KEY, k TEXT)");
+    exec_sql(
+        &exec,
+        "INSERT INTO a (id, k) VALUES (1, NULL), (2, NULL), (3, 'x'), (4, 'y'), (5, 'z')",
+    );
+    exec_sql(
+        &exec,
+        "INSERT INTO b (id, k) VALUES (1, NULL), (2, 'x'), (3, 'y'), (4, 'w'), (5, 'q')",
+    );
+
+    for join in ["INNER", "LEFT", "RIGHT"] {
+        let sql = format!("SELECT a.id, b.id FROM a {join} JOIN b ON a.k = b.k");
+        let (_cols, rows) = exec_rows(&exec, &sql);
+
+        let (_cols, plan_rows) = exec_rows(&exec, &format!("EXPLAIN ANALYZE {sql}"));
+        let hash_join_line = plan_rows
+            .iter()
+            .map(|r| r.first().cloned().unwrap_or_default())
+            .find(|l| l.contains("Hash Join"))
+            .unwrap_or_else(|| {
+                panic!("{join} JOIN plan should contain a Hash Join: {plan_rows:?}")
+            });
+        assert!(
+            hash_join_line.contains(&format!("actual rows={}", rows.len())),
+            "{join} JOIN: EXPLAIN ANALYZE must report the same row count as the volcano \
+             executor ({}): {hash_join_line}",
+            rows.len()
+        );
+    }
+}
