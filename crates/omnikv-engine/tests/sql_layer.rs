@@ -1998,3 +1998,37 @@ fn window_order_by_follows_column_type() {
         ]
     );
 }
+
+/// A window function's ORDER BY must resolve a sort key from either side of
+/// a join, not just the first table: a TEXT key on the right table that
+/// falls back to the numeric heuristic would order '2' before '10'.
+#[test]
+fn window_order_by_resolves_right_table_of_join() {
+    let (_db, exec) = create_sql_env("winjoin");
+
+    exec_sql(&exec, "CREATE TABLE l (id INTEGER PRIMARY KEY, x INTEGER)");
+    exec_sql(&exec, "CREATE TABLE r (id INTEGER PRIMARY KEY, v TEXT)");
+    exec_sql(
+        &exec,
+        "INSERT INTO l (id, x) VALUES (1, 10), (2, 20), (3, 30)",
+    );
+    exec_sql(
+        &exec,
+        "INSERT INTO r (id, v) VALUES (1, '2'), (2, '10'), (3, '1')",
+    );
+
+    // The sort key v belongs to r, the second table. Lexical order is
+    // '1', '10', '2', so the row numbers follow it, not numeric order.
+    let (_cols, rows) = exec_rows(
+        &exec,
+        "SELECT r.v, ROW_NUMBER() OVER (ORDER BY r.v) FROM l JOIN r ON l.id = r.id",
+    );
+    assert_eq!(
+        rows,
+        vec![
+            vec!["1".to_string(), "1".to_string()],
+            vec!["10".to_string(), "2".to_string()],
+            vec!["2".to_string(), "3".to_string()],
+        ]
+    );
+}
