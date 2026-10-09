@@ -795,7 +795,7 @@ impl SqlExecutor {
                 }
 
                 if has_window {
-                    self.apply_window_functions(&mut rows, columns);
+                    self.apply_window_functions(&mut rows, columns, from);
                 }
 
                 let (col_names, mut result_rows) = self.project(&rows, columns, from)?;
@@ -871,18 +871,41 @@ impl SqlExecutor {
     }
 
     /// Window function post-processing (ROW_NUMBER, RANK, DENSE_RANK).
-    fn apply_window_functions(&self, rows: &mut [Row], columns: &[SelectColumn]) {
+    fn apply_window_functions(
+        &self,
+        rows: &mut [Row],
+        columns: &[SelectColumn],
+        from: &FromClause,
+    ) {
+        let from_tables: Vec<String> = match from {
+            FromClause::Table(t) => vec![t.clone()],
+            FromClause::Join { left, right, .. } => vec![left.clone(), right.clone()],
+        };
         for col in columns {
             if let SelectColumn::WindowFunc {
                 order_by: ob, desc, ..
             } = col
             {
                 let ob = ob.clone();
+                let col_type = from_tables
+                    .iter()
+                    .find_map(|t| self.catalog.get_table(t))
+                    .and_then(|table| {
+                        table
+                            .columns
+                            .iter()
+                            .find(|c| c.name.eq_ignore_ascii_case(&ob))
+                            .map(|c| c.col_type.clone())
+                    });
                 rows.sort_by(|a, b| {
                     let va = a.get(&ob).cloned().flatten();
                     let vb = b.get(&ob).cloned().flatten();
                     let cmp = match (va.as_deref(), vb.as_deref()) {
-                        (Some(x), Some(y)) => smart_cmp(x, y),
+                        (Some(x), Some(y)) => match &col_type {
+                            Some(t) if t.is_numeric() => smart_cmp(x, y),
+                            Some(_) => x.cmp(y),
+                            None => smart_cmp(x, y),
+                        },
                         (Some(_), None) => std::cmp::Ordering::Less,
                         (None, Some(_)) => std::cmp::Ordering::Greater,
                         (None, None) => std::cmp::Ordering::Equal,
@@ -1149,25 +1172,26 @@ impl SqlExecutor {
             }
         };
 
-        if let Some(expr) = where_clause {
-            // Predicates compare by the column's affinity, and a qualified
-            // name resolves through the `table.column` key the join stores.
-            let from_tables: Vec<String> = match from {
-                FromClause::Table(t) => vec![t.clone()],
-                FromClause::Join { left, right, .. } => vec![left.clone(), right.clone()],
-            };
-            let mut col_types = crate::volcano::ColumnTypeMap::new();
-            for t in &from_tables {
-                if let Some(table) = self.catalog.get_table(t) {
-                    for c in &table.columns {
-                        // Left wins a bare-key clash, matching execute_join.
-                        col_types
-                            .entry(c.name.clone())
-                            .or_insert(c.col_type.clone());
-                        col_types.insert(format!("{t}.{}", c.name), c.col_type.clone());
-                    }
+        // Predicates compare by the column's affinity, and a qualified name
+        // resolves through the `table.column` key the join stores. The same
+        // types govern ORDER BY below, so they are built once here.
+        let from_tables: Vec<String> = match from {
+            FromClause::Table(t) => vec![t.clone()],
+            FromClause::Join { left, right, .. } => vec![left.clone(), right.clone()],
+        };
+        let mut col_types = crate::volcano::ColumnTypeMap::new();
+        for t in &from_tables {
+            if let Some(table) = self.catalog.get_table(t) {
+                for c in &table.columns {
+                    // Left wins a bare-key clash, matching execute_join.
+                    col_types
+                        .entry(c.name.clone())
+                        .or_insert(c.col_type.clone());
+                    col_types.insert(format!("{t}.{}", c.name), c.col_type.clone());
                 }
             }
+        }
+        if let Some(expr) = where_clause {
             rows.retain(|row| eval_where_typed(row, expr, &col_types));
         }
 
@@ -1185,11 +1209,16 @@ impl SqlExecutor {
         for item in order_by.iter().rev() {
             let col = item.column.clone();
             let desc = item.desc;
+            let col_type = col_types.get(&col).cloned();
             rows.sort_by(|a, b| {
                 let va = a.get(&col).cloned().flatten();
                 let vb = b.get(&col).cloned().flatten();
                 let cmp = match (va.as_deref(), vb.as_deref()) {
-                    (Some(x), Some(y)) => smart_cmp(x, y),
+                    (Some(x), Some(y)) => match &col_type {
+                        Some(t) if t.is_numeric() => smart_cmp(x, y),
+                        Some(_) => x.cmp(y),
+                        None => smart_cmp(x, y),
+                    },
                     (Some(_), None) => std::cmp::Ordering::Less,
                     (None, Some(_)) => std::cmp::Ordering::Greater,
                     (None, None) => std::cmp::Ordering::Equal,

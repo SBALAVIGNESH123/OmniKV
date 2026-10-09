@@ -489,16 +489,32 @@ pub struct SortIter {
 }
 
 impl SortIter {
-    pub fn new(mut child: Box<dyn RowIterator>, order_by: Vec<OrderByItem>) -> Self {
+    /// `types` carries the sort key's declared `ColumnType`, so a TEXT
+    /// column orders lexically and a numeric one numerically. Without it
+    /// `smart_cmp` would order TEXT "10" before "2", disagreeing with the
+    /// type-aware comparison a WHERE clause on the same column uses.
+    pub fn new(
+        mut child: Box<dyn RowIterator>,
+        order_by: Vec<OrderByItem>,
+        types: ColumnTypeMap,
+    ) -> Self {
         let mut rows = child.collect_all();
         for item in order_by.iter().rev() {
             let col = item.column.clone();
             let desc = item.desc;
+            let col_type = types.get(&col).cloned();
             rows.sort_by(|a, b| {
                 let va = a.get(&col).cloned().flatten();
                 let vb = b.get(&col).cloned().flatten();
                 let cmp = match (va.as_deref(), vb.as_deref()) {
-                    (Some(x), Some(y)) => smart_cmp(x, y),
+                    (Some(x), Some(y)) => match &col_type {
+                        // A declared type decides: numeric columns compare
+                        // numerically, everything else lexically.
+                        Some(t) if t.is_numeric() => smart_cmp(x, y),
+                        Some(_) => x.cmp(y),
+                        // No declared type: keep the type-agnostic heuristic.
+                        None => smart_cmp(x, y),
+                    },
                     (Some(_), None) => std::cmp::Ordering::Less,
                     (None, Some(_)) => std::cmp::Ordering::Greater,
                     (None, None) => std::cmp::Ordering::Equal,
@@ -938,7 +954,8 @@ pub fn compile_plan_with_scan(
             child, order_by, ..
         } => {
             let child_iter = compile_plan_with_scan(child, db, catalog, scan);
-            Box::new(SortIter::new(child_iter, order_by.clone()))
+            let col_types = child.output_types(catalog);
+            Box::new(SortIter::new(child_iter, order_by.clone(), col_types))
         }
         PlanNode::Limit { child, count } => {
             let child_iter = compile_plan_with_scan(child, db, catalog, scan);

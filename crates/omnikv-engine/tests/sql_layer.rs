@@ -1915,3 +1915,86 @@ fn typed_table_keeps_literal_null_text() {
         "EXPLAIN ANALYZE must find the literal-text row: {project}"
     );
 }
+
+/// ORDER BY follows the column's declared type: a TEXT column orders
+/// lexically ("10" < "2") while a numeric one orders numerically. A
+/// type-agnostic sort would order text numerically and disagree with the
+/// type-aware comparison a WHERE clause on the same column uses.
+#[test]
+fn order_by_follows_column_type() {
+    let (_db, exec) = create_sql_env("ordsort");
+
+    exec_sql(&exec, "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)");
+    exec_sql(
+        &exec,
+        "INSERT INTO t (id, v) VALUES (1, '2'), (2, '10'), (3, '1')",
+    );
+
+    // TEXT column: lexical, so '10' sorts before '2'.
+    let (_cols, text_asc) = exec_rows(&exec, "SELECT v FROM t ORDER BY v");
+    assert_eq!(
+        text_asc,
+        vec![
+            vec!["1".to_string()],
+            vec!["10".to_string()],
+            vec!["2".to_string()],
+        ]
+    );
+
+    // INTEGER column: numeric, so 1 < 2 < 10 by id.
+    let (_cols, num_asc) = exec_rows(&exec, "SELECT v FROM t ORDER BY id");
+    assert_eq!(
+        num_asc,
+        vec![
+            vec!["2".to_string()],
+            vec!["10".to_string()],
+            vec!["1".to_string()],
+        ]
+    );
+
+    // DESC reverses the same lexical order, not a numeric one.
+    let (_cols, text_desc) = exec_rows(&exec, "SELECT v FROM t ORDER BY v DESC");
+    assert_eq!(
+        text_desc,
+        vec![
+            vec!["2".to_string()],
+            vec!["10".to_string()],
+            vec!["1".to_string()],
+        ]
+    );
+
+    // EXPLAIN ANALYZE sorts through PlanExecutor; it must agree.
+    let (_cols, plan) = exec_rows(&exec, "EXPLAIN ANALYZE SELECT v FROM t ORDER BY v");
+    let sort_line = plan
+        .iter()
+        .map(|r| r.first().cloned().unwrap_or_default())
+        .find(|l| l.contains("Sort"))
+        .expect("plan has a Sort node");
+    assert!(
+        sort_line.contains("actual rows=3"),
+        "EXPLAIN ANALYZE must sort the same rows: {sort_line}"
+    );
+}
+
+/// A window function's ORDER BY respects the column type too.
+#[test]
+fn window_order_by_follows_column_type() {
+    let (_db, exec) = create_sql_env("winordsort");
+
+    exec_sql(&exec, "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)");
+    exec_sql(
+        &exec,
+        "INSERT INTO t (id, v) VALUES (1, '2'), (2, '10'), (3, '1')",
+    );
+
+    // Lexical order is '1', '10', '2', so the row numbers follow it.
+    let (_cols, rows) = exec_rows(&exec, "SELECT v, ROW_NUMBER() OVER (ORDER BY v) FROM t");
+    assert_eq!(
+        rows,
+        vec![
+            vec!["1".to_string(), "1".to_string()],
+            vec!["10".to_string(), "2".to_string()],
+            vec!["2".to_string(), "3".to_string()],
+        ]
+    );
+}

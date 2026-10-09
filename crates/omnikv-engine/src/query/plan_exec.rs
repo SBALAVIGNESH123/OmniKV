@@ -7,6 +7,7 @@ use crate::catalog::{Catalog, RowFormat, TableDef};
 use crate::optimizer::{AccessMethod, PlanNode};
 use crate::sql::{AggFunc, JoinType, OrderByItem, SelectColumn, WhereExpr};
 use crate::sql_exec::Row;
+use crate::volcano::ColumnTypeMap;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -74,7 +75,8 @@ impl PlanExecutor {
                 child, order_by, ..
             } => {
                 let mut rows = self.execute_plan(child)?;
-                self.exec_sort(&mut rows, order_by);
+                let types = child.output_types(&self.catalog);
+                self.exec_sort(&mut rows, order_by, &types);
                 Ok(rows)
             }
             PlanNode::Limit { child, count } => {
@@ -346,15 +348,22 @@ impl PlanExecutor {
 
     // ─── Sort ───────────────────────────────────────────────────────────
 
-    fn exec_sort(&self, rows: &mut [Row], order_by: &[OrderByItem]) {
+    /// Sorts by the sort key's declared type where it is known, so a TEXT
+    /// column orders lexically and a numeric one numerically.
+    fn exec_sort(&self, rows: &mut [Row], order_by: &[OrderByItem], types: &ColumnTypeMap) {
         for item in order_by.iter().rev() {
             let col = item.column.clone();
             let desc = item.desc;
+            let col_type = types.get(&col).cloned();
             rows.sort_by(|a, b| {
                 let va = a.get(&col).cloned().flatten();
                 let vb = b.get(&col).cloned().flatten();
                 let cmp = match (va.as_deref(), vb.as_deref()) {
-                    (Some(x), Some(y)) => smart_cmp(x, y),
+                    (Some(x), Some(y)) => match &col_type {
+                        Some(t) if t.is_numeric() => smart_cmp(x, y),
+                        Some(_) => x.cmp(y),
+                        None => smart_cmp(x, y),
+                    },
                     (Some(_), None) => std::cmp::Ordering::Less,
                     (None, Some(_)) => std::cmp::Ordering::Greater,
                     (None, None) => std::cmp::Ordering::Equal,
