@@ -57,10 +57,13 @@ impl ColumnType {
     /// Canonical form for a value of this type: a numeric payload prints as
     /// its number, anything else is kept verbatim.
     ///
-    /// Float canonicalize is lossy by design: `1.50` normalizes to `1.5`,
-    /// and a value too large for the shortest f64 repr falls back to the
-    /// input text. Comparison stays consistent because both sides go through
-    /// the same path, but a FLOAT column does not preserve the typed digits.
+    /// A FLOAT column normalizing `1.50` to `1.5` is not lossy storage --
+    /// it is IEEE-754 semantics, and the same rule PostgreSQL applies to
+    /// `double precision`. `1.50` and `1.5` parse to the identical f64, so
+    /// the trailing zero was never information the type could hold;
+    /// `f64`'s shortest-round-trip display preserves every value exactly.
+    /// Preserving typed digits is a `NUMERIC`/decimal type's job, which this
+    /// engine does not have.
     pub fn canonicalize(&self, value: &str) -> String {
         match self {
             Self::Integer => value
