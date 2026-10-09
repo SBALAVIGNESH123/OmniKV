@@ -497,6 +497,10 @@ impl SqlExecutor {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs(),
+            // This table is created by the typed-Row code, so its NULLs are
+            // JSON `null` and "NULL" is literal text. Old manifests lack the
+            // field and default to legacy.
+            row_format: crate::catalog::RowFormat::Typed,
         };
 
         // Inside a transaction the CREATE stages in the pending batch —
@@ -680,7 +684,9 @@ impl SqlExecutor {
 
         results
             .into_iter()
-            .filter_map(|(_key, value)| crate::plan_exec::PlanExecutor::deserialize_row(&value))
+            .filter_map(|(_key, value)| {
+                crate::plan_exec::PlanExecutor::deserialize_row(&value, table.row_format)
+            })
             .collect()
     }
 

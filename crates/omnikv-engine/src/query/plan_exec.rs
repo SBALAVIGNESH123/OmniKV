@@ -3,7 +3,7 @@
 //! Executes queries using the optimizer's physical plan tree.
 
 use crate::OmniKV;
-use crate::catalog::{Catalog, TableDef};
+use crate::catalog::{Catalog, RowFormat, TableDef};
 use crate::optimizer::{AccessMethod, PlanNode};
 use crate::sql::{AggFunc, JoinType, OrderByItem, SelectColumn, WhereExpr};
 use crate::sql_exec::Row;
@@ -202,7 +202,7 @@ impl PlanExecutor {
                     .scan(&key, &end, seq)
                     .unwrap_or_default()
                     .into_iter()
-                    .filter_map(|(_, value)| Self::deserialize_row(&value))
+                    .filter_map(|(_, value)| Self::deserialize_row(&value, table.row_format))
                     .collect()
             }
             AccessMethod::IndexScan { .. } | AccessMethod::SeqScan => self.load_table_rows(&table),
@@ -215,14 +215,29 @@ impl PlanExecutor {
         Ok(rows)
     }
 
-    /// Deserialize a stored row, mapping the legacy `"NULL"` sentinel to a
-    /// real NULL. Rows written before the typed-Row change stored SQL NULL as
-    /// the literal string "NULL"; without this they would read back as text.
-    pub fn deserialize_row(value: &str) -> Option<Row> {
+    /// Deserialize a stored row.
+    ///
+    /// On a [`Legacy`](crate::catalog::RowFormat::Legacy) table a stored
+    /// "NULL" is the pre-typed-Row encoding of SQL NULL and becomes `None`;
+    /// on a [`Typed`](crate::catalog::RowFormat::Typed) table it is the
+    /// user's literal text and is kept. The two byte patterns are identical,
+    /// so the value alone cannot distinguish them — the table's recorded
+    /// format is the only signal.
+    /// Map one stored value to a typed cell, per the table's row format.
+    fn decode(v: Option<String>, format: RowFormat) -> Option<String> {
+        match format {
+            // Stored "NULL" is SQL NULL; the typed code never writes it.
+            RowFormat::Legacy => v.filter(|s| s != "NULL"),
+            // Stored "NULL" is the user's literal text; JSON null is NULL.
+            RowFormat::Typed => v,
+        }
+    }
+
+    pub fn deserialize_row(value: &str, format: RowFormat) -> Option<Row> {
         let row: Row = serde_json::from_str(value).ok()?;
         Some(
             row.into_iter()
-                .map(|(k, v)| (k, v.filter(|s| s != "NULL")))
+                .map(|(k, v)| (k, Self::decode(v, format)))
                 .collect(),
         )
     }
@@ -234,7 +249,7 @@ impl PlanExecutor {
             .scan(&prefix, &format!("{}\x7F", prefix), seq)
             .unwrap_or_default()
             .into_iter()
-            .filter_map(|(_, value)| Self::deserialize_row(&value))
+            .filter_map(|(_, value)| Self::deserialize_row(&value, table.row_format))
             .collect()
     }
 
@@ -247,7 +262,7 @@ impl PlanExecutor {
             .unwrap_or_default()
             .into_iter()
             .filter_map(|(_, value)| {
-                let full: Row = Self::deserialize_row(&value)?;
+                let full: Row = Self::deserialize_row(&value, table.row_format)?;
                 if needed_cols.is_empty() {
                     return Some(full);
                 }
@@ -508,6 +523,35 @@ impl PlanCache {
     pub fn invalidate(&self) {
         if let Ok(mut cache) = self.cache.lock() {
             cache.clear();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::catalog::RowFormat;
+
+    #[test]
+    fn legacy_sentinel_is_null_but_typed_text_is_text() {
+        // The two row formats share the exact same byte pattern for a stored
+        // "NULL"; only the table's recorded format decides what it means.
+        let stored = r#"{"id":"1","v":"NULL"}"#;
+        let legacy = PlanExecutor::deserialize_row(stored, RowFormat::Legacy).unwrap();
+        assert!(legacy.get("v").is_some_and(|o| o.is_none()));
+        let typed = PlanExecutor::deserialize_row(stored, RowFormat::Typed).unwrap();
+        assert_eq!(typed.get("v").and_then(|o| o.as_deref()), Some("NULL"));
+    }
+
+    #[test]
+    fn json_null_is_null_in_both_formats() {
+        let stored = r#"{"id":"2","v":null}"#;
+        for fmt in [RowFormat::Legacy, RowFormat::Typed] {
+            let row = PlanExecutor::deserialize_row(stored, fmt).unwrap();
+            assert!(
+                row.get("v").is_some_and(|o| o.is_none()),
+                "JSON null is NULL"
+            );
         }
     }
 }

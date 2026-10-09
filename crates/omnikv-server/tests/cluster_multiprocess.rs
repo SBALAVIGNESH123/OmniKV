@@ -276,18 +276,27 @@ fn boot_cluster() -> Vec<Node> {
     // Each node gets its own budget: a single deadline shared across the
     // loop lets a slow first node consume the window the rest need, and
     // a loaded CI machine times the last node out before it binds.
+    //
+    // Readiness is a full round trip, not an accepted connection: a node
+    // whose listener is bound but whose command handler is still coming up
+    // accepts the socket and closes it without a reply. Probing only for a
+    // connect lets that node through, and the first real command then races
+    // the handler and fails. An unauthenticated GET must come back with the
+    // AUTH_REQUIRED refusal before the cluster is considered booted.
     for node in &nodes {
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             assert!(
                 Instant::now() <= deadline,
-                "node {} TCP listener never came up",
+                "node {} command interface never became ready",
                 node.id
             );
-            if TcpStream::connect(("127.0.0.1", node.tcp_port())).is_ok() {
-                break;
+            match tcp_cmd_unauthenticated(node.tcp_port(), "GET failover:key") {
+                Ok(resp) if resp.contains("AUTH_REQUIRED") => break,
+                // Not up yet: either the bind is still pending, or the
+                // handler accepted and closed mid-init. Both are transient.
+                _ => std::thread::sleep(Duration::from_millis(100)),
             }
-            std::thread::sleep(Duration::from_millis(100));
         }
     }
     nodes

@@ -27,7 +27,7 @@
 )]
 
 use crate::OmniKV;
-use crate::catalog::{Catalog, ColumnType, TableDef};
+use crate::catalog::{Catalog, ColumnType, RowFormat, TableDef};
 use crate::optimizer::{AccessMethod, PlanNode};
 use crate::sql::{AggFunc, CmpOp, JoinType, OrderByItem, SelectColumn, SqlValue, WhereExpr};
 use crate::sql_exec::Row;
@@ -160,14 +160,17 @@ impl SeqScanIter {
                         return None;
                     }
                 }
-                serde_json::from_str::<Row>(&value).ok()
+                crate::plan_exec::PlanExecutor::deserialize_row(&value, table.row_format)
             })
             .collect();
         if let Some(ov) = overlay {
             for (key, value) in ov {
                 let in_table = key.starts_with(prefix.as_str()) && key.len() > prefix.len();
                 if let (true, Some(serialized)) = (in_table, value)
-                    && let Ok(row) = serde_json::from_str::<Row>(serialized)
+                    && let Some(row) = crate::plan_exec::PlanExecutor::deserialize_row(
+                        serialized,
+                        RowFormat::Typed,
+                    )
                 {
                     rows.push(row);
                 }
@@ -235,7 +238,10 @@ impl PkLookupIter {
                 // Buffered write: read our own uncommitted row.
                 Some(Some(serialized)) => {
                     return Self {
-                        row: serde_json::from_str::<Row>(serialized).ok(),
+                        row: crate::plan_exec::PlanExecutor::deserialize_row(
+                            serialized,
+                            RowFormat::Typed,
+                        ),
                         consumed: false,
                     };
                 }
@@ -259,7 +265,9 @@ impl PkLookupIter {
             .unwrap_or_default()
             .into_iter()
             .next()
-            .and_then(|(_, value)| serde_json::from_str::<Row>(&value).ok());
+            .and_then(|(_, value)| {
+                crate::plan_exec::PlanExecutor::deserialize_row(&value, table.row_format)
+            });
         Self {
             row,
             consumed: false,

@@ -1880,3 +1880,38 @@ fn test_explain_analyze_null_join_key_matches_volcano() {
         );
     }
 }
+
+/// The typed-Row change made the stored byte pattern for SQL NULL ("NULL")
+/// identical to the stored pattern for the user's literal text 'NULL'. The
+/// table records which format its rows are in, and only a legacy table maps
+/// the sentinel to NULL — a table created by the current code keeps 'NULL'
+/// as text on every read path.
+#[test]
+fn typed_table_keeps_literal_null_text() {
+    let (_db, exec) = create_sql_env("typednull");
+
+    exec_sql(&exec, "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)");
+    exec_sql(&exec, "INSERT INTO t (id, v) VALUES (1, 'NULL')");
+    exec_sql(&exec, "INSERT INTO t (id, v) VALUES (2, NULL)");
+
+    // Literal 'NULL' stays text; a real NULL stays NULL.
+    let (_cols, text_row) = exec_rows(&exec, "SELECT v FROM t WHERE id = 1");
+    assert_eq!(text_row, vec![vec!["NULL".to_string()]]);
+    let (_cols, nulls) = exec_rows(&exec, "SELECT id FROM t WHERE v IS NULL");
+    assert_eq!(nulls, vec![vec!["2".to_string()]]);
+    let (_cols, literal) = exec_rows(&exec, "SELECT id FROM t WHERE v = 'NULL'");
+    assert_eq!(literal, vec![vec!["1".to_string()]]);
+
+    // EXPLAIN ANALYZE runs through PlanExecutor, a different decoder than
+    // the volcano scan; it must find the same literal-text row.
+    let (_cols, plan) = exec_rows(&exec, "EXPLAIN ANALYZE SELECT id FROM t WHERE v = 'NULL'");
+    let project = plan
+        .iter()
+        .map(|r| r.first().cloned().unwrap_or_default())
+        .find(|l| l.contains("Project"))
+        .expect("plan has a Project node");
+    assert!(
+        project.contains("actual rows=1"),
+        "EXPLAIN ANALYZE must find the literal-text row: {project}"
+    );
+}

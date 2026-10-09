@@ -85,12 +85,34 @@ pub struct Column {
     pub default: Option<String>,
 }
 
+/// How a table's rows encode a SQL NULL on disk.
+///
+/// The typed-`Row` change (NULL stored as JSON `null`) is not byte-compatible
+/// with what came before it: the old code stored a NULL as the literal string
+/// "NULL", which is now how a user's literal text `'NULL'` is stored. The two
+/// cannot be told apart by value, so the table records which format its rows
+/// are in and the decoders consult it. Existing manifests have no field, so
+/// `serde(default)` reads them as [`RowFormat::Legacy`]; tables created after
+/// the change are [`RowFormat::Typed`].
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum RowFormat {
+    /// NULL is the literal string "NULL"; pre-typed-Row databases only.
+    #[default]
+    Legacy,
+    /// NULL is a JSON `null`; "NULL" is the user's literal text.
+    Typed,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TableDef {
     pub name: String,
     pub columns: Vec<Column>,
     pub primary_key: String,
     pub created_at: u64,
+    /// How this table's rows encode NULL. Defaults to legacy for tables
+    /// deserialized from a manifest written before the field existed.
+    #[serde(default)]
+    pub row_format: RowFormat,
 }
 
 impl TableDef {
