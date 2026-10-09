@@ -185,6 +185,31 @@ pub struct OrderByItem {
     pub desc: bool,
 }
 
+/// A bound value's type when no column affinity is available. Typed columns
+/// never reach here — `cmp_by_affinity` follows the declared `ColumnType` —
+/// so this only governs untyped targets.
+fn coerce_param(v: &str) -> SqlValue {
+    // Parsed as i128 to match smart_cmp, so an integer above the i64 range
+    // is still numeric instead of falling back to text. SqlValue carries
+    // only i64, so an overflowing value keeps its string form there.
+    if let Ok(i) = v.parse::<i128>()
+        && i.to_string() == v
+    {
+        return i
+            .try_into()
+            .map(SqlValue::Integer)
+            .unwrap_or_else(|_| SqlValue::Text(v.to_string()));
+    }
+    // The f64 parser accepts "NaN"/"inf", which are words here.
+    if let Ok(f) = v.parse::<f64>()
+        && f.is_finite()
+        && f.to_string() == v
+    {
+        return SqlValue::Float(f);
+    }
+    SqlValue::Text(v.to_string())
+}
+
 /// Substitutes extended-protocol Bind values into a parsed statement's
 /// `Placeholder(n)` nodes, by position. Values are injected as AST data -
 /// they are never re-parsed as SQL, so a bound value containing operators
@@ -196,8 +221,9 @@ pub fn bind_statement_params(
     stmt: SqlStatement,
     params: &[Option<String>],
 ) -> Result<SqlStatement, String> {
-    let resolve = |n: usize| -> Result<SqlValue, String> {
+    let resolve = |n: usize, predicate: bool| -> Result<SqlValue, String> {
         match params.get(n.checked_sub(1).expect("n >= 1")) {
+            Some(Some(v)) if predicate => Ok(coerce_param(v)),
             Some(Some(v)) => Ok(SqlValue::Text(v.clone())),
             Some(None) => Ok(SqlValue::Null),
             None => Err(format!("no value specified for parameter ${n}")),
@@ -220,7 +246,7 @@ pub fn count_statement_params(sql: &str) -> usize {
         return 0;
     };
     let max_seen = std::cell::Cell::new(0usize);
-    let resolve = |n: usize| {
+    let resolve = |n: usize, _predicate: bool| {
         max_seen.set(max_seen.get().max(n));
         Ok(SqlValue::Null)
     };
@@ -236,11 +262,12 @@ pub fn count_statement_params(sql: &str) -> usize {
 /// resolved to bound data.
 fn bind_walk(
     stmt: SqlStatement,
-    resolve: &dyn Fn(usize) -> Result<SqlValue, String>,
+    resolve: &dyn Fn(usize, bool) -> Result<SqlValue, String>,
 ) -> Result<SqlStatement, String> {
+    // Written values keep the client's bytes exactly, so the flag is false.
     let bind_val = |v: SqlValue| -> Result<SqlValue, String> {
         match v {
-            SqlValue::Placeholder(n) => resolve(n),
+            SqlValue::Placeholder(n) => resolve(n, false),
             other => Ok(other),
         }
     };
@@ -337,12 +364,13 @@ fn bind_walk(
 
 fn bind_where(
     expr: WhereExpr,
-    resolve: &dyn Fn(usize) -> Result<SqlValue, String>,
+    resolve: &dyn Fn(usize, bool) -> Result<SqlValue, String>,
 ) -> Result<WhereExpr, String> {
+    // Predicate values may be coerced to a number so ranges order numerically.
     Ok(match expr {
         WhereExpr::Comparison { column, op, value } => {
             let value = match value {
-                SqlValue::Placeholder(n) => resolve(n)?,
+                SqlValue::Placeholder(n) => resolve(n, true)?,
                 other => other,
             };
             WhereExpr::Comparison { column, op, value }
@@ -360,7 +388,7 @@ fn bind_where(
             let mut bound = Vec::with_capacity(values.len());
             for v in values {
                 bound.push(match v {
-                    SqlValue::Placeholder(n) => resolve(n)?,
+                    SqlValue::Placeholder(n) => resolve(n, true)?,
                     other => other,
                 });
             }
@@ -464,9 +492,16 @@ fn tokenize(input: &str) -> Vec<String> {
     while let Some(ch) = chars.next() {
         if in_string {
             if ch == '\'' {
-                tokens.push(format!("'{}'", current));
-                current.clear();
-                in_string = false;
+                if chars.peek() == Some(&'\'') {
+                    // Tokens are re-joined into SQL and re-parsed by
+                    // UNION/EXPLAIN, so the escape must round-trip.
+                    chars.next();
+                    current.push_str("''");
+                } else {
+                    tokens.push(format!("'{}'", current));
+                    current.clear();
+                    in_string = false;
+                }
             } else {
                 current.push(ch);
             }
@@ -494,11 +529,16 @@ fn tokenize(input: &str) -> Vec<String> {
                 tokens.push(current.clone());
                 current.clear();
             }
-            if chars.peek() == Some(&'=') {
-                chars.next();
-                tokens.push(format!("{}=", ch));
-            } else {
-                tokens.push(ch.to_string());
+            match chars.peek() {
+                Some('=') => {
+                    chars.next();
+                    tokens.push(format!("{}=", ch));
+                }
+                Some('>') if ch == '<' => {
+                    chars.next();
+                    tokens.push("<>".to_string());
+                }
+                _ => tokens.push(ch.to_string()),
             }
         } else if ch == '=' {
             if !current.is_empty() {
@@ -533,7 +573,8 @@ fn parse_value(token: &str) -> SqlValue {
     }
 
     if token.starts_with('\'') && token.ends_with('\'') {
-        return SqlValue::Text(token[1..token.len() - 1].to_string());
+        // '' is the SQL escape for '.
+        return SqlValue::Text(token[1..token.len() - 1].replace("''", "'"));
     }
     let upper = token.to_uppercase();
     if upper == "NULL" {
@@ -1071,9 +1112,10 @@ fn parse_where_atom(tokens: &[String], start: usize) -> Result<(WhereExpr, usize
         }
         (format!("{}({})", func, arg), j)
     } else {
-        let col = tokens[i].clone();
-        let name = col.split('.').next_back().unwrap_or(&col).to_string();
-        (name, i + 1)
+        // Keep a qualified name intact: `orders.id` must reach validation
+        // and evaluation still qualified, so a bogus qualifier is an error
+        // and the name binds to the right table on a column clash.
+        (tokens[i].clone(), i + 1)
     };
 
     if i < tokens.len() && tokens[i].to_uppercase() == "IS" {
@@ -1138,7 +1180,7 @@ fn parse_where_atom(tokens: &[String], start: usize) -> Result<(WhereExpr, usize
     } else {
         match tokens[i].as_str() {
             "=" => CmpOp::Eq,
-            "!=" => CmpOp::Ne,
+            "!=" | "<>" => CmpOp::Ne,
             ">" => CmpOp::Gt,
             "<" => CmpOp::Lt,
             ">=" => CmpOp::Gte,
@@ -1234,6 +1276,7 @@ fn parse_delete_sql(tokens: &[String]) -> Result<SqlStatement, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prop_assert_eq;
 
     #[test]
     fn test_create_table() {
@@ -1378,10 +1421,61 @@ mod tests {
     }
 
     #[test]
+    fn test_negative_number_literal_round_trip() {
+        let tokens = tokenize("SELECT * FROM t WHERE x > -1 AND y < -5");
+        let joined = tokens.join(" ");
+        assert_eq!(
+            joined, "SELECT * FROM t WHERE x > -1 AND y < -5",
+            "negative numbers must re-join verbatim for a UNION/EXPLAIN re-parse"
+        );
+        assert_eq!(parse_value("-5"), SqlValue::Integer(-5));
+    }
+
+    #[test]
+    fn test_quoted_quote_escape_chain() {
+        // Four quotes = an empty string containing one escaped quote -> "'".
+        assert_eq!(parse_value("''''"), SqlValue::Text("'".into()));
+        // O''Brien round-trips through tokenize without losing the escape.
+        let tokens = tokenize("SELECT 'O''Brien'");
+        assert_eq!(tokens, vec!["SELECT", "'O''Brien'"]);
+        assert_eq!(parse_value(&tokens[1]), SqlValue::Text("O'Brien".into()));
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn quoted_string_round_trips(s in ".*") {
+            let escaped = s.replace('\'', "''");
+            let tokens = tokenize(&format!("'{}'", escaped));
+            prop_assert_eq!(tokens.len(), 1);
+            prop_assert_eq!(parse_value(&tokens[0]), SqlValue::Text(s));
+        }
+    }
+
+    #[test]
     fn test_lowercase_update_delete_and_show_tables() {
         parse_sql("update users set name = 'bala' where id = 1").expect("lowercase UPDATE");
         parse_sql("delete from users where id = 1").expect("lowercase DELETE");
         parse_sql("show tables").expect("lowercase SHOW TABLES");
         parse_sql("Explain Select * From users").expect("mixed-case EXPLAIN");
+    }
+
+    #[test]
+    fn coerce_param_keeps_exact_digits_past_i64() {
+        // In range: numeric.
+        assert!(matches!(coerce_param("42"), SqlValue::Integer(42)));
+        // i64 max, still Integer.
+        assert!(matches!(
+            coerce_param("9223372036854775807"),
+            SqlValue::Integer(9223372036854775807)
+        ));
+        // One past i64 max: i128 parses it, SqlValue cannot hold it, so the
+        // exact text survives rather than becoming a lossy Float.
+        assert_eq!(
+            coerce_param("9223372036854775808"),
+            SqlValue::Text("9223372036854775808".to_string())
+        );
+        // A round-tripping float stays a float; a word stays text.
+        assert!(matches!(coerce_param("1.5"), SqlValue::Float(_)));
+        assert_eq!(coerce_param("abc"), SqlValue::Text("abc".to_string()));
     }
 }

@@ -149,7 +149,7 @@ fn test_window_func_execution() {
     );
     assert_eq!(cols.len(), 2);
     assert_eq!(cols[1], "row_number");
-    assert!(!rows.is_empty());
+    assert_ne!(rows.len(), 0);
 
     // Row numbers should be 1,2,3,4
     let row_nums: Vec<&str> = rows.iter().map(|r| r[1].as_str()).collect();
@@ -190,7 +190,7 @@ fn test_group_by_aggregate() {
         "SELECT region, SUM(amount) FROM sales GROUP BY region",
     );
     assert_eq!(cols.len(), 2);
-    assert!(!rows.is_empty());
+    assert_ne!(rows.len(), 0);
 
     println!("✅ SQL 25a: GROUP BY with SUM aggregate executed");
 }
@@ -314,9 +314,635 @@ fn test_is_null() {
 
     let (_cols, rows) = exec_rows(&exec, "SELECT id FROM nullable WHERE val IS NOT NULL");
     // At least 1 row with non-null val
-    assert!(!rows.is_empty());
+    assert_ne!(rows.len(), 0);
 
     println!("✅ SQL 28b: IS NULL / IS NOT NULL filter working");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Comparison semantics (#149)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// `=` and `>` must agree: both compare numerically on a numeric column.
+#[test]
+fn test_equality_and_ordering_agree_on_numbers() {
+    let (_db, exec) = create_sql_env("cmpagree");
+
+    exec_sql(
+        &exec,
+        "CREATE TABLE nums (id INTEGER PRIMARY KEY, v INTEGER)",
+    );
+    exec_sql(&exec, "INSERT INTO nums (id, v) VALUES (1, 1)");
+    exec_sql(&exec, "INSERT INTO nums (id, v) VALUES (2, 10)");
+
+    let (_cols, rows) = exec_rows(&exec, "SELECT id FROM nums WHERE v = 1.0");
+    assert_eq!(rows, vec![vec!["1".to_string()]]);
+
+    let (_cols, rows) = exec_rows(&exec, "SELECT id FROM nums WHERE v > 2");
+    assert_eq!(rows, vec![vec!["2".to_string()]]);
+}
+
+/// A text literal compares lexically, so the f64 specials are not numbers here.
+#[test]
+fn test_text_literals_compare_lexically() {
+    let (_db, exec) = create_sql_env("lex");
+
+    exec_sql(&exec, "CREATE TABLE words (id INTEGER PRIMARY KEY, w TEXT)");
+    exec_sql(&exec, "INSERT INTO words (id, w) VALUES (1, 'NaN')");
+    exec_sql(&exec, "INSERT INTO words (id, w) VALUES (2, 'apple')");
+
+    let (_cols, rows) = exec_rows(&exec, "SELECT id FROM words WHERE w = 'NaN'");
+    assert_eq!(rows, vec![vec!["1".to_string()]]);
+
+    let (_cols, rows) = exec_rows(&exec, "SELECT id FROM words WHERE w > 'NaN'");
+    assert_eq!(rows, vec![vec!["2".to_string()]]);
+}
+
+/// `= NULL` is UNKNOWN and matches nothing; only IS NULL finds nulls.
+#[test]
+fn test_null_comparison_is_unknown() {
+    let (_db, exec) = create_sql_env("nullcmp");
+
+    exec_sql(&exec, "CREATE TABLE n (id INTEGER PRIMARY KEY, name TEXT)");
+    exec_sql(&exec, "INSERT INTO n (id, name) VALUES (1, 'alice')");
+    exec_sql(&exec, "INSERT INTO n (id, name) VALUES (2, NULL)");
+
+    let (_cols, rows) = exec_rows(&exec, "SELECT id FROM n WHERE name = NULL");
+    assert_eq!(rows.len(), 0);
+
+    let (_cols, rows) = exec_rows(&exec, "SELECT id FROM n WHERE name <> NULL");
+    assert_eq!(rows.len(), 0);
+
+    let (_cols, rows) = exec_rows(&exec, "SELECT id FROM n WHERE name IS NULL");
+    assert_eq!(rows, vec![vec!["2".to_string()]]);
+}
+
+/// An empty string is data, not a null.
+#[test]
+fn test_empty_string_is_not_null() {
+    let (_db, exec) = create_sql_env("empty");
+
+    exec_sql(&exec, "CREATE TABLE e (id INTEGER PRIMARY KEY, name TEXT)");
+    exec_sql(&exec, "INSERT INTO e (id, name) VALUES (1, '')");
+    exec_sql(&exec, "INSERT INTO e (id, name) VALUES (2, NULL)");
+
+    let (_cols, rows) = exec_rows(&exec, "SELECT id FROM e WHERE name IS NULL");
+    assert_eq!(rows, vec![vec!["2".to_string()]]);
+
+    let (_cols, rows) = exec_rows(&exec, "SELECT id FROM e WHERE name = ''");
+    assert_eq!(rows, vec![vec!["1".to_string()]]);
+}
+
+/// A row that omits a column is NULL, so a comparison is UNKNOWN (no match)
+/// and agrees with IS NULL on the same row.
+#[test]
+fn test_missing_column_key_is_null_in_predicate() {
+    let (_db, exec) = create_sql_env("missing");
+
+    exec_sql(
+        &exec,
+        "CREATE TABLE miss (id INTEGER PRIMARY KEY, name TEXT)",
+    );
+    exec_sql(&exec, "INSERT INTO miss (id) VALUES (1)"); // no name key at all
+
+    let (_cols, rows) = exec_rows(&exec, "SELECT id FROM miss WHERE name IS NULL");
+    assert_eq!(rows, vec![vec!["1".to_string()]]);
+
+    let (_cols, rows) = exec_rows(&exec, "SELECT id FROM miss WHERE name = ''");
+    assert!(rows.is_empty(), "a missing key is not an empty string");
+
+    let (_cols, rows) = exec_rows(&exec, "SELECT id FROM miss WHERE name <> 'x'");
+    assert!(rows.is_empty(), "a missing key compares UNKNOWN, not true");
+
+    let (_cols, rows) = exec_rows(&exec, "SELECT id FROM miss WHERE NOT (name = 'x')");
+    assert!(rows.is_empty(), "NOT of UNKNOWN stays UNKNOWN");
+
+    let (_cols, rows) = exec_rows(&exec, "SELECT id FROM miss WHERE name IN ('x', '')");
+    assert!(rows.is_empty(), "IN over a missing key is UNKNOWN");
+}
+
+/// `IN` must use the same comparison as `=`: with non-canonical numeric
+/// text, a lexical IN would disagree with a numeric equality.
+#[test]
+fn test_in_and_equality_agree() {
+    let (_db, exec) = create_sql_env("inagree");
+
+    // A numeric column: "1e3" is stored canonically as 1000, and both `=` and
+    // `IN` compare by value.
+    exec_sql(
+        &exec,
+        "CREATE TABLE num (id INTEGER PRIMARY KEY, v INTEGER)",
+    );
+    exec_sql(&exec, "INSERT INTO num (id, v) VALUES (1, '1e3')");
+
+    let (_cols, eq_rows) = exec_rows(&exec, "SELECT id FROM num WHERE v = 1000");
+    let (_cols, in_rows) = exec_rows(&exec, "SELECT id FROM num WHERE v IN (1000)");
+    assert_eq!(eq_rows, in_rows);
+    assert_eq!(eq_rows, vec![vec!["1".to_string()]]);
+
+    let (_cols, rows) = exec_rows(&exec, "SELECT id FROM num WHERE v IN (1000, 2000)");
+    assert_eq!(rows, vec![vec!["1".to_string()]]);
+
+    // A text column: the same payload is a word, compared lexically.
+    exec_sql(&exec, "CREATE TABLE txt (id INTEGER PRIMARY KEY, v TEXT)");
+    exec_sql(&exec, "INSERT INTO txt (id, v) VALUES (1, '1e3')");
+
+    let (_cols, rows) = exec_rows(&exec, "SELECT id FROM txt WHERE v = 1000");
+    assert!(
+        rows.is_empty(),
+        "a text column does not compare 1e3 as 1000"
+    );
+    let (_cols, rows) = exec_rows(&exec, "SELECT id FROM txt WHERE v = '1e3'");
+    assert_eq!(rows, vec![vec!["1".to_string()]]);
+}
+
+/// A column the table does not have is an error, not an empty result.
+#[test]
+fn test_unknown_column_errors() {
+    let (_db, exec) = create_sql_env("unknowncol");
+
+    exec_sql(&exec, "CREATE TABLE k (id INTEGER PRIMARY KEY, name TEXT)");
+    exec_sql(&exec, "INSERT INTO k (id, name) VALUES (1, 'a')");
+
+    let stmt = parse_sql("SELECT id FROM k WHERE no_such_col = 5").unwrap();
+    let Err(err) = exec.execute(&stmt) else {
+        panic!("unknown column must error, not return rows");
+    };
+    assert!(
+        err.contains("does not exist"),
+        "error should name the missing column: {err}"
+    );
+}
+
+/// COUNT(*) tallies rows, COUNT(col) skips nulls, and SUM/AVG stay exact.
+#[test]
+fn test_aggregate_null_and_integer_semantics() {
+    let (_db, exec) = create_sql_env("aggsem");
+
+    exec_sql(
+        &exec,
+        "CREATE TABLE agg (id INTEGER PRIMARY KEY, n INTEGER)",
+    );
+    exec_sql(&exec, "INSERT INTO agg (id, n) VALUES (1, 10)");
+    exec_sql(&exec, "INSERT INTO agg (id, n) VALUES (2, 5)");
+    exec_sql(&exec, "INSERT INTO agg (id, n) VALUES (3, NULL)");
+
+    let (_cols, rows) = exec_rows(&exec, "SELECT COUNT(*) FROM agg");
+    assert_eq!(rows, vec![vec!["3".to_string()]]);
+
+    let (_cols, rows) = exec_rows(&exec, "SELECT COUNT(n) FROM agg");
+    assert_eq!(rows, vec![vec!["2".to_string()]]);
+
+    let (_cols, rows) = exec_rows(&exec, "SELECT SUM(n) FROM agg");
+    assert_eq!(rows, vec![vec!["15".to_string()]]);
+
+    let (_cols, rows) = exec_rows(&exec, "SELECT AVG(n) FROM agg");
+    assert_eq!(rows, vec![vec!["7.5".to_string()]]);
+
+    // Aggregates skip nulls: MIN/MAX never report the NULL row as a value.
+    let (_cols, rows) = exec_rows(&exec, "SELECT MIN(n) FROM agg");
+    assert_eq!(rows, vec![vec!["5".to_string()]]);
+
+    let (_cols, rows) = exec_rows(&exec, "SELECT MAX(n) FROM agg");
+    assert_eq!(rows, vec![vec!["10".to_string()]]);
+}
+
+/// SUM/AVG/MIN/MAX over no non-null values are NULL, not 0 or "": an
+/// all-NULL column must not look like it contains a zero. COUNT is still 0.
+#[test]
+fn test_aggregates_are_null_on_empty_input() {
+    let (_db, exec) = create_sql_env("aggempty");
+
+    exec_sql(&exec, "CREATE TABLE ae (id INTEGER PRIMARY KEY, n INTEGER)");
+    exec_sql(&exec, "INSERT INTO ae (id, n) VALUES (1, NULL)");
+    exec_sql(&exec, "INSERT INTO ae (id, n) VALUES (2, NULL)");
+
+    let (_cols, rows) = exec_rows(&exec, "SELECT SUM(n) FROM ae");
+    assert_eq!(rows, vec![vec!["NULL".to_string()]]);
+
+    let (_cols, rows) = exec_rows(&exec, "SELECT AVG(n) FROM ae");
+    assert_eq!(rows, vec![vec!["NULL".to_string()]]);
+
+    let (_cols, rows) = exec_rows(&exec, "SELECT MIN(n) FROM ae");
+    assert_eq!(rows, vec![vec!["NULL".to_string()]]);
+
+    let (_cols, rows) = exec_rows(&exec, "SELECT MAX(n) FROM ae");
+    assert_eq!(rows, vec![vec!["NULL".to_string()]]);
+
+    let (_cols, rows) = exec_rows(&exec, "SELECT COUNT(n) FROM ae");
+    assert_eq!(rows, vec![vec!["0".to_string()]]);
+}
+
+/// The fraction is zero-padded before trimming, so interior zeros survive:
+/// 1/32 is 0.03125, not 0.3125. The sign also survives when the whole part
+/// is zero: -1/32 is -0.03125, not 0.03125.
+#[test]
+fn test_avg_fraction_keeps_interior_zeros_and_sign() {
+    let (_db, exec) = create_sql_env("avgfrac");
+
+    exec_sql(
+        &exec,
+        "CREATE TABLE pos (id INTEGER PRIMARY KEY, n INTEGER)",
+    );
+    exec_sql(&exec, "INSERT INTO pos (id, n) VALUES (1, 1)");
+    for i in 2..=32 {
+        exec_sql(&exec, &format!("INSERT INTO pos (id, n) VALUES ({i}, 0)"));
+    }
+
+    let (_cols, rows) = exec_rows(&exec, "SELECT AVG(n) FROM pos");
+    assert_eq!(rows, vec![vec!["0.03125".to_string()]]);
+
+    exec_sql(
+        &exec,
+        "CREATE TABLE neg (id INTEGER PRIMARY KEY, n INTEGER)",
+    );
+    exec_sql(&exec, "INSERT INTO neg (id, n) VALUES (1, -1)");
+    for i in 2..=32 {
+        exec_sql(&exec, &format!("INSERT INTO neg (id, n) VALUES ({i}, 0)"));
+    }
+
+    let (_cols, rows) = exec_rows(&exec, "SELECT AVG(n) FROM neg");
+    assert_eq!(rows, vec![vec!["-0.03125".to_string()]]);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Three-valued logic and column resolution
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// UNKNOWN survives NOT: `NOT (col = NULL)` must not flip to true.
+#[test]
+fn test_unknown_survives_not() {
+    let (_db, exec) = create_sql_env("notnull");
+
+    exec_sql(&exec, "CREATE TABLE nn (id INTEGER PRIMARY KEY, v TEXT)");
+    exec_sql(&exec, "INSERT INTO nn (id, v) VALUES (1, 'x')");
+    exec_sql(&exec, "INSERT INTO nn (id, v) VALUES (2, NULL)");
+
+    let (_cols, rows) = exec_rows(&exec, "SELECT id FROM nn WHERE NOT (v = NULL)");
+    assert_eq!(rows.len(), 0, "NOT of UNKNOWN stays UNKNOWN");
+
+    let (_cols, rows) = exec_rows(&exec, "SELECT id FROM nn WHERE v = NULL OR id = 1");
+    assert_eq!(rows, vec![vec!["1".to_string()]]);
+}
+
+/// Column names are exact-case; a wrong case is an error, not silence.
+#[test]
+fn test_column_case_is_significant() {
+    let (_db, exec) = create_sql_env("colcase");
+
+    exec_sql(&exec, "CREATE TABLE cc (id INTEGER PRIMARY KEY, Name TEXT)");
+    exec_sql(&exec, "INSERT INTO cc (id, Name) VALUES (1, 'a')");
+
+    let (_cols, rows) = exec_rows(&exec, "SELECT id FROM cc WHERE Name = 'a'");
+    assert_eq!(rows, vec![vec!["1".to_string()]]);
+
+    let stmt = parse_sql("SELECT id FROM cc WHERE name = 'a'").unwrap();
+    let Err(err) = exec.execute(&stmt) else {
+        panic!("wrong-case column must error");
+    };
+    assert!(
+        err.contains("does not exist"),
+        "error names the column: {err}"
+    );
+}
+
+/// UPDATE and DELETE validate WHERE columns too, not just SELECT.
+#[test]
+fn test_update_delete_validate_columns() {
+    let (_db, exec) = create_sql_env("d4ud");
+
+    exec_sql(&exec, "CREATE TABLE d (id INTEGER PRIMARY KEY, v TEXT)");
+    exec_sql(&exec, "INSERT INTO d (id, v) VALUES (1, 'a')");
+
+    let stmt = parse_sql("DELETE FROM d WHERE no_such_col = 5").unwrap();
+    let Err(err) = exec.execute(&stmt) else {
+        panic!("DELETE with unknown column must error");
+    };
+    assert!(err.contains("does not exist"), "DELETE error: {err}");
+
+    let stmt = parse_sql("UPDATE d SET v = 'b' WHERE no_such_col = 5").unwrap();
+    let Err(err) = exec.execute(&stmt) else {
+        panic!("UPDATE with unknown column must error");
+    };
+    assert!(err.contains("does not exist"), "UPDATE error: {err}");
+}
+
+/// A primary-key lookup must still evaluate the other predicates in WHERE.
+#[test]
+fn test_pk_lookup_still_filters_other_predicates() {
+    let (_db, exec) = create_sql_env("pkfilt");
+
+    exec_sql(
+        &exec,
+        "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, city TEXT)",
+    );
+    exec_sql(
+        &exec,
+        "INSERT INTO users (id, name, city) VALUES (1, 'Alice', 'NYC')",
+    );
+    exec_sql(
+        &exec,
+        "INSERT INTO users (id, name, city) VALUES (2, 'Bob', 'LA')",
+    );
+
+    let (_cols, rows) = exec_rows(
+        &exec,
+        "SELECT * FROM users WHERE id = 1 AND name = 'nobody'",
+    );
+    assert!(
+        rows.is_empty(),
+        "the remaining predicate must be evaluated, not dropped: {rows:?}"
+    );
+
+    let (_cols, rows) = exec_rows(&exec, "SELECT * FROM users WHERE id = 1 AND id = 2");
+    assert!(
+        rows.is_empty(),
+        "contradictory predicates must match nothing: {rows:?}"
+    );
+
+    let (_cols, rows) = exec_rows(&exec, "SELECT * FROM users WHERE id = 1 AND city = 'LA'");
+    assert!(
+        rows.is_empty(),
+        "city predicate must be evaluated: {rows:?}"
+    );
+
+    // SELECT * emits columns in declared order.
+    let (_cols, rows) = exec_rows(&exec, "SELECT * FROM users WHERE id = 2");
+    assert_eq!(
+        rows,
+        vec![vec!["2".to_string(), "Bob".to_string(), "LA".to_string()]]
+    );
+}
+
+/// A column named `id` that is not the primary key gets no key lookup.
+#[test]
+fn test_pk_lookup_ignores_column_just_named_id() {
+    let (_db, exec) = create_sql_env("pkname");
+
+    exec_sql(
+        &exec,
+        "CREATE TABLE o (order_no TEXT PRIMARY KEY, id INTEGER)",
+    );
+    exec_sql(&exec, "INSERT INTO o (order_no, id) VALUES ('K1', 5)");
+    exec_sql(&exec, "INSERT INTO o (order_no, id) VALUES ('K2', 99)");
+
+    // 'K2' is a key value, not an id.
+    let (_cols, rows) = exec_rows(&exec, "SELECT * FROM o WHERE id = 'K2'");
+    assert!(
+        rows.is_empty(),
+        "a non-key column named 'id' must not trigger a key lookup: {rows:?}"
+    );
+
+    // SELECT * emits columns in declared order.
+    let (_cols, rows) = exec_rows(&exec, "SELECT * FROM o WHERE order_no = 'K2'");
+    assert_eq!(rows, vec![vec!["K2".to_string(), "99".to_string()]]);
+}
+
+/// Writes store under the column's declared name and reject unknown columns.
+#[test]
+fn test_write_resolves_declared_column_name() {
+    let (_db, exec) = create_sql_env("wrname");
+
+    exec_sql(&exec, "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)");
+    exec_sql(&exec, "INSERT INTO t (ID, NAME) VALUES (1, 'Alice')");
+
+    let (cols, rows) = exec_rows(&exec, "SELECT * FROM t");
+    assert_eq!(cols, vec!["id".to_string(), "name".to_string()]);
+    assert_eq!(rows, vec![vec!["1".to_string(), "Alice".to_string()]]);
+
+    exec_sql(&exec, "UPDATE t SET NAME = 'Bob' WHERE id = 1");
+    let (_cols, rows) = exec_rows(&exec, "SELECT name FROM t");
+    assert_eq!(
+        rows,
+        vec![vec!["Bob".to_string()]],
+        "the case-mismatched assignment must update the declared column: {rows:?}"
+    );
+
+    let stmt = parse_sql("UPDATE t SET nope = 'x' WHERE id = 1").unwrap();
+    let Err(err) = exec.execute(&stmt) else {
+        panic!("UPDATE with unknown column must error");
+    };
+    assert!(err.contains("does not exist"), "UPDATE error: {err}");
+
+    let stmt = parse_sql("INSERT INTO t (id, nope) VALUES (2, 'y')").unwrap();
+    let Err(err) = exec.execute(&stmt) else {
+        panic!("INSERT with unknown column must error");
+    };
+    assert!(err.contains("does not exist"), "INSERT error: {err}");
+
+    let (_cols, rows) = exec_rows(&exec, "SELECT * FROM t");
+    assert_eq!(rows, vec![vec!["1".to_string(), "Bob".to_string()]]);
+}
+
+/// UPDATE must reject an unknown SET column even when no rows match, so the
+/// error does not depend on the WHERE clause finding a row.
+#[test]
+fn test_update_rejects_unknown_column_without_match() {
+    let (_db, exec) = create_sql_env("updnm");
+
+    exec_sql(&exec, "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)");
+    exec_sql(&exec, "INSERT INTO t (id, name) VALUES (1, 'Alice')");
+
+    let stmt = parse_sql("UPDATE t SET nope = 'x' WHERE id = 999").unwrap();
+    let Err(err) = exec.execute(&stmt) else {
+        panic!("UPDATE with unknown column must error even with no matches");
+    };
+    assert!(err.contains("does not exist"), "UPDATE error: {err}");
+
+    // A known column with no matching rows is still a no-op, not an error.
+    exec_sql(&exec, "UPDATE t SET name = 'Bob' WHERE id = 999");
+    let (_cols, rows) = exec_rows(&exec, "SELECT name FROM t");
+    assert_eq!(rows, vec![vec!["Alice".to_string()]]);
+}
+
+/// `SELECT *` on a join emits every column of both tables in FROM order, so
+/// two same-named columns appear as two columns rather than collapsing into
+/// one bare key.
+#[test]
+fn test_star_on_join_keeps_both_tables_columns() {
+    let (_db, exec) = create_sql_env("starjoin");
+
+    exec_sql(&exec, "CREATE TABLE a (id INTEGER PRIMARY KEY, name TEXT)");
+    exec_sql(
+        &exec,
+        "CREATE TABLE b (id INTEGER PRIMARY KEY, name TEXT, v INTEGER)",
+    );
+    exec_sql(&exec, "INSERT INTO a (id, name) VALUES (1, 'a1')");
+    exec_sql(&exec, "INSERT INTO b (id, name, v) VALUES (1, 'b1', 7)");
+
+    let (cols, rows) = exec_rows(&exec, "SELECT * FROM a JOIN b ON a.id = b.id");
+    assert_eq!(cols, vec!["id", "name", "id", "name", "v"]);
+    assert_eq!(rows, vec![vec!["1", "a1", "1", "b1", "7"]]);
+
+    // A LEFT JOIN keeps the shape, with the missing side read as NULL.
+    exec_sql(&exec, "INSERT INTO a (id, name) VALUES (2, 'a2')");
+    let (cols, rows) = exec_rows(&exec, "SELECT * FROM a LEFT JOIN b ON a.id = b.id");
+    assert_eq!(cols, vec!["id", "name", "id", "name", "v"]);
+    assert_eq!(
+        rows,
+        vec![
+            vec!["1", "a1", "1", "b1", "7"],
+            vec!["2", "a2", "NULL", "NULL", "NULL"],
+        ]
+    );
+}
+
+/// `SELECT *` alongside a window function must still emit the window column,
+/// which is written under a bare key after the plan runs.
+#[test]
+fn test_star_with_window_function_keeps_window_column() {
+    let (_db, exec) = create_sql_env("starwin");
+
+    exec_sql(&exec, "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)");
+    exec_sql(&exec, "INSERT INTO t (id, name) VALUES (1, 'a')");
+    exec_sql(&exec, "INSERT INTO t (id, name) VALUES (2, 'b')");
+
+    let (cols, rows) = exec_rows(&exec, "SELECT *, ROW_NUMBER() OVER (ORDER BY id) FROM t");
+    assert_eq!(cols, vec!["id", "name", "row_number"]);
+    assert_eq!(rows, vec![vec!["1", "a", "1"], vec!["2", "b", "2"],]);
+}
+
+/// Two ids above 2^53 are one `f64` apart, so a float comparison treats them
+/// as equal. Predicates and ordering must compare integers exactly.
+#[test]
+fn test_large_integers_do_not_collide_as_floats() {
+    let (_db, exec) = create_sql_env("i64exact");
+
+    exec_sql(&exec, "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)");
+    exec_sql(
+        &exec,
+        "INSERT INTO t (id, name) VALUES (9007199254740992, 'a')",
+    );
+    exec_sql(
+        &exec,
+        "INSERT INTO t (id, name) VALUES (9007199254740993, 'b')",
+    );
+
+    let (_cols, rows) = exec_rows(&exec, "SELECT name FROM t WHERE id = 9007199254740992");
+    assert_eq!(rows, vec![vec!["a".to_string()]]);
+
+    let (_cols, rows) = exec_rows(
+        &exec,
+        "SELECT name FROM t WHERE id > 9007199254740992 ORDER BY id",
+    );
+    assert_eq!(rows, vec![vec!["b".to_string()]]);
+
+    // An UPDATE must not touch the neighbouring row.
+    exec_sql(&exec, "UPDATE t SET name = 'c' WHERE id = 9007199254740992");
+    let (_cols, rows) = exec_rows(&exec, "SELECT name FROM t ORDER BY id");
+    assert_eq!(rows, vec![vec!["c".to_string()], vec!["b".to_string()]]);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Tokenizer, operator, and join regressions
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// A doubled quote inside a string literal is one literal quote, not the end
+/// of the string.
+#[test]
+fn test_escaped_quote_in_string_literal() {
+    let (_db, exec) = create_sql_env("escq");
+
+    exec_sql(
+        &exec,
+        "CREATE TABLE esc (id INTEGER PRIMARY KEY, name TEXT)",
+    );
+    exec_sql(&exec, "INSERT INTO esc (id, name) VALUES (1, 'O''Brien')");
+
+    let (_cols, rows) = exec_rows(&exec, "SELECT name FROM esc WHERE id = 1");
+    assert_eq!(rows, vec![vec!["O'Brien".to_string()]]);
+
+    let (_cols, rows) = exec_rows(&exec, "SELECT name FROM esc WHERE name = 'O''Brien'");
+    assert_eq!(rows, vec![vec!["O'Brien".to_string()]]);
+}
+
+/// UNION/EXPLAIN/subquery paths join tokens back into SQL and re-parse,
+/// so an escaped quote must survive the second pass.
+#[test]
+fn test_escaped_quote_survives_reparse() {
+    let (_db, exec) = create_sql_env("escrp");
+
+    exec_sql(&exec, "CREATE TABLE er (id INTEGER PRIMARY KEY, name TEXT)");
+    exec_sql(&exec, "INSERT INTO er (id, name) VALUES (1, 'O''Brien')");
+    exec_sql(&exec, "INSERT INTO er (id, name) VALUES (2, 'a''b')");
+
+    let (_cols, rows) = exec_rows(
+        &exec,
+        "SELECT name FROM er WHERE name = 'O''Brien' UNION SELECT name FROM er",
+    );
+    assert_eq!(
+        rows,
+        vec![vec!["O'Brien".to_string()], vec!["a'b".to_string()]]
+    );
+
+    // The subquery path re-parses too.
+    let (_cols, rows) = exec_rows(
+        &exec,
+        "SELECT id FROM er WHERE name IN (SELECT name FROM er WHERE name = 'a''b')",
+    );
+    assert_eq!(rows, vec![vec!["2".to_string()]]);
+}
+
+/// `<>` is the SQL standard spelling of `!=` and must exclude the matching row.
+#[test]
+fn test_not_equal_operator() {
+    let (_db, exec) = create_sql_env("neop");
+
+    exec_sql(&exec, "CREATE TABLE ne (id INTEGER PRIMARY KEY, name TEXT)");
+    exec_sql(&exec, "INSERT INTO ne (id, name) VALUES (1, 'alice')");
+    exec_sql(&exec, "INSERT INTO ne (id, name) VALUES (2, 'bob')");
+    exec_sql(&exec, "INSERT INTO ne (id, name) VALUES (3, 'carol')");
+
+    let ids = |sql: &str| {
+        let (_cols, rows) = exec_rows(&exec, sql);
+        let mut v: Vec<String> = rows.into_iter().flatten().collect();
+        v.sort();
+        v
+    };
+
+    assert_eq!(ids("SELECT id FROM ne WHERE id <> 2"), vec!["1", "3"]);
+    assert_eq!(ids("SELECT id FROM ne WHERE id != 2"), vec!["1", "3"]);
+    assert_eq!(ids("SELECT id FROM ne WHERE name <> 'bob'"), vec!["1", "3"]);
+}
+
+/// LIKE metacharacters are literal; only `%` and `_` are wildcards.
+#[test]
+fn test_like_metacharacters_are_literal() {
+    let (_db, exec) = create_sql_env("likemeta");
+
+    exec_sql(&exec, "CREATE TABLE lm (id INTEGER PRIMARY KEY, name TEXT)");
+    exec_sql(&exec, "INSERT INTO lm (id, name) VALUES (1, 'a.b')");
+    exec_sql(&exec, "INSERT INTO lm (id, name) VALUES (2, 'axb')");
+
+    let (_cols, rows) = exec_rows(&exec, "SELECT id FROM lm WHERE name LIKE 'a.b'");
+    assert_eq!(rows, vec![vec!["1".to_string()]]);
+
+    exec_sql(&exec, "DELETE FROM lm WHERE name LIKE 'a.b'");
+    let (_cols, rows) = exec_rows(&exec, "SELECT id FROM lm");
+    assert_eq!(rows, vec![vec!["2".to_string()]]);
+}
+
+/// Two tables sharing a column name must each contribute their own value.
+#[test]
+fn test_join_shared_column_name() {
+    let (_db, exec) = create_sql_env("jshare");
+
+    exec_sql(
+        &exec,
+        "CREATE TABLE js_a (id INTEGER PRIMARY KEY, shared TEXT)",
+    );
+    exec_sql(
+        &exec,
+        "CREATE TABLE js_b (id INTEGER PRIMARY KEY, shared TEXT)",
+    );
+    exec_sql(&exec, "INSERT INTO js_a (id, shared) VALUES (1, 'A1')");
+    exec_sql(&exec, "INSERT INTO js_b (id, shared) VALUES (1, 'B1')");
+
+    let (_cols, rows) = exec_rows(
+        &exec,
+        "SELECT js_a.shared, js_b.shared FROM js_a JOIN js_b ON js_a.id = js_b.id",
+    );
+    assert_eq!(rows, vec![vec!["A1".to_string(), "B1".to_string()]]);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -470,7 +1096,939 @@ fn test_explain() {
 
     let (cols, rows) = exec_rows(&exec, "EXPLAIN SELECT * FROM expl_t");
     assert_eq!(cols[0], "QUERY PLAN");
-    assert!(!rows.is_empty());
+    assert_ne!(rows.len(), 0);
 
     println!("✅ SQL 31c: EXPLAIN produces query plan output");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Bound parameters and column case
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// A bound value has no parse-time type, so a numeric payload must be
+/// treated as a number: `WHERE v > $1` with `$1 = "9"` has to match 10,
+/// which a lexical comparison misses ("1" < "9"). Text stays text.
+#[test]
+fn test_bound_parameter_compares_numerically() {
+    let (_db, exec) = create_sql_env("bindnum");
+
+    exec_sql(&exec, "CREATE TABLE bp (id INTEGER PRIMARY KEY, v INTEGER)");
+    exec_sql(&exec, "INSERT INTO bp (id, v) VALUES (1, 5)");
+    exec_sql(&exec, "INSERT INTO bp (id, v) VALUES (2, 10)");
+    exec_sql(&exec, "INSERT INTO bp (id, v) VALUES (3, 20)");
+
+    let stmt = parse_sql("SELECT id FROM bp WHERE v > $1").unwrap();
+    let stmt = bind_statement_params(stmt, &[Some("9".to_string())]).unwrap();
+    let (_cols, rows) = exec_rows_from_stmt(&exec, &stmt);
+    assert_eq!(
+        rows,
+        vec![vec!["2".to_string()], vec!["3".to_string()]],
+        "numeric bound must compare numerically"
+    );
+
+    // A non-numeric payload stays text and compares as text.
+    exec_sql(&exec, "CREATE TABLE bt (id INTEGER PRIMARY KEY, name TEXT)");
+    exec_sql(&exec, "INSERT INTO bt (id, name) VALUES (1, 'abc')");
+
+    let stmt = parse_sql("SELECT id FROM bt WHERE name = $1").unwrap();
+    let stmt = bind_statement_params(stmt, &[Some("abc".to_string())]).unwrap();
+    let (_cols, rows) = exec_rows_from_stmt(&exec, &stmt);
+    assert_eq!(rows, vec![vec!["1".to_string()]]);
+}
+
+/// The aggregate result key keeps the column's case: lowercasing the
+/// whole key made `SUM(MyCol)` look up `sum(mycol)` and print NULL.
+#[test]
+fn test_aggregate_keeps_column_case() {
+    let (_db, exec) = create_sql_env("aggcase");
+
+    exec_sql(
+        &exec,
+        "CREATE TABLE mc (id INTEGER PRIMARY KEY, MyCol INTEGER)",
+    );
+    exec_sql(&exec, "INSERT INTO mc (id, MyCol) VALUES (1, 10)");
+    exec_sql(&exec, "INSERT INTO mc (id, MyCol) VALUES (2, 20)");
+
+    let (cols, rows) = exec_rows(&exec, "SELECT SUM(MyCol) FROM mc");
+    assert_eq!(
+        rows,
+        vec![vec!["30".to_string()]],
+        "mixed-case target is found"
+    );
+    assert_eq!(cols, vec!["sum(MyCol)".to_string()]);
+}
+
+/// A bound value written to a table keeps the client's bytes exactly:
+/// numeric coercion applies only to predicate comparison, never to stored
+/// data, so "007" is not rewritten to "7" nor "1.50" to "1.5".
+#[test]
+fn test_bound_value_is_stored_verbatim() {
+    let (_db, exec) = create_sql_env("bindverbatim");
+
+    exec_sql(&exec, "CREATE TABLE bv (id TEXT PRIMARY KEY, v TEXT)");
+
+    let stmt = parse_sql("INSERT INTO bv (id, v) VALUES ($1, $2)").unwrap();
+    let stmt =
+        bind_statement_params(stmt, &[Some("007".to_string()), Some("1.50".to_string())]).unwrap();
+    exec.execute(&stmt).expect("insert must succeed");
+
+    let (_cols, rows) = exec_rows(&exec, "SELECT id, v FROM bv");
+    assert_eq!(rows, vec![vec!["007".to_string(), "1.50".to_string()]]);
+
+    // An UPDATE assignment is stored data too.
+    let stmt = parse_sql("UPDATE bv SET v = $1 WHERE id = '007'").unwrap();
+    let stmt = bind_statement_params(stmt, &[Some("08".to_string())]).unwrap();
+    exec.execute(&stmt).expect("update must succeed");
+
+    let (_cols, rows) = exec_rows(&exec, "SELECT v FROM bv");
+    assert_eq!(rows, vec![vec!["08".to_string()]]);
+}
+
+/// A predicate payload written the way its number does NOT print stays
+/// text, so it finds the row stored under that exact text by every path —
+/// scan, primary-key lookup, and IN. A canonical "7" still compares numerically.
+#[test]
+fn test_bound_predicate_round_trips_non_canonical_text() {
+    let (_db, exec) = create_sql_env("bindrt");
+
+    exec_sql(&exec, "CREATE TABLE rt (id TEXT PRIMARY KEY, v INTEGER)");
+    exec_sql(&exec, "INSERT INTO rt (id, v) VALUES ('007', 9)");
+
+    let stmt = parse_sql("SELECT id FROM rt WHERE id = $1").unwrap();
+    let stmt = bind_statement_params(stmt, &[Some("007".to_string())]).unwrap();
+    let (_cols, rows) = exec_rows_from_stmt(&exec, &stmt);
+    assert_eq!(rows, vec![vec!["007".to_string()]]);
+
+    let stmt = parse_sql("SELECT id FROM rt WHERE id IN ($1)").unwrap();
+    let stmt = bind_statement_params(stmt, &[Some("007".to_string())]).unwrap();
+    let (_cols, rows) = exec_rows_from_stmt(&exec, &stmt);
+    assert_eq!(rows, vec![vec!["007".to_string()]]);
+
+    // A canonical numeric payload still orders numerically.
+    let stmt = parse_sql("SELECT id FROM rt WHERE v > $1").unwrap();
+    let stmt = bind_statement_params(stmt, &[Some("5".to_string())]).unwrap();
+    let (_cols, rows) = exec_rows_from_stmt(&exec, &stmt);
+    assert_eq!(rows, vec![vec!["007".to_string()]]);
+}
+
+/// A numeric column's declared type decides comparison, not the payload's
+/// shape: a bound "007" matches the row stored as "7" by scan, primary-key
+/// lookup, and IN, while a text column keeps the same payload verbatim.
+#[test]
+fn test_numeric_affinity_matches_non_canonical_payload() {
+    let (_db, exec) = create_sql_env("affinity");
+
+    exec_sql(
+        &exec,
+        "CREATE TABLE num (id INTEGER PRIMARY KEY, v INTEGER)",
+    );
+    exec_sql(&exec, "INSERT INTO num (id, v) VALUES (7, 1000)");
+
+    // The stored form is canonical, so an unquoted literal finds it.
+    let (_cols, rows) = exec_rows(&exec, "SELECT id FROM num WHERE id = 7");
+    assert_eq!(rows, vec![vec!["7".to_string()]]);
+
+    // A bound non-canonical payload matches the numeric column by value.
+    let stmt = parse_sql("SELECT id FROM num WHERE id = $1").unwrap();
+    let stmt = bind_statement_params(stmt, &[Some("007".to_string())]).unwrap();
+    let (_cols, rows) = exec_rows_from_stmt(&exec, &stmt);
+    assert_eq!(rows, vec![vec!["7".to_string()]]);
+
+    let stmt = parse_sql("SELECT id FROM num WHERE id IN ($1)").unwrap();
+    let stmt = bind_statement_params(stmt, &[Some("007".to_string())]).unwrap();
+    let (_cols, rows) = exec_rows_from_stmt(&exec, &stmt);
+    assert_eq!(rows, vec![vec!["7".to_string()]]);
+
+    // A text column stores the same payload verbatim and matches only itself.
+    exec_sql(&exec, "CREATE TABLE txt (id TEXT PRIMARY KEY)");
+    exec_sql(&exec, "INSERT INTO txt (id) VALUES ('007')");
+
+    let stmt = parse_sql("SELECT id FROM txt WHERE id = $1").unwrap();
+    let stmt = bind_statement_params(stmt, &[Some("007".to_string())]).unwrap();
+    let (_cols, rows) = exec_rows_from_stmt(&exec, &stmt);
+    assert_eq!(rows, vec![vec!["007".to_string()]]);
+
+    let stmt = parse_sql("SELECT id FROM txt WHERE id = $1").unwrap();
+    let stmt = bind_statement_params(stmt, &[Some("7".to_string())]).unwrap();
+    let (_cols, rows) = exec_rows_from_stmt(&exec, &stmt);
+    assert!(rows.is_empty(), "a text column must not match 7 for 007");
+}
+
+fn exec_rows_from_stmt(
+    executor: &SqlExecutor,
+    stmt: &SqlStatement,
+) -> (Vec<String>, Vec<Vec<String>>) {
+    match executor
+        .execute(stmt)
+        .unwrap_or_else(|e| panic!("Exec error: {e}"))
+    {
+        ExecResult::Rows { columns, rows } => (columns, rows),
+        _ => panic!("Expected Rows result"),
+    }
+}
+
+/// UPDATE and DELETE predicates must compare by the column's declared
+/// affinity, not the literal's: `WHERE Qty = $1` with `$1 = "007"` has to
+/// hit an integer 7 exactly as the equivalent SELECT does. Lexical
+/// comparison reads "7" > "007" and misses. The mixed-case column also
+/// exercises type-map keying by the declared name.
+#[test]
+fn test_update_delete_predicate_uses_column_type() {
+    let (_db, exec) = create_sql_env("updeltyped");
+
+    exec_sql(
+        &exec,
+        "CREATE TABLE ud (id INTEGER PRIMARY KEY, Qty INTEGER)",
+    );
+    exec_sql(&exec, "INSERT INTO ud (id, Qty) VALUES (1, 7)");
+    exec_sql(&exec, "INSERT INTO ud (id, Qty) VALUES (2, 10)");
+    exec_sql(&exec, "INSERT INTO ud (id, Qty) VALUES (3, 20)");
+
+    // SELECT is the reference behaviour: numeric match for a bound "007".
+    let stmt = parse_sql("SELECT id FROM ud WHERE Qty = $1").unwrap();
+    let stmt = bind_statement_params(stmt, &[Some("007".to_string())]).unwrap();
+    let (_cols, rows) = exec_rows_from_stmt(&exec, &stmt);
+    assert_eq!(
+        rows,
+        vec![vec!["1".to_string()]],
+        "SELECT must match integer 7 for bound 007"
+    );
+
+    // UPDATE must agree: only the 7 row flips.
+    let stmt = parse_sql("UPDATE ud SET Qty = 100 WHERE Qty = $1").unwrap();
+    let stmt = bind_statement_params(stmt, &[Some("007".to_string())]).unwrap();
+    match exec.execute(&stmt).unwrap() {
+        ExecResult::Modified { count, .. } => assert_eq!(
+            count, 1,
+            "UPDATE bound 007 must match exactly the integer 7 row"
+        ),
+        _ => panic!("Expected Modified result"),
+    }
+    let (_cols, rows) = exec_rows(&exec, "SELECT id, Qty FROM ud ORDER BY id");
+    assert_eq!(
+        rows,
+        vec![
+            vec!["1".to_string(), "100".to_string()],
+            vec!["2".to_string(), "10".to_string()],
+            vec!["3".to_string(), "20".to_string()],
+        ]
+    );
+
+    // DELETE must agree too: bound "15" is numeric, so 100 and 20 go, 10 stays.
+    let stmt = parse_sql("DELETE FROM ud WHERE Qty > $1").unwrap();
+    let stmt = bind_statement_params(stmt, &[Some("15".to_string())]).unwrap();
+    match exec.execute(&stmt).unwrap() {
+        ExecResult::Modified { count, .. } => assert_eq!(
+            count, 2,
+            "DELETE bound 15 must remove 100 and 20 numerically"
+        ),
+        _ => panic!("Expected Modified result"),
+    }
+    let (_cols, rows) = exec_rows(&exec, "SELECT id, Qty FROM ud");
+    assert_eq!(
+        rows,
+        vec![vec!["2".to_string(), "10".to_string()]],
+        "only the row under 15 survives"
+    );
+}
+
+/// A qualified WHERE name resolves against the table it names, even when
+/// both sides of a join share the column: `WHERE b.id = 2` must read B's
+/// `id`, not A's. A qualifier naming no FROM table is an error.
+#[test]
+fn test_qualified_where_column_binds_to_its_table() {
+    let (_db, exec) = create_sql_env("qualwhere");
+
+    exec_sql(
+        &exec,
+        "CREATE TABLE qa (id INTEGER PRIMARY KEY, shared INTEGER)",
+    );
+    exec_sql(
+        &exec,
+        "CREATE TABLE qb (id INTEGER PRIMARY KEY, shared INTEGER)",
+    );
+    exec_sql(&exec, "INSERT INTO qa (id, shared) VALUES (1, 10)");
+    exec_sql(&exec, "INSERT INTO qa (id, shared) VALUES (2, 40)");
+    exec_sql(&exec, "INSERT INTO qb (id, shared) VALUES (1, 20)");
+    exec_sql(&exec, "INSERT INTO qb (id, shared) VALUES (2, 30)");
+
+    // Unqualified `shared` resolves to the build side's value (10) — the
+    // reference behaviour the qualified lookups must not disturb.
+    let (_cols, rows) = exec_rows(&exec, "SELECT qb.id FROM qa JOIN qb ON qa.id = qb.id");
+    assert_eq!(
+        rows,
+        vec![vec!["1".to_string()], vec!["2".to_string()]],
+        "join returns both rows"
+    );
+
+    // Qualified predicate binds to the table it names: qb.shared = 30 is
+    // only true for qb row 2, never for the shared-10 build side.
+    let (_cols, rows) = exec_rows(
+        &exec,
+        "SELECT qb.id FROM qa JOIN qb ON qa.id = qb.id WHERE qb.shared = 30",
+    );
+    assert_eq!(
+        rows,
+        vec![vec!["2".to_string()]],
+        "qualified qb.shared must bind to qb, not the build side"
+    );
+
+    // The other side's qualifier works too: qa.shared = 10 matches only
+    // qa row 1, which joins to qb row 1.
+    let (_cols, rows) = exec_rows(
+        &exec,
+        "SELECT qb.id FROM qa JOIN qb ON qa.id = qb.id WHERE qa.shared = 10",
+    );
+    assert_eq!(rows, vec![vec!["1".to_string()]]);
+
+    // A qualifier naming no FROM table is rejected, not silently ignored.
+    let stmt = parse_sql("SELECT qb.id FROM qa JOIN qb ON qa.id = qb.id WHERE nope.shared = 30");
+    assert!(stmt.is_ok());
+    match exec.execute(&stmt.unwrap()) {
+        Err(e) => assert!(
+            e.contains("not in the FROM clause"),
+            "bogus qualifier must error, got: {e}"
+        ),
+        Ok(_) => panic!("bogus qualifier must be an error, not a silent match"),
+    }
+}
+
+/// A qualified name on a single-table statement still works and still
+/// compares by the column's affinity, while a wrong qualifier is rejected.
+#[test]
+fn test_qualified_where_single_table() {
+    let (_db, exec) = create_sql_env("qualsingle");
+
+    exec_sql(
+        &exec,
+        "CREATE TABLE st (id INTEGER PRIMARY KEY, Qty INTEGER)",
+    );
+    exec_sql(&exec, "INSERT INTO st (id, Qty) VALUES (1, 7)");
+    exec_sql(&exec, "INSERT INTO st (id, Qty) VALUES (2, 9)");
+
+    // Qualified name on its own table resolves and compares numerically:
+    // bound "007" equals integer 7.
+    let stmt = parse_sql("SELECT id FROM st WHERE st.Qty = $1").unwrap();
+    let stmt = bind_statement_params(stmt, &[Some("007".to_string())]).unwrap();
+    let (_cols, rows) = exec_rows_from_stmt(&exec, &stmt);
+    assert_eq!(
+        rows,
+        vec![vec!["1".to_string()]],
+        "qualified single-table predicate compares by affinity"
+    );
+
+    // A qualifier naming another table is an error on a single-table statement.
+    let stmt = parse_sql("SELECT id FROM st WHERE other.Qty = 7").unwrap();
+    match exec.execute(&stmt) {
+        Err(e) => assert!(
+            e.contains("not in the FROM clause"),
+            "wrong single-table qualifier must error, got: {e}"
+        ),
+        Ok(_) => panic!("wrong qualifier must be an error"),
+    }
+
+    // UPDATE/DELETE accept the qualified name too.
+    let stmt = parse_sql("UPDATE st SET Qty = 100 WHERE st.Qty = $1").unwrap();
+    let stmt = bind_statement_params(stmt, &[Some("009".to_string())]).unwrap();
+    match exec.execute(&stmt).unwrap() {
+        ExecResult::Modified { count, .. } => assert_eq!(count, 1, "qualified UPDATE matches"),
+        _ => panic!("Expected Modified result"),
+    }
+    let (_cols, rows) = exec_rows(&exec, "SELECT id, Qty FROM st ORDER BY id");
+    assert_eq!(
+        rows,
+        vec![
+            vec!["1".to_string(), "7".to_string()],
+            vec!["2".to_string(), "100".to_string()],
+        ]
+    );
+}
+
+/// On an outer join, a qualified name for the unmatched side must read as
+/// NULL, not rebind to the present table's column of the same name —
+/// otherwise `WHERE r.id IS NULL` silently matches every row instead of
+/// acting as an anti-join.
+#[test]
+fn test_outer_join_qualified_null_side() {
+    let (_db, exec) = create_sql_env("ojnull");
+
+    exec_sql(
+        &exec,
+        "CREATE TABLE ojl (id INTEGER PRIMARY KEY, shared INTEGER)",
+    );
+    exec_sql(
+        &exec,
+        "CREATE TABLE ojr (id INTEGER PRIMARY KEY, shared INTEGER)",
+    );
+    exec_sql(&exec, "INSERT INTO ojl (id, shared) VALUES (1, 10)");
+    exec_sql(&exec, "INSERT INTO ojl (id, shared) VALUES (2, 20)");
+    exec_sql(&exec, "INSERT INTO ojr (id, shared) VALUES (1, 30)");
+
+    let (_cols, rows) = exec_rows(
+        &exec,
+        "SELECT ojl.id FROM ojl LEFT JOIN ojr ON ojl.id = ojr.id",
+    );
+    assert_eq!(rows, vec![vec!["1".to_string()], vec!["2".to_string()]]);
+
+    // Row 2 has no ojr partner, so ojr.id is NULL there and only it survives.
+    let (_cols, rows) = exec_rows(
+        &exec,
+        "SELECT ojl.id FROM ojl LEFT JOIN ojr ON ojl.id = ojr.id WHERE ojr.id IS NULL",
+    );
+    assert_eq!(
+        rows,
+        vec![vec!["2".to_string()]],
+        "qualified name on the missing side must be NULL, not the present side's value"
+    );
+
+    let (_cols, rows) = exec_rows(
+        &exec,
+        "SELECT ojl.id FROM ojl LEFT JOIN ojr ON ojl.id = ojr.id WHERE ojr.shared IS NULL",
+    );
+    assert_eq!(rows, vec![vec!["2".to_string()]]);
+
+    // A value predicate still picks the matched row.
+    let (_cols, rows) = exec_rows(
+        &exec,
+        "SELECT ojl.id FROM ojl LEFT JOIN ojr ON ojl.id = ojr.id WHERE ojr.shared = 30",
+    );
+    assert_eq!(rows, vec![vec!["1".to_string()]]);
+
+    // A predicate on the preserved side is unaffected.
+    let (_cols, rows) = exec_rows(
+        &exec,
+        "SELECT ojl.id FROM ojl LEFT JOIN ojr ON ojl.id = ojr.id WHERE ojl.shared = 20",
+    );
+    assert_eq!(rows, vec![vec!["2".to_string()]]);
+}
+
+/// The optimizer swaps the join operands to build the hash table from the
+/// smaller side. Swapping must keep the preserved table, so `small LEFT
+/// JOIN big` still returns small's rows.
+#[test]
+fn test_outer_join_preserves_side_after_reorder() {
+    let (_db, exec) = create_sql_env("ojorder");
+
+    exec_sql(&exec, "CREATE TABLE os (id INTEGER PRIMARY KEY, v INTEGER)");
+    exec_sql(&exec, "CREATE TABLE ob (id INTEGER PRIMARY KEY, v INTEGER)");
+    exec_sql(&exec, "INSERT INTO os (id, v) VALUES (1, 10)");
+    exec_sql(&exec, "INSERT INTO ob (id, v) VALUES (1, 20)");
+    exec_sql(&exec, "INSERT INTO ob (id, v) VALUES (2, 30)");
+
+    // os has one row, ob has two, so ob becomes the probe side. A LEFT JOIN
+    // must still preserve os, whose only row matches ob row 1.
+    let (_cols, rows) = exec_rows(&exec, "SELECT os.id FROM os LEFT JOIN ob ON os.id = ob.id");
+    assert_eq!(
+        rows,
+        vec![vec!["1".to_string()]],
+        "LEFT JOIN must preserve the left table after operand reorder"
+    );
+
+    // RIGHT JOIN preserves the right table regardless of which side is
+    // smaller. Here ob (2 rows) is the preserved side.
+    let (_cols, rows) = exec_rows(&exec, "SELECT ob.id FROM os RIGHT JOIN ob ON os.id = ob.id");
+    assert_eq!(
+        rows,
+        vec![vec!["1".to_string()], vec!["2".to_string()]],
+        "RIGHT JOIN must preserve the right table after operand reorder"
+    );
+}
+
+/// EXPLAIN ANALYZE's hash join must keep the unmatched build rows of a
+/// Right-typed plan, matching the volcano executor.
+#[test]
+fn test_explain_analyze_right_join_keeps_unmatched_build() {
+    let (_db, exec) = create_sql_env("eajoin");
+
+    exec_sql(
+        &exec,
+        "CREATE TABLE big (id INTEGER PRIMARY KEY, v INTEGER)",
+    );
+    exec_sql(
+        &exec,
+        "CREATE TABLE small (id INTEGER PRIMARY KEY, v INTEGER)",
+    );
+    exec_sql(
+        &exec,
+        "INSERT INTO big (id, v) VALUES (1, 10), (2, 20), (3, 30)",
+    );
+    exec_sql(&exec, "INSERT INTO small (id, v) VALUES (1, 40), (9, 90)");
+
+    // big is the probe side, so the plan is Right-typed; small's row 9
+    // matches nothing and must survive.
+    let (_cols, rows) = exec_rows(
+        &exec,
+        "SELECT small.id FROM big RIGHT JOIN small ON big.id = small.id",
+    );
+    assert_eq!(
+        rows,
+        vec![vec!["1".to_string()], vec!["9".to_string()]],
+        "RIGHT JOIN must preserve the unmatched build row: {rows:?}"
+    );
+
+    let (_cols, plan_rows) = exec_rows(
+        &exec,
+        "EXPLAIN ANALYZE SELECT small.id FROM big RIGHT JOIN small ON big.id = small.id",
+    );
+    let hash_join_line = plan_rows
+        .iter()
+        .map(|r| r.first().cloned().unwrap_or_default())
+        .find(|l| l.contains("Hash Join"))
+        .unwrap_or_else(|| panic!("plan should contain a Hash Join: {plan_rows:?}"));
+    assert!(
+        hash_join_line.contains("actual rows=2"),
+        "EXPLAIN ANALYZE must report both rows: {hash_join_line}"
+    );
+}
+
+/// A projection of the missing side must read NULL, not the present table's
+/// column of the same name.
+#[test]
+fn test_outer_join_projects_missing_side_as_null() {
+    let (_db, exec) = create_sql_env("ojproj");
+
+    exec_sql(
+        &exec,
+        "CREATE TABLE ojl (id INTEGER PRIMARY KEY, shared INTEGER)",
+    );
+    exec_sql(
+        &exec,
+        "CREATE TABLE ojr (id INTEGER PRIMARY KEY, shared INTEGER)",
+    );
+    exec_sql(&exec, "INSERT INTO ojl (id, shared) VALUES (1, 10)");
+    exec_sql(&exec, "INSERT INTO ojl (id, shared) VALUES (2, 20)");
+    exec_sql(&exec, "INSERT INTO ojr (id, shared) VALUES (1, 30)");
+
+    // Row 2 has no ojr side.
+    let (_cols, rows) = exec_rows(
+        &exec,
+        "SELECT ojr.shared FROM ojl LEFT JOIN ojr ON ojl.id = ojr.id",
+    );
+    assert_eq!(
+        rows,
+        vec![vec!["30".to_string()], vec!["NULL".to_string()]],
+        "projecting the missing side must yield NULL, not the present side's value"
+    );
+
+    // The join key collides by name with ojl.id.
+    let (_cols, rows) = exec_rows(
+        &exec,
+        "SELECT ojr.id FROM ojl LEFT JOIN ojr ON ojl.id = ojr.id",
+    );
+    assert_eq!(
+        rows,
+        vec![vec!["1".to_string()], vec!["NULL".to_string()]],
+        "the missing side's join key must project to NULL"
+    );
+
+    let (_cols, rows) = exec_rows(
+        &exec,
+        "SELECT ojl.shared FROM ojl LEFT JOIN ojr ON ojl.id = ojr.id",
+    );
+    assert_eq!(rows, vec![vec!["10".to_string()], vec!["20".to_string()]]);
+
+    // Both sides at once: each keeps its own table's value.
+    let (cols, rows) = exec_rows(
+        &exec,
+        "SELECT ojl.shared, ojr.shared FROM ojl LEFT JOIN ojr ON ojl.id = ojr.id",
+    );
+    assert_eq!(cols, vec!["shared".to_string(), "shared".to_string()]);
+    assert_eq!(
+        rows,
+        vec![
+            vec!["10".to_string(), "30".to_string()],
+            vec!["20".to_string(), "NULL".to_string()]
+        ],
+        "two clashing qualified columns must each bind to its own table"
+    );
+}
+
+/// An unqualified column that exists on both sides of a join is ambiguous;
+/// the error names both tables.
+#[test]
+fn test_ambiguous_column_is_rejected() {
+    let (_db, exec) = create_sql_env("ambcol");
+
+    exec_sql(
+        &exec,
+        "CREATE TABLE qa (id INTEGER PRIMARY KEY, shared INTEGER)",
+    );
+    exec_sql(
+        &exec,
+        "CREATE TABLE qb (id INTEGER PRIMARY KEY, shared INTEGER)",
+    );
+    exec_sql(&exec, "INSERT INTO qa (id, shared) VALUES (1, 10)");
+    exec_sql(&exec, "INSERT INTO qb (id, shared) VALUES (1, 30)");
+
+    let expect_ambiguous = |sql: &str| {
+        let stmt = parse_sql(sql).expect("parse");
+        match exec.execute(&stmt) {
+            Err(e) => {
+                assert!(
+                    e.contains("is ambiguous"),
+                    "{sql}: expected an ambiguity error, got: {e}"
+                );
+                assert!(
+                    e.contains("qa") && e.contains("qb"),
+                    "{sql}: error should name both tables: {e}"
+                );
+            }
+            Ok(ExecResult::Rows { rows, .. }) => {
+                panic!("{sql}: ambiguous column was accepted, returned {rows:?}")
+            }
+            Ok(_) => panic!("{sql}: unexpected non-rows result"),
+        }
+    };
+
+    expect_ambiguous("SELECT shared FROM qa JOIN qb ON qa.id = qb.id");
+    expect_ambiguous("SELECT id FROM qa JOIN qb ON qa.id = qb.id");
+    expect_ambiguous("SELECT qa.id FROM qa JOIN qb ON qa.id = qb.id WHERE shared = 10");
+    expect_ambiguous("SELECT qa.id FROM qa JOIN qb ON qa.id = qb.id ORDER BY shared");
+    expect_ambiguous("SELECT qa.id FROM qa JOIN qb ON qa.id = qb.id GROUP BY shared");
+
+    // A qualified name is unambiguous.
+    let (_cols, rows) = exec_rows(
+        &exec,
+        "SELECT qa.shared FROM qa JOIN qb ON qa.id = qb.id WHERE qa.shared = 10",
+    );
+    assert_eq!(rows, vec![vec!["10".to_string()]]);
+
+    let (_cols, rows) = exec_rows(
+        &exec,
+        "SELECT qb.shared FROM qa JOIN qb ON qa.id = qb.id WHERE qb.shared = 30",
+    );
+    assert_eq!(rows, vec![vec!["30".to_string()]]);
+
+    // A name only one table owns is not ambiguous.
+    exec_sql(
+        &exec,
+        "CREATE TABLE qc (id INTEGER PRIMARY KEY, only INTEGER)",
+    );
+    exec_sql(&exec, "INSERT INTO qc (id, only) VALUES (1, 40)");
+    let (_cols, rows) = exec_rows(&exec, "SELECT only FROM qc JOIN qb ON qc.id = qb.id");
+    assert_eq!(rows, vec![vec!["40".to_string()]]);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SQL NULL is distinct from the literal text 'NULL'
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// A stored NULL and a stored 'NULL' string are two different rows, and each
+/// predicate matches only its own.
+#[test]
+fn test_null_is_distinct_from_null_text() {
+    let (_db, exec) = create_sql_env("nulldist");
+    exec_sql(&exec, "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)");
+    exec_sql(&exec, "INSERT INTO t (id, v) VALUES (1, NULL)");
+    exec_sql(&exec, "INSERT INTO t (id, v) VALUES (2, 'NULL')");
+
+    let (_cols, rows) = exec_rows(&exec, "SELECT id FROM t WHERE v IS NULL");
+    assert_eq!(rows, vec![vec!["1".to_string()]]);
+
+    let (_cols, rows) = exec_rows(&exec, "SELECT id FROM t WHERE v = 'NULL'");
+    assert_eq!(rows, vec![vec!["2".to_string()]]);
+}
+
+/// COUNT(*) tallies rows; COUNT(col) skips a NULL, and SUM ignores it.
+#[test]
+fn test_aggregates_skip_nulls_but_count_rows() {
+    let (_db, exec) = create_sql_env("aggnull");
+    exec_sql(&exec, "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)");
+    exec_sql(&exec, "INSERT INTO t (id, v) VALUES (1, NULL)");
+    exec_sql(&exec, "INSERT INTO t (id, v) VALUES (2, 10)");
+
+    let (_cols, rows) = exec_rows(&exec, "SELECT COUNT(*) FROM t");
+    assert_eq!(rows, vec![vec!["2".to_string()]]);
+    let (_cols, rows) = exec_rows(&exec, "SELECT COUNT(v) FROM t");
+    assert_eq!(rows, vec![vec!["1".to_string()]]);
+    let (_cols, rows) = exec_rows(&exec, "SELECT SUM(v) FROM t");
+    assert_eq!(rows, vec![vec!["10".to_string()]]);
+}
+
+/// A row whose join key is NULL is preserved by an outer join: NULL never
+/// matches, but the row is not dropped from the preserved side.
+#[test]
+fn test_outer_join_preserves_null_key_row() {
+    let (_db, exec) = create_sql_env("joinnull");
+    exec_sql(&exec, "CREATE TABLE a (id INTEGER PRIMARY KEY, k TEXT)");
+    exec_sql(&exec, "CREATE TABLE b (id INTEGER PRIMARY KEY, k TEXT)");
+    exec_sql(&exec, "INSERT INTO a (id, k) VALUES (1, NULL)");
+    exec_sql(&exec, "INSERT INTO a (id, k) VALUES (2, 'x')");
+    exec_sql(&exec, "INSERT INTO b (id, k) VALUES (1, NULL)");
+    exec_sql(&exec, "INSERT INTO b (id, k) VALUES (2, 'x')");
+
+    let (_cols, rows) = exec_rows(
+        &exec,
+        "SELECT a.id, b.id FROM a JOIN b ON a.k = b.k ORDER BY a.id",
+    );
+    assert_eq!(rows, vec![vec!["2".to_string(), "2".to_string()]]);
+
+    let (_cols, rows) = exec_rows(
+        &exec,
+        "SELECT a.id, b.id FROM a LEFT JOIN b ON a.k = b.k ORDER BY a.id",
+    );
+    assert_eq!(
+        rows,
+        vec![
+            vec!["1".to_string(), "NULL".to_string()],
+            vec!["2".to_string(), "2".to_string()]
+        ]
+    );
+
+    let (_cols, rows) = exec_rows(
+        &exec,
+        "SELECT a.id, b.id FROM a RIGHT JOIN b ON a.k = b.k ORDER BY b.id",
+    );
+    assert_eq!(
+        rows,
+        vec![
+            vec!["NULL".to_string(), "1".to_string()],
+            vec!["2".to_string(), "2".to_string()]
+        ]
+    );
+}
+
+/// A NULL join key is not an empty string: it matches nothing, but the row
+/// is still preserved by an outer join.
+#[test]
+fn test_null_join_key_never_matches_empty_string() {
+    let (_db, exec) = create_sql_env("nullvsempty");
+    exec_sql(&exec, "CREATE TABLE a (id INTEGER PRIMARY KEY, k TEXT)");
+    exec_sql(&exec, "CREATE TABLE b (id INTEGER PRIMARY KEY, k TEXT)");
+    exec_sql(&exec, "INSERT INTO a (id, k) VALUES (1, NULL)");
+    exec_sql(&exec, "INSERT INTO b (id, k) VALUES (2, '')");
+
+    let (_cols, rows) = exec_rows(&exec, "SELECT a.id, b.id FROM a JOIN b ON a.k = b.k");
+    assert!(rows.is_empty(), "NULL must not join to '': {rows:?}");
+
+    let (_cols, rows) = exec_rows(
+        &exec,
+        "SELECT a.id, b.id FROM a LEFT JOIN b ON a.k = b.k ORDER BY a.id",
+    );
+    assert_eq!(rows, vec![vec!["1".to_string(), "NULL".to_string()]]);
+
+    let (_cols, rows) = exec_rows(
+        &exec,
+        "SELECT a.id, b.id FROM a RIGHT JOIN b ON a.k = b.k ORDER BY b.id",
+    );
+    assert_eq!(rows, vec![vec!["NULL".to_string(), "2".to_string()]]);
+}
+
+/// GROUP BY keys containing the join separator must not collide: ("x", "y|z")
+/// and ("x|y", "z") both join to "x|y|z" under a naive separator join but are
+/// different groups.
+#[test]
+fn test_group_by_key_with_separator_does_not_collide() {
+    let (_db, exec) = create_sql_env("gbseps");
+    exec_sql(
+        &exec,
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT, b TEXT)",
+    );
+    exec_sql(&exec, "INSERT INTO t (id, a, b) VALUES (1, 'x', 'y|z')");
+    exec_sql(&exec, "INSERT INTO t (id, a, b) VALUES (2, 'x|y', 'z')");
+    exec_sql(&exec, "INSERT INTO t (id, a, b) VALUES (3, 'x', 'y|z')");
+
+    let (_cols, rows) = exec_rows(
+        &exec,
+        "SELECT a, b, COUNT(*) FROM t GROUP BY a, b ORDER BY a, b",
+    );
+    assert_eq!(
+        rows,
+        vec![
+            vec!["x".to_string(), "y|z".to_string(), "2".to_string()],
+            vec!["x|y".to_string(), "z".to_string(), "1".to_string()],
+        ]
+    );
+}
+
+/// `EXPLAIN ANALYZE` runs the hash join through `PlanExecutor`, which must agree
+/// with the volcano executor when join keys are NULL: a NULL key never
+/// matches, but an outer join still preserves its row. A NULL-key probe row
+/// or build row that silently dropped would make these counts diverge.
+#[test]
+fn test_explain_analyze_null_join_key_matches_volcano() {
+    let (_db, exec) = create_sql_env("eanulljoin");
+
+    exec_sql(&exec, "CREATE TABLE a (id INTEGER PRIMARY KEY, k TEXT)");
+    exec_sql(&exec, "CREATE TABLE b (id INTEGER PRIMARY KEY, k TEXT)");
+    exec_sql(
+        &exec,
+        "INSERT INTO a (id, k) VALUES (1, NULL), (2, NULL), (3, 'x'), (4, 'y'), (5, 'z')",
+    );
+    exec_sql(
+        &exec,
+        "INSERT INTO b (id, k) VALUES (1, NULL), (2, 'x'), (3, 'y'), (4, 'w'), (5, 'q')",
+    );
+
+    for join in ["INNER", "LEFT", "RIGHT"] {
+        let sql = format!("SELECT a.id, b.id FROM a {join} JOIN b ON a.k = b.k");
+        let (_cols, rows) = exec_rows(&exec, &sql);
+
+        let (_cols, plan_rows) = exec_rows(&exec, &format!("EXPLAIN ANALYZE {sql}"));
+        let hash_join_line = plan_rows
+            .iter()
+            .map(|r| r.first().cloned().unwrap_or_default())
+            .find(|l| l.contains("Hash Join"))
+            .unwrap_or_else(|| {
+                panic!("{join} JOIN plan should contain a Hash Join: {plan_rows:?}")
+            });
+        assert!(
+            hash_join_line.contains(&format!("actual rows={}", rows.len())),
+            "{join} JOIN: EXPLAIN ANALYZE must report the same row count as the volcano \
+             executor ({}): {hash_join_line}",
+            rows.len()
+        );
+    }
+}
+
+/// The typed-Row change made the stored byte pattern for SQL NULL ("NULL")
+/// identical to the stored pattern for the user's literal text 'NULL'. The
+/// table records which format its rows are in, and only a legacy table maps
+/// the sentinel to NULL — a table created by the current code keeps 'NULL'
+/// as text on every read path.
+#[test]
+fn typed_table_keeps_literal_null_text() {
+    let (_db, exec) = create_sql_env("typednull");
+
+    exec_sql(&exec, "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)");
+    exec_sql(&exec, "INSERT INTO t (id, v) VALUES (1, 'NULL')");
+    exec_sql(&exec, "INSERT INTO t (id, v) VALUES (2, NULL)");
+
+    // Literal 'NULL' stays text; a real NULL stays NULL.
+    let (_cols, text_row) = exec_rows(&exec, "SELECT v FROM t WHERE id = 1");
+    assert_eq!(text_row, vec![vec!["NULL".to_string()]]);
+    let (_cols, nulls) = exec_rows(&exec, "SELECT id FROM t WHERE v IS NULL");
+    assert_eq!(nulls, vec![vec!["2".to_string()]]);
+    let (_cols, literal) = exec_rows(&exec, "SELECT id FROM t WHERE v = 'NULL'");
+    assert_eq!(literal, vec![vec!["1".to_string()]]);
+
+    // EXPLAIN ANALYZE runs through PlanExecutor, a different decoder than
+    // the volcano scan; it must find the same literal-text row.
+    let (_cols, plan) = exec_rows(&exec, "EXPLAIN ANALYZE SELECT id FROM t WHERE v = 'NULL'");
+    let project = plan
+        .iter()
+        .map(|r| r.first().cloned().unwrap_or_default())
+        .find(|l| l.contains("Project"))
+        .expect("plan has a Project node");
+    assert!(
+        project.contains("actual rows=1"),
+        "EXPLAIN ANALYZE must find the literal-text row: {project}"
+    );
+}
+
+/// ORDER BY follows the column's declared type: a TEXT column orders
+/// lexically ("10" < "2") while a numeric one orders numerically. A
+/// type-agnostic sort would order text numerically and disagree with the
+/// type-aware comparison a WHERE clause on the same column uses.
+#[test]
+fn order_by_follows_column_type() {
+    let (_db, exec) = create_sql_env("ordsort");
+
+    exec_sql(&exec, "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)");
+    exec_sql(
+        &exec,
+        "INSERT INTO t (id, v) VALUES (1, '2'), (2, '10'), (3, '1')",
+    );
+
+    // TEXT column: lexical, so '10' sorts before '2'.
+    let (_cols, text_asc) = exec_rows(&exec, "SELECT v FROM t ORDER BY v");
+    assert_eq!(
+        text_asc,
+        vec![
+            vec!["1".to_string()],
+            vec!["10".to_string()],
+            vec!["2".to_string()],
+        ]
+    );
+
+    // INTEGER column: numeric, so 1 < 2 < 10 by id.
+    let (_cols, num_asc) = exec_rows(&exec, "SELECT v FROM t ORDER BY id");
+    assert_eq!(
+        num_asc,
+        vec![
+            vec!["2".to_string()],
+            vec!["10".to_string()],
+            vec!["1".to_string()],
+        ]
+    );
+
+    // DESC reverses the same lexical order, not a numeric one.
+    let (_cols, text_desc) = exec_rows(&exec, "SELECT v FROM t ORDER BY v DESC");
+    assert_eq!(
+        text_desc,
+        vec![
+            vec!["2".to_string()],
+            vec!["10".to_string()],
+            vec!["1".to_string()],
+        ]
+    );
+
+    // EXPLAIN ANALYZE sorts through PlanExecutor; it must agree.
+    let (_cols, plan) = exec_rows(&exec, "EXPLAIN ANALYZE SELECT v FROM t ORDER BY v");
+    let sort_line = plan
+        .iter()
+        .map(|r| r.first().cloned().unwrap_or_default())
+        .find(|l| l.contains("Sort"))
+        .expect("plan has a Sort node");
+    assert!(
+        sort_line.contains("actual rows=3"),
+        "EXPLAIN ANALYZE must sort the same rows: {sort_line}"
+    );
+}
+
+/// A window function's ORDER BY respects the column type too.
+#[test]
+fn window_order_by_follows_column_type() {
+    let (_db, exec) = create_sql_env("winordsort");
+
+    exec_sql(&exec, "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)");
+    exec_sql(
+        &exec,
+        "INSERT INTO t (id, v) VALUES (1, '2'), (2, '10'), (3, '1')",
+    );
+
+    // Lexical order is '1', '10', '2', so the row numbers follow it.
+    let (_cols, rows) = exec_rows(&exec, "SELECT v, ROW_NUMBER() OVER (ORDER BY v) FROM t");
+    assert_eq!(
+        rows,
+        vec![
+            vec!["1".to_string(), "1".to_string()],
+            vec!["10".to_string(), "2".to_string()],
+            vec!["2".to_string(), "3".to_string()],
+        ]
+    );
+}
+
+/// A window function's ORDER BY must resolve a sort key from either side of
+/// a join, not just the first table: a TEXT key on the right table that
+/// falls back to the numeric heuristic would order '2' before '10'.
+#[test]
+fn window_order_by_resolves_right_table_of_join() {
+    let (_db, exec) = create_sql_env("winjoin");
+
+    exec_sql(&exec, "CREATE TABLE l (id INTEGER PRIMARY KEY, x INTEGER)");
+    exec_sql(&exec, "CREATE TABLE r (id INTEGER PRIMARY KEY, v TEXT)");
+    exec_sql(
+        &exec,
+        "INSERT INTO l (id, x) VALUES (1, 10), (2, 20), (3, 30)",
+    );
+    exec_sql(
+        &exec,
+        "INSERT INTO r (id, v) VALUES (1, '2'), (2, '10'), (3, '1')",
+    );
+
+    // The sort key v belongs to r, the second table. Lexical order is
+    // '1', '10', '2', so the row numbers follow it, not numeric order.
+    let (_cols, rows) = exec_rows(
+        &exec,
+        "SELECT r.v, ROW_NUMBER() OVER (ORDER BY r.v) FROM l JOIN r ON l.id = r.id",
+    );
+    assert_eq!(
+        rows,
+        vec![
+            vec!["1".to_string(), "1".to_string()],
+            vec!["10".to_string(), "2".to_string()],
+            vec!["2".to_string(), "3".to_string()],
+        ]
+    );
 }

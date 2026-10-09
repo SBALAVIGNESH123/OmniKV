@@ -25,7 +25,7 @@ fn api_json_corpus() -> Vec<Vec<u8>> {
             }
         }
     }
-    assert!(!bytes.is_empty(), "expected checked-in API JSON corpus");
+    assert_ne!(bytes.len(), 0, "expected checked-in API JSON corpus");
     bytes
 }
 

@@ -48,6 +48,35 @@ impl ColumnType {
             Self::Json => 114,       // JSON
         }
     }
+
+    /// A numeric column orders by value, so "7" and "007" are one key.
+    pub fn is_numeric(&self) -> bool {
+        matches!(self, Self::Integer | Self::Float)
+    }
+
+    /// Canonical form for a value of this type: a numeric payload prints as
+    /// its number, anything else is kept verbatim.
+    ///
+    /// A FLOAT column normalizing `1.50` to `1.5` is not lossy storage --
+    /// it is IEEE-754 semantics, and the same rule PostgreSQL applies to
+    /// `double precision`. `1.50` and `1.5` parse to the identical f64, so
+    /// the trailing zero was never information the type could hold;
+    /// `f64`'s shortest-round-trip display preserves every value exactly.
+    /// Preserving typed digits is a `NUMERIC`/decimal type's job, which this
+    /// engine does not have.
+    pub fn canonicalize(&self, value: &str) -> String {
+        match self {
+            Self::Integer => value
+                .parse::<i128>()
+                .map(|n| n.to_string())
+                .unwrap_or_else(|_| value.to_string()),
+            Self::Float => value
+                .parse::<f64>()
+                .map(|f| f.to_string())
+                .unwrap_or_else(|_| value.to_string()),
+            _ => value.to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -59,12 +88,34 @@ pub struct Column {
     pub default: Option<String>,
 }
 
+/// How a table's rows encode a SQL NULL on disk.
+///
+/// The typed-`Row` change (NULL stored as JSON `null`) is not byte-compatible
+/// with what came before it: the old code stored a NULL as the literal string
+/// "NULL", which is now how a user's literal text `'NULL'` is stored. The two
+/// cannot be told apart by value, so the table records which format its rows
+/// are in and the decoders consult it. Existing manifests have no field, so
+/// `serde(default)` reads them as [`RowFormat::Legacy`]; tables created after
+/// the change are [`RowFormat::Typed`].
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum RowFormat {
+    /// NULL is the literal string "NULL"; pre-typed-Row databases only.
+    #[default]
+    Legacy,
+    /// NULL is a JSON `null`; "NULL" is the user's literal text.
+    Typed,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TableDef {
     pub name: String,
     pub columns: Vec<Column>,
     pub primary_key: String,
     pub created_at: u64,
+    /// How this table's rows encode NULL. Defaults to legacy for tables
+    /// deserialized from a manifest written before the field existed.
+    #[serde(default)]
+    pub row_format: RowFormat,
 }
 
 impl TableDef {

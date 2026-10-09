@@ -204,7 +204,7 @@ fn test_prometheus_metrics_render() {
     // Force lazy_static metric registration
     metrics_prometheus::COMMIT_RATE.inc();
     let output = metrics_prometheus::render_metrics();
-    assert!(!output.is_empty(), "Prometheus output should not be empty");
+    assert_ne!(output.len(), 0, "Prometheus output should not be empty");
     assert!(
         output.contains("omnikv_"),
         "Output should contain omnikv_ metrics"
@@ -518,7 +518,7 @@ fn test_error_types_display() {
 
     for err in &errors {
         let msg = format!("{err}");
-        assert!(!msg.is_empty());
+        assert_ne!(msg.len(), 0);
     }
     println!("✅ OPS: All {} error types display correctly", errors.len());
 }

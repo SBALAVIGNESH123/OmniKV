@@ -250,6 +250,14 @@ fn is_cleartext_safe_bind(bind_addr: &str) -> bool {
     }
 }
 
+/// Digested first so the configured length and any matched prefix stay
+/// unreadable from the response timing.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    use sha2::{Digest, Sha256};
+    use subtle::ConstantTimeEq;
+    Sha256::digest(a).ct_eq(&Sha256::digest(b)).into()
+}
+
 /// Loopback only. A private network is shared, so with TLS configured
 /// plaintext startup is refused there too.
 fn is_loopback_bind(bind_addr: &str) -> bool {
@@ -925,9 +933,18 @@ fn handle_startup(
     stream.read_exact(&mut pw_buf)?;
     // Password is null-terminated
     let supplied = pw_buf.split(|&b| b == 0).next().unwrap_or(&[]);
-    let supplied = std::str::from_utf8(supplied).unwrap_or("");
+    let supplied = match std::str::from_utf8(supplied) {
+        Ok(s) => s,
+        Err(_) => {
+            send_error_response(&mut stream, "28P01", "password is not valid UTF-8")?;
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "password message is not valid UTF-8",
+            ));
+        }
+    };
 
-    if supplied != expected_password {
+    if !constant_time_eq(supplied.as_bytes(), expected_password.as_bytes()) {
         tracing::warn!("PGWire authentication failed — bad password");
         send_error_response(&mut stream, "28P01", "password authentication failed")?;
         return Err(std::io::Error::new(
@@ -1957,6 +1974,23 @@ fn merge_staged_writes_into_txn(
     }
 }
 
+/// SQLSTATE for a statement-execution error, so clients can branch like they
+/// do on a real PostgreSQL: 42703 undefined column, 42P01 undefined table,
+/// 42P07 duplicate table, and the catch-all internal-error code.
+fn sqlstate_for_exec_error(e: &str) -> &'static str {
+    if e.contains("column \"") && e.contains("does not exist") {
+        "42703"
+    } else if e.contains("is ambiguous") {
+        "42702"
+    } else if e.contains("does not exist") {
+        "42P01"
+    } else if e.contains("already exists") {
+        "42P07"
+    } else {
+        "XX000"
+    }
+}
+
 /// Executes everything that is not a transaction-control statement: the
 /// failed-transaction guard, health-check shortcuts, the SQL path, and the
 /// legacy KV fallback. Shares the connection's transaction snapshot when a
@@ -2069,13 +2103,7 @@ fn execute_non_transactional_statement(
                     // one: clients branch on these (42P01 undefined
                     // table, 42P07 duplicate table) the same way they
                     // branch on 23505 for duplicate keys.
-                    let code = if e.contains("does not exist") {
-                        "42P01"
-                    } else if e.contains("already exists") {
-                        "42P07"
-                    } else {
-                        "XX000"
-                    };
+                    let code = sqlstate_for_exec_error(&e);
                     StepOutcome::error(code, format!("Exec error: {e}"))
                 }
             }
@@ -2542,6 +2570,37 @@ fn error_response_bytes(severity: &str, code: &str, message: &str) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn sqlstate_undefined_column_is_42703() {
+        assert_eq!(
+            sqlstate_for_exec_error("column \"v\" does not exist"),
+            "42703"
+        );
+    }
+
+    #[test]
+    fn sqlstate_undefined_table_is_42p01() {
+        assert_eq!(sqlstate_for_exec_error("Table 't' does not exist"), "42P01");
+    }
+
+    #[test]
+    fn sqlstate_duplicate_table_is_42p07() {
+        assert_eq!(sqlstate_for_exec_error("Table 't' already exists"), "42P07");
+    }
+
+    #[test]
+    fn sqlstate_other_is_internal_error() {
+        assert_eq!(sqlstate_for_exec_error("disk on fire"), "XX000");
+    }
+
+    #[test]
+    fn sqlstate_ambiguous_column_is_42702() {
+        assert_eq!(
+            sqlstate_for_exec_error("column \"id\" is ambiguous — qualify it"),
+            "42702"
+        );
+    }
+
     use crate::sql::{SqlStatement, parse_sql};
 
     fn pgwire_frame_length(frame: &[u8]) -> usize {
@@ -2650,6 +2709,16 @@ mod tests {
 
         let too_wide = parse_sql("SELECT * FROM users LIMIT 10000 OFFSET 1").expect("parse");
         assert!(enforce_pgwire_statement_limits(too_wide).is_err());
+    }
+
+    #[test]
+    fn pgwire_password_compare_reads_every_byte() {
+        assert!(constant_time_eq(b"hunter2", b"hunter2"));
+        assert!(!constant_time_eq(b"hunter2", b"hunter3"));
+        assert!(!constant_time_eq(b"hunter2", b"hunter"));
+        assert!(!constant_time_eq(b"hunter2", b"xunter2"));
+        assert!(constant_time_eq(b"", b""));
+        assert!(!constant_time_eq(b"", b"a"));
     }
 
     #[test]
