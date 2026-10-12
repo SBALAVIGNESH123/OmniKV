@@ -1123,6 +1123,20 @@ fn pgwire_transaction_ddl_rolls_back_with_transaction() {
     );
     let _ = read_ready_status(&mut stream);
 
+    // DML reaches the same table through its own error path, which used to
+    // phrase a missing table as "not found" and map to XX000.
+    for q in ["UPDATE rolled SET id = 1", "DELETE FROM rolled"] {
+        send_query(&mut stream, q).expect("dml on missing table");
+        let (msg_type, body) = read_message(&mut stream).expect("error frame");
+        assert_eq!(msg_type, b'E', "{q} must fail");
+        let text = String::from_utf8_lossy(&body);
+        assert!(
+            text.contains("42P01"),
+            "{q} must report 42P01, got {text:?}"
+        );
+        let _ = read_ready_status(&mut stream);
+    }
+
     // Committed CREATE persists.
     send_query(&mut stream, "BEGIN").expect("begin");
     read_command_complete(&mut stream);

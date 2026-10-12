@@ -364,9 +364,10 @@ impl SqlExecutor {
                 let optimizer = crate::optimizer::Optimizer::new(stats);
                 match optimizer.optimize(inner) {
                     Ok(plan) => {
-                        let plan_exec = crate::plan_exec::PlanExecutor::new(
+                        let plan_exec = crate::plan_exec::PlanExecutor::for_plan(
                             self.db.clone(),
                             self.catalog.clone(),
+                            &plan,
                         );
                         match plan_exec.explain_analyze(&plan) {
                             Ok((_rows, node_stats)) => {
@@ -570,6 +571,62 @@ impl SqlExecutor {
         Ok(ExecResult::Ok(format!("DROP TABLE {}", name)))
     }
 
+    /// Rewrite a legacy table's rows to the typed encoding before the typed
+    /// write path appends to them. A stored "NULL" is a SQL NULL under the
+    /// legacy encoding and the user's literal text under the typed one; the
+    /// bytes are identical, so the two cannot coexist in one table.
+    fn migrate_to_typed(&self, table: &TableDef) -> Result<(), String> {
+        let prefix = table.row_prefix();
+        let end = format!("{}\u{7F}", prefix);
+        self.record_range_read(&prefix, &end);
+        let seq = self.snapshot_seq.unwrap_or_else(|| self.db.get_seq());
+        let mut stored = self.db.scan(&prefix, &end, seq).unwrap_or_default();
+
+        let overlay = self.pending_overlay();
+        if let Some(ov) = &overlay {
+            stored.retain(|(key, _)| !ov.contains_key(key.as_str()));
+            for (key, value) in ov {
+                let in_table = key.starts_with(prefix.as_str()) && key.len() > prefix.len();
+                if let (true, Some(serialized)) = (in_table, value)
+                    && serde_json::from_str::<Row>(serialized).is_ok()
+                {
+                    stored.push((key.clone(), serialized.clone()));
+                }
+            }
+        }
+
+        let mut batch = WriteBatch::new();
+        let mut changed = false;
+        for (key, serialized) in &stored {
+            let Some(row) =
+                crate::plan_exec::PlanExecutor::deserialize_row(serialized, table.row_format)
+            else {
+                continue;
+            };
+            let typed = serde_json::to_string(&row).map_err(|e| format!("{}", e))?;
+            if &typed != serialized {
+                batch.set(key, typed).map_err(|e| format!("{:?}", e))?;
+                changed = true;
+            }
+        }
+
+        if changed {
+            self.stage_or_commit(batch)?;
+        }
+
+        // The format flip stages with the row rewrites so a ROLLBACK drops both.
+        let mut updated = table.clone();
+        updated.row_format = crate::catalog::RowFormat::Typed;
+        let (cat_key, cat_value) = Catalog::staged_create_entry(&updated)?;
+        let mut cat_batch = WriteBatch::new();
+        cat_batch
+            .set(&cat_key, cat_value)
+            .map_err(|e| format!("{:?}", e))?;
+        self.stage_or_commit(cat_batch)?;
+        self.catalog.insert_staged(updated);
+        Ok(())
+    }
+
     fn exec_insert(
         &self,
         table_name: &str,
@@ -581,6 +638,9 @@ impl SqlExecutor {
             .get_table(table_name)
             .ok_or_else(|| format!("Table '{}' does not exist", table_name))?;
         self.record_catalog_read(table_name);
+        if table.row_format == crate::catalog::RowFormat::Legacy {
+            self.migrate_to_typed(&table)?;
+        }
 
         let columns = if col_names.is_empty() {
             table
@@ -832,12 +892,13 @@ impl SqlExecutor {
                 // Execute the subquery
                 match self.execute(sub_stmt)? {
                     ExecResult::Rows { rows, .. } => {
-                        // Extract first column from each row
                         let values: Vec<SqlValue> = rows
                             .into_iter()
                             .filter_map(|row| row.into_iter().next())
                             .map(|v| {
-                                if let Ok(n) = v.parse::<i64>() {
+                                if v == "NULL" {
+                                    SqlValue::Null
+                                } else if let Ok(n) = v.parse::<i64>() {
                                     SqlValue::Integer(n)
                                 } else if let Ok(f) = v.parse::<f64>() {
                                     SqlValue::Float(f)
@@ -968,12 +1029,41 @@ impl SqlExecutor {
                 self.record_catalog_read(name);
                 Ok(())
             }
-            FromClause::Join { left, right, .. } => {
+            FromClause::Join {
+                left,
+                right,
+                on_left,
+                on_right,
+                ..
+            } => {
                 for side in [left, right] {
                     if self.catalog.get_table(side).is_none() {
                         return Err(format!("Table '{}' does not exist", side));
                     }
                     self.record_catalog_read(side);
+                }
+                // An unknown ON column would otherwise read as a missing key
+                // and yield an empty or wrongly-bound outer join.
+                for (table, col) in [(left, on_left), (right, on_right)] {
+                    let table_def = self
+                        .catalog
+                        .get_table(table)
+                        .ok_or_else(|| format!("Table '{table}' does not exist"))?;
+                    let bare = col.rsplit('.').next().unwrap_or(col);
+                    if let Some((qual, _)) = col.split_once('.')
+                        && !qual.eq_ignore_ascii_case(table)
+                    {
+                        return Err(format!(
+                            "table \"{qual}\" is not in the FROM clause of this statement"
+                        ));
+                    }
+                    if !table_def
+                        .column_names()
+                        .iter()
+                        .any(|c| c.eq_ignore_ascii_case(bare))
+                    {
+                        return Err(format!("column \"{col}\" does not exist"));
+                    }
                 }
                 Ok(())
             }
@@ -1142,7 +1232,7 @@ impl SqlExecutor {
                 let table = self
                     .catalog
                     .get_table(name)
-                    .ok_or_else(|| format!("Table '{}' not found", name))?;
+                    .ok_or_else(|| format!("Table '{}' does not exist", name))?;
                 self.record_catalog_read(name);
                 self.load_table_rows(&table)
             }
@@ -1158,11 +1248,11 @@ impl SqlExecutor {
                 let lt = self
                     .catalog
                     .get_table(left)
-                    .ok_or_else(|| format!("Table '{}' not found", left))?;
+                    .ok_or_else(|| format!("Table '{}' does not exist", left))?;
                 let rt = self
                     .catalog
                     .get_table(right)
-                    .ok_or_else(|| format!("Table '{}' not found", right))?;
+                    .ok_or_else(|| format!("Table '{}' does not exist", right))?;
                 let left_rows = self.load_table_rows(&lt);
                 let right_rows = self.load_table_rows(&rt);
                 self.execute_join(
@@ -1201,14 +1291,14 @@ impl SqlExecutor {
         }
 
         if !group_by.is_empty() {
-            return self.exec_group_by(&rows, columns, group_by, order_by, limit);
+            return self.exec_group_by(&rows, columns, group_by, order_by, limit, &col_types);
         }
 
         let has_agg = columns
             .iter()
             .any(|c| matches!(c, SelectColumn::Aggregate(..)));
         if has_agg {
-            return self.exec_aggregate_no_group(&rows, columns);
+            return self.exec_aggregate_no_group(&rows, columns, &col_types);
         }
 
         for item in order_by.iter().rev() {
@@ -1347,19 +1437,13 @@ impl SqlExecutor {
         group_by: &[String],
         order_by: &[OrderByItem],
         limit: Option<usize>,
+        col_types: &ColumnTypeMap,
     ) -> Result<ExecResult, String> {
         let mut groups: HashMap<String, Vec<&Row>> = HashMap::new();
         for row in rows {
             let key: String = group_by
                 .iter()
-                .map(|g| {
-                    let part = row
-                        .get(g)
-                        .cloned()
-                        .flatten()
-                        .unwrap_or_else(|| "\u{1}NULL\u{1}".to_string());
-                    format!("{}:{part}", part.len())
-                })
+                .map(|g| crate::volcano::encode_key_part(crate::volcano::row_lookup(row, g)))
                 .collect::<Vec<_>>()
                 .join("|");
             groups.entry(key).or_default().push(row);
@@ -1374,12 +1458,22 @@ impl SqlExecutor {
                 match col {
                     SelectColumn::Named(name) => {
                         col_names.push(name.clone());
-                        result_row.push(render(group_rows[0].get(name).and_then(|v| v.as_deref())));
+                        result_row.push(render(crate::volcano::row_lookup(group_rows[0], name)));
+                    }
+                    SelectColumn::Qualified(t, n) => {
+                        col_names.push(n.clone());
+                        let key = format!("{}.{}", t, n);
+                        result_row.push(render(crate::volcano::row_lookup(group_rows[0], &key)));
                     }
                     SelectColumn::Aggregate(func, target) => {
-                        let (name, val) = compute_aggregate(func, target, group_rows);
+                        let (name, val) = compute_aggregate(
+                            func,
+                            target,
+                            group_rows,
+                            crate::volcano::type_lookup(col_types, target),
+                        );
                         col_names.push(name);
-                        result_row.push(val);
+                        result_row.push(render(val.as_deref()));
                     }
                     _ => {}
                 }
@@ -1401,6 +1495,7 @@ impl SqlExecutor {
         &self,
         rows: &[Row],
         columns: &[SelectColumn],
+        col_types: &ColumnTypeMap,
     ) -> Result<ExecResult, String> {
         let refs: Vec<&Row> = rows.iter().collect();
         let mut col_names = Vec::new();
@@ -1408,9 +1503,14 @@ impl SqlExecutor {
 
         for col in columns {
             if let SelectColumn::Aggregate(func, target) = col {
-                let (name, val) = compute_aggregate(func, target, &refs);
+                let (name, val) = compute_aggregate(
+                    func,
+                    target,
+                    &refs,
+                    crate::volcano::type_lookup(col_types, target),
+                );
                 col_names.push(name);
-                result_row.push(val);
+                result_row.push(render(val.as_deref()));
             }
         }
         Ok(ExecResult::Rows {
@@ -1534,8 +1634,11 @@ impl SqlExecutor {
         let table = self
             .catalog
             .get_table(table_name)
-            .ok_or_else(|| format!("Table '{}' not found", table_name))?;
+            .ok_or_else(|| format!("Table '{}' does not exist", table_name))?;
         self.record_catalog_read(table_name);
+        if table.row_format == crate::catalog::RowFormat::Legacy {
+            self.migrate_to_typed(&table)?;
+        }
         self.validate_where_columns_of(table_name, where_clause)?;
         // Validate the assignments before filtering: a statement that
         // matches no rows would otherwise skip the loop and silently accept
@@ -1594,7 +1697,7 @@ impl SqlExecutor {
         let table = self
             .catalog
             .get_table(table_name)
-            .ok_or_else(|| format!("Table '{}' not found", table_name))?;
+            .ok_or_else(|| format!("Table '{}' does not exist", table_name))?;
         self.record_catalog_read(table_name);
         self.validate_where_columns_of(table_name, where_clause)?;
         let mut rows = self.load_table_rows(&table);
@@ -1666,6 +1769,11 @@ fn smart_cmp(a: &str, b: &str) -> std::cmp::Ordering {
     crate::volcano::smart_cmp(a, b)
 }
 
-fn compute_aggregate(func: &AggFunc, target: &str, rows: &[&Row]) -> (String, String) {
-    crate::volcano::compute_aggregate(func, target, rows)
+fn compute_aggregate(
+    func: &AggFunc,
+    target: &str,
+    rows: &[&Row],
+    col_type: Option<&ColumnType>,
+) -> (String, Option<String>) {
+    crate::volcano::compute_aggregate(func, target, rows, col_type)
 }

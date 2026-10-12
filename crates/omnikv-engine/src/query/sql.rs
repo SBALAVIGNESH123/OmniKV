@@ -264,7 +264,8 @@ fn bind_walk(
     stmt: SqlStatement,
     resolve: &dyn Fn(usize, bool) -> Result<SqlValue, String>,
 ) -> Result<SqlStatement, String> {
-    // Written values keep the client's bytes exactly, so the flag is false.
+    // Written values resolve as text so the binder never guesses a type; the
+    // column's declared type canonicalizes them at write time ("007" -> "7").
     let bind_val = |v: SqlValue| -> Result<SqlValue, String> {
         match v {
             SqlValue::Placeholder(n) => resolve(n, false),
@@ -588,6 +589,14 @@ fn parse_value(token: &str) -> SqlValue {
     }
     if let Ok(i) = token.parse::<i64>() {
         return SqlValue::Integer(i);
+    }
+    // An integer above the i64 range keeps its exact text: f64 would round
+    // it, and smart_cmp compares this string as i128 anyway. Matches how a
+    // bound parameter of the same magnitude is coerced.
+    if let Ok(i) = token.parse::<i128>()
+        && i.to_string() == token
+    {
+        return SqlValue::Text(token.to_string());
     }
     if let Ok(f) = token.parse::<f64>() {
         return SqlValue::Float(f);

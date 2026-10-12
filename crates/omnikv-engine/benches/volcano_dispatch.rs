@@ -10,7 +10,8 @@
 use omni_engine::sql::{AggFunc, CmpOp, SelectColumn, SqlValue, WhereExpr};
 use omni_engine::sql_exec::Row;
 use omni_engine::volcano::{
-    AggregateIter, DEFAULT_ROW_CHUNK_SIZE, FilterIter, LimitIter, ProjectIter, RowIterator,
+    AggregateIter, ColumnTypeMap, DEFAULT_ROW_CHUNK_SIZE, FilterIter, LimitIter, ProjectIter,
+    RowIterator,
 };
 use std::time::{Duration, Instant};
 
@@ -174,6 +175,7 @@ fn aggregate_pipeline(rows: &[Row]) -> Box<dyn RowIterator> {
             SelectColumn::Named("bucket".into()),
             SelectColumn::Aggregate(AggFunc::Count, "id".into()),
         ],
+        ColumnTypeMap::new(),
     ))
 }
 

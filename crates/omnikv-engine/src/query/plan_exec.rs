@@ -3,11 +3,14 @@
 //! Executes queries using the optimizer's physical plan tree.
 
 use crate::OmniKV;
+use crate::catalog::ColumnType;
 use crate::catalog::{Catalog, RowFormat, TableDef};
 use crate::optimizer::{AccessMethod, PlanNode};
 use crate::sql::{AggFunc, JoinType, OrderByItem, SelectColumn, WhereExpr};
 use crate::sql_exec::Row;
-use crate::volcano::ColumnTypeMap;
+use crate::volcano::{
+    ColumnTypeMap, eval_where_typed, legacy_pk_needs_scan, qualify_row, row_lookup, type_lookup,
+};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -26,11 +29,22 @@ pub struct NodeStats {
 pub struct PlanExecutor {
     pub db: Arc<OmniKV>,
     pub catalog: Arc<Catalog>,
+    types: ColumnTypeMap,
 }
 
 impl PlanExecutor {
     pub fn new(db: Arc<OmniKV>, catalog: Arc<Catalog>) -> Self {
-        Self { db, catalog }
+        Self {
+            db,
+            catalog,
+            types: ColumnTypeMap::new(),
+        }
+    }
+
+    pub fn for_plan(db: Arc<OmniKV>, catalog: Arc<Catalog>, plan: &PlanNode) -> Self {
+        let mut types = ColumnTypeMap::new();
+        collect_plan_types(plan, &catalog, &mut types);
+        Self { db, catalog, types }
     }
 
     /// Execute a plan node, returning rows.
@@ -48,6 +62,8 @@ impl PlanExecutor {
                 join_type,
                 on_left_col,
                 on_right_col,
+                left_table,
+                right_table,
                 ..
             } => {
                 let left_rows = self.execute_plan(left)?;
@@ -58,13 +74,15 @@ impl PlanExecutor {
                     on_left_col,
                     on_right_col,
                     join_type,
+                    left_table,
+                    right_table,
                 ))
             }
             PlanNode::Filter {
                 child, predicate, ..
             } => {
                 let mut rows = self.execute_plan(child)?;
-                rows.retain(|row| eval_where(row, predicate));
+                rows.retain(|row| eval_where_typed(row, predicate, &self.types));
                 Ok(rows)
             }
             PlanNode::Project { child, columns } => {
@@ -193,10 +211,20 @@ impl PlanExecutor {
         let table = self
             .catalog
             .get_table(table_name)
-            .ok_or_else(|| format!("Table '{}' not found", table_name))?;
+            .ok_or_else(|| format!("Table '{}' does not exist", table_name))?;
 
         let mut rows = match access {
+            AccessMethod::PkLookup { key_value } if legacy_pk_needs_scan(&table) => {
+                // A legacy numeric key may be stored as "007", which the
+                // canonical key range can never reach.
+                let key_value = crate::volcano::canonicalize_pk_key(&table, key_value);
+                let predicate = crate::volcano::pk_equality(&table, &key_value);
+                let mut scanned = self.load_table_rows(&table);
+                scanned.retain(|row| eval_where_typed(row, &predicate, &self.types));
+                scanned
+            }
             AccessMethod::PkLookup { key_value } => {
+                let key_value = crate::volcano::canonicalize_pk_key(&table, key_value);
                 let key = format!("{}{}", table.row_prefix(), key_value);
                 let end = format!("{}{}\x7F", table.row_prefix(), key_value);
                 let seq = self.db.get_seq();
@@ -211,7 +239,7 @@ impl PlanExecutor {
         };
 
         if let Some(expr) = filter {
-            rows.retain(|row| eval_where(row, expr));
+            rows.retain(|row| eval_where_typed(row, expr, &self.types));
         }
 
         Ok(rows)
@@ -279,6 +307,10 @@ impl PlanExecutor {
 
     // ─── Hash Join ──────────────────────────────────────────────────────
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Each join side carries its own rows, key column, and table name; grouping them would hide which side a qualifier belongs to."
+    )]
     fn exec_hash_join(
         &self,
         build: &[Row],
@@ -286,12 +318,23 @@ impl PlanExecutor {
         build_col: &str,
         probe_col: &str,
         join_type: &JoinType,
+        build_table: &str,
+        probe_table: &str,
     ) -> Vec<Row> {
+        // Qualify each side's keys with its table name, exactly as the Volcano
+        // hash join does, so on an unmatched outer-join row a qualified lookup
+        // like right.id binds to the side that is present instead of falling
+        // back to the other table's bare id.
+        let build_prefix = format!("{build_table}.");
+        let probe_prefix = format!("{probe_table}.");
+        let build_key_type = crate::volcano::join_key_type(&self.catalog, build_table, build_col);
+        let probe_key_type = crate::volcano::join_key_type(&self.catalog, probe_table, probe_col);
         let mut hash_table: HashMap<String, Vec<&Row>> = HashMap::with_capacity(build.len());
         let mut null_key_build_rows: Vec<&Row> = Vec::new();
         for row in build {
             match row.get(build_col).cloned().flatten() {
                 Some(key) => {
+                    let key = crate::volcano::canonicalize_join_key(&key, build_key_type.as_ref());
                     hash_table.entry(key).or_default().push(row);
                 }
                 None => null_key_build_rows.push(row),
@@ -304,7 +347,11 @@ impl PlanExecutor {
         for probe_row in probe {
             // A NULL probe key matches nothing, but on a LEFT join the probe
             // row is still preserved.
-            let key = probe_row.get(probe_col).cloned().flatten();
+            let key = probe_row
+                .get(probe_col)
+                .cloned()
+                .flatten()
+                .map(|k| crate::volcano::canonicalize_join_key(&k, probe_key_type.as_ref()));
             match (key.as_deref().and_then(|k| hash_table.get(k)), join_type) {
                 (Some(matches), _) => {
                     if matches!(join_type, JoinType::Right) {
@@ -314,15 +361,18 @@ impl PlanExecutor {
                         let mut combined = Row::new();
                         for (k, v) in *build_row {
                             combined.insert(k.clone(), v.clone());
+                            combined.insert(format!("{build_prefix}{k}"), v.clone());
                         }
                         for (k, v) in probe_row {
+                            // Also store it qualified so a shared name isn't dropped.
+                            combined.insert(format!("{probe_prefix}{k}"), v.clone());
                             combined.entry(k.clone()).or_insert_with(|| v.clone());
                         }
                         result.push(combined);
                     }
                 }
                 (None, JoinType::Left) => {
-                    result.push(probe_row.clone());
+                    result.push(qualify_row(probe_row.clone(), &probe_prefix));
                 }
                 _ => {}
             }
@@ -336,11 +386,11 @@ impl PlanExecutor {
                     continue;
                 }
                 for build_row in rows {
-                    result.push((**build_row).clone());
+                    result.push(qualify_row((**build_row).clone(), &build_prefix));
                 }
             }
             for build_row in &null_key_build_rows {
-                result.push((**build_row).clone());
+                result.push(qualify_row((**build_row).clone(), &build_prefix));
             }
         }
         result
@@ -390,8 +440,9 @@ impl PlanExecutor {
             for col in columns {
                 if let SelectColumn::Aggregate(func, target) = col {
                     let refs: Vec<&Row> = rows.iter().collect();
-                    let (name, val) = compute_aggregate(func, target, &refs);
-                    result.insert(name, Some(val));
+                    let (name, val) =
+                        compute_aggregate(func, target, &refs, type_lookup(&self.types, target));
+                    result.insert(name, val);
                 }
             }
             return Ok(vec![result]);
@@ -401,14 +452,7 @@ impl PlanExecutor {
         for row in rows {
             let key: String = group_by
                 .iter()
-                .map(|g| {
-                    let part = row
-                        .get(g)
-                        .cloned()
-                        .flatten()
-                        .unwrap_or_else(|| "\x01NULL\x01".to_string());
-                    format!("{}:{part}", part.len())
-                })
+                .map(|g| crate::volcano::encode_key_part(row_lookup(row, g)))
                 .collect::<Vec<_>>()
                 .join("|");
             groups.entry(key).or_default().push(row);
@@ -420,13 +464,24 @@ impl PlanExecutor {
             for col in columns {
                 match col {
                     SelectColumn::Named(name) => {
-                        if let Some(val) = group_rows[0].get(name) {
-                            row.insert(name.clone(), val.clone());
+                        if let Some(val) = row_lookup(group_rows[0], name).map(str::to_string) {
+                            row.insert(name.clone(), Some(val));
+                        }
+                    }
+                    SelectColumn::Qualified(t, n) => {
+                        let key = format!("{}.{}", t, n);
+                        if let Some(val) = row_lookup(group_rows[0], &key).map(str::to_string) {
+                            row.insert(key, Some(val));
                         }
                     }
                     SelectColumn::Aggregate(func, target) => {
-                        let (name, val) = compute_aggregate(func, target, group_rows);
-                        row.insert(name, Some(val));
+                        let (name, val) = compute_aggregate(
+                            func,
+                            target,
+                            group_rows,
+                            type_lookup(&self.types, target),
+                        );
+                        row.insert(name, val);
                     }
                     _ => {}
                 }
@@ -474,6 +529,30 @@ impl PlanExecutor {
     }
 }
 
+fn collect_plan_types(plan: &PlanNode, catalog: &Catalog, types: &mut ColumnTypeMap) {
+    match plan {
+        PlanNode::Scan { table, .. } => {
+            if let Some(table_def) = catalog.get_table(table) {
+                for c in &table_def.columns {
+                    types.insert(c.name.clone(), c.col_type.clone());
+                    types.insert(format!("{}.{}", table_def.name, c.name), c.col_type.clone());
+                }
+            }
+        }
+        PlanNode::HashJoin { left, right, .. } => {
+            collect_plan_types(left, catalog, types);
+            collect_plan_types(right, catalog, types);
+        }
+        PlanNode::Filter { child, .. }
+        | PlanNode::Project { child, .. }
+        | PlanNode::Sort { child, .. }
+        | PlanNode::Limit { child, .. }
+        | PlanNode::Aggregate { child, .. } => {
+            collect_plan_types(child, catalog, types);
+        }
+    }
+}
+
 // ─── Shared helpers ─────────────────────────────────────────────────────────
 
 fn eval_where(row: &Row, expr: &WhereExpr) -> bool {
@@ -488,11 +567,14 @@ fn smart_cmp(a: &str, b: &str) -> std::cmp::Ordering {
     }
 }
 
-fn compute_aggregate(func: &AggFunc, target: &str, rows: &[&Row]) -> (String, String) {
-    crate::volcano::compute_aggregate(func, target, rows)
+fn compute_aggregate(
+    func: &AggFunc,
+    target: &str,
+    rows: &[&Row],
+    col_type: Option<&ColumnType>,
+) -> (String, Option<String>) {
+    crate::volcano::compute_aggregate(func, target, rows, col_type)
 }
-
-// ─── Plan Cache (LRU) ───────────────────────────────────────────────────
 
 /// LRU plan cache — avoids re-optimizing identical queries.
 pub struct PlanCache {

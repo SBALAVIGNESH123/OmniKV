@@ -502,10 +502,10 @@ impl SortIter {
         for item in order_by.iter().rev() {
             let col = item.column.clone();
             let desc = item.desc;
-            let col_type = types.get(&col).cloned();
+            let col_type = type_lookup(&types, &col).cloned();
             rows.sort_by(|a, b| {
-                let va = a.get(&col).cloned().flatten();
-                let vb = b.get(&col).cloned().flatten();
+                let va = row_lookup(a, &col).map(str::to_string);
+                let vb = row_lookup(b, &col).map(str::to_string);
                 let cmp = match (va.as_deref(), vb.as_deref()) {
                     (Some(x), Some(y)) => match &col_type {
                         // A declared type decides: numeric columns compare
@@ -578,9 +578,14 @@ pub struct HashJoinIter {
     right_unmatched: Vec<Row>,
     right_unmatched_pos: usize,
     probe_exhausted: bool,
+    probe_key_type: Option<ColumnType>,
 }
 
 impl HashJoinIter {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Each join side supplies its iterator, key column, table name, and key type; the sides stay positional so the build/probe pairing is visible at the call site."
+    )]
     pub fn new(
         mut build: Box<dyn RowIterator>,
         probe: Box<dyn RowIterator>,
@@ -589,6 +594,8 @@ impl HashJoinIter {
         join_type: JoinType,
         build_table: &str,
         probe_table: &str,
+        build_key_type: Option<ColumnType>,
+        probe_key_type: Option<ColumnType>,
     ) -> Self {
         // Build phase: materialize build side into hash table
         let mut hash_table: HashMap<String, Vec<Row>> = HashMap::new();
@@ -598,6 +605,7 @@ impl HashJoinIter {
                 null_key_build_rows.push(row);
                 continue;
             };
+            let key = canonicalize_join_key(&key, build_key_type.as_ref());
             hash_table.entry(key).or_default().push(row);
         }
         Self {
@@ -615,6 +623,7 @@ impl HashJoinIter {
             right_unmatched: Vec::new(),
             right_unmatched_pos: 0,
             probe_exhausted: false,
+            probe_key_type,
         }
     }
 }
@@ -625,7 +634,7 @@ impl HashJoinIter {
 /// predicate naming the absent table would rebind to the present table's
 /// column of the same name. Carrying its own qualified keys keeps the
 /// binding and lets the missing side read as NULL.
-fn qualify_row(row: Row, prefix: &str) -> Row {
+pub(crate) fn qualify_row(row: Row, prefix: &str) -> Row {
     let mut out = Row::new();
     for (k, v) in &row {
         out.insert(k.clone(), v.clone());
@@ -678,7 +687,11 @@ impl RowIterator for HashJoinIter {
                     continue;
                 }
             };
-            let key = probe_row.get(&self.probe_col).cloned().flatten();
+            let key = probe_row
+                .get(&self.probe_col)
+                .cloned()
+                .flatten()
+                .map(|k| canonicalize_join_key(&k, self.probe_key_type.as_ref()));
 
             // A NULL probe key matches nothing: `NULL = x` is UNKNOWN, so it
             // must not fall through to a "" lookup and hit a build row whose
@@ -729,6 +742,7 @@ impl AggregateIter {
         mut child: Box<dyn RowIterator>,
         group_by: Vec<String>,
         agg_columns: Vec<SelectColumn>,
+        types: ColumnTypeMap,
     ) -> Self {
         let all_rows = child.collect_all();
 
@@ -742,8 +756,9 @@ impl AggregateIter {
             let mut row = Row::new();
             for col in &agg_columns {
                 if let SelectColumn::Aggregate(func, target) = col {
-                    let (name, val) = compute_aggregate(func, target, &refs);
-                    row.insert(name, Some(val));
+                    let (name, val) =
+                        compute_aggregate(func, target, &refs, type_lookup(&types, target));
+                    row.insert(name, val);
                 }
             }
             return Self {
@@ -756,12 +771,7 @@ impl AggregateIter {
         for row in &all_rows {
             let key: String = group_by
                 .iter()
-                .map(|g| {
-                    row.get(g)
-                        .cloned()
-                        .flatten()
-                        .unwrap_or_else(|| "\u{1}NULL\u{1}".to_string())
-                })
+                .map(|g| encode_key_part(row_lookup(row, g)))
                 .collect::<Vec<_>>()
                 .join("\u{0}");
             groups.entry(key).or_default().push(row.clone());
@@ -774,13 +784,20 @@ impl AggregateIter {
             for col in &agg_columns {
                 match col {
                     SelectColumn::Named(name) => {
-                        if let Some(val) = refs[0].get(name) {
-                            row.insert(name.clone(), val.clone());
+                        if let Some(val) = row_lookup(refs[0], name).map(str::to_string) {
+                            row.insert(name.clone(), Some(val));
+                        }
+                    }
+                    SelectColumn::Qualified(t, n) => {
+                        let key = format!("{}.{}", t, n);
+                        if let Some(val) = row_lookup(refs[0], &key).map(str::to_string) {
+                            row.insert(key, Some(val));
                         }
                     }
                     SelectColumn::Aggregate(func, target) => {
-                        let (name, val) = compute_aggregate(func, target, &refs);
-                        row.insert(name, Some(val));
+                        let (name, val) =
+                            compute_aggregate(func, target, &refs, type_lookup(&types, target));
+                        row.insert(name, val);
                     }
                     _ => {}
                 }
@@ -885,16 +902,36 @@ pub fn compile_plan_with_scan(
             let base: Box<dyn RowIterator> = match access {
                 AccessMethod::PkLookup { key_value } => {
                     let key_value = canonicalize_pk_key(&table_def, key_value);
-                    match scan {
-                        Some(ctx) => Box::new(PkLookupIter::with_scan(
-                            db,
-                            &table_def,
-                            &key_value,
-                            ctx.scan_seq,
-                            Some(&ctx.overlay),
-                            ctx.reads.as_ref(),
-                        )),
-                        None => Box::new(PkLookupIter::new(db, &table_def, &key_value)),
+                    if legacy_pk_needs_scan(&table_def) {
+                        // A legacy numeric key may be stored as "007", which
+                        // the canonical key range can never reach.
+                        let base: Box<dyn RowIterator> = match scan {
+                            Some(ctx) => Box::new(SeqScanIter::with_scan(
+                                db,
+                                &table_def,
+                                ctx.scan_seq,
+                                Some(&ctx.overlay),
+                                ctx.reads.as_ref(),
+                            )),
+                            None => Box::new(SeqScanIter::new(db, &table_def)),
+                        };
+                        Box::new(FilterIter::with_types(
+                            base,
+                            pk_equality(&table_def, &key_value),
+                            col_types.clone(),
+                        ))
+                    } else {
+                        match scan {
+                            Some(ctx) => Box::new(PkLookupIter::with_scan(
+                                db,
+                                &table_def,
+                                &key_value,
+                                ctx.scan_seq,
+                                Some(&ctx.overlay),
+                                ctx.reads.as_ref(),
+                            )),
+                            None => Box::new(PkLookupIter::new(db, &table_def, &key_value)),
+                        }
                     }
                 }
                 AccessMethod::SeqScan | AccessMethod::IndexScan { .. } => match scan {
@@ -933,6 +970,8 @@ pub fn compile_plan_with_scan(
                 join_type.clone(),
                 left_table,
                 right_table,
+                join_key_type(catalog, left_table, on_left_col),
+                join_key_type(catalog, right_table, on_right_col),
             ))
         }
         PlanNode::Filter {
@@ -968,10 +1007,12 @@ pub fn compile_plan_with_scan(
             ..
         } => {
             let child_iter = compile_plan_with_scan(child, db, catalog, scan);
+            let types = child.output_types(catalog);
             Box::new(AggregateIter::new(
                 child_iter,
                 group_by.clone(),
                 aggregates.clone(),
+                types,
             ))
         }
     }
@@ -998,9 +1039,51 @@ fn cmp_by_affinity(
     }
 }
 
+/// Declared type of a join key, resolving either a bare column or a
+/// `table.column` reference against the named table.
+pub(crate) fn join_key_type(catalog: &Catalog, table: &str, col: &str) -> Option<ColumnType> {
+    let table_def = catalog.get_table(table)?;
+    let bare = col.rsplit('.').next().unwrap_or(col);
+    table_def
+        .columns
+        .iter()
+        .find(|c| c.name.eq_ignore_ascii_case(bare))
+        .map(|c| c.col_type.clone())
+}
+
+/// Canonical form of a numeric join key, so a legacy "007" hashes next to a
+/// probe key written as "7".
+pub(crate) fn canonicalize_join_key(value: &str, col_type: Option<&ColumnType>) -> String {
+    match col_type {
+        Some(t) if t.is_numeric() => t.canonicalize(value),
+        _ => value.to_string(),
+    }
+}
+
+/// A legacy numeric primary key may be stored as "007"; the canonical
+/// key-range lookup cannot reach it.
+pub(crate) fn legacy_pk_needs_scan(table: &TableDef) -> bool {
+    table.row_format == RowFormat::Legacy
+        && table
+            .columns
+            .iter()
+            .find(|c| c.name.eq_ignore_ascii_case(&table.primary_key))
+            .is_some_and(|c| c.col_type.is_numeric())
+}
+
+/// `pk = value` for the scan-and-filter fallback, so the comparison runs
+/// through the typed predicate path and matches by the column's affinity.
+pub(crate) fn pk_equality(table: &TableDef, value: &str) -> WhereExpr {
+    WhereExpr::Comparison {
+        column: table.primary_key.clone(),
+        op: CmpOp::Eq,
+        value: SqlValue::Text(value.to_string()),
+    }
+}
+
 /// Stored form of a primary-key value: canonical for a numeric key, so a
 /// lookup for "007" reads the row written as "7".
-fn canonicalize_pk_key(table: &TableDef, key_value: &str) -> String {
+pub(crate) fn canonicalize_pk_key(table: &TableDef, key_value: &str) -> String {
     let pk_type = table
         .columns
         .iter()
@@ -1052,7 +1135,7 @@ pub(crate) fn row_lookup<'a>(row: &'a Row, column: &str) -> Option<&'a str> {
 
 /// Resolve a predicate column to its declared type, mirroring [`row_lookup`]
 /// so a qualified predicate compares by the named column's affinity.
-fn type_lookup<'a>(types: &'a ColumnTypeMap, column: &str) -> Option<&'a ColumnType> {
+pub(crate) fn type_lookup<'a>(types: &'a ColumnTypeMap, column: &str) -> Option<&'a ColumnType> {
     if let Some(t) = types.get(column) {
         return Some(t);
     }
@@ -1105,11 +1188,29 @@ fn eval_tri(row: &Row, expr: &WhereExpr, types: &ColumnTypeMap) -> Option<bool> 
         WhereExpr::IsNull(col) => Some(row_lookup(row, col).is_none()),
         WhereExpr::IsNotNull(col) => Some(row_lookup(row, col).is_some()),
         WhereExpr::In(col, vals) => {
+            // A NULL element that didn't match makes the result UNKNOWN, not
+            // FALSE.
             let row_val = row_lookup(row, col)?;
             let col_type = type_lookup(types, col);
-            Some(vals.iter().any(|v| {
-                cmp_by_affinity(row_val, v, &v.as_string(), col_type) == std::cmp::Ordering::Equal
-            }))
+            let mut matched = false;
+            let mut saw_null = false;
+            for v in vals {
+                if matches!(v, SqlValue::Null) {
+                    saw_null = true;
+                    continue;
+                }
+                if cmp_by_affinity(row_val, v, &v.as_string(), col_type)
+                    == std::cmp::Ordering::Equal
+                {
+                    matched = true;
+                    break;
+                }
+            }
+            match (matched, saw_null) {
+                (true, _) => Some(true),
+                (false, true) => None,
+                (false, false) => Some(false),
+            }
         }
         WhereExpr::InSubquery(_, _) => Some(false),
     }
@@ -1145,6 +1246,20 @@ pub fn eval_where_typed(row: &Row, expr: &WhereExpr, types: &ColumnTypeMap) -> b
 
 /// Integers compare as `i128`, not `f64`: two distinct ids above 2^53 are
 /// one `f64` apart and would match the wrong row on `WHERE id = ...`.
+/// One part of a composite grouping key.
+///
+/// The parts are joined with a NUL separator, so a value containing an
+/// embedded NUL would blend into its neighbors and two distinct tuples
+/// could share one key. Length-prefixing each part makes the split
+/// unambiguous, and a NULL gets its own tag so it can never equal a text
+/// value that happens to look like the marker.
+pub(crate) fn encode_key_part(v: Option<&str>) -> String {
+    match v {
+        Some(s) => format!("{}:{s}", s.len()),
+        None => "\u{2}NULL\u{2}".to_string(),
+    }
+}
+
 pub(crate) fn smart_cmp(a: &str, b: &str) -> std::cmp::Ordering {
     match (a.parse::<i128>(), b.parse::<i128>()) {
         (Ok(x), Ok(y)) => x.cmp(&y),
@@ -1157,15 +1272,72 @@ pub(crate) fn smart_cmp(a: &str, b: &str) -> std::cmp::Ordering {
     }
 }
 
-pub fn compute_aggregate(func: &AggFunc, target: &str, rows: &[&Row]) -> (String, String) {
+/// MIN/MAX ordering by the column's declared affinity, so a TEXT column
+/// orders lexically like it does in WHERE and ORDER BY while a numeric
+/// column still orders numerically. An unresolved type keeps the
+/// type-agnostic comparison.
+pub(crate) fn cmp_by_type(a: &str, b: &str, col_type: Option<&ColumnType>) -> std::cmp::Ordering {
+    match col_type {
+        Some(t) if t.is_numeric() => smart_cmp(a, b),
+        Some(_) => a.cmp(b),
+        None => smart_cmp(a, b),
+    }
+}
+
+/// `sum / n` as a decimal string. A terminating fraction renders in full; a
+/// repeating one is rounded half-up at `FRAC_DIGITS` places rather than
+/// truncated at an arbitrary fixed point.
+fn avg_decimal(sum: i128, n: i128) -> String {
+    const FRAC_DIGITS: usize = 15;
+    let neg = sum < 0;
+    let mut rem = sum.unsigned_abs();
+    let n = n.unsigned_abs();
+    let int_part = rem / n;
+    rem %= n;
+    if rem == 0 {
+        return format!("{}{int_part}", if neg { "-" } else { "" });
+    }
+    let mut digits: Vec<u8> = Vec::with_capacity(FRAC_DIGITS);
+    while rem != 0 && digits.len() < FRAC_DIGITS {
+        rem *= 10;
+        digits.push((rem / n) as u8);
+        rem %= n;
+    }
+    // A remainder here means the expansion continues past the kept digits.
+    if rem != 0 {
+        rem *= 10;
+        if rem / n >= 5 {
+            for i in (0..FRAC_DIGITS).rev() {
+                if digits[i] < 9 {
+                    digits[i] += 1;
+                    break;
+                }
+                digits[i] = 0;
+                if i == 0 {
+                    return format!("{}{}", if neg { "-" } else { "" }, int_part + 1);
+                }
+            }
+        }
+    }
+    while digits.last() == Some(&0) {
+        digits.pop();
+    }
+    let frac: String = digits.iter().map(|d| (b'0' + d) as char).collect();
+    format!("{}{int_part}.{frac}", if neg { "-" } else { "" })
+}
+
+pub fn compute_aggregate(
+    func: &AggFunc,
+    target: &str,
+    rows: &[&Row],
+    col_type: Option<&ColumnType>,
+) -> (String, Option<String>) {
     let name = format!("{}({})", format!("{:?}", func).to_lowercase(), target);
     // COUNT(*) tallies rows; COUNT(col) skips nulls, per the SQL standard.
     let values: Vec<&str> = if target == "*" {
         Vec::new()
     } else {
-        rows.iter()
-            .filter_map(|r| r.get(target).and_then(|v| v.as_deref()))
-            .collect()
+        rows.iter().filter_map(|r| row_lookup(r, target)).collect()
     };
     match func {
         AggFunc::Count => {
@@ -1174,11 +1346,11 @@ pub fn compute_aggregate(func: &AggFunc, target: &str, rows: &[&Row]) -> (String
             } else {
                 values.len()
             };
-            (name, n.to_string())
+            (name, Some(n.to_string()))
         }
         // SQL: over no non-null values these are NULL, not 0.
         AggFunc::Sum | AggFunc::Avg | AggFunc::Min | AggFunc::Max if values.is_empty() => {
-            (name, "NULL".to_string())
+            (name, None)
         }
         AggFunc::Sum => {
             if values.iter().all(|v| v.parse::<i64>().is_ok()) {
@@ -1188,47 +1360,29 @@ pub fn compute_aggregate(func: &AggFunc, target: &str, rows: &[&Row]) -> (String
                     .iter()
                     .map(|v| v.parse::<i64>().unwrap() as i128)
                     .sum();
-                (name, sum.to_string())
+                (name, Some(sum.to_string()))
             } else {
                 let sum: f64 = values.iter().filter_map(|v| v.parse::<f64>().ok()).sum();
-                (name, sum.to_string())
+                (name, Some(sum.to_string()))
             }
         }
         AggFunc::Avg => {
             if values.iter().all(|v| v.parse::<i64>().is_ok()) && !values.is_empty() {
+                // i128, not i64: a full column of i64 values would otherwise
+                // overflow the accumulator.
                 let sum: i128 = values
                     .iter()
                     .map(|v| v.parse::<i64>().unwrap() as i128)
                     .sum();
                 let n = values.len() as i128;
-                let avg = sum / n;
-                let rem = sum % n;
-                if rem == 0 {
-                    (name, avg.to_string())
-                } else {
-                    // Fixed point to six places, then trim: the fraction is
-                    // zero-padded so interior zeros survive (0.03125, not
-                    // 0.3125) while trailing zeros do not. The sign rides on
-                    // q itself, because a whole part of 0 would drop it for
-                    // any average between -1 and 0.
-                    let q = (sum * 1_000_000) / n;
-                    let sign = if q < 0 { "-" } else { "" };
-                    let q = q.abs();
-                    (
-                        name,
-                        format!("{sign}{}.{:06}", q / 1_000_000, q % 1_000_000)
-                            .trim_end_matches('0')
-                            .trim_end_matches('.')
-                            .to_string(),
-                    )
-                }
+                (name, Some(avg_decimal(sum, n)))
             } else {
                 let avg = values
                     .iter()
                     .filter_map(|v| v.parse::<f64>().ok())
                     .sum::<f64>()
                     / values.len() as f64;
-                (name, avg.to_string())
+                (name, Some(avg.to_string()))
             }
         }
         AggFunc::Min => {
@@ -1236,18 +1390,16 @@ pub fn compute_aggregate(func: &AggFunc, target: &str, rows: &[&Row]) -> (String
             let min = values
                 .iter()
                 .copied()
-                .min_by(|a, b| smart_cmp(a, b))
-                .map(str::to_string)
-                .unwrap_or_default();
+                .min_by(|a, b| cmp_by_type(a, b, col_type))
+                .map(str::to_string);
             (name, min)
         }
         AggFunc::Max => {
             let max = values
                 .iter()
                 .copied()
-                .max_by(|a, b| smart_cmp(a, b))
-                .map(str::to_string)
-                .unwrap_or_default();
+                .max_by(|a, b| cmp_by_type(a, b, col_type))
+                .map(str::to_string);
             (name, max)
         }
     }
