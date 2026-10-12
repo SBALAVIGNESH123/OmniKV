@@ -47,6 +47,14 @@ fn sorted(mut rows: Vec<Vec<String>>) -> Vec<Vec<String>> {
     rows
 }
 
+fn no_rows(executor: &SqlExecutor, sql: &str) {
+    assert_eq!(
+        rows(executor, sql),
+        Vec::<Vec<String>>::new(),
+        "expected '{sql}' to return no rows"
+    );
+}
+
 /// A hand-written manifest with no `row_format` field, which is what the
 /// pre-typed code wrote: serde reads it back as [`RowFormat::Legacy`].
 fn legacy_env(prefix: &str, table: &str, extra_columns: &str) -> SqlExecutor {
@@ -200,8 +208,8 @@ fn in_not_in_three_valued_logic() {
         rows(&e, "SELECT id FROM t WHERE v IN ('a', NULL)"),
         vec![["1"]]
     );
-    assert!(rows(&e, "SELECT id FROM t WHERE v IN ('z', NULL)").is_empty());
-    assert!(rows(&e, "SELECT id FROM t WHERE NOT (v IN ('z', NULL))").is_empty());
+    no_rows(&e, "SELECT id FROM t WHERE v IN ('z', NULL)");
+    no_rows(&e, "SELECT id FROM t WHERE NOT (v IN ('z', NULL))");
     assert_eq!(
         sorted(rows(&e, "SELECT id FROM t WHERE NOT (v IN ('z'))")),
         vec![["1"], ["2"]]
@@ -224,7 +232,7 @@ fn in_subquery_null_is_unknown() {
         rows(&e, "SELECT id FROM t WHERE v IN (SELECT w FROM s)"),
         vec![["1"]]
     );
-    assert!(rows(&e, "SELECT id FROM t WHERE NOT (v IN (SELECT w FROM s))").is_empty());
+    no_rows(&e, "SELECT id FROM t WHERE NOT (v IN (SELECT w FROM s))");
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -430,7 +438,7 @@ fn explain_analyze_matches_typed_query() {
     exec(&e, "INSERT INTO t (id, v) VALUES (1, '10'), (2, '2')");
 
     // TEXT '10' is not > '2' lexically, so no rows qualify.
-    assert!(rows(&e, "SELECT id FROM t WHERE v > 2").is_empty());
+    no_rows(&e, "SELECT id FROM t WHERE v > 2");
     let plan = rows(&e, "EXPLAIN ANALYZE SELECT id FROM t WHERE v > 2");
     assert!(
         plan.iter().any(|r| r[0].contains("actual rows=0")),
