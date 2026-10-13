@@ -1975,14 +1975,17 @@ fn merge_staged_writes_into_txn(
 }
 
 /// SQLSTATE for a statement-execution error, so clients can branch like they
-/// do on a real PostgreSQL: 42703 undefined column, 42P01 undefined table,
-/// 42P07 duplicate table, and the catch-all internal-error code.
+/// do on a real PostgreSQL: 42703 undefined column, 42702 ambiguous column,
+/// 42P01 undefined table, 42P07 duplicate table, and the catch-all
+/// internal-error code.
 fn sqlstate_for_exec_error(e: &str) -> &'static str {
     if e.contains("column \"") && e.contains("does not exist") {
         "42703"
     } else if e.contains("is ambiguous") {
         "42702"
-    } else if e.contains("does not exist") {
+    } else if e.contains("does not exist") || e.contains("is not in the FROM clause") {
+        // A missing FROM-clause entry is an undefined table, not an internal
+        // error: PostgreSQL reports it as 42P01 too.
         "42P01"
     } else if e.contains("already exists") {
         "42P07"
@@ -2581,6 +2584,13 @@ mod tests {
     #[test]
     fn sqlstate_undefined_table_is_42p01() {
         assert_eq!(sqlstate_for_exec_error("Table 't' does not exist"), "42P01");
+    }
+    #[test]
+    fn sqlstate_missing_from_clause_entry_is_42p01() {
+        assert_eq!(
+            sqlstate_for_exec_error("table \"nope\" is not in the FROM clause of this statement"),
+            "42P01"
+        );
     }
 
     #[test]

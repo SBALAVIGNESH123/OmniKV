@@ -149,7 +149,7 @@ fn test_window_func_execution() {
     );
     assert_eq!(cols.len(), 2);
     assert_eq!(cols[1], "row_number");
-    assert_ne!(rows.len(), 0);
+    assert!(!rows.is_empty(), "window functions must produce rows");
 
     // Row numbers should be 1,2,3,4
     let row_nums: Vec<&str> = rows.iter().map(|r| r[1].as_str()).collect();
@@ -190,7 +190,7 @@ fn test_group_by_aggregate() {
         "SELECT region, SUM(amount) FROM sales GROUP BY region",
     );
     assert_eq!(cols.len(), 2);
-    assert_ne!(rows.len(), 0);
+    assert!(!rows.is_empty(), "GROUP BY must produce rows");
 
     println!("✅ SQL 25a: GROUP BY with SUM aggregate executed");
 }
@@ -314,7 +314,7 @@ fn test_is_null() {
 
     let (_cols, rows) = exec_rows(&exec, "SELECT id FROM nullable WHERE val IS NOT NULL");
     // At least 1 row with non-null val
-    assert_ne!(rows.len(), 0);
+    assert!(!rows.is_empty(), "at least one row has a non-null val");
 
     println!("✅ SQL 28b: IS NULL / IS NOT NULL filter working");
 }
@@ -1096,7 +1096,7 @@ fn test_explain() {
 
     let (cols, rows) = exec_rows(&exec, "EXPLAIN SELECT * FROM expl_t");
     assert_eq!(cols[0], "QUERY PLAN");
-    assert_ne!(rows.len(), 0);
+    assert!(!rows.is_empty(), "EXPLAIN must produce a plan");
 
     println!("✅ SQL 31c: EXPLAIN produces query plan output");
 }

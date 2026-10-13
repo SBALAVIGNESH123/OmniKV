@@ -151,6 +151,60 @@ fn legacy_noncanonical_pk_is_reachable() {
         plan.iter().any(|r| r[0].contains("actual rows=1")),
         "plan must find the legacy row: {plan:?}"
     );
+
+    // A typed write migrates the table, re-keying the legacy row at ...7.
+    // The typed PK lookup and the keys UPDATE/DELETE build both expect it
+    // there, so the row must stay reachable by either form.
+    exec(&e, "INSERT INTO legacy_t (id, v) VALUES (9, 'y')");
+    assert_eq!(rows(&e, "SELECT v FROM legacy_t WHERE id = 7"), vec![["x"]]);
+    assert_eq!(
+        rows(&e, "SELECT v FROM legacy_t WHERE id = '007'"),
+        vec![["x"]]
+    );
+    assert_eq!(
+        sorted(rows(&e, "SELECT id FROM legacy_t")),
+        vec![["7"], ["9"]]
+    );
+
+    exec(&e, "UPDATE legacy_t SET v = 'z' WHERE id = 7");
+    assert_eq!(rows(&e, "SELECT v FROM legacy_t WHERE id = 7"), vec![["z"]]);
+    exec(&e, "DELETE FROM legacy_t WHERE id = 7");
+    no_rows(&e, "SELECT v FROM legacy_t WHERE id = 7");
+    assert_eq!(rows(&e, "SELECT v FROM legacy_t WHERE id = 9"), vec![["y"]]);
+}
+
+/// Two legacy keys that canonicalize to one are reported instead of one
+/// silently overwriting the other, and the table is left as it was.
+#[test]
+fn legacy_pk_collision_blocks_migration() {
+    let e = legacy_env("legacy_pk_collide", "legacy_t", "");
+    let mut wb = omni_engine::WriteBatch::new();
+    wb.set(
+        "\u{0}T\u{0}legacy_t\u{0}007",
+        "{\"id\":\"007\",\"v\":\"x\"}".to_string(),
+    )
+    .unwrap();
+    wb.set(
+        "\u{0}T\u{0}legacy_t\u{0}7",
+        "{\"id\":\"7\",\"v\":\"y\"}".to_string(),
+    )
+    .unwrap();
+    e.db.commit_batch(&wb).unwrap();
+
+    let err = err(&e, "INSERT INTO legacy_t (id, v) VALUES (9, 'z')");
+    assert!(
+        err.contains("canonicalize"),
+        "colliding legacy keys must be reported: {err}"
+    );
+    assert!(
+        err.contains("'007'") && err.contains("'7'"),
+        "both colliding values must be named: {err}"
+    );
+    // The table stays legacy, so both rows are still reachable.
+    assert_eq!(
+        sorted(rows(&e, "SELECT v FROM legacy_t")),
+        vec![["x"], ["y"]]
+    );
 }
 
 /// A legacy row's non-canonical join key still joins a canonical partner key.
@@ -456,6 +510,50 @@ fn join_on_unknown_column_errors() {
     assert!(
         err.contains("does not exist"),
         "bad ON column must error: {err}"
+    );
+}
+
+/// A window function's ORDER BY resolves a qualified join column, so the
+/// ranking reflects that column's values rather than reading every row as a
+/// tie.
+#[test]
+fn window_order_by_resolves_a_qualified_join_column() {
+    let e = create_env("window_join_order");
+    exec(&e, "CREATE TABLE a (id INTEGER PRIMARY KEY)");
+    exec(
+        &e,
+        "CREATE TABLE b (id INTEGER PRIMARY KEY, a_id INTEGER, v INTEGER)",
+    );
+    exec(&e, "INSERT INTO a (id) VALUES (1), (2), (3)");
+    exec(
+        &e,
+        "INSERT INTO b (id, a_id, v) VALUES (1, 1, 5), (2, 2, 15), (3, 3, 25)",
+    );
+
+    assert_eq!(
+        rows(
+            &e,
+            "SELECT b.id, ROW_NUMBER() OVER (ORDER BY b.v DESC) \
+             FROM a JOIN b ON a.id = b.a_id"
+        ),
+        vec![["3", "1"], ["2", "2"], ["1", "3"]]
+    );
+
+    exec(&e, "INSERT INTO b (id, a_id, v) VALUES (4, 1, 15)");
+    assert_eq!(
+        sorted(rows(
+            &e,
+            "SELECT b.id, RANK() OVER (ORDER BY b.v) FROM a JOIN b ON a.id = b.a_id"
+        )),
+        vec![["1", "1"], ["2", "2"], ["3", "4"], ["4", "2"]]
+    );
+    assert_eq!(
+        sorted(rows(
+            &e,
+            "SELECT b.id, DENSE_RANK() OVER (ORDER BY b.v) \
+             FROM a JOIN b ON a.id = b.a_id"
+        )),
+        vec![["1", "1"], ["2", "2"], ["3", "3"], ["4", "2"]]
     );
 }
 

@@ -274,7 +274,7 @@ fn test_explain_analyze() {
         cols[0].contains("QUERY PLAN"),
         "Column should contain QUERY PLAN"
     );
-    assert_ne!(rows.len(), 0);
+    assert!(!rows.is_empty(), "EXPLAIN ANALYZE must produce a plan");
 
     // Should contain timing info
     let plan_text: String = rows

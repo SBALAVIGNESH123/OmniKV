@@ -572,15 +572,17 @@ impl SqlExecutor {
     }
 
     /// Rewrite a legacy table's rows to the typed encoding before the typed
-    /// write path appends to them. A stored "NULL" is a SQL NULL under the
-    /// legacy encoding and the user's literal text under the typed one; the
-    /// bytes are identical, so the two cannot coexist in one table.
+    /// write path appends to them: a stored "NULL" is a SQL NULL under the
+    /// legacy encoding and the user's literal text under the typed one.
     fn migrate_to_typed(&self, table: &TableDef) -> Result<(), String> {
         let prefix = table.row_prefix();
         let end = format!("{}\u{7F}", prefix);
         self.record_range_read(&prefix, &end);
         let seq = self.snapshot_seq.unwrap_or_else(|| self.db.get_seq());
-        let mut stored = self.db.scan(&prefix, &end, seq).unwrap_or_default();
+        let mut stored = self
+            .db
+            .scan(&prefix, &end, seq)
+            .map_err(|e| format!("{:?}", e))?;
 
         let overlay = self.pending_overlay();
         if let Some(ov) = &overlay {
@@ -597,14 +599,40 @@ impl SqlExecutor {
 
         let mut batch = WriteBatch::new();
         let mut changed = false;
+        // The typed path keys and compares a numeric primary key canonically,
+        // so a legacy row stored at ...007 is re-keyed to ...7 as it is
+        // rewritten, and its stored value is canonicalized to match.
+        let mut canonical_keys: HashMap<String, &str> = HashMap::new();
         for (key, serialized) in &stored {
-            let Some(row) =
+            let Some(mut row) =
                 crate::plan_exec::PlanExecutor::deserialize_row(serialized, table.row_format)
             else {
                 continue;
             };
+
+            let stored_suffix = key.strip_prefix(prefix.as_str()).unwrap_or_default();
+            let canonical_suffix = crate::volcano::canonicalize_pk_key(table, stored_suffix);
+            if let Some(first) = canonical_keys.insert(canonical_suffix.clone(), stored_suffix) {
+                return Err(format!(
+                    "primary key values '{first}' and '{stored_suffix}' in table '{}' both canonicalize to '{canonical_suffix}'",
+                    table.name
+                ));
+            }
+            if let Some(slot) = row.get_mut(&table.primary_key)
+                && let Some(pk) = slot
+            {
+                *pk = crate::volcano::canonicalize_pk_key(table, pk);
+            }
+
             let typed = serde_json::to_string(&row).map_err(|e| format!("{}", e))?;
-            if &typed != serialized {
+            let canonical_key = format!("{prefix}{canonical_suffix}");
+            if &canonical_key != key {
+                batch.delete(key).map_err(|e| format!("{:?}", e))?;
+                batch
+                    .set(&canonical_key, typed)
+                    .map_err(|e| format!("{:?}", e))?;
+                changed = true;
+            } else if &typed != serialized {
                 batch.set(key, typed).map_err(|e| format!("{:?}", e))?;
                 changed = true;
             }
@@ -938,10 +966,8 @@ impl SqlExecutor {
         columns: &[SelectColumn],
         from: &FromClause,
     ) {
-        // Every table's column types, so a sort key from either side of a
-        // join resolves. A bare name takes the leftmost table's column,
-        // matching how execute_join keys the row; a qualified name is
-        // unambiguous.
+        // A bare name takes the leftmost table's column, matching how
+        // execute_join keys a join row.
         let mut col_types = crate::volcano::ColumnTypeMap::new();
         for t in match from {
             FromClause::Table(t) => vec![t.clone()],
@@ -961,23 +987,14 @@ impl SqlExecutor {
                 order_by: ob, desc, ..
             } = col
             {
-                let ob = ob.clone();
-                let col_type = col_types.get(&ob).cloned();
-                rows.sort_by(|a, b| {
-                    let va = a.get(&ob).cloned().flatten();
-                    let vb = b.get(&ob).cloned().flatten();
-                    let cmp = match (va.as_deref(), vb.as_deref()) {
-                        (Some(x), Some(y)) => match &col_type {
-                            Some(t) if t.is_numeric() => smart_cmp(x, y),
-                            Some(_) => x.cmp(y),
-                            None => smart_cmp(x, y),
-                        },
-                        (Some(_), None) => std::cmp::Ordering::Less,
-                        (None, Some(_)) => std::cmp::Ordering::Greater,
-                        (None, None) => std::cmp::Ordering::Equal,
-                    };
-                    if *desc { cmp.reverse() } else { cmp }
-                });
+                crate::volcano::sort_rows(
+                    rows,
+                    std::slice::from_ref(&OrderByItem {
+                        column: ob.clone(),
+                        desc: *desc,
+                    }),
+                    &col_types,
+                );
                 break;
             }
         }
@@ -990,7 +1007,7 @@ impl SqlExecutor {
                 let mut rank = 0usize;
                 let mut dense_rank = 0usize;
                 for (i, row) in rows.iter_mut().enumerate() {
-                    let cur_val = row.get(ob).cloned().flatten();
+                    let cur_val = crate::volcano::row_lookup(row, ob).map(str::to_string);
                     match func {
                         WindowFuncType::RowNumber => {
                             row.insert("row_number".into(), Some((i + 1).to_string()));
@@ -1301,26 +1318,7 @@ impl SqlExecutor {
             return self.exec_aggregate_no_group(&rows, columns, &col_types);
         }
 
-        for item in order_by.iter().rev() {
-            let col = item.column.clone();
-            let desc = item.desc;
-            let col_type = col_types.get(&col).cloned();
-            rows.sort_by(|a, b| {
-                let va = a.get(&col).cloned().flatten();
-                let vb = b.get(&col).cloned().flatten();
-                let cmp = match (va.as_deref(), vb.as_deref()) {
-                    (Some(x), Some(y)) => match &col_type {
-                        Some(t) if t.is_numeric() => smart_cmp(x, y),
-                        Some(_) => x.cmp(y),
-                        None => smart_cmp(x, y),
-                    },
-                    (Some(_), None) => std::cmp::Ordering::Less,
-                    (None, Some(_)) => std::cmp::Ordering::Greater,
-                    (None, None) => std::cmp::Ordering::Equal,
-                };
-                if desc { cmp.reverse() } else { cmp }
-            });
-        }
+        crate::volcano::sort_rows(&mut rows, order_by, &col_types);
 
         if let Some(lim) = limit {
             rows.truncate(lim);
@@ -1763,10 +1761,6 @@ fn render(cell: Option<&str>) -> String {
 
 fn eval_where(row: &Row, expr: &WhereExpr) -> bool {
     crate::volcano::eval_where(row, expr)
-}
-
-fn smart_cmp(a: &str, b: &str) -> std::cmp::Ordering {
-    crate::volcano::smart_cmp(a, b)
 }
 
 fn compute_aggregate(

@@ -432,6 +432,13 @@ fn project_row(row: Row, columns: &[SelectColumn]) -> Row {
                     projected.insert(name, v.clone());
                 }
             }
+            SelectColumn::WindowFunc { order_by: ob, .. } => {
+                // The window's sort key is read after this projection, so it
+                // has to survive it.
+                if let Some(v) = row_lookup(&row, ob) {
+                    projected.insert(ob.clone(), Some(v.to_string()));
+                }
+            }
             _ => {}
         }
     }
@@ -489,39 +496,13 @@ pub struct SortIter {
 }
 
 impl SortIter {
-    /// `types` carries the sort key's declared `ColumnType`, so a TEXT
-    /// column orders lexically and a numeric one numerically. Without it
-    /// `smart_cmp` would order TEXT "10" before "2", disagreeing with the
-    /// type-aware comparison a WHERE clause on the same column uses.
     pub fn new(
         mut child: Box<dyn RowIterator>,
         order_by: Vec<OrderByItem>,
         types: ColumnTypeMap,
     ) -> Self {
         let mut rows = child.collect_all();
-        for item in order_by.iter().rev() {
-            let col = item.column.clone();
-            let desc = item.desc;
-            let col_type = type_lookup(&types, &col).cloned();
-            rows.sort_by(|a, b| {
-                let va = row_lookup(a, &col).map(str::to_string);
-                let vb = row_lookup(b, &col).map(str::to_string);
-                let cmp = match (va.as_deref(), vb.as_deref()) {
-                    (Some(x), Some(y)) => match &col_type {
-                        // A declared type decides: numeric columns compare
-                        // numerically, everything else lexically.
-                        Some(t) if t.is_numeric() => smart_cmp(x, y),
-                        Some(_) => x.cmp(y),
-                        // No declared type: keep the type-agnostic heuristic.
-                        None => smart_cmp(x, y),
-                    },
-                    (Some(_), None) => std::cmp::Ordering::Less,
-                    (None, Some(_)) => std::cmp::Ordering::Greater,
-                    (None, None) => std::cmp::Ordering::Equal,
-                };
-                if desc { cmp.reverse() } else { cmp }
-            });
-        }
+        sort_rows(&mut rows, &order_by, &types);
         Self {
             sorted: rows,
             pos: 0,
@@ -1150,6 +1131,27 @@ pub(crate) fn type_lookup<'a>(types: &'a ColumnTypeMap, column: &str) -> Option<
                 .is_some_and(|(q, b)| q.eq_ignore_ascii_case(qual) && b == bare)
         })
         .map(|(_, v)| v)
+}
+
+/// Order `rows` by `order_by`, resolving each key through [`row_lookup`] and
+/// [`type_lookup`] so a qualified join column sorts by the column it names,
+/// and comparing by that column's type when it is known. NULLs sort last,
+/// which PostgreSQL does by default and `DESC` reverses.
+pub(crate) fn sort_rows(rows: &mut [Row], order_by: &[OrderByItem], types: &ColumnTypeMap) {
+    for item in order_by.iter().rev() {
+        let col = item.column.clone();
+        let desc = item.desc;
+        let col_type = type_lookup(types, &col).cloned();
+        rows.sort_by(|a, b| {
+            let cmp = match (row_lookup(a, &col), row_lookup(b, &col)) {
+                (Some(x), Some(y)) => cmp_by_type(x, y, col_type.as_ref()),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => std::cmp::Ordering::Equal,
+            };
+            if desc { cmp.reverse() } else { cmp }
+        });
+    }
 }
 
 /// Evaluate a predicate, preserving SQL three-valued logic: `None` is

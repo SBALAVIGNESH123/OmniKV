@@ -6,7 +6,7 @@ use crate::OmniKV;
 use crate::catalog::ColumnType;
 use crate::catalog::{Catalog, RowFormat, TableDef};
 use crate::optimizer::{AccessMethod, PlanNode};
-use crate::sql::{AggFunc, JoinType, OrderByItem, SelectColumn, WhereExpr};
+use crate::sql::{AggFunc, JoinType, SelectColumn, WhereExpr};
 use crate::sql_exec::Row;
 use crate::volcano::{
     ColumnTypeMap, eval_where_typed, legacy_pk_needs_scan, qualify_row, row_lookup, type_lookup,
@@ -94,7 +94,7 @@ impl PlanExecutor {
             } => {
                 let mut rows = self.execute_plan(child)?;
                 let types = child.output_types(&self.catalog);
-                self.exec_sort(&mut rows, order_by, &types);
+                crate::volcano::sort_rows(&mut rows, order_by, &types);
                 Ok(rows)
             }
             PlanNode::Limit { child, count } => {
@@ -245,15 +245,9 @@ impl PlanExecutor {
         Ok(rows)
     }
 
-    /// Deserialize a stored row.
-    ///
-    /// On a [`Legacy`](crate::catalog::RowFormat::Legacy) table a stored
-    /// "NULL" is the pre-typed-Row encoding of SQL NULL and becomes `None`;
-    /// on a [`Typed`](crate::catalog::RowFormat::Typed) table it is the
-    /// user's literal text and is kept. The two byte patterns are identical,
-    /// so the value alone cannot distinguish them — the table's recorded
-    /// format is the only signal.
-    /// Map one stored value to a typed cell, per the table's row format.
+    /// Map one stored value to a typed cell, per the table's row format:
+    /// [`RowFormat`] is the only signal that tells a stored "NULL" from the
+    /// user's literal text.
     fn decode(v: Option<String>, format: RowFormat) -> Option<String> {
         match format {
             // Stored "NULL" is SQL NULL; the typed code never writes it.
@@ -396,33 +390,6 @@ impl PlanExecutor {
         result
     }
 
-    // ─── Sort ───────────────────────────────────────────────────────────
-
-    /// Sorts by the sort key's declared type where it is known, so a TEXT
-    /// column orders lexically and a numeric one numerically.
-    fn exec_sort(&self, rows: &mut [Row], order_by: &[OrderByItem], types: &ColumnTypeMap) {
-        for item in order_by.iter().rev() {
-            let col = item.column.clone();
-            let desc = item.desc;
-            let col_type = types.get(&col).cloned();
-            rows.sort_by(|a, b| {
-                let va = a.get(&col).cloned().flatten();
-                let vb = b.get(&col).cloned().flatten();
-                let cmp = match (va.as_deref(), vb.as_deref()) {
-                    (Some(x), Some(y)) => match &col_type {
-                        Some(t) if t.is_numeric() => smart_cmp(x, y),
-                        Some(_) => x.cmp(y),
-                        None => smart_cmp(x, y),
-                    },
-                    (Some(_), None) => std::cmp::Ordering::Less,
-                    (None, Some(_)) => std::cmp::Ordering::Greater,
-                    (None, None) => std::cmp::Ordering::Equal,
-                };
-                if desc { cmp.reverse() } else { cmp }
-            });
-        }
-    }
-
     // ─── Aggregate ──────────────────────────────────────────────────────
 
     fn exec_aggregate(
@@ -520,6 +487,13 @@ impl PlanExecutor {
                                 projected.insert(name, v.clone());
                             }
                         }
+                        SelectColumn::WindowFunc { order_by: ob, .. } => {
+                            // The window's sort key is read after this
+                            // projection, so it has to survive it.
+                            if let Some(v) = crate::volcano::row_lookup(row, ob) {
+                                projected.insert(ob.clone(), Some(v.to_string()));
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -557,14 +531,6 @@ fn collect_plan_types(plan: &PlanNode, catalog: &Catalog, types: &mut ColumnType
 
 fn eval_where(row: &Row, expr: &WhereExpr) -> bool {
     crate::volcano::eval_where(row, expr)
-}
-
-fn smart_cmp(a: &str, b: &str) -> std::cmp::Ordering {
-    if let (Ok(ai), Ok(bi)) = (a.parse::<f64>(), b.parse::<f64>()) {
-        ai.partial_cmp(&bi).unwrap_or(std::cmp::Ordering::Equal)
-    } else {
-        a.cmp(b)
-    }
 }
 
 fn compute_aggregate(

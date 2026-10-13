@@ -55,15 +55,10 @@ impl ColumnType {
     }
 
     /// Canonical form for a value of this type: a numeric payload prints as
-    /// its number, anything else is kept verbatim.
-    ///
-    /// A FLOAT column normalizing `1.50` to `1.5` is not lossy storage --
-    /// it is IEEE-754 semantics, and the same rule PostgreSQL applies to
-    /// `double precision`. `1.50` and `1.5` parse to the identical f64, so
-    /// the trailing zero was never information the type could hold;
-    /// `f64`'s shortest-round-trip display preserves every value exactly.
-    /// Preserving typed digits is a `NUMERIC`/decimal type's job, which this
-    /// engine does not have.
+    /// its number, anything else is kept verbatim. `1.50` and `1.5` parse to
+    /// the same f64, so the trailing zero is not information the type holds;
+    /// keeping typed digits is a `NUMERIC` type's job, which this engine does
+    /// not have.
     pub fn canonicalize(&self, value: &str) -> String {
         match self {
             Self::Integer => value
@@ -90,16 +85,13 @@ pub struct Column {
 
 /// How a table's rows encode a SQL NULL on disk.
 ///
-/// The typed-`Row` change (NULL stored as JSON `null`) is not byte-compatible
-/// with what came before it: the old code stored a NULL as the literal string
-/// "NULL", which is now how a user's literal text `'NULL'` is stored. The two
-/// cannot be told apart by value, so the table records which format its rows
-/// are in and the decoders consult it. Existing manifests have no field, so
-/// `serde(default)` reads them as [`RowFormat::Legacy`]; tables created after
-/// the change are [`RowFormat::Typed`].
+/// A stored "NULL" is a SQL NULL under [`Legacy`](Self::Legacy) and the
+/// user's literal text under [`Typed`](Self::Typed); the bytes are identical,
+/// so the table records which one its rows use and the decoders consult it.
+/// Manifests without the field read back as [`Legacy`](Self::Legacy).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub enum RowFormat {
-    /// NULL is the literal string "NULL"; pre-typed-Row databases only.
+    /// NULL is the literal string "NULL"; older databases only.
     #[default]
     Legacy,
     /// NULL is a JSON `null`; "NULL" is the user's literal text.
