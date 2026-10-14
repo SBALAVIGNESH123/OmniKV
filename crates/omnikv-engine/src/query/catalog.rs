@@ -138,12 +138,25 @@ impl Catalog {
             db,
             cache: std::sync::RwLock::new(HashMap::new()),
         };
-        cat.load_all();
+        cat.load_all(None);
         cat
     }
 
-    fn load_all(&self) {
-        let seq = self.db.get_seq();
+    /// Loads table definitions as they were at `seq`. A transaction reading
+    /// at an older snapshot must also see the older schema: a table another
+    /// connection migrated in the meantime would otherwise decode this
+    /// transaction's rows under the wrong NULL encoding.
+    pub fn at_snapshot(db: Arc<OmniKV>, seq: u64) -> Self {
+        let cat = Self {
+            db,
+            cache: std::sync::RwLock::new(HashMap::new()),
+        };
+        cat.load_all(Some(seq));
+        cat
+    }
+
+    fn load_all(&self, seq: Option<u64>) {
+        let seq = seq.unwrap_or_else(|| self.db.get_seq());
         if let Ok(results) = self
             .db
             .scan(CATALOG_PREFIX, &format!("{}\x7F", CATALOG_PREFIX), seq)
@@ -237,13 +250,18 @@ impl Catalog {
     /// the transactional executor stages exactly this pair so the SSI
     /// engine applies it at COMMIT and a ROLLBACK discards it.
     pub fn staged_create_entry(table: &TableDef) -> Result<(String, String), String> {
-        let key = format!("{}{}", CATALOG_PREFIX, table.name.to_lowercase());
+        let key = Self::catalog_key(&table.name);
         let value = serde_json::to_string(table).map_err(|e| format!("Serialize: {}", e))?;
         Ok((key, value))
     }
 
     /// The storage key a DROP TABLE deletes from the catalog.
     pub fn staged_drop_key(name: &str) -> String {
+        Self::catalog_key(name)
+    }
+
+    /// The single key under which a table's definition is stored.
+    pub fn catalog_key(name: &str) -> String {
         format!("{}{}", CATALOG_PREFIX, name.to_lowercase())
     }
 

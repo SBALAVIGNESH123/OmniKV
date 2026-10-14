@@ -28,7 +28,10 @@ fn exec(executor: &SqlExecutor, sql: &str) {
 fn rows(executor: &SqlExecutor, sql: &str) -> Vec<Vec<String>> {
     let stmt = parse_sql(sql).unwrap_or_else(|e| panic!("Parse error for '{sql}': {e}"));
     match executor.execute(&stmt) {
-        Ok(ExecResult::Rows { rows, .. }) => rows,
+        Ok(ExecResult::Rows { rows, .. }) => rows
+            .into_iter()
+            .map(|r| omni_engine::sql_exec::render_row(&r))
+            .collect(),
         Ok(_) => panic!("expected rows for '{sql}'"),
         Err(e) => panic!("Exec error for '{sql}': {e}"),
     }
@@ -583,7 +586,9 @@ fn i64_overflow_literal_stays_exact() {
     let stmt = parse_sql("SELECT v FROM t WHERE v = $1").unwrap();
     let bound = bind_statement_params(stmt, &[Some(big.to_string())]).unwrap();
     match e.execute(&bound) {
-        Ok(ExecResult::Rows { rows, .. }) => assert_eq!(rows, vec![["9223372036854775808"]]),
+        Ok(ExecResult::Rows { rows, .. }) => {
+            assert_eq!(rows, vec![vec![Some("9223372036854775808".to_string())]])
+        }
         Ok(_) => panic!("bound i128 lookup returned no rows"),
         Err(e) => panic!("bound i128 lookup failed: {e}"),
     }
@@ -637,4 +642,249 @@ fn dml_missing_table_wording_matches_select() {
             "'{q}' must say the table does not exist: {err}"
         );
     }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Migration atomicity and catalog currency
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// The row format recorded on disk for a table, independent of any
+/// executor's cached copy.
+fn persisted_row_format(e: &SqlExecutor, table: &str) -> omni_engine::catalog::RowFormat {
+    let key = format!("\u{0}CATALOG\u{0}{table}");
+    let seq = e.db.get_seq();
+    let stored =
+        e.db.scan(&key, &format!("{key}\u{7F}"), seq)
+            .expect("catalog scan");
+    let (_, value) = &stored[0];
+    serde_json::from_str::<omni_engine::catalog::TableDef>(value)
+        .expect("catalog manifest")
+        .row_format
+}
+
+/// A statement that fails validation must not leave the table migrated.
+#[test]
+fn failed_legacy_write_does_not_flip_format() {
+    let e = legacy_env("failed_legacy_write", "legacy_t", "");
+    let mut wb = omni_engine::WriteBatch::new();
+    wb.set(
+        "\u{0}T\u{0}legacy_t\u{0}1",
+        "{\"id\":\"1\",\"v\":\"NULL\"}".to_string(),
+    )
+    .unwrap();
+    e.db.commit_batch(&wb).unwrap();
+
+    let err = err(&e, "INSERT INTO legacy_t (no_such_column) VALUES (2)");
+    assert!(
+        err.contains("does not exist"),
+        "the unknown column must be rejected: {err}"
+    );
+    assert_eq!(
+        persisted_row_format(&e, "legacy_t"),
+        omni_engine::catalog::RowFormat::Legacy,
+        "a failed statement must not migrate the table"
+    );
+    assert_eq!(
+        rows(&e, "SELECT id FROM legacy_t WHERE v IS NULL"),
+        vec![["1"]]
+    );
+}
+
+/// A legacy row that cannot be decoded must block migration, not be skipped.
+#[test]
+fn malformed_legacy_row_blocks_migration() {
+    let e = legacy_env("malformed_legacy", "legacy_t", "");
+    let mut wb = omni_engine::WriteBatch::new();
+    wb.set("\u{0}T\u{0}legacy_t\u{0}1", "this is not json".to_string())
+        .unwrap();
+    e.db.commit_batch(&wb).unwrap();
+
+    let err = err(&e, "INSERT INTO legacy_t (id, v) VALUES (2, 'x')");
+    assert!(
+        err.contains("cannot be decoded"),
+        "an undecodable row must abort migration: {err}"
+    );
+    assert_eq!(
+        persisted_row_format(&e, "legacy_t"),
+        omni_engine::catalog::RowFormat::Legacy,
+        "the table must stay legacy when migration fails"
+    );
+}
+
+/// A transaction's snapshot pins the schema it saw: a migration committed
+/// by another connection must not change how the snapshot decodes its rows.
+#[test]
+fn legacy_migration_respects_transaction_snapshot() {
+    let e = legacy_env("legacy_snap", "legacy_t", "");
+    let mut wb = omni_engine::WriteBatch::new();
+    wb.set(
+        "\u{0}T\u{0}legacy_t\u{0}1",
+        "{\"id\":\"1\",\"v\":\"NULL\"}".to_string(),
+    )
+    .unwrap();
+    e.db.commit_batch(&wb).unwrap();
+    let snap_seq = e.db.get_seq();
+
+    // Another connection migrates the table after the snapshot was taken.
+    let other = SqlExecutor::new(e.db.clone(), Arc::new(Catalog::new(e.db.clone())));
+    exec(&other, "INSERT INTO legacy_t (id, v) VALUES (2, 'x')");
+
+    let snap_catalog = Arc::new(Catalog::at_snapshot(e.db.clone(), snap_seq));
+    let snap = SqlExecutor::with_snapshot(e.db, snap_catalog, snap_seq);
+    assert_eq!(
+        rows(&snap, "SELECT id FROM legacy_t WHERE v IS NULL"),
+        vec![["1"]],
+        "the snapshot must still read its legacy NULL as a SQL NULL"
+    );
+}
+
+/// An executor holding a stale legacy catalog must not re-migrate rows that
+/// another executor already wrote as typed.
+#[test]
+fn stale_catalog_does_not_remigrate_typed_rows() {
+    let e = legacy_env("stale_catalog", "legacy_t", "");
+
+    // A second executor migrates the table and stores the literal text 'NULL'.
+    let other = SqlExecutor::new(e.db.clone(), Arc::new(Catalog::new(e.db.clone())));
+    exec(&other, "INSERT INTO legacy_t (id, v) VALUES (2, 'NULL')");
+
+    // This executor's cached copy still says legacy.
+    exec(&e, "INSERT INTO legacy_t (id, v) VALUES (3, 'x')");
+
+    assert_eq!(
+        sorted(rows(&e, "SELECT id FROM legacy_t WHERE v = 'NULL'")),
+        vec![["2"]],
+        "the typed literal text must survive a stale executor's write"
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// NULL at the result boundary
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// A subquery returning the literal text 'NULL' must not turn it into a SQL
+/// NULL on the way out.
+#[test]
+fn subquery_literal_null_text_is_not_sql_null() {
+    let e = create_env("subq_literal_null");
+    exec(&e, "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)");
+    exec(&e, "CREATE TABLE s (id INTEGER PRIMARY KEY, v TEXT)");
+    exec(&e, "INSERT INTO t (id, v) VALUES (1, 'NULL')");
+    exec(&e, "INSERT INTO s (id, v) VALUES (1, 'NULL')");
+
+    assert_eq!(
+        rows(&e, "SELECT id FROM t WHERE v IN (SELECT v FROM s)"),
+        vec![["1"]]
+    );
+}
+
+/// SQL NULL and the literal text "NULL" are two distinct values, so a UNION
+/// keeps both rows.
+#[test]
+fn set_operation_keeps_null_separate_from_literal_text() {
+    let e = create_env("set_null_text");
+    exec(&e, "CREATE TABLE a (id INTEGER PRIMARY KEY, v TEXT)");
+    exec(&e, "CREATE TABLE b (id INTEGER PRIMARY KEY, v TEXT)");
+    exec(&e, "INSERT INTO a (id, v) VALUES (1, NULL)");
+    exec(&e, "INSERT INTO b (id, v) VALUES (2, 'NULL')");
+
+    assert_eq!(
+        rows(&e, "SELECT v FROM a UNION SELECT v FROM b"),
+        vec![["NULL"], ["NULL"]]
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Aggregate and window semantics
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// SUM over values past the i64 limit stays exact: the integer domain is
+/// i128, so accumulation must not fall back to f64.
+#[test]
+fn big_integer_sum_is_exact() {
+    let e = create_env("big_int_sum");
+    exec(&e, "CREATE TABLE t (id INTEGER PRIMARY KEY, v BIGINT)");
+    exec(&e, "INSERT INTO t (id, v) VALUES (1, 9223372036854775808)");
+    exec(&e, "INSERT INTO t (id, v) VALUES (2, 9223372036854775809)");
+
+    assert_eq!(
+        rows(&e, "SELECT SUM(v) FROM t"),
+        vec![["18446744073709551617"]]
+    );
+}
+
+/// The first row of a window always starts its own peer group, so a leading
+/// NULL is ranked 1 rather than tied with nothing.
+#[test]
+fn rank_of_leading_null_is_one() {
+    let e = create_env("rank_leading_null");
+    exec(&e, "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)");
+    exec(&e, "INSERT INTO t (id, v) VALUES (1, NULL)");
+    exec(&e, "INSERT INTO t (id, v) VALUES (2, 5)");
+
+    assert_eq!(
+        rows(&e, "SELECT v, RANK() OVER (ORDER BY v DESC) FROM t"),
+        vec![["NULL", "1"], ["5", "2"]]
+    );
+    assert_eq!(
+        rows(&e, "SELECT v, DENSE_RANK() OVER (ORDER BY v DESC) FROM t"),
+        vec![["NULL", "1"], ["5", "2"]]
+    );
+}
+
+/// A grouped TEXT column keeps lexical ordering above the aggregate: the
+/// sort must not fall back to the numeric-looking heuristic.
+#[test]
+fn group_by_preserves_text_sort_affinity() {
+    let e = create_env("group_text_order");
+    exec(&e, "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)");
+    exec(&e, "INSERT INTO t (id, v) VALUES (1, '2')");
+    exec(&e, "INSERT INTO t (id, v) VALUES (2, '10')");
+    exec(&e, "INSERT INTO t (id, v) VALUES (3, '1')");
+
+    assert_eq!(
+        rows(&e, "SELECT v, COUNT(*) FROM t GROUP BY v ORDER BY v"),
+        vec![["1", "1"], ["10", "1"], ["2", "1"]]
+    );
+}
+
+/// `SELECT *` expands the whole row, but its ORDER BY still names a column
+/// and an unqualified name shared by both join sides is still ambiguous.
+#[test]
+fn star_does_not_skip_ambiguous_order_validation() {
+    let e = create_env("star_ambiguous");
+    exec(&e, "CREATE TABLE a (id INTEGER PRIMARY KEY, k INTEGER)");
+    exec(&e, "CREATE TABLE b (id INTEGER PRIMARY KEY, k INTEGER)");
+    exec(&e, "INSERT INTO a (id, k) VALUES (1, 1)");
+    exec(&e, "INSERT INTO b (id, k) VALUES (1, 1)");
+
+    let err = err(&e, "SELECT * FROM a JOIN b ON a.k = b.k ORDER BY id");
+    assert!(
+        err.contains("ambiguous"),
+        "SELECT * must not skip ORDER BY validation: {err}"
+    );
+}
+
+/// Statistics decode rows with the table's own format, so a typed table's
+/// real NULLs are counted in the histogram.
+#[test]
+fn stats_decode_typed_null_rows() {
+    let e = create_env("stats_typed_null");
+    exec(&e, "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)");
+    exec(&e, "INSERT INTO t (id, v) VALUES (1, NULL)");
+    exec(&e, "INSERT INTO t (id, v) VALUES (2, 'x')");
+
+    let stats = omni_engine::optimizer::gather_stats(&e.catalog, None, &e.db);
+    let table = &stats["t"];
+    let v = table
+        .histograms
+        .iter()
+        .find(|h| h.column == "v")
+        .expect("a histogram for v");
+    assert!(
+        (v.null_fraction - 0.5).abs() < 1e-9,
+        "one of two rows is NULL: {:?}",
+        table.histograms
+    );
+    assert_eq!(v.distinct_count, 1, "the literal 'x' is the only value");
 }

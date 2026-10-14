@@ -9,11 +9,11 @@
 //!
 //! The optimizer produces a `QueryPlan` tree that the executor walks.
 
-use crate::catalog::Catalog;
+use crate::catalog::{Catalog, ColumnType};
 use crate::secondary_index::{IndexCatalog, IndexDefinition};
 use crate::sql::{
-    CmpOp, FromClause, JoinType, OrderByItem, SelectColumn, SqlStatement, SqlValue, WhereExpr,
-    parse_sql,
+    AggFunc, CmpOp, FromClause, JoinType, OrderByItem, SelectColumn, SqlStatement, SqlValue,
+    WhereExpr, parse_sql,
 };
 use crate::volcano::ColumnTypeMap;
 use std::fmt;
@@ -108,16 +108,17 @@ pub fn gather_stats(
                     std::collections::HashMap::new();
                 let sample_size = sample.len().min(1000);
                 for (_, value) in sample.iter().take(sample_size) {
-                    if let Ok(row) =
-                        serde_json::from_str::<std::collections::HashMap<String, String>>(value)
+                    // Decode with the table's own row format: a typed row
+                    // carries NULL as a JSON null, a legacy one as "NULL".
+                    if let Some(row) =
+                        crate::plan_exec::PlanExecutor::deserialize_row(value, table.row_format)
                     {
                         for (col, val) in &row {
-                            col_values
-                                .entry(col.clone())
-                                .or_default()
-                                .insert(val.clone());
-                            if val == "NULL" || val.is_empty() {
-                                *col_nulls.entry(col.clone()).or_default() += 1;
+                            match val {
+                                None => *col_nulls.entry(col.clone()).or_default() += 1,
+                                Some(v) => {
+                                    col_values.entry(col.clone()).or_default().insert(v.clone());
+                                }
                             }
                         }
                     }
@@ -132,7 +133,7 @@ pub fn gather_stats(
                         } else {
                             0.0
                         },
-                        most_common: vec![], // TODO: frequency counting
+                        most_common: vec![],
                     });
                 }
             }
@@ -275,9 +276,47 @@ impl PlanNode {
             | Self::Limit { child, .. } => {
                 child.collect_types(catalog, map);
             }
-            // Aggregates replace the row's shape; a predicate above one is
-            // HAVING and is filtered by the executor, not here.
-            Self::Aggregate { .. } => {}
+            // An aggregate keeps the grouped columns and emits one column
+            // per aggregate, so a sort above it still sees real types
+            // instead of falling back to the numeric-looking heuristic.
+            Self::Aggregate {
+                child, aggregates, ..
+            } => {
+                let mut child_types = ColumnTypeMap::new();
+                child.collect_types(catalog, &mut child_types);
+                for col in aggregates {
+                    match col {
+                        SelectColumn::Named(n) => {
+                            if let Some(t) = child_types.get(n) {
+                                map.insert(n.clone(), t.clone());
+                            }
+                        }
+                        SelectColumn::Qualified(t, n) => {
+                            let key = format!("{t}.{n}");
+                            if let Some(v) = child_types.get(&key).or_else(|| child_types.get(n)) {
+                                map.insert(key, v.clone());
+                                map.entry(n.clone()).or_insert(v.clone());
+                            }
+                        }
+                        SelectColumn::Aggregate(func, target) => {
+                            let name =
+                                format!("{}({})", format!("{:?}", func).to_lowercase(), target);
+                            let ty = match func {
+                                AggFunc::Count => ColumnType::Integer,
+                                AggFunc::Sum | AggFunc::Avg => child_types
+                                    .get(target)
+                                    .cloned()
+                                    .unwrap_or(ColumnType::Integer),
+                                AggFunc::Min | AggFunc::Max => {
+                                    child_types.get(target).cloned().unwrap_or(ColumnType::Text)
+                                }
+                            };
+                            map.insert(name, ty);
+                        }
+                        _ => {}
+                    }
+                }
+            }
         }
     }
 }

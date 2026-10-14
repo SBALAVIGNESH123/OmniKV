@@ -29,7 +29,12 @@ fn exec_sql(executor: &SqlExecutor, sql: &str) -> ExecResult {
 
 fn exec_rows(executor: &SqlExecutor, sql: &str) -> (Vec<String>, Vec<Vec<String>>) {
     match exec_sql(executor, sql) {
-        ExecResult::Rows { columns, rows } => (columns, rows),
+        ExecResult::Rows { columns, rows } => (
+            columns,
+            rows.into_iter()
+                .map(|r| omni_engine::sql_exec::render_row(&r))
+                .collect(),
+        ),
         _ => panic!("Expected Rows result for: {sql}"),
     }
 }
@@ -1262,7 +1267,12 @@ fn exec_rows_from_stmt(
         .execute(stmt)
         .unwrap_or_else(|e| panic!("Exec error: {e}"))
     {
-        ExecResult::Rows { columns, rows } => (columns, rows),
+        ExecResult::Rows { columns, rows } => (
+            columns,
+            rows.into_iter()
+                .map(|r| omni_engine::sql_exec::render_row(&r))
+                .collect(),
+        ),
         _ => panic!("Expected Rows result"),
     }
 }

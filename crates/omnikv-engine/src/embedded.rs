@@ -226,7 +226,13 @@ pub enum EmbeddedSqlResult {
 impl From<ExecResult> for EmbeddedSqlResult {
     fn from(value: ExecResult) -> Self {
         match value {
-            ExecResult::Rows { columns, rows } => Self::Rows { columns, rows },
+            ExecResult::Rows { columns, rows } => Self::Rows {
+                columns,
+                rows: rows
+                    .into_iter()
+                    .map(|row| crate::sql_exec::render_row(&row))
+                    .collect(),
+            },
             ExecResult::Modified { count, command } => Self::Modified { count, command },
             ExecResult::Ok(message) => Self::Ok(message),
         }

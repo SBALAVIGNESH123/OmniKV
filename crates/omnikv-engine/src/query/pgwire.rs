@@ -2051,7 +2051,17 @@ fn execute_non_transactional_statement(
                     return StepOutcome::error("54000", msg);
                 }
             };
-            let catalog = std::sync::Arc::new(crate::catalog::Catalog::new(db.clone()));
+            // The catalog is read at the transaction's snapshot sequence:
+            // a table migrated by another connection mid-transaction must
+            // still decode the way this transaction's snapshot saw it.
+            let catalog = if let Some(ref txn) = conn.txn {
+                std::sync::Arc::new(crate::catalog::Catalog::at_snapshot(
+                    db.clone(),
+                    txn.read_seq,
+                ))
+            } else {
+                std::sync::Arc::new(crate::catalog::Catalog::new(db.clone()))
+            };
 
             // Inside an explicit transaction the executor stages DML into
             // its pending batch (visible to this transaction's later reads,
@@ -2070,13 +2080,14 @@ fn execute_non_transactional_statement(
 
             match executor.execute(&stmt) {
                 Ok(crate::sql_exec::ExecResult::Rows { columns, rows }) => {
-                    // A read-only statement never stages writes; flush
-                    // anyway for the invariant (a no-op here).
                     merge_staged_writes_into_txn(&mut executor, conn);
                     let tag = format!("SELECT {}", rows.len());
                     StepOutcome::Rows {
                         columns: columns.into_iter().map(|c| (c, 25)).collect(),
-                        rows,
+                        rows: rows
+                            .into_iter()
+                            .map(|row| crate::sql_exec::render_row(&row))
+                            .collect(),
                         tag,
                     }
                 }

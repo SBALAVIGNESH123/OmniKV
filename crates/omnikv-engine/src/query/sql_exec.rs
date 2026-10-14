@@ -17,11 +17,15 @@ use std::sync::Arc;
 /// `None` is a SQL NULL; `Some("NULL")` is the literal text.
 pub type Row = HashMap<String, Option<String>>;
 
+/// One cell of an output row. NULL stays `None` until the wire boundary
+/// renders it, so subqueries and set operations never confuse the two.
+pub type Cell = Option<String>;
+
 /// Execution result
 pub enum ExecResult {
     Rows {
         columns: Vec<String>,
-        rows: Vec<Vec<String>>,
+        rows: Vec<Vec<Cell>>,
     },
     Modified {
         count: usize,
@@ -330,7 +334,7 @@ impl SqlExecutor {
             } => self.exec_delete(table, where_clause.as_ref()),
             SqlStatement::ShowTables => {
                 let tables = self.catalog.list_tables();
-                let rows: Vec<Vec<String>> = tables.into_iter().map(|t| vec![t]).collect();
+                let rows: Vec<Vec<Cell>> = tables.into_iter().map(|t| vec![Some(t)]).collect();
                 Ok(ExecResult::Rows {
                     columns: vec!["table_name".into()],
                     rows,
@@ -343,9 +347,9 @@ impl SqlExecutor {
                 match optimizer.optimize(inner) {
                     Ok(plan) => {
                         let plan_text = format!("{}", plan);
-                        let rows: Vec<Vec<String>> = plan_text
+                        let rows: Vec<Vec<Cell>> = plan_text
                             .lines()
-                            .map(|line| vec![line.to_string()])
+                            .map(|line| vec![Some(line.to_string())])
                             .collect();
                         Ok(ExecResult::Rows {
                             columns: vec!["QUERY PLAN".into()],
@@ -354,7 +358,7 @@ impl SqlExecutor {
                     }
                     Err(_) => Ok(ExecResult::Rows {
                         columns: vec!["QUERY PLAN".into()],
-                        rows: vec![vec![format!("{:?}", inner)]],
+                        rows: vec![vec![Some(format!("{:?}", inner))]],
                     }),
                 }
             }
@@ -373,10 +377,10 @@ impl SqlExecutor {
                             Ok((_rows, node_stats)) => {
                                 let mut output = Vec::new();
                                 for (label, ns) in &node_stats {
-                                    output.push(vec![format!(
+                                    output.push(vec![Some(format!(
                                         "{} (est. rows={}, actual rows={}, time={:.3}ms)",
                                         label, ns.estimated_rows, ns.actual_rows, ns.actual_time_ms
-                                    )]);
+                                    ))]);
                                 }
                                 Ok(ExecResult::Rows {
                                     columns: vec!["QUERY PLAN (ANALYZE)".into()],
@@ -385,13 +389,13 @@ impl SqlExecutor {
                             }
                             Err(e) => Ok(ExecResult::Rows {
                                 columns: vec!["QUERY PLAN (ANALYZE)".into()],
-                                rows: vec![vec![format!("Error: {}", e)]],
+                                rows: vec![vec![Some(format!("Error: {}", e))]],
                             }),
                         }
                     }
                     Err(_) => Ok(ExecResult::Rows {
                         columns: vec!["QUERY PLAN (ANALYZE)".into()],
-                        rows: vec![vec![format!("{:?}", inner)]],
+                        rows: vec![vec![Some(format!("{:?}", inner))]],
                     }),
                 }
             }
@@ -418,38 +422,34 @@ impl SqlExecutor {
                         let mut result = left_rows;
                         result.extend(right_rows);
                         if !all {
-                            // Remove duplicates
                             let mut seen = std::collections::HashSet::new();
-                            result.retain(|row| {
-                                let key = row.join("\0");
-                                seen.insert(key)
-                            });
+                            result.retain(|row| seen.insert(row.clone()));
                         }
                         result
                     }
                     SetOpType::Intersect => {
-                        let right_set: std::collections::HashSet<String> =
-                            right_rows.iter().map(|r| r.join("\0")).collect();
-                        let mut result: Vec<Vec<String>> = left_rows
+                        let right_set: std::collections::HashSet<Vec<Cell>> =
+                            right_rows.into_iter().collect();
+                        let mut result: Vec<Vec<Cell>> = left_rows
                             .into_iter()
-                            .filter(|r| right_set.contains(&r.join("\0")))
+                            .filter(|r| right_set.contains(r))
                             .collect();
                         if !all {
                             let mut seen = std::collections::HashSet::new();
-                            result.retain(|row| seen.insert(row.join("\0")));
+                            result.retain(|row| seen.insert(row.clone()));
                         }
                         result
                     }
                     SetOpType::Except => {
-                        let right_set: std::collections::HashSet<String> =
-                            right_rows.iter().map(|r| r.join("\0")).collect();
-                        let mut result: Vec<Vec<String>> = left_rows
+                        let right_set: std::collections::HashSet<Vec<Cell>> =
+                            right_rows.into_iter().collect();
+                        let mut result: Vec<Vec<Cell>> = left_rows
                             .into_iter()
-                            .filter(|r| !right_set.contains(&r.join("\0")))
+                            .filter(|r| !right_set.contains(r))
                             .collect();
                         if !all {
                             let mut seen = std::collections::HashSet::new();
-                            result.retain(|row| seen.insert(row.join("\0")));
+                            result.retain(|row| seen.insert(row.clone()));
                         }
                         result
                     }
@@ -571,10 +571,45 @@ impl SqlExecutor {
         Ok(ExecResult::Ok(format!("DROP TABLE {}", name)))
     }
 
-    /// Rewrite a legacy table's rows to the typed encoding before the typed
-    /// write path appends to them: a stored "NULL" is a SQL NULL under the
-    /// legacy encoding and the user's literal text under the typed one.
-    fn migrate_to_typed(&self, table: &TableDef) -> Result<(), String> {
+    /// The table definition as recorded at this statement's read point. The
+    /// catalog cache can lag a migration, and a stale `row_format` would
+    /// re-migrate rows that are already typed.
+    fn effective_table(&self, name: &str) -> Result<Option<TableDef>, String> {
+        let key = Catalog::catalog_key(name);
+        if let Some(overlay) = self.pending_overlay()
+            && let Some(staged) = overlay.get(&key)
+        {
+            return Ok(staged
+                .as_deref()
+                .and_then(|v| serde_json::from_str::<TableDef>(v).ok()));
+        }
+        let seq = self.snapshot_seq.unwrap_or_else(|| self.db.get_seq());
+        self.record_point_read(&key);
+        let end = format!("{key}\x7F");
+        Ok(self
+            .db
+            .scan(&key, &end, seq)
+            .map_err(|e| format!("{:?}", e))?
+            .into_iter()
+            .next()
+            .and_then(|(_, value)| serde_json::from_str::<TableDef>(&value).ok()))
+    }
+
+    /// Builds the batch that rewrites a legacy table's rows to the typed
+    /// encoding and records the new format in the catalog. The caller merges
+    /// this with its own writes and commits both together, so a statement
+    /// that fails validation leaves the table exactly as it was.
+    fn migration_batch(&self, table: &TableDef) -> Result<WriteBatch, String> {
+        let persisted = self.effective_table(&table.name)?;
+        // Already migrated: nothing to rewrite. Refresh this executor's
+        // cached copy so its own later reads decode rows as typed.
+        if let Some(persisted) = persisted
+            && persisted.row_format == crate::catalog::RowFormat::Typed
+        {
+            self.catalog.insert_staged(persisted);
+            return Ok(WriteBatch::new());
+        }
+
         let prefix = table.row_prefix();
         let end = format!("{}\u{7F}", prefix);
         self.record_range_read(&prefix, &end);
@@ -598,17 +633,18 @@ impl SqlExecutor {
         }
 
         let mut batch = WriteBatch::new();
-        let mut changed = false;
         // The typed path keys and compares a numeric primary key canonically,
-        // so a legacy row stored at ...007 is re-keyed to ...7 as it is
-        // rewritten, and its stored value is canonicalized to match.
+        // so a legacy row stored at ...007 is re-keyed to ...7.
         let mut canonical_keys: HashMap<String, &str> = HashMap::new();
         for (key, serialized) in &stored {
-            let Some(mut row) =
+            let mut row =
                 crate::plan_exec::PlanExecutor::deserialize_row(serialized, table.row_format)
-            else {
-                continue;
-            };
+                    .ok_or_else(|| {
+                        format!(
+                            "table '{}' holds a row that cannot be decoded; refusing to migrate it",
+                            table.name
+                        )
+                    })?;
 
             let stored_suffix = key.strip_prefix(prefix.as_str()).unwrap_or_default();
             let canonical_suffix = crate::volcano::canonicalize_pk_key(table, stored_suffix);
@@ -631,28 +667,19 @@ impl SqlExecutor {
                 batch
                     .set(&canonical_key, typed)
                     .map_err(|e| format!("{:?}", e))?;
-                changed = true;
             } else if &typed != serialized {
                 batch.set(key, typed).map_err(|e| format!("{:?}", e))?;
-                changed = true;
             }
         }
 
-        if changed {
-            self.stage_or_commit(batch)?;
-        }
-
-        // The format flip stages with the row rewrites so a ROLLBACK drops both.
         let mut updated = table.clone();
         updated.row_format = crate::catalog::RowFormat::Typed;
         let (cat_key, cat_value) = Catalog::staged_create_entry(&updated)?;
-        let mut cat_batch = WriteBatch::new();
-        cat_batch
+        batch
             .set(&cat_key, cat_value)
             .map_err(|e| format!("{:?}", e))?;
-        self.stage_or_commit(cat_batch)?;
         self.catalog.insert_staged(updated);
-        Ok(())
+        Ok(batch)
     }
 
     fn exec_insert(
@@ -666,10 +693,9 @@ impl SqlExecutor {
             .get_table(table_name)
             .ok_or_else(|| format!("Table '{}' does not exist", table_name))?;
         self.record_catalog_read(table_name);
-        if table.row_format == crate::catalog::RowFormat::Legacy {
-            self.migrate_to_typed(&table)?;
-        }
 
+        // Resolve and validate every column before touching storage: a
+        // failed statement must not leave a migrated table behind.
         let columns = if col_names.is_empty() {
             table
                 .column_names()
@@ -677,17 +703,12 @@ impl SqlExecutor {
                 .map(|s| s.to_string())
                 .collect::<Vec<_>>()
         } else {
-            // Resolve up front so each row is keyed by the real column name.
             let mut resolved = Vec::with_capacity(col_names.len());
             for c in col_names {
                 resolved.push(resolve_column_name(&table, c)?.to_string());
             }
             resolved
         };
-
-        let mut batch = WriteBatch::new();
-        let mut count = 0;
-
         for row_vals in values {
             if row_vals.len() != columns.len() {
                 return Err(format!(
@@ -696,7 +717,19 @@ impl SqlExecutor {
                     row_vals.len()
                 ));
             }
+        }
 
+        // The migration and the inserts commit in one batch, so a ROLLBACK
+        // (or a later failure) drops the row rewrites and the format flip
+        // together.
+        let mut batch = if table.row_format == crate::catalog::RowFormat::Legacy {
+            self.migration_batch(&table)?
+        } else {
+            WriteBatch::new()
+        };
+        let mut count = 0;
+
+        for row_vals in values {
             let mut row_map = Row::new();
             let mut pk_val = String::new();
             for (i, col) in columns.iter().enumerate() {
@@ -916,30 +949,28 @@ impl SqlExecutor {
     /// and converting to a plain IN(values) expression.
     fn resolve_subqueries(&self, expr: &WhereExpr) -> Result<WhereExpr, String> {
         match expr {
-            WhereExpr::InSubquery(col, sub_stmt) => {
-                // Execute the subquery
-                match self.execute(sub_stmt)? {
-                    ExecResult::Rows { rows, .. } => {
-                        let values: Vec<SqlValue> = rows
-                            .into_iter()
-                            .filter_map(|row| row.into_iter().next())
-                            .map(|v| {
-                                if v == "NULL" {
-                                    SqlValue::Null
-                                } else if let Ok(n) = v.parse::<i64>() {
+            WhereExpr::InSubquery(col, sub_stmt) => match self.execute(sub_stmt)? {
+                ExecResult::Rows { rows, .. } => {
+                    let values: Vec<SqlValue> = rows
+                        .into_iter()
+                        .filter_map(|row| row.into_iter().next())
+                        .map(|cell| match cell {
+                            None => SqlValue::Null,
+                            Some(v) => {
+                                if let Ok(n) = v.parse::<i64>() {
                                     SqlValue::Integer(n)
                                 } else if let Ok(f) = v.parse::<f64>() {
                                     SqlValue::Float(f)
                                 } else {
                                     SqlValue::Text(v)
                                 }
-                            })
-                            .collect();
-                        Ok(WhereExpr::In(col.clone(), values))
-                    }
-                    _ => Ok(WhereExpr::In(col.clone(), vec![])),
+                            }
+                        })
+                        .collect();
+                    Ok(WhereExpr::In(col.clone(), values))
                 }
-            }
+                _ => Ok(WhereExpr::In(col.clone(), vec![])),
+            },
             WhereExpr::And(left, right) => {
                 let l = self.resolve_subqueries(left)?;
                 let r = self.resolve_subqueries(right)?;
@@ -1004,28 +1035,34 @@ impl SqlExecutor {
             } = col
             {
                 let mut prev_val: Option<String> = None;
+                // The first row always starts a new peer group, even when its
+                // value is NULL: `None != None` would otherwise call it a tie
+                // with the nonexistent previous row and rank it zero.
+                let mut have_prev = false;
                 let mut rank = 0usize;
                 let mut dense_rank = 0usize;
                 for (i, row) in rows.iter_mut().enumerate() {
                     let cur_val = crate::volcano::row_lookup(row, ob).map(str::to_string);
+                    let new_peer = !have_prev || cur_val != prev_val;
                     match func {
                         WindowFuncType::RowNumber => {
                             row.insert("row_number".into(), Some((i + 1).to_string()));
                         }
                         WindowFuncType::Rank => {
-                            if cur_val != prev_val {
+                            if new_peer {
                                 rank = i + 1;
                             }
                             row.insert("rank".into(), Some(rank.to_string()));
                         }
                         WindowFuncType::DenseRank => {
-                            if cur_val != prev_val {
+                            if new_peer {
                                 dense_rank += 1;
                             }
                             row.insert("dense_rank".into(), Some(dense_rank.to_string()));
                         }
                     }
                     prev_val = cur_val;
+                    have_prev = true;
                 }
                 break;
             }
@@ -1204,26 +1241,27 @@ impl SqlExecutor {
         order_by: &[OrderByItem],
         group_by: &[String],
     ) -> Result<(), String> {
-        if columns.iter().any(|c| matches!(c, SelectColumn::Star)) {
-            return Ok(());
-        }
         let per_table = self.columns_per_table(from)?;
-        for col in columns {
-            match col {
-                SelectColumn::Named(n) => self.check_column_reference(&per_table, n)?,
-                SelectColumn::Qualified(t, n) => {
-                    self.check_column_reference(&per_table, &format!("{t}.{n}"))?
-                }
-                SelectColumn::Aggregate(_, target) => {
-                    // COUNT(*) tallies rows and names no column.
-                    if target != "*" {
-                        self.check_column_reference(&per_table, target)?
+        // `*` expands to every column, so only the select list is skipped;
+        // ORDER BY and GROUP BY still name columns and must still resolve.
+        if !columns.iter().any(|c| matches!(c, SelectColumn::Star)) {
+            for col in columns {
+                match col {
+                    SelectColumn::Named(n) => self.check_column_reference(&per_table, n)?,
+                    SelectColumn::Qualified(t, n) => {
+                        self.check_column_reference(&per_table, &format!("{t}.{n}"))?
                     }
+                    SelectColumn::Aggregate(_, target) => {
+                        // COUNT(*) tallies rows and names no column.
+                        if target != "*" {
+                            self.check_column_reference(&per_table, target)?
+                        }
+                    }
+                    SelectColumn::WindowFunc { order_by: ob, .. } => {
+                        self.check_column_reference(&per_table, ob)?
+                    }
+                    SelectColumn::Star => {}
                 }
-                SelectColumn::WindowFunc { order_by: ob, .. } => {
-                    self.check_column_reference(&per_table, ob)?
-                }
-                SelectColumn::Star => {}
             }
         }
         for item in order_by {
@@ -1448,7 +1486,7 @@ impl SqlExecutor {
         }
 
         let mut col_names = Vec::new();
-        let mut result_rows = Vec::new();
+        let mut result_rows: Vec<Vec<Cell>> = Vec::new();
 
         for group_rows in groups.values() {
             let mut result_row = Vec::new();
@@ -1456,12 +1494,16 @@ impl SqlExecutor {
                 match col {
                     SelectColumn::Named(name) => {
                         col_names.push(name.clone());
-                        result_row.push(render(crate::volcano::row_lookup(group_rows[0], name)));
+                        result_row.push(
+                            crate::volcano::row_lookup(group_rows[0], name).map(str::to_string),
+                        );
                     }
                     SelectColumn::Qualified(t, n) => {
                         col_names.push(n.clone());
                         let key = format!("{}.{}", t, n);
-                        result_row.push(render(crate::volcano::row_lookup(group_rows[0], &key)));
+                        result_row.push(
+                            crate::volcano::row_lookup(group_rows[0], &key).map(str::to_string),
+                        );
                     }
                     SelectColumn::Aggregate(func, target) => {
                         let (name, val) = compute_aggregate(
@@ -1471,7 +1513,7 @@ impl SqlExecutor {
                             crate::volcano::type_lookup(col_types, target),
                         );
                         col_names.push(name);
-                        result_row.push(render(val.as_deref()));
+                        result_row.push(val);
                     }
                     _ => {}
                 }
@@ -1497,7 +1539,7 @@ impl SqlExecutor {
     ) -> Result<ExecResult, String> {
         let refs: Vec<&Row> = rows.iter().collect();
         let mut col_names = Vec::new();
-        let mut result_row = Vec::new();
+        let mut result_row: Vec<Cell> = Vec::new();
 
         for col in columns {
             if let SelectColumn::Aggregate(func, target) = col {
@@ -1508,7 +1550,7 @@ impl SqlExecutor {
                     crate::volcano::type_lookup(col_types, target),
                 );
                 col_names.push(name);
-                result_row.push(render(val.as_deref()));
+                result_row.push(val);
             }
         }
         Ok(ExecResult::Rows {
@@ -1522,7 +1564,7 @@ impl SqlExecutor {
         rows: &[Row],
         columns: &[SelectColumn],
         from: &FromClause,
-    ) -> Result<(Vec<String>, Vec<Vec<String>>), String> {
+    ) -> Result<(Vec<String>, Vec<Vec<Cell>>), String> {
         if columns.iter().any(|c| matches!(c, SelectColumn::Star)) {
             if rows.is_empty() {
                 return Ok((vec![], vec![]));
@@ -1553,15 +1595,11 @@ impl SqlExecutor {
                     keys.push(name.to_string());
                 }
             }
-            let result: Vec<Vec<String>> = rows
+            let result: Vec<Vec<Cell>> = rows
                 .iter()
                 .map(|r| {
                     keys.iter()
-                        .map(|k| {
-                            crate::volcano::row_lookup(r, k)
-                                .map(str::to_string)
-                                .unwrap_or_else(|| "NULL".into())
-                        })
+                        .map(|k| crate::volcano::row_lookup(r, k).map(str::to_string))
                         .collect()
                 })
                 .collect();
@@ -1588,33 +1626,34 @@ impl SqlExecutor {
             }
         }
 
-        let result: Vec<Vec<String>> = rows
+        let result: Vec<Vec<Cell>> = rows
             .iter()
             .map(|r| {
                 columns
                     .iter()
                     .map(|c| match c {
-                        SelectColumn::Named(n) => render(r.get(n).and_then(|v| v.as_deref())),
+                        SelectColumn::Named(n) => r.get(n).cloned().flatten(),
                         SelectColumn::Qualified(t, n) => {
-                            render(crate::volcano::row_lookup(r, &format!("{}.{}", t, n)))
+                            crate::volcano::row_lookup(r, &format!("{}.{}", t, n))
+                                .map(str::to_string)
                         }
-                        SelectColumn::Aggregate(func, target) => render(
-                            r.get(&format!(
+                        SelectColumn::Aggregate(func, target) => r
+                            .get(&format!(
                                 "{}({})",
                                 format!("{:?}", func).to_lowercase(),
                                 target
                             ))
-                            .and_then(|v| v.as_deref()),
-                        ),
+                            .cloned()
+                            .flatten(),
                         SelectColumn::WindowFunc { func, .. } => {
                             let key = match func {
                                 WindowFuncType::RowNumber => "row_number",
                                 WindowFuncType::Rank => "rank",
                                 WindowFuncType::DenseRank => "dense_rank",
                             };
-                            render(r.get(key).and_then(|v| v.as_deref()))
+                            r.get(key).cloned().flatten()
                         }
-                        _ => "NULL".into(),
+                        _ => None,
                     })
                     .collect()
             })
@@ -1634,9 +1673,6 @@ impl SqlExecutor {
             .get_table(table_name)
             .ok_or_else(|| format!("Table '{}' does not exist", table_name))?;
         self.record_catalog_read(table_name);
-        if table.row_format == crate::catalog::RowFormat::Legacy {
-            self.migrate_to_typed(&table)?;
-        }
         self.validate_where_columns_of(table_name, where_clause)?;
         // Validate the assignments before filtering: a statement that
         // matches no rows would otherwise skip the loop and silently accept
@@ -1652,7 +1688,13 @@ impl SqlExecutor {
             rows.retain(|row| eval_where_typed(row, expr, &col_types));
         }
 
-        let mut batch = WriteBatch::new();
+        // The migration batch lands first so its rewrite of an untouched
+        // row loses to this statement's write of the same (canonical) key.
+        let mut batch = if table.row_format == crate::catalog::RowFormat::Legacy {
+            self.migration_batch(&table)?
+        } else {
+            WriteBatch::new()
+        };
         let count = rows.len();
         for row in &mut rows {
             for (resolved, val) in &assignments {
@@ -1673,12 +1715,18 @@ impl SqlExecutor {
                 .cloned()
                 .flatten()
                 .unwrap_or_default();
-            let key = format!("{}{}", table.row_prefix(), pk);
+            // A legacy row may be stored under a non-canonical key ("007");
+            // the typed path addresses it as "7".
+            let key = format!(
+                "{}{}",
+                table.row_prefix(),
+                crate::volcano::canonicalize_pk_key(&table, &pk)
+            );
             let value = serde_json::to_string(&row).map_err(|e| format!("{}", e))?;
             batch.set(&key, value).map_err(|e| format!("{:?}", e))?;
         }
 
-        if count > 0 {
+        if !batch.is_empty() {
             self.stage_or_commit(batch)?;
         }
         Ok(ExecResult::Modified {
@@ -1705,7 +1753,13 @@ impl SqlExecutor {
             rows.retain(|row| eval_where_typed(row, expr, &col_types));
         }
 
-        let mut batch = WriteBatch::new();
+        // Deletes commit after the migration's rewrites inside one batch, so
+        // a row the statement removes disappears even if migration moved it.
+        let mut batch = if table.row_format == crate::catalog::RowFormat::Legacy {
+            self.migration_batch(&table)?
+        } else {
+            WriteBatch::new()
+        };
         let count = rows.len();
         for row in &rows {
             let pk = row
@@ -1713,11 +1767,15 @@ impl SqlExecutor {
                 .cloned()
                 .flatten()
                 .unwrap_or_default();
-            let key = format!("{}{}", table.row_prefix(), pk);
+            let key = format!(
+                "{}{}",
+                table.row_prefix(),
+                crate::volcano::canonicalize_pk_key(&table, &pk)
+            );
             batch.delete(&key).map_err(|e| format!("{:?}", e))?;
         }
 
-        if count > 0 {
+        if !batch.is_empty() {
             self.stage_or_commit(batch)?;
         }
         Ok(ExecResult::Modified {
@@ -1755,8 +1813,12 @@ fn resolve_column_name<'t>(table: &'t TableDef, col: &str) -> Result<&'t str, St
         })
 }
 
-fn render(cell: Option<&str>) -> String {
-    cell.unwrap_or("NULL").to_string()
+/// Renders one result row as protocol strings. This is the boundary where
+/// a SQL NULL becomes the text "NULL"; everything upstream keeps them apart.
+pub fn render_row(row: &[Cell]) -> Vec<String> {
+    row.iter()
+        .map(|cell| cell.clone().unwrap_or_else(|| "NULL".into()))
+        .collect()
 }
 
 fn eval_where(row: &Row, expr: &WhereExpr) -> bool {

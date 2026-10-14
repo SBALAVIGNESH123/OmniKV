@@ -1355,13 +1355,11 @@ pub fn compute_aggregate(
             (name, None)
         }
         AggFunc::Sum => {
-            if values.iter().all(|v| v.parse::<i64>().is_ok()) {
-                // i128, not i64: a full column of i64 values would otherwise
-                // overflow the accumulator.
-                let sum: i128 = values
-                    .iter()
-                    .map(|v| v.parse::<i64>().unwrap() as i128)
-                    .sum();
+            if values.iter().all(|v| v.parse::<i128>().is_ok()) {
+                // The integer domain is i128, so a column of values past the
+                // i64 limit still sums exactly instead of falling back to
+                // f64 and losing the low digits.
+                let sum: i128 = values.iter().map(|v| v.parse::<i128>().unwrap()).sum();
                 (name, Some(sum.to_string()))
             } else {
                 let sum: f64 = values.iter().filter_map(|v| v.parse::<f64>().ok()).sum();
@@ -1369,13 +1367,8 @@ pub fn compute_aggregate(
             }
         }
         AggFunc::Avg => {
-            if values.iter().all(|v| v.parse::<i64>().is_ok()) && !values.is_empty() {
-                // i128, not i64: a full column of i64 values would otherwise
-                // overflow the accumulator.
-                let sum: i128 = values
-                    .iter()
-                    .map(|v| v.parse::<i64>().unwrap() as i128)
-                    .sum();
+            if values.iter().all(|v| v.parse::<i128>().is_ok()) && !values.is_empty() {
+                let sum: i128 = values.iter().map(|v| v.parse::<i128>().unwrap()).sum();
                 let n = values.len() as i128;
                 (name, Some(avg_decimal(sum, n)))
             } else {
