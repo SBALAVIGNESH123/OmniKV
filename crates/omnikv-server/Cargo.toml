@@ -14,9 +14,10 @@ axum = { version = "0.7.5", features = ["macros"] }
 axum-server = { version = "0.8.0", features = ["tls-rustls"] }
 tower-http = { version = "0.5.2", features = ["cors"] }
 quinn = "0.11.9"
-# >=0.23.45: RUSTSEC-2026-0285 (TLS 1.3 handshake messages accepted
-# across encryption level boundaries).
-rustls = { version = "0.23.45", features = ["ring"] }
+# >=0.23.46: RUSTSEC-2026-0285 (TLS 1.3 handshake boundary),
+# RUSTSEC-2026-0346..0349 (ECH rejection, brotli alloc, ServerHello
+# downgrade, Debug TLS secret exposure).
+rustls = { version = "0.23.46", features = ["ring"] }
 tokio-rustls = "0.26"
 webpki-roots = "0.26"
 rcgen = "0.14.7"
