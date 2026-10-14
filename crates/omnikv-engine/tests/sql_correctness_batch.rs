@@ -587,7 +587,7 @@ fn i64_overflow_literal_stays_exact() {
     let bound = bind_statement_params(stmt, &[Some(big.to_string())]).unwrap();
     match e.execute(&bound) {
         Ok(ExecResult::Rows { rows, .. }) => {
-            assert_eq!(rows, vec![vec![Some("9223372036854775808".to_string())]])
+            assert_eq!(rows, vec![vec![Some("9223372036854775808".to_string())]]);
         }
         Ok(_) => panic!("bound i128 lookup returned no rows"),
         Err(e) => panic!("bound i128 lookup failed: {e}"),
