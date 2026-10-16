@@ -164,6 +164,77 @@ fn test_window_func_execution() {
     println!("✅ SQL 24c: Window function ROW_NUMBER executed on 4 rows");
 }
 
+/// Every window expression in a SELECT list must be evaluated. The executor
+/// used to stop after the first `ROW_NUMBER/RANK/DENSE_RANK` expression and
+/// leave the remaining projected columns NULL.
+#[test]
+fn test_multiple_window_functions_are_all_computed() {
+    let (_db, exec) = create_sql_env("wf_multi");
+
+    exec_sql(
+        &exec,
+        "CREATE TABLE scores (id INTEGER PRIMARY KEY, price INTEGER)",
+    );
+    exec_sql(&exec, "INSERT INTO scores (id, price) VALUES (1, 10)");
+    exec_sql(&exec, "INSERT INTO scores (id, price) VALUES (2, 30)");
+    exec_sql(&exec, "INSERT INTO scores (id, price) VALUES (3, 20)");
+
+    let (columns, rows) = exec_rows(
+        &exec,
+        "SELECT id, ROW_NUMBER() OVER (ORDER BY price DESC), \
+         RANK() OVER (ORDER BY price DESC), \
+         DENSE_RANK() OVER (ORDER BY price DESC) FROM scores",
+    );
+
+    assert_eq!(columns, vec!["id", "row_number", "rank", "dense_rank",]);
+    assert_eq!(
+        rows,
+        vec![
+            vec!["2", "1", "1", "1"],
+            vec!["3", "2", "2", "2"],
+            vec!["1", "3", "3", "3"],
+        ]
+    );
+}
+
+/// The query's outer ORDER BY is independent of a window's ordering. Window
+/// evaluation may sort its working rows, but the final result must honor the
+/// caller's requested order after the window values have been materialized.
+#[test]
+fn test_outer_order_by_is_preserved_after_window_functions() {
+    let (_db, exec) = create_sql_env("wf_outer_order");
+
+    exec_sql(
+        &exec,
+        "CREATE TABLE scores (id INTEGER PRIMARY KEY, price INTEGER)",
+    );
+    exec_sql(&exec, "INSERT INTO scores (id, price) VALUES (1, 10)");
+    exec_sql(&exec, "INSERT INTO scores (id, price) VALUES (2, 30)");
+    exec_sql(&exec, "INSERT INTO scores (id, price) VALUES (3, 20)");
+
+    let (_columns, rows) = exec_rows(
+        &exec,
+        "SELECT price, ROW_NUMBER() OVER (ORDER BY price DESC) \
+         FROM scores ORDER BY id ASC",
+    );
+
+    assert_eq!(
+        rows,
+        vec![vec!["10", "3"], vec!["30", "1"], vec!["20", "2"],]
+    );
+
+    let (_columns, rows) = exec_rows(
+        &exec,
+        "SELECT price, ROW_NUMBER() OVER (ORDER BY price DESC) \
+         FROM scores ORDER BY id ASC LIMIT 1",
+    );
+    assert_eq!(
+        rows,
+        vec![vec!["10", "3"]],
+        "LIMIT must apply after window numbering and outer ordering"
+    );
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // HAVING clause (parsed as part of GROUP BY)
 // ═══════════════════════════════════════════════════════════════════════════

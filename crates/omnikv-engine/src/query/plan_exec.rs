@@ -431,15 +431,19 @@ impl PlanExecutor {
             for col in columns {
                 match col {
                     SelectColumn::Named(name) => {
-                        if let Some(val) = row_lookup(group_rows[0], name).map(str::to_string) {
-                            row.insert(name.clone(), Some(val));
-                        }
+                        row.insert(
+                            name.clone(),
+                            row_lookup(group_rows[0], name).map(str::to_string),
+                        );
                     }
                     SelectColumn::Qualified(t, n) => {
                         let key = format!("{}.{}", t, n);
-                        if let Some(val) = row_lookup(group_rows[0], &key).map(str::to_string) {
-                            row.insert(key, Some(val));
-                        }
+                        row.insert(
+                            key.clone(),
+                            row_lookup(group_rows[0], &key).map(str::to_string),
+                        );
+                        row.entry(n.clone())
+                            .or_insert_with(|| row_lookup(group_rows[0], &key).map(str::to_string));
                     }
                     SelectColumn::Aggregate(func, target) => {
                         let (name, val) = compute_aggregate(
@@ -462,7 +466,48 @@ impl PlanExecutor {
 
     fn exec_project(&self, rows: &[Row], columns: &[SelectColumn]) -> Vec<Row> {
         if columns.iter().any(|c| matches!(c, SelectColumn::Star)) {
-            return rows.to_vec();
+            return rows
+                .iter()
+                .map(|row| {
+                    let mut projected = row.clone();
+                    // A star keeps the full row, but explicit columns beside
+                    // it still need validation and must not disappear from
+                    // the plan-driven projection.
+                    for col in columns {
+                        match col {
+                            SelectColumn::Named(name) => {
+                                if let Some(value) = row_lookup(row, name) {
+                                    projected.insert(name.clone(), Some(value.to_string()));
+                                }
+                            }
+                            SelectColumn::Qualified(table, name) => {
+                                let key = format!("{table}.{name}");
+                                projected
+                                    .insert(key.clone(), row_lookup(row, &key).map(str::to_string));
+                            }
+                            SelectColumn::Aggregate(func, target) => {
+                                let key =
+                                    format!("{}({})", format!("{:?}", func).to_lowercase(), target);
+                                if let Some(value) = row.get(&key) {
+                                    projected.insert(key, value.clone());
+                                }
+                            }
+                            SelectColumn::WindowFunc { func, .. } => {
+                                let key = match func {
+                                    crate::sql::WindowFuncType::RowNumber => "row_number",
+                                    crate::sql::WindowFuncType::Rank => "rank",
+                                    crate::sql::WindowFuncType::DenseRank => "dense_rank",
+                                };
+                                if let Some(value) = row.get(key) {
+                                    projected.insert(key.to_string(), value.clone());
+                                }
+                            }
+                            SelectColumn::Star => {}
+                        }
+                    }
+                    projected
+                })
+                .collect();
         }
         rows.iter()
             .map(|row| {

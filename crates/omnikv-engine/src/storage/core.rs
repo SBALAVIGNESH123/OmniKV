@@ -172,6 +172,56 @@ fn cleanup_obsolete_sstable_pair(path: &str, context: &'static str) {
     cleanup_obsolete_file(path.replace(".sst", ".bloom"), context);
 }
 
+/// Return the Bloom sidecar path for a base file. Base files use `.bin` in a
+/// fresh database and `.sst` after L1-to-base compaction, so replacing only
+/// `.bin` would make a reopen treat the SSTable itself as the Bloom file.
+pub(crate) fn bloom_path_for_base(path: &str) -> String {
+    let extension_is = |expected: &str| {
+        Path::new(path)
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case(expected))
+    };
+    if extension_is("sst") || extension_is("bin") {
+        Path::new(path)
+            .with_extension("bloom")
+            .to_string_lossy()
+            .into_owned()
+    } else {
+        format!("{path}.bloom")
+    }
+}
+
+fn cleanup_obsolete_base_pair(path: &str, context: &'static str) {
+    cleanup_obsolete_file(path, context);
+    cleanup_obsolete_file(bloom_path_for_base(path), context);
+}
+
+/// Removes newly-created compaction outputs if publication fails. A failed
+/// compaction must not leave orphaned data or Bloom sidecars that accumulate
+/// across retries and eventually exhaust the database volume.
+struct CompactionOutputGuard {
+    paths: Vec<String>,
+}
+
+impl CompactionOutputGuard {
+    fn new(paths: Vec<String>) -> Self {
+        Self { paths }
+    }
+
+    fn disarm(&mut self) {
+        self.paths.clear();
+    }
+}
+
+impl Drop for CompactionOutputGuard {
+    fn drop(&mut self) {
+        for path in &self.paths {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
 fn cleanup_obsolete_file_with<F>(
     path: &Path,
     context: &'static str,
@@ -411,12 +461,46 @@ pub struct BloomFilter {
     num_hashes: usize,
 }
 
+/// Atomically publish a small metadata file after its contents have reached
+/// stable storage. Readers either see the previous complete file or the new
+/// complete file; they never observe a partially-written JSON sidecar.
+fn atomic_replace(path: &str, content: &[u8]) -> Result<(), OmniError> {
+    let tmp_path = format!("{path}.tmp");
+    let result = (|| {
+        let mut file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&tmp_path)?;
+        file.write_all(content)?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&tmp_path, path)?;
+
+        // On Unix, syncing the directory makes the rename durable across a
+        // sudden power loss as well as making the file contents durable.
+        #[cfg(unix)]
+        if let Some(parent) = Path::new(path)
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            File::open(parent)?.sync_all()?;
+        }
+
+        Ok::<(), OmniError>(())
+    })();
+
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp_path);
+    }
+    result
+}
+
 impl BloomFilter {
     pub fn save(&self, path: &str) -> Result<(), OmniError> {
         let content = serde_json::to_string(self)
             .map_err(|e| OmniError::IoError(format!("Bloom filter serialize: {}", e)))?;
-        std::fs::write(path, content)?;
-        Ok(())
+        atomic_replace(path, content.as_bytes())
     }
 
     pub fn load(path: &str) -> Result<Self, OmniError> {
@@ -657,13 +741,7 @@ impl Manifest {
         to_save.format_version = MANIFEST_FORMAT_VERSION;
         let content = serde_json::to_string(&to_save)
             .map_err(|e| OmniError::IoError(format!("Manifest serialize: {}", e)))?;
-        let tmp_path = format!("{}.tmp", path);
-        std::fs::write(&tmp_path, content)?;
-        if let Ok(file) = std::fs::OpenOptions::new().write(true).open(&tmp_path) {
-            let _ = file.sync_all();
-        }
-        std::fs::rename(&tmp_path, path)?;
-        Ok(())
+        atomic_replace(path, content.as_bytes())
     }
 }
 
@@ -1202,7 +1280,9 @@ impl OmniKV {
             transition_guard: RwLock::new(()),
             cluster_gateway: std::sync::OnceLock::new(),
             ssi_history: std::sync::Arc::new(crate::transaction::SsiHistory::default()),
-            file_seq: std::sync::atomic::AtomicU64::new(0),
+            // Start from a process-unique seed so reopening a database does
+            // not immediately reuse the previous instance's token sequence.
+            file_seq: std::sync::atomic::AtomicU64::new(rand::random()),
             db_lock,
         }))
     }
@@ -1212,11 +1292,40 @@ impl OmniKV {
     // Compaction and reads use these; snapshot install bypasses them and swaps roots directly.
 
     /// A per-instance token unique across concurrent and back-to-back
-    /// compactions, so two outputs written in the same millisecond never
-    /// collide on `create_new`.
+    /// compactions. The random seed also avoids immediately reusing the
+    /// previous instance's token sequence after a reopen.
     fn next_file_token(&self) -> u64 {
         self.file_seq
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Creates a compaction output with an exclusive create. The token makes
+    /// normal output names unique; retrying on `AlreadyExists` makes that
+    /// guarantee hold even if a previous process used the same random seed or
+    /// left an output file behind after a crash.
+    fn create_unique_output<F>(&self, mut path_for_token: F) -> Result<(String, File), OmniError>
+    where
+        F: FnMut(u64) -> String,
+    {
+        const MAX_ATTEMPTS: usize = 32;
+
+        for _ in 0..MAX_ATTEMPTS {
+            let path = path_for_token(self.next_file_token());
+            match OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .read(true)
+                .open(&path)
+            {
+                Ok(file) => return Ok((path, file)),
+                Err(err) if err.kind() == ErrorKind::AlreadyExists => {}
+                Err(err) => return Err(err.into()),
+            }
+        }
+
+        Err(OmniError::IoError(
+            "unable to allocate a unique compaction output path after 32 attempts".into(),
+        ))
     }
 
     #[inline]
@@ -1322,7 +1431,7 @@ impl OmniKV {
         let base_mmap = Arc::new(unsafe { MmapOptions::new().map(&base_file)? });
 
         let reader = SSTableReader::from_mmap(base_mmap.clone());
-        let base_bloom_path = manifest.base_path.replace(".bin", ".bloom");
+        let base_bloom_path = bloom_path_for_base(&manifest.base_path);
         let base_bloom = match BloomFilter::load(&base_bloom_path) {
             Ok(b) => b,
             Err(_) => {
@@ -2488,21 +2597,19 @@ impl OmniKV {
             bloom.add(h.finish());
         }
 
-        let sst_path = format!(
-            "{}_l0_0_{}_{}.sst",
-            self.manifest_path,
-            std::time::UNIX_EPOCH
-                .elapsed()
-                .unwrap_or_default()
-                .as_millis(),
-            self.next_file_token()
-        );
-        let _ = bloom.save(&sst_path.replace(".sst", ".bloom"));
-        let file = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .read(true)
-            .open(&sst_path)?;
+        let (sst_path, file) = self.create_unique_output(|token| {
+            format!(
+                "{}_l0_0_{}_{}.sst",
+                self.manifest_path,
+                std::time::UNIX_EPOCH
+                    .elapsed()
+                    .unwrap_or_default()
+                    .as_millis(),
+                token
+            )
+        })?;
+        let mut output_guard =
+            CompactionOutputGuard::new(vec![sst_path.clone(), sst_path.replace(".sst", ".bloom")]);
 
         let mut writer = SSTableWriter::new(&file);
         for rec in &records {
@@ -2511,6 +2618,7 @@ impl OmniKV {
         writer.finish()?;
 
         file.sync_all()?;
+        bloom.save(&sst_path.replace(".sst", ".bloom"))?;
 
         // SAFETY: The new L0 SSTable is fully written, flushed, and fsynced
         // before this read-only mapping is created. After publication, OmniKV
@@ -2532,6 +2640,7 @@ impl OmniKV {
             sstables: Arc::new(sstables),
             ..r.clone()
         });
+        output_guard.disarm();
 
         self.remove_frozen_memtable(frozen_idx)?;
         stats.record(
@@ -2622,27 +2731,26 @@ impl OmniKV {
             bloom.add(h.finish());
         }
 
-        let sst_path = format!(
-            "{}_l1_{}_{}.sst",
-            self.manifest_path,
-            std::time::UNIX_EPOCH
-                .elapsed()
-                .unwrap_or_default()
-                .as_millis(),
-            self.next_file_token()
-        );
-        let _ = bloom.save(&sst_path.replace(".sst", ".bloom"));
-        let file = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .read(true)
-            .open(&sst_path)?;
+        let (sst_path, file) = self.create_unique_output(|token| {
+            format!(
+                "{}_l1_{}_{}.sst",
+                self.manifest_path,
+                std::time::UNIX_EPOCH
+                    .elapsed()
+                    .unwrap_or_default()
+                    .as_millis(),
+                token
+            )
+        })?;
+        let mut output_guard =
+            CompactionOutputGuard::new(vec![sst_path.clone(), sst_path.replace(".sst", ".bloom")]);
         let mut writer = SSTableWriter::new(&file);
         for rec in &records {
             writer.append(rec)?;
         }
         writer.finish()?;
         file.sync_all()?;
+        bloom.save(&sst_path.replace(".sst", ".bloom"))?;
 
         // SAFETY: The new L1 SSTable is fully materialized and synced before
         // mapping. Compaction installs the mapping via an atomic root swap and
@@ -2664,6 +2772,7 @@ impl OmniKV {
             sstables: Arc::new(Vec::new()),
             ..r.clone()
         });
+        output_guard.disarm();
 
         let old_paths: Vec<String> = sstables.iter().map(|(_, _, p)| p.clone()).collect();
         std::thread::spawn(move || {
@@ -2753,27 +2862,28 @@ impl OmniKV {
             bloom.add(h.finish());
         }
 
-        let new_base_path = format!(
-            "{}_base_{}_{}.sst",
-            self.manifest_path,
-            std::time::UNIX_EPOCH
-                .elapsed()
-                .unwrap_or_default()
-                .as_millis(),
-            self.next_file_token()
-        );
-        let file = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .read(true)
-            .open(&new_base_path)?;
-
+        let (new_base_path, file) = self.create_unique_output(|token| {
+            format!(
+                "{}_base_{}_{}.sst",
+                self.manifest_path,
+                std::time::UNIX_EPOCH
+                    .elapsed()
+                    .unwrap_or_default()
+                    .as_millis(),
+                token
+            )
+        })?;
+        let mut output_guard = CompactionOutputGuard::new(vec![
+            new_base_path.clone(),
+            new_base_path.replace(".sst", ".bloom"),
+        ]);
         let mut writer = SSTableWriter::new(&file);
         for rec in &records {
             writer.append(rec)?;
         }
         writer.finish()?;
         file.sync_all()?;
+        bloom.save(&new_base_path.replace(".sst", ".bloom"))?;
 
         // SAFETY: The replacement base SSTable is complete and fsynced before
         // mapping. Existing readers retain Arc-owned mappings for old files,
@@ -2802,6 +2912,7 @@ impl OmniKV {
             manifest: Arc::new(manifest),
             ..r.clone()
         });
+        output_guard.disarm();
 
         let old_paths: Vec<String> = l1_sstables_snap[..num_l1_merged]
             .iter()
@@ -2809,7 +2920,7 @@ impl OmniKV {
             .collect();
         std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_secs(5));
-            cleanup_obsolete_file(&old_base_path, "l1_to_base_cleanup");
+            cleanup_obsolete_base_pair(&old_base_path, "l1_to_base_cleanup");
             for path in old_paths {
                 cleanup_obsolete_sstable_pair(&path, "l1_to_base_cleanup");
             }
@@ -2907,35 +3018,39 @@ impl OmniKV {
             }
         }
 
-        let new_heap_path = format!(
-            "{}_heap_compacted_{}_{}.bin",
-            self.manifest_path,
-            std::time::UNIX_EPOCH
-                .elapsed()
-                .unwrap_or_default()
-                .as_millis(),
-            self.next_file_token()
-        );
-        let new_base_path = format!(
-            "{}_database_compacted_{}_{}.bin",
-            self.manifest_path,
-            std::time::UNIX_EPOCH
-                .elapsed()
-                .unwrap_or_default()
-                .as_millis(),
-            self.next_file_token()
-        );
-
-        let new_heap_file = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .read(true)
-            .open(&new_heap_path)?;
-        let new_base_file = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .read(true)
-            .open(&new_base_path)?;
+        let (new_heap_path, new_heap_file) = self.create_unique_output(|token| {
+            format!(
+                "{}_heap_compacted_{}_{}.bin",
+                self.manifest_path,
+                std::time::UNIX_EPOCH
+                    .elapsed()
+                    .unwrap_or_default()
+                    .as_millis(),
+                token
+            )
+        })?;
+        let (new_base_path, new_base_file) = match self.create_unique_output(|token| {
+            format!(
+                "{}_database_compacted_{}_{}.bin",
+                self.manifest_path,
+                std::time::UNIX_EPOCH
+                    .elapsed()
+                    .unwrap_or_default()
+                    .as_millis(),
+                token
+            )
+        }) {
+            Ok(output) => output,
+            Err(err) => {
+                let _ = std::fs::remove_file(&new_heap_path);
+                return Err(err);
+            }
+        };
+        let mut output_guard = CompactionOutputGuard::new(vec![
+            new_heap_path.clone(),
+            new_base_path.clone(),
+            bloom_path_for_base(&new_base_path),
+        ]);
 
         let mut new_heap_writer = BufWriter::new(&new_heap_file);
         let mut base_sst_writer = SSTableWriter::new(&new_base_file);
@@ -3011,17 +3126,17 @@ impl OmniKV {
         let new_base_mmap = unsafe { MmapOptions::new().map(&new_base_file)? };
 
         let new_heap_reader = OpenOptions::new().read(true).open(&new_heap_path)?;
-        let manifest_for_roots = {
-            let old_manifest = self.roots.load().manifest.clone().as_ref().clone();
-            let mut manifest = old_manifest.clone();
-            manifest.heap_path = new_heap_path.clone();
-            manifest.base_path = new_base_path.clone();
-            manifest.sstables.clear();
-            manifest.l1_sstables.clear();
-            manifest.save(&self.manifest_path)?;
-            manifest
-        };
-        let _ = bloom.save(&new_base_path.replace(".bin", ".bloom"));
+        // Capture the pre-GC manifest before publishing the replacement
+        // topology. Cleanup must delete these obsolete files, never the new
+        // paths that are about to become the active roots.
+        let old_manifest = self.roots.load().manifest.clone().as_ref().clone();
+        let mut manifest_for_roots = old_manifest.clone();
+        manifest_for_roots.heap_path = new_heap_path.clone();
+        manifest_for_roots.base_path = new_base_path.clone();
+        manifest_for_roots.sstables.clear();
+        manifest_for_roots.l1_sstables.clear();
+        bloom.save(&bloom_path_for_base(&new_base_path))?;
+        manifest_for_roots.save(&self.manifest_path)?;
 
         let cur = self.roots.load();
         self.roots.store(Arc::new(StorageRoots {
@@ -3034,6 +3149,7 @@ impl OmniKV {
             memtable: cur.memtable.clone(),
             frozen_memtables: cur.frozen_memtables.clone(),
         }));
+        output_guard.disarm();
         self.block_cache.invalidate_all();
 
         let mut heap_lock = self
@@ -3049,12 +3165,10 @@ impl OmniKV {
         // These entries are harmless duplicates that will be deduplicated
         // during the next compaction cycle.
 
-        let old_manifest = self.roots.load().manifest.clone();
-
         std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_secs(5));
             cleanup_obsolete_file(&old_manifest.heap_path, "heap_gc_cleanup");
-            cleanup_obsolete_file(&old_manifest.base_path, "heap_gc_cleanup");
+            cleanup_obsolete_base_pair(&old_manifest.base_path, "heap_gc_cleanup");
             for p in old_manifest
                 .sstables
                 .iter()

@@ -52,7 +52,9 @@ argon2 = "0.5.3"
 password-hash = "0.6.1"
 regex = "1.11"
 openraft = { version = "0.9.24", features = ["serde"] }
-rustls = { version = "0.23", features = ["ring"] }
+# Keep the engine's direct dependency pinned to the patched release. A broad
+# 0.23 range lets a fresh lockfile select a vulnerable earlier patch version.
+rustls = { version = "0.23.46", features = ["ring"] }
 
 [dev-dependencies]
 proptest = "1.9.0"

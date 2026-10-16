@@ -813,6 +813,135 @@ fn big_integer_sum_is_exact() {
     );
 }
 
+/// Aggregating two valid i128 values must not panic in debug or wrap in
+/// release when the sum exceeds the width of one stored integer.
+#[test]
+fn aggregate_sum_and_avg_are_safe_past_i128() {
+    let e = create_env("big_int_overflow");
+    exec(&e, "CREATE TABLE t (id INTEGER PRIMARY KEY, v BIGINT)");
+    let max = "170141183460469231731687303715884105727";
+    exec(&e, &format!("INSERT INTO t (id, v) VALUES (1, {max})"));
+    exec(&e, &format!("INSERT INTO t (id, v) VALUES (2, {max})"));
+
+    assert_eq!(
+        rows(&e, "SELECT SUM(v) FROM t"),
+        vec![vec!["340282366920938463463374607431768211454".to_string()]]
+    );
+    assert_eq!(
+        rows(&e, "SELECT AVG(v) FROM t"),
+        vec![vec![max.to_string()]]
+    );
+}
+
+/// Canonical numeric primary-key aliases are duplicates, both across
+/// statements and within one multi-row INSERT; a failed statement is atomic.
+#[test]
+fn insert_rejects_canonical_primary_key_duplicates() {
+    let e = create_env("insert_pk_dupes");
+    exec(&e, "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)");
+    exec(&e, "INSERT INTO t (id, v) VALUES (7, 'first')");
+
+    let duplicate = err(&e, "INSERT INTO t (id, v) VALUES ('007', 'second')");
+    assert!(
+        duplicate.contains("duplicate key"),
+        "duplicate error: {duplicate}"
+    );
+    assert_eq!(
+        rows(&e, "SELECT v FROM t WHERE id = 7"),
+        vec![vec!["first".to_string()]]
+    );
+
+    let duplicate_in_batch = err(&e, "INSERT INTO t (id, v) VALUES (8, 'a'), (8, 'b')");
+    assert!(
+        duplicate_in_batch.contains("duplicate key"),
+        "in-statement duplicate error: {duplicate_in_batch}"
+    );
+    assert_eq!(
+        rows(&e, "SELECT id FROM t WHERE id = 8"),
+        Vec::<Vec<String>>::new()
+    );
+}
+
+/// HAVING and ORDER BY can reference hidden group/aggregate expressions, and
+/// HAVING must filter before an outer LIMIT consumes a group.
+#[test]
+fn grouped_having_retains_hidden_expressions_and_filters_before_limit() {
+    let e = create_env("having_hidden");
+    exec(&e, "CREATE TABLE t (id INTEGER PRIMARY KEY, region TEXT)");
+    exec(
+        &e,
+        "INSERT INTO t (id, region) VALUES (1, 'a'), (2, 'b'), (3, 'b')",
+    );
+
+    assert_eq!(
+        rows(
+            &e,
+            "SELECT region FROM t GROUP BY region HAVING COUNT(*) > 1"
+        ),
+        vec![vec!["b".to_string()]]
+    );
+    assert_eq!(
+        rows(
+            &e,
+            "SELECT COUNT(*) FROM t GROUP BY region HAVING region = 'b'"
+        ),
+        vec![vec!["2".to_string()]]
+    );
+    assert_eq!(
+        rows(
+            &e,
+            "SELECT region, COUNT(*) FROM t GROUP BY region \
+             HAVING COUNT(*) > 1 ORDER BY region LIMIT 1"
+        ),
+        vec![vec!["b".to_string(), "2".to_string()]]
+    );
+
+    let invalid = err(
+        &e,
+        "SELECT region, COUNT(*) FROM t GROUP BY region HAVING no_such_column = 1",
+    );
+    assert!(
+        invalid.contains("does not exist"),
+        "invalid HAVING: {invalid}"
+    );
+}
+
+/// A star is an expansion item, not a replacement for the rest of the SELECT
+/// list. Explicit columns remain visible and are still validated.
+#[test]
+fn star_mixed_with_explicit_columns_is_preserved_and_validated() {
+    let e = create_env("star_mixed");
+    exec(&e, "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)");
+    exec(&e, "INSERT INTO t (id, v) VALUES (1, 'x')");
+
+    assert_eq!(
+        rows(&e, "SELECT *, id FROM t"),
+        vec![vec!["1".to_string(), "x".to_string(), "1".to_string(),]]
+    );
+    let invalid = err(&e, "SELECT *, no_such_column FROM t");
+    assert!(
+        invalid.contains("does not exist"),
+        "invalid mixed star: {invalid}"
+    );
+}
+
+/// JOIN ON uses the same exact-case read contract as WHERE and projection;
+/// accepting a wrong-case key must not silently produce an empty join.
+#[test]
+fn join_on_wrong_case_is_rejected() {
+    let e = create_env("join_case");
+    exec(&e, "CREATE TABLE a (id INTEGER PRIMARY KEY, k TEXT)");
+    exec(&e, "CREATE TABLE b (id INTEGER PRIMARY KEY, k TEXT)");
+    exec(&e, "INSERT INTO a (id, k) VALUES (1, 'x')");
+    exec(&e, "INSERT INTO b (id, k) VALUES (1, 'x')");
+
+    let invalid = err(&e, "SELECT a.id, b.id FROM a JOIN b ON a.K = b.K");
+    assert!(
+        invalid.contains("does not exist"),
+        "invalid JOIN key: {invalid}"
+    );
+}
+
 /// The first row of a window always starts its own peer group, so a leading
 /// NULL is ranked 1 rather than tied with nothing.
 #[test]

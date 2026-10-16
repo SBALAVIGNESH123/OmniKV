@@ -492,6 +492,52 @@ fn test_l1_to_base_and_gc_preserve_active_snapshot_across_delete() {
     );
 }
 
+/// GC cleanup must retain the newly-published heap, base, and Bloom sidecar.
+/// This waits past the asynchronous cleanup delay and then reopens the store,
+/// catching the regression where cleanup captured the post-GC manifest.
+#[test]
+fn test_gc_cleanup_never_deletes_newly_published_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let manifest = dir.path().join("gc_publish_manifest.json");
+    let wal = dir.path().join("gc_publish_wal.bin");
+    let db = OmniKV::open(manifest.to_str().unwrap(), wal.to_str().unwrap()).unwrap();
+
+    write_n(&db, "gc_publish", 64);
+    db.compact_sstables().unwrap();
+    db.compact_l0_to_l1().unwrap();
+    db.compact_l1_to_l2().unwrap();
+    db.run_garbage_collection().unwrap();
+
+    let (heap_path, base_path) = {
+        let roots = db.load_roots();
+        let base_path = roots.manifest.base_path.clone();
+        assert!(
+            std::path::Path::new(&base_path.replace(".bin", ".bloom")).exists(),
+            "L2 compaction must publish its Bloom sidecar"
+        );
+        (roots.manifest.heap_path.clone(), base_path)
+    };
+
+    std::thread::sleep(std::time::Duration::from_secs(6));
+
+    assert!(
+        std::path::Path::new(&heap_path).exists(),
+        "GC cleanup deleted the active heap file"
+    );
+    assert!(
+        std::path::Path::new(&base_path).exists(),
+        "GC cleanup deleted the active base file"
+    );
+    assert!(
+        std::path::Path::new(&base_path.replace(".bin", ".bloom")).exists(),
+        "GC cleanup deleted the active base Bloom sidecar"
+    );
+
+    drop(db);
+    let reopened = OmniKV::open(manifest.to_str().unwrap(), wal.to_str().unwrap()).unwrap();
+    verify_n(&reopened, "gc_publish", 64);
+}
+
 #[test]
 fn test_replica_retention_floor_lifecycle() {
     let (db, _dir) = create_temp_db("replica_retention_lifecycle");

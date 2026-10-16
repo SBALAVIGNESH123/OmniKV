@@ -765,15 +765,13 @@ impl AggregateIter {
             for col in &agg_columns {
                 match col {
                     SelectColumn::Named(name) => {
-                        if let Some(val) = row_lookup(refs[0], name).map(str::to_string) {
-                            row.insert(name.clone(), Some(val));
-                        }
+                        row.insert(name.clone(), row_lookup(refs[0], name).map(str::to_string));
                     }
                     SelectColumn::Qualified(t, n) => {
                         let key = format!("{}.{}", t, n);
-                        if let Some(val) = row_lookup(refs[0], &key).map(str::to_string) {
-                            row.insert(key, Some(val));
-                        }
+                        row.insert(key.clone(), row_lookup(refs[0], &key).map(str::to_string));
+                        row.entry(n.clone())
+                            .or_insert_with(|| row_lookup(refs[0], &key).map(str::to_string));
                     }
                     SelectColumn::Aggregate(func, target) => {
                         let (name, val) =
@@ -1286,46 +1284,189 @@ pub(crate) fn cmp_by_type(a: &str, b: &str, col_type: Option<&ColumnType>) -> st
     }
 }
 
+/// Add two non-negative decimal integers without imposing an i128-sized
+/// accumulator. INTEGER columns are stored as i128 values, but an aggregate
+/// over several valid rows can exceed that domain; decimal strings keep the
+/// result exact instead of panicking in debug or wrapping in release.
+fn add_abs_decimal(left: &str, right: &str) -> String {
+    let mut out = Vec::with_capacity(left.len().max(right.len()) + 1);
+    let mut i = left.len();
+    let mut j = right.len();
+    let mut carry = 0u8;
+    while i > 0 || j > 0 || carry != 0 {
+        let a = if i > 0 {
+            i -= 1;
+            left.as_bytes()[i] - b'0'
+        } else {
+            0
+        };
+        let b = if j > 0 {
+            j -= 1;
+            right.as_bytes()[j] - b'0'
+        } else {
+            0
+        };
+        let digit = a + b + carry;
+        out.push(b'0' + digit % 10);
+        carry = digit / 10;
+    }
+    out.reverse();
+    String::from_utf8(out).expect("decimal digits are valid UTF-8")
+}
+
+fn cmp_abs_decimal(left: &str, right: &str) -> std::cmp::Ordering {
+    let left = left.trim_start_matches('0');
+    let right = right.trim_start_matches('0');
+    left.len().cmp(&right.len()).then_with(|| left.cmp(right))
+}
+
+/// Subtract `right` from `left` where both are non-negative and left >= right.
+fn sub_abs_decimal(left: &str, right: &str) -> String {
+    let mut out = Vec::with_capacity(left.len());
+    let mut i = left.len();
+    let mut j = right.len();
+    let mut borrow = 0i8;
+    while i > 0 {
+        i -= 1;
+        let mut digit = (left.as_bytes()[i] - b'0') as i8 - borrow;
+        let other = if j > 0 {
+            j -= 1;
+            (right.as_bytes()[j] - b'0') as i8
+        } else {
+            0
+        };
+        if digit < other {
+            digit += 10;
+            borrow = 1;
+        } else {
+            borrow = 0;
+        }
+        out.push((digit - other) as u8 + b'0');
+    }
+    while out.len() > 1 && out.last() == Some(&b'0') {
+        out.pop();
+    }
+    out.reverse();
+    String::from_utf8(out).expect("decimal digits are valid UTF-8")
+}
+
+fn normalized_decimal(value: &str) -> (bool, &str) {
+    let (negative, digits) = value
+        .strip_prefix('-')
+        .map_or((false, value), |v| (true, v));
+    let digits = digits.strip_prefix('+').unwrap_or(digits);
+    let digits = digits.trim_start_matches('0');
+    if digits.is_empty() {
+        (false, "0")
+    } else {
+        (negative, digits)
+    }
+}
+
+fn add_signed_decimal(left: &str, right: &str) -> String {
+    let (left_negative, left_abs) = normalized_decimal(left);
+    let (right_negative, right_abs) = normalized_decimal(right);
+    if left_negative == right_negative {
+        let sum = add_abs_decimal(left_abs, right_abs);
+        if left_negative && sum != "0" {
+            format!("-{sum}")
+        } else {
+            sum
+        }
+    } else {
+        match cmp_abs_decimal(left_abs, right_abs) {
+            std::cmp::Ordering::Equal => "0".to_string(),
+            std::cmp::Ordering::Greater => {
+                let difference = sub_abs_decimal(left_abs, right_abs);
+                if left_negative {
+                    format!("-{difference}")
+                } else {
+                    difference
+                }
+            }
+            std::cmp::Ordering::Less => {
+                let difference = sub_abs_decimal(right_abs, left_abs);
+                if right_negative {
+                    format!("-{difference}")
+                } else {
+                    difference
+                }
+            }
+        }
+    }
+}
+
 /// `sum / n` as a decimal string. A terminating fraction renders in full; a
-/// repeating one is rounded half-up at `FRAC_DIGITS` places rather than
-/// truncated at an arbitrary fixed point.
-fn avg_decimal(sum: i128, n: i128) -> String {
+/// repeating one is rounded half-up at `FRAC_DIGITS` places. The sum is kept
+/// as a decimal string so AVG remains safe when SUM exceeds i128.
+fn avg_decimal(sum: &str, n: usize) -> String {
     const FRAC_DIGITS: usize = 15;
-    let neg = sum < 0;
-    let mut rem = sum.unsigned_abs();
-    let n = n.unsigned_abs();
-    let int_part = rem / n;
-    rem %= n;
-    if rem == 0 {
-        return format!("{}{int_part}", if neg { "-" } else { "" });
+    debug_assert!(n > 0);
+    let (negative, absolute_sum) = normalized_decimal(sum);
+    let divisor = n as u128;
+    let mut quotient = String::new();
+    let mut remainder = 0u128;
+    for byte in absolute_sum.bytes() {
+        let current = remainder * 10 + u128::from(byte - b'0');
+        let digit = current / divisor;
+        remainder = current % divisor;
+        if !quotient.is_empty() || digit != 0 {
+            quotient.push(char::from(b'0' + digit as u8));
+        }
     }
-    let mut digits: Vec<u8> = Vec::with_capacity(FRAC_DIGITS);
-    while rem != 0 && digits.len() < FRAC_DIGITS {
-        rem *= 10;
-        digits.push((rem / n) as u8);
-        rem %= n;
+    if quotient.is_empty() {
+        quotient.push('0');
     }
-    // A remainder here means the expansion continues past the kept digits.
-    if rem != 0 {
-        rem *= 10;
-        if rem / n >= 5 {
-            for i in (0..FRAC_DIGITS).rev() {
-                if digits[i] < 9 {
-                    digits[i] += 1;
+    if remainder == 0 {
+        return if negative && quotient != "0" {
+            format!("-{quotient}")
+        } else {
+            quotient
+        };
+    }
+
+    let mut digits = Vec::with_capacity(FRAC_DIGITS);
+    while remainder != 0 && digits.len() < FRAC_DIGITS {
+        remainder *= 10;
+        digits.push((remainder / divisor) as u8);
+        remainder %= divisor;
+    }
+
+    if remainder != 0 {
+        let next = remainder * 10 / divisor;
+        if next >= 5 {
+            let mut carried = true;
+            for digit in digits.iter_mut().rev() {
+                if *digit < 9 {
+                    *digit += 1;
+                    carried = false;
                     break;
                 }
-                digits[i] = 0;
-                if i == 0 {
-                    return format!("{}{}", if neg { "-" } else { "" }, int_part + 1);
-                }
+                *digit = 0;
+            }
+            if carried {
+                quotient = add_abs_decimal(&quotient, "1");
+                digits.clear();
             }
         }
     }
     while digits.last() == Some(&0) {
         digits.pop();
     }
-    let frac: String = digits.iter().map(|d| (b'0' + d) as char).collect();
-    format!("{}{int_part}.{frac}", if neg { "-" } else { "" })
+    let fraction: String = digits
+        .iter()
+        .map(|digit| char::from(b'0' + *digit))
+        .collect();
+    let result = if fraction.is_empty() {
+        quotient
+    } else {
+        format!("{quotient}.{fraction}")
+    };
+    if negative && result != "0" {
+        format!("-{result}")
+    } else {
+        result
+    }
 }
 
 pub fn compute_aggregate(
@@ -1356,11 +1497,13 @@ pub fn compute_aggregate(
         }
         AggFunc::Sum => {
             if values.iter().all(|v| v.parse::<i128>().is_ok()) {
-                // The integer domain is i128, so a column of values past the
-                // i64 limit still sums exactly instead of falling back to
-                // f64 and losing the low digits.
-                let sum: i128 = values.iter().map(|v| v.parse::<i128>().unwrap()).sum();
-                (name, Some(sum.to_string()))
+                // The integer domain is i128, but a valid aggregate can be
+                // wider than one row. Decimal accumulation stays exact and
+                // cannot panic or wrap when the sum exceeds i128.
+                let sum = values.iter().fold("0".to_string(), |sum, value| {
+                    add_signed_decimal(&sum, value)
+                });
+                (name, Some(sum))
             } else {
                 let sum: f64 = values.iter().filter_map(|v| v.parse::<f64>().ok()).sum();
                 (name, Some(sum.to_string()))
@@ -1368,9 +1511,10 @@ pub fn compute_aggregate(
         }
         AggFunc::Avg => {
             if values.iter().all(|v| v.parse::<i128>().is_ok()) && !values.is_empty() {
-                let sum: i128 = values.iter().map(|v| v.parse::<i128>().unwrap()).sum();
-                let n = values.len() as i128;
-                (name, Some(avg_decimal(sum, n)))
+                let sum = values.iter().fold("0".to_string(), |sum, value| {
+                    add_signed_decimal(&sum, value)
+                });
+                (name, Some(avg_decimal(&sum, values.len())))
             } else {
                 let avg = values
                     .iter()

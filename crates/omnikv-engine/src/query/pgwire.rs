@@ -141,7 +141,7 @@ struct Portal {
 /// The retained result of a partially-consumed portal.
 struct SuspendedRows {
     columns: Vec<(String, i32)>,
-    rows: Vec<Vec<String>>,
+    rows: Vec<Vec<Option<String>>>,
     tag: String,
     streamed: usize,
 }
@@ -184,7 +184,7 @@ enum StepOutcome {
     /// CommandComplete tag appended by the writer.
     Rows {
         columns: Vec<(String, i32)>,
-        rows: Vec<Vec<String>>,
+        rows: Vec<Vec<Option<String>>>,
         tag: String,
     },
     /// Benign warning (e.g. COMMIT with no open transaction) — the frame is
@@ -1631,8 +1631,7 @@ fn handle_execute(
     // came from Describe(portal) or Describe(statement)+Bind; Execute
     // streams DataRows only, on every round.
     for row in &rows[start..end] {
-        let refs: Vec<&str> = row.iter().map(String::as_str).collect();
-        send_data_row(stream, &refs)?;
+        send_data_row(stream, row)?;
     }
     if suspended_now {
         let portal = conn.portals.get_mut(portal_name);
@@ -1746,8 +1745,7 @@ fn write_step_outcome_simple(stream: &mut PgStream, outcome: StepOutcome) -> std
                 columns.iter().map(|(c, oid)| (c.as_str(), *oid)).collect();
             send_row_description(stream, &col_defs)?;
             for row in &rows {
-                let refs: Vec<&str> = row.iter().map(String::as_str).collect();
-                send_data_row(stream, &refs)?;
+                send_data_row(stream, row)?;
             }
             send_command_complete(stream, &tag)?;
         }
@@ -1979,7 +1977,9 @@ fn merge_staged_writes_into_txn(
 /// 42P01 undefined table, 42P07 duplicate table, and the catch-all
 /// internal-error code.
 fn sqlstate_for_exec_error(e: &str) -> &'static str {
-    if e.contains("column \"") && e.contains("does not exist") {
+    if e.contains("duplicate key value violates primary key") {
+        "23505"
+    } else if e.contains("column \"") && e.contains("does not exist") {
         "42703"
     } else if e.contains("is ambiguous") {
         "42702"
@@ -2019,7 +2019,7 @@ fn execute_non_transactional_statement(
     if normalized == "SELECT 1" || normalized.starts_with("SELECT VERSION") {
         return StepOutcome::Rows {
             columns: vec![("version".into(), 25)],
-            rows: vec![vec!["OmniKV 0.1.0 — Distributed KV Engine".into()]],
+            rows: vec![vec![Some("OmniKV 0.1.0 — Distributed KV Engine".into())]],
             tag: "SELECT 1".into(),
         };
     }
@@ -2084,10 +2084,7 @@ fn execute_non_transactional_statement(
                     let tag = format!("SELECT {}", rows.len());
                     StepOutcome::Rows {
                         columns: columns.into_iter().map(|c| (c, 25)).collect(),
-                        rows: rows
-                            .into_iter()
-                            .map(|row| crate::sql_exec::render_row(&row))
-                            .collect(),
+                        rows,
                         tag,
                     }
                 }
@@ -2185,7 +2182,7 @@ fn execute_parsed_kv_query(
                 if rows.len() >= limit {
                     break;
                 }
-                rows.push(vec![key.clone(), value.clone()]);
+                rows.push(vec![Some(key.clone()), Some(value.clone())]);
             }
 
             let count = rows.len();
@@ -2202,7 +2199,7 @@ fn execute_parsed_kv_query(
 
             StepOutcome::Rows {
                 columns: vec![("count".into(), 20)],
-                rows: vec![vec![results.len().to_string()]],
+                rows: vec![vec![Some(results.len().to_string())]],
                 tag: "SELECT 1".into(),
             }
         }
@@ -2492,21 +2489,30 @@ fn send_parameter_description(stream: &mut PgStream, oids: &[u32]) -> std::io::R
     stream.write_all(&buf)
 }
 
-fn send_data_row(stream: &mut PgStream, values: &[&str]) -> std::io::Result<()> {
+fn send_data_row(stream: &mut PgStream, values: &[Option<String>]) -> std::io::Result<()> {
+    stream.write_all(&data_row_bytes(values))
+}
+
+fn data_row_bytes(values: &[Option<String>]) -> Vec<u8> {
     let mut body = Vec::new();
     body.extend_from_slice(&(values.len() as i16).to_be_bytes());
 
     for val in values {
-        let bytes = val.as_bytes();
-        body.extend_from_slice(&(bytes.len() as i32).to_be_bytes());
-        body.extend_from_slice(bytes);
+        match val {
+            None => body.extend_from_slice(&(-1i32).to_be_bytes()),
+            Some(val) => {
+                let bytes = val.as_bytes();
+                body.extend_from_slice(&(bytes.len() as i32).to_be_bytes());
+                body.extend_from_slice(bytes);
+            }
+        }
     }
 
     let mut buf = Vec::new();
     buf.push(DATA_ROW);
     buf.extend_from_slice(&((body.len() + 4) as i32).to_be_bytes());
     buf.extend_from_slice(&body);
-    stream.write_all(&buf)
+    buf
 }
 
 fn send_command_complete(stream: &mut PgStream, tag: &str) -> std::io::Result<()> {
@@ -2622,6 +2628,14 @@ mod tests {
         );
     }
 
+    #[test]
+    fn sqlstate_duplicate_primary_key_is_23505() {
+        assert_eq!(
+            sqlstate_for_exec_error("duplicate key value violates primary key of table 't'"),
+            "23505"
+        );
+    }
+
     use crate::sql::{SqlStatement, parse_sql};
 
     fn pgwire_frame_length(frame: &[u8]) -> usize {
@@ -2644,6 +2658,21 @@ mod tests {
         assert_eq!(frame[0], b'C');
         assert_eq!(pgwire_frame_length(&frame), frame.len() - 1);
         assert_eq!(&frame[5..], b"SELECT 1\0");
+    }
+
+    #[test]
+    fn pgwire_data_row_null_uses_negative_length_literal_null_is_text() {
+        let frame = data_row_bytes(&[None, Some("NULL".into())]);
+
+        assert_eq!(
+            frame,
+            vec![
+                b'D', 0, 0, 0, 18, // frame type and length
+                0, 2, // two fields
+                0xff, 0xff, 0xff, 0xff, // SQL NULL
+                0, 0, 0, 4, b'N', b'U', b'L', b'L', // literal text "NULL"
+            ]
+        );
     }
 
     #[test]

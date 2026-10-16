@@ -36,11 +36,11 @@ jobs:
           target
         key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
     - name: Build library
-      run: cargo build -p omnikv-engine --lib
+      run: cargo build -p omnikv-engine --lib --locked
     - name: Build binary
-      run: cargo build -p omnikv-server --release
+      run: cargo build -p omnikv-server --release --locked
     - name: Build all targets
-      run: cargo build --workspace --all-targets
+      run: cargo build --workspace --all-targets --locked
 
   test-storage:
     name: Storage Tests
@@ -59,22 +59,22 @@ jobs:
           target
         key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
     - name: Storage tests (76 tests)
-      run: cargo test -p omnikv-engine --test storage_tests -- --test-threads=1
+      run: cargo test -p omnikv-engine --test storage_tests --locked -- --test-threads=1
     - name: Storage core unit tests
-      run: cargo test -p omnikv-engine storage::core::tests --lib -- --test-threads=1
+      run: cargo test -p omnikv-engine storage::core::tests --lib --locked -- --test-threads=1
     - name: Storage correctness (14 tests)
-      run: cargo test -p omnikv-engine --test storage_correctness -- --test-threads=1
-    - name: Storage engine (19 tests)
-      run: cargo test -p omnikv-engine --test storage_engine -- --test-threads=1
+      run: cargo test -p omnikv-engine --test storage_correctness --locked -- --test-threads=1
+    - name: Storage engine (20 tests)
+      run: cargo test -p omnikv-engine --test storage_engine --locked -- --test-threads=1
     - name: Backup/restore contract
-      run: cargo test -p omnikv-engine --test backup_restore -- --test-threads=1
+      run: cargo test -p omnikv-engine --test backup_restore --locked -- --test-threads=1
     - name: Compaction and reopen regression tests
       run: |
-        cargo test -p omnikv-engine --test compaction_regression -- --test-threads=1
-        cargo test -p omnikv-engine --test compaction_many_records_regression -- --test-threads=1
-        cargo test -p omnikv-engine --test reopen_regression -- --test-threads=1
+        cargo test -p omnikv-engine --test compaction_regression --locked -- --test-threads=1
+        cargo test -p omnikv-engine --test compaction_many_records_regression --locked -- --test-threads=1
+        cargo test -p omnikv-engine --test reopen_regression --locked -- --test-threads=1
     - name: Storage performance smoke (21 tests)
-      run: cargo test -p omnikv-engine --test storage_perf -- --test-threads=1 --nocapture
+      run: cargo test -p omnikv-engine --test storage_perf --locked -- --test-threads=1 --nocapture
 
   test-transactions:
     name: Transaction & Concurrency Tests
@@ -93,11 +93,11 @@ jobs:
           target
         key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
     - name: SSI anomaly demonstration tests (4 tests)
-      run: cargo test -p omnikv-engine --test anomaly_demos -- --test-threads=1
+      run: cargo test -p omnikv-engine --test anomaly_demos --locked -- --test-threads=1
     - name: Concurrent stress tests (6 tests)
-      run: cargo test -p omnikv-engine --test concurrent_stress -- --test-threads=1 --nocapture
+      run: cargo test -p omnikv-engine --test concurrent_stress --locked -- --test-threads=1 --nocapture
     - name: Operations (25 tests)
-      run: cargo test -p omnikv-engine --test operations -- --test-threads=1
+      run: cargo test -p omnikv-engine --test operations --locked -- --test-threads=1
 
   test-sql:
     name: SQL & Ops Tests
@@ -115,12 +115,16 @@ jobs:
           ~/.cargo/git
           target
         key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-    - name: SQL layer (18 tests)
-      run: cargo test -p omnikv-engine --test sql_layer -- --test-threads=1
+    - name: SQL layer (20 tests)
+      run: cargo test -p omnikv-engine --test sql_layer --locked -- --test-threads=1
+    - name: SQL correctness regression batch
+      run: cargo test -p omnikv-engine --test sql_correctness_batch --locked -- --test-threads=1
+    - name: SQL maturity matrix
+      run: cargo test -p omnikv-engine --test sql_maturity_matrix --locked -- --test-threads=1
     - name: SQL v3 feature coverage
-      run: cargo test -p omnikv-engine --test sql_v3_features -- --test-threads=1
+      run: cargo test -p omnikv-engine --test sql_v3_features --locked -- --test-threads=1
     - name: Ops maturity (24 tests)
-      run: cargo test -p omnikv-engine --test ops_maturity -- --test-threads=1 --nocapture
+      run: cargo test -p omnikv-engine --test ops_maturity --locked -- --test-threads=1 --nocapture
 
   test-api-contract:
     name: API & Client Contract Tests
@@ -139,13 +143,13 @@ jobs:
           target
         key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
     - name: REST API response contracts
-      run: cargo test -p omnikv-server rest_contract -- --test-threads=1
+      run: cargo test -p omnikv-server rest_contract --locked -- --test-threads=1
     - name: PgWire protocol frame contracts
-      run: cargo test -p omnikv-engine pgwire_contract --lib -- --test-threads=1
+      run: cargo test -p omnikv-engine pgwire_contract --lib --locked -- --test-threads=1
     - name: PgWire libpq compatibility (real sockets)
-      run: cargo test -p omnikv-engine --test pgwire_compat -- --test-threads=1
+      run: cargo test -p omnikv-engine --test pgwire_compat --locked -- --test-threads=1
     - name: Rust client smoke contracts
-      run: cargo test -p omni-client client_contract -- --test-threads=1
+      run: cargo test -p omni-client client_contract --locked -- --test-threads=1
 
   python-embedded-bridge:
     name: Python Embedded Bridge
@@ -167,7 +171,7 @@ jobs:
           target
         key: ${{ runner.os }}-cargo-python-bridge-${{ hashFiles('**/Cargo.lock') }}
     - name: Build Python bridge crate
-      run: cargo check -p omnikv-python
+      run: cargo check -p omnikv-python --locked
     - name: Install Python bridge
       run: |
         python -m pip install pytest
@@ -193,13 +197,13 @@ jobs:
           fuzz/target
         key: ${{ runner.os }}-cargo-fuzz-property-${{ hashFiles('**/Cargo.lock', 'fuzz/Cargo.toml') }}
     - name: Build cargo-fuzz targets
-      run: cargo check --manifest-path fuzz/Cargo.toml --bins
+      run: cargo check --manifest-path fuzz/Cargo.toml --bins --locked
     - name: Storage property tests
-      run: cargo test -p omnikv-engine --test property_storage -- --test-threads=1
+      run: cargo test -p omnikv-engine --test property_storage --locked -- --test-threads=1
     - name: Fuzz corpus regression smoke
       run: |
-        cargo test -p omnikv-engine --test fuzz_regressions -- --test-threads=1
-        cargo test -p omnikv-server --test fuzz_api_regressions -- --test-threads=1
+        cargo test -p omnikv-engine --test fuzz_regressions --locked -- --test-threads=1
+        cargo test -p omnikv-server --test fuzz_api_regressions --locked -- --test-threads=1
 
   test-raft:
     name: Raft Consensus Tests
@@ -218,9 +222,9 @@ jobs:
           target
         key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
     - name: Raft cluster (58 tests)
-      run: cargo test -p omnikv-engine --test raft_cluster -- --test-threads=1
+      run: cargo test -p omnikv-engine --test raft_cluster --locked -- --test-threads=1
     - name: Multi-process cluster failover (kill the leader)
-      run: cargo test -p omnikv-server --test cluster_multiprocess -- --test-threads=1
+      run: cargo test -p omnikv-server --test cluster_multiprocess --locked -- --test-threads=1
 
   clippy:
     name: Clippy Lint (All Targets)
@@ -232,13 +236,12 @@ jobs:
     - uses: dtolnay/rust-toolchain@stable
       with:
         components: clippy
-    - run: cargo clippy --workspace --all-targets -- -D warnings
+    - run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
   benchmark-smoke:
     name: Benchmark Smoke
     runs-on: ubuntu-latest
     needs: build
-    continue-on-error: true
     steps:
     - uses: actions/checkout@v5
       with:
@@ -252,9 +255,9 @@ jobs:
           target
         key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
     - name: Benchmark suite smoke test
-      run: cargo test -p omnikv-engine --test benchmarks --release -- --test-threads=1 --nocapture
+      run: cargo test -p omnikv-engine --test benchmarks --release --locked -- --test-threads=1 --nocapture
     - name: Reproducible benchmark JSON smoke
-      run: cargo bench -p omnikv-engine --bench reproducible_bench -- --profile smoke --json-out target/omnikv-benchmark-smoke.json
+      run: cargo bench -p omnikv-engine --bench reproducible_bench --locked -- --profile smoke --json-out target/omnikv-benchmark-smoke.json
     - name: Upload benchmark smoke artifact
       uses: actions/upload-artifact@v4
       if: always()
@@ -285,6 +288,9 @@ jobs:
     - name: Install cargo-audit
       run: cargo install cargo-audit --locked
     - run: cargo audit --deny warnings
+    - name: Audit fuzz workspace lockfile
+      run: cargo audit --deny warnings
+      working-directory: fuzz
 
   docker:
     name: Docker Image Build and Compose Smoke
