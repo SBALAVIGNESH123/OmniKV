@@ -141,7 +141,7 @@ struct Portal {
 /// The retained result of a partially-consumed portal.
 struct SuspendedRows {
     columns: Vec<(String, i32)>,
-    rows: Vec<Vec<String>>,
+    rows: Vec<Vec<Option<String>>>,
     tag: String,
     streamed: usize,
 }
@@ -184,7 +184,7 @@ enum StepOutcome {
     /// CommandComplete tag appended by the writer.
     Rows {
         columns: Vec<(String, i32)>,
-        rows: Vec<Vec<String>>,
+        rows: Vec<Vec<Option<String>>>,
         tag: String,
     },
     /// Benign warning (e.g. COMMIT with no open transaction) — the frame is
@@ -248,6 +248,14 @@ fn is_cleartext_safe_bind(bind_addr: &str) -> bool {
             ip.is_loopback() || (ip.segments()[0] & 0xfe00) == 0xfc00 // fc00::/7 ULA
         }
     }
+}
+
+/// Digested first so the configured length and any matched prefix stay
+/// unreadable from the response timing.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    use sha2::{Digest, Sha256};
+    use subtle::ConstantTimeEq;
+    Sha256::digest(a).ct_eq(&Sha256::digest(b)).into()
 }
 
 /// Loopback only. A private network is shared, so with TLS configured
@@ -925,9 +933,18 @@ fn handle_startup(
     stream.read_exact(&mut pw_buf)?;
     // Password is null-terminated
     let supplied = pw_buf.split(|&b| b == 0).next().unwrap_or(&[]);
-    let supplied = std::str::from_utf8(supplied).unwrap_or("");
+    let supplied = match std::str::from_utf8(supplied) {
+        Ok(s) => s,
+        Err(_) => {
+            send_error_response(&mut stream, "28P01", "password is not valid UTF-8")?;
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "password message is not valid UTF-8",
+            ));
+        }
+    };
 
-    if supplied != expected_password {
+    if !constant_time_eq(supplied.as_bytes(), expected_password.as_bytes()) {
         tracing::warn!("PGWire authentication failed — bad password");
         send_error_response(&mut stream, "28P01", "password authentication failed")?;
         return Err(std::io::Error::new(
@@ -1614,8 +1631,7 @@ fn handle_execute(
     // came from Describe(portal) or Describe(statement)+Bind; Execute
     // streams DataRows only, on every round.
     for row in &rows[start..end] {
-        let refs: Vec<&str> = row.iter().map(String::as_str).collect();
-        send_data_row(stream, &refs)?;
+        send_data_row(stream, row)?;
     }
     if suspended_now {
         let portal = conn.portals.get_mut(portal_name);
@@ -1729,8 +1745,7 @@ fn write_step_outcome_simple(stream: &mut PgStream, outcome: StepOutcome) -> std
                 columns.iter().map(|(c, oid)| (c.as_str(), *oid)).collect();
             send_row_description(stream, &col_defs)?;
             for row in &rows {
-                let refs: Vec<&str> = row.iter().map(String::as_str).collect();
-                send_data_row(stream, &refs)?;
+                send_data_row(stream, row)?;
             }
             send_command_complete(stream, &tag)?;
         }
@@ -1957,6 +1972,28 @@ fn merge_staged_writes_into_txn(
     }
 }
 
+/// SQLSTATE for a statement-execution error, so clients can branch like they
+/// do on a real PostgreSQL: 42703 undefined column, 42702 ambiguous column,
+/// 42P01 undefined table, 42P07 duplicate table, and the catch-all
+/// internal-error code.
+fn sqlstate_for_exec_error(e: &str) -> &'static str {
+    if e.contains("duplicate key value violates primary key") {
+        "23505"
+    } else if e.contains("column \"") && e.contains("does not exist") {
+        "42703"
+    } else if e.contains("is ambiguous") {
+        "42702"
+    } else if e.contains("does not exist") || e.contains("is not in the FROM clause") {
+        // A missing FROM-clause entry is an undefined table, not an internal
+        // error: PostgreSQL reports it as 42P01 too.
+        "42P01"
+    } else if e.contains("already exists") {
+        "42P07"
+    } else {
+        "XX000"
+    }
+}
+
 /// Executes everything that is not a transaction-control statement: the
 /// failed-transaction guard, health-check shortcuts, the SQL path, and the
 /// legacy KV fallback. Shares the connection's transaction snapshot when a
@@ -1982,7 +2019,7 @@ fn execute_non_transactional_statement(
     if normalized == "SELECT 1" || normalized.starts_with("SELECT VERSION") {
         return StepOutcome::Rows {
             columns: vec![("version".into(), 25)],
-            rows: vec![vec!["OmniKV 0.1.0 — Distributed KV Engine".into()]],
+            rows: vec![vec![Some("OmniKV 0.1.0 — Distributed KV Engine".into())]],
             tag: "SELECT 1".into(),
         };
     }
@@ -2014,7 +2051,17 @@ fn execute_non_transactional_statement(
                     return StepOutcome::error("54000", msg);
                 }
             };
-            let catalog = std::sync::Arc::new(crate::catalog::Catalog::new(db.clone()));
+            // The catalog is read at the transaction's snapshot sequence:
+            // a table migrated by another connection mid-transaction must
+            // still decode the way this transaction's snapshot saw it.
+            let catalog = if let Some(ref txn) = conn.txn {
+                std::sync::Arc::new(crate::catalog::Catalog::at_snapshot(
+                    db.clone(),
+                    txn.read_seq,
+                ))
+            } else {
+                std::sync::Arc::new(crate::catalog::Catalog::new(db.clone()))
+            };
 
             // Inside an explicit transaction the executor stages DML into
             // its pending batch (visible to this transaction's later reads,
@@ -2033,8 +2080,6 @@ fn execute_non_transactional_statement(
 
             match executor.execute(&stmt) {
                 Ok(crate::sql_exec::ExecResult::Rows { columns, rows }) => {
-                    // A read-only statement never stages writes; flush
-                    // anyway for the invariant (a no-op here).
                     merge_staged_writes_into_txn(&mut executor, conn);
                     let tag = format!("SELECT {}", rows.len());
                     StepOutcome::Rows {
@@ -2069,13 +2114,7 @@ fn execute_non_transactional_statement(
                     // one: clients branch on these (42P01 undefined
                     // table, 42P07 duplicate table) the same way they
                     // branch on 23505 for duplicate keys.
-                    let code = if e.contains("does not exist") {
-                        "42P01"
-                    } else if e.contains("already exists") {
-                        "42P07"
-                    } else {
-                        "XX000"
-                    };
+                    let code = sqlstate_for_exec_error(&e);
                     StepOutcome::error(code, format!("Exec error: {e}"))
                 }
             }
@@ -2143,7 +2182,7 @@ fn execute_parsed_kv_query(
                 if rows.len() >= limit {
                     break;
                 }
-                rows.push(vec![key.clone(), value.clone()]);
+                rows.push(vec![Some(key.clone()), Some(value.clone())]);
             }
 
             let count = rows.len();
@@ -2160,7 +2199,7 @@ fn execute_parsed_kv_query(
 
             StepOutcome::Rows {
                 columns: vec![("count".into(), 20)],
-                rows: vec![vec![results.len().to_string()]],
+                rows: vec![vec![Some(results.len().to_string())]],
                 tag: "SELECT 1".into(),
             }
         }
@@ -2450,21 +2489,30 @@ fn send_parameter_description(stream: &mut PgStream, oids: &[u32]) -> std::io::R
     stream.write_all(&buf)
 }
 
-fn send_data_row(stream: &mut PgStream, values: &[&str]) -> std::io::Result<()> {
+fn send_data_row(stream: &mut PgStream, values: &[Option<String>]) -> std::io::Result<()> {
+    stream.write_all(&data_row_bytes(values))
+}
+
+fn data_row_bytes(values: &[Option<String>]) -> Vec<u8> {
     let mut body = Vec::new();
     body.extend_from_slice(&(values.len() as i16).to_be_bytes());
 
     for val in values {
-        let bytes = val.as_bytes();
-        body.extend_from_slice(&(bytes.len() as i32).to_be_bytes());
-        body.extend_from_slice(bytes);
+        match val {
+            None => body.extend_from_slice(&(-1i32).to_be_bytes()),
+            Some(val) => {
+                let bytes = val.as_bytes();
+                body.extend_from_slice(&(bytes.len() as i32).to_be_bytes());
+                body.extend_from_slice(bytes);
+            }
+        }
     }
 
     let mut buf = Vec::new();
     buf.push(DATA_ROW);
     buf.extend_from_slice(&((body.len() + 4) as i32).to_be_bytes());
     buf.extend_from_slice(&body);
-    stream.write_all(&buf)
+    buf
 }
 
 fn send_command_complete(stream: &mut PgStream, tag: &str) -> std::io::Result<()> {
@@ -2542,6 +2590,52 @@ fn error_response_bytes(severity: &str, code: &str, message: &str) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn sqlstate_undefined_column_is_42703() {
+        assert_eq!(
+            sqlstate_for_exec_error("column \"v\" does not exist"),
+            "42703"
+        );
+    }
+
+    #[test]
+    fn sqlstate_undefined_table_is_42p01() {
+        assert_eq!(sqlstate_for_exec_error("Table 't' does not exist"), "42P01");
+    }
+    #[test]
+    fn sqlstate_missing_from_clause_entry_is_42p01() {
+        assert_eq!(
+            sqlstate_for_exec_error("table \"nope\" is not in the FROM clause of this statement"),
+            "42P01"
+        );
+    }
+
+    #[test]
+    fn sqlstate_duplicate_table_is_42p07() {
+        assert_eq!(sqlstate_for_exec_error("Table 't' already exists"), "42P07");
+    }
+
+    #[test]
+    fn sqlstate_other_is_internal_error() {
+        assert_eq!(sqlstate_for_exec_error("disk on fire"), "XX000");
+    }
+
+    #[test]
+    fn sqlstate_ambiguous_column_is_42702() {
+        assert_eq!(
+            sqlstate_for_exec_error("column \"id\" is ambiguous — qualify it"),
+            "42702"
+        );
+    }
+
+    #[test]
+    fn sqlstate_duplicate_primary_key_is_23505() {
+        assert_eq!(
+            sqlstate_for_exec_error("duplicate key value violates primary key of table 't'"),
+            "23505"
+        );
+    }
+
     use crate::sql::{SqlStatement, parse_sql};
 
     fn pgwire_frame_length(frame: &[u8]) -> usize {
@@ -2564,6 +2658,21 @@ mod tests {
         assert_eq!(frame[0], b'C');
         assert_eq!(pgwire_frame_length(&frame), frame.len() - 1);
         assert_eq!(&frame[5..], b"SELECT 1\0");
+    }
+
+    #[test]
+    fn pgwire_data_row_null_uses_negative_length_literal_null_is_text() {
+        let frame = data_row_bytes(&[None, Some("NULL".into())]);
+
+        assert_eq!(
+            frame,
+            vec![
+                b'D', 0, 0, 0, 18, // frame type and length
+                0, 2, // two fields
+                0xff, 0xff, 0xff, 0xff, // SQL NULL
+                0, 0, 0, 4, b'N', b'U', b'L', b'L', // literal text "NULL"
+            ]
+        );
     }
 
     #[test]
@@ -2650,6 +2759,16 @@ mod tests {
 
         let too_wide = parse_sql("SELECT * FROM users LIMIT 10000 OFFSET 1").expect("parse");
         assert!(enforce_pgwire_statement_limits(too_wide).is_err());
+    }
+
+    #[test]
+    fn pgwire_password_compare_reads_every_byte() {
+        assert!(constant_time_eq(b"hunter2", b"hunter2"));
+        assert!(!constant_time_eq(b"hunter2", b"hunter3"));
+        assert!(!constant_time_eq(b"hunter2", b"hunter"));
+        assert!(!constant_time_eq(b"hunter2", b"xunter2"));
+        assert!(constant_time_eq(b"", b""));
+        assert!(!constant_time_eq(b"", b"a"));
     }
 
     #[test]

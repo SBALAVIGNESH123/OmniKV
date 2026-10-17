@@ -4,6 +4,7 @@
 //! database manifest, the storage files referenced by that manifest, an optional
 //! WAL, and a small metadata file used for restore-time verification.
 
+use crate::storage::core::bloom_path_for_base;
 use crate::{Manifest, OmniKV};
 use flate2::Compression;
 use flate2::read::GzDecoder;
@@ -512,10 +513,6 @@ fn resolve_source_path(manifest_dir: &Path, stored_path: &str) -> Result<PathBuf
     }
 
     Err(format!("Backup source path does not exist: {stored_path}"))
-}
-
-fn bloom_path_for_base(path: &str) -> String {
-    path.replace(".bin", ".bloom")
 }
 
 fn bloom_path_for_sstable(path: &str) -> String {

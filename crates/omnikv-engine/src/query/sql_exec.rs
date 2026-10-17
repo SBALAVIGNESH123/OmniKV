@@ -4,22 +4,28 @@
 //! GROUP BY aggregation, and ORDER BY sorting.
 
 use crate::catalog::{Catalog, Column, ColumnType, TableDef};
+use crate::optimizer::extract_where_columns;
 use crate::sql::{
-    AggFunc, CmpOp, FromClause, JoinType, OrderByItem, SelectColumn, SetOpType, SqlColumnDef,
+    AggFunc, FromClause, JoinType, OrderByItem, SelectColumn, SetOpType, SqlColumnDef,
     SqlStatement, SqlValue, WhereExpr, WindowFuncType,
 };
+use crate::volcano::{ColumnTypeMap, eval_where_typed};
 use crate::{OmniKV, WriteBatch};
 use std::collections::HashMap;
 use std::sync::Arc;
 
-/// Result row: column_name → value
-pub type Row = HashMap<String, String>;
+/// `None` is a SQL NULL; `Some("NULL")` is the literal text.
+pub type Row = HashMap<String, Option<String>>;
+
+/// One cell of an output row. NULL stays `None` until the wire boundary
+/// renders it, so subqueries and set operations never confuse the two.
+pub type Cell = Option<String>;
 
 /// Execution result
 pub enum ExecResult {
     Rows {
         columns: Vec<String>,
-        rows: Vec<Vec<String>>,
+        rows: Vec<Vec<Cell>>,
     },
     Modified {
         count: usize,
@@ -328,7 +334,7 @@ impl SqlExecutor {
             } => self.exec_delete(table, where_clause.as_ref()),
             SqlStatement::ShowTables => {
                 let tables = self.catalog.list_tables();
-                let rows: Vec<Vec<String>> = tables.into_iter().map(|t| vec![t]).collect();
+                let rows: Vec<Vec<Cell>> = tables.into_iter().map(|t| vec![Some(t)]).collect();
                 Ok(ExecResult::Rows {
                     columns: vec!["table_name".into()],
                     rows,
@@ -341,9 +347,9 @@ impl SqlExecutor {
                 match optimizer.optimize(inner) {
                     Ok(plan) => {
                         let plan_text = format!("{}", plan);
-                        let rows: Vec<Vec<String>> = plan_text
+                        let rows: Vec<Vec<Cell>> = plan_text
                             .lines()
-                            .map(|line| vec![line.to_string()])
+                            .map(|line| vec![Some(line.to_string())])
                             .collect();
                         Ok(ExecResult::Rows {
                             columns: vec!["QUERY PLAN".into()],
@@ -352,7 +358,7 @@ impl SqlExecutor {
                     }
                     Err(_) => Ok(ExecResult::Rows {
                         columns: vec!["QUERY PLAN".into()],
-                        rows: vec![vec![format!("{:?}", inner)]],
+                        rows: vec![vec![Some(format!("{:?}", inner))]],
                     }),
                 }
             }
@@ -362,18 +368,19 @@ impl SqlExecutor {
                 let optimizer = crate::optimizer::Optimizer::new(stats);
                 match optimizer.optimize(inner) {
                     Ok(plan) => {
-                        let plan_exec = crate::plan_exec::PlanExecutor::new(
+                        let plan_exec = crate::plan_exec::PlanExecutor::for_plan(
                             self.db.clone(),
                             self.catalog.clone(),
+                            &plan,
                         );
                         match plan_exec.explain_analyze(&plan) {
                             Ok((_rows, node_stats)) => {
                                 let mut output = Vec::new();
                                 for (label, ns) in &node_stats {
-                                    output.push(vec![format!(
+                                    output.push(vec![Some(format!(
                                         "{} (est. rows={}, actual rows={}, time={:.3}ms)",
                                         label, ns.estimated_rows, ns.actual_rows, ns.actual_time_ms
-                                    )]);
+                                    ))]);
                                 }
                                 Ok(ExecResult::Rows {
                                     columns: vec!["QUERY PLAN (ANALYZE)".into()],
@@ -382,13 +389,13 @@ impl SqlExecutor {
                             }
                             Err(e) => Ok(ExecResult::Rows {
                                 columns: vec!["QUERY PLAN (ANALYZE)".into()],
-                                rows: vec![vec![format!("Error: {}", e)]],
+                                rows: vec![vec![Some(format!("Error: {}", e))]],
                             }),
                         }
                     }
                     Err(_) => Ok(ExecResult::Rows {
                         columns: vec!["QUERY PLAN (ANALYZE)".into()],
-                        rows: vec![vec![format!("{:?}", inner)]],
+                        rows: vec![vec![Some(format!("{:?}", inner))]],
                     }),
                 }
             }
@@ -415,38 +422,34 @@ impl SqlExecutor {
                         let mut result = left_rows;
                         result.extend(right_rows);
                         if !all {
-                            // Remove duplicates
                             let mut seen = std::collections::HashSet::new();
-                            result.retain(|row| {
-                                let key = row.join("\0");
-                                seen.insert(key)
-                            });
+                            result.retain(|row| seen.insert(row.clone()));
                         }
                         result
                     }
                     SetOpType::Intersect => {
-                        let right_set: std::collections::HashSet<String> =
-                            right_rows.iter().map(|r| r.join("\0")).collect();
-                        let mut result: Vec<Vec<String>> = left_rows
+                        let right_set: std::collections::HashSet<Vec<Cell>> =
+                            right_rows.into_iter().collect();
+                        let mut result: Vec<Vec<Cell>> = left_rows
                             .into_iter()
-                            .filter(|r| right_set.contains(&r.join("\0")))
+                            .filter(|r| right_set.contains(r))
                             .collect();
                         if !all {
                             let mut seen = std::collections::HashSet::new();
-                            result.retain(|row| seen.insert(row.join("\0")));
+                            result.retain(|row| seen.insert(row.clone()));
                         }
                         result
                     }
                     SetOpType::Except => {
-                        let right_set: std::collections::HashSet<String> =
-                            right_rows.iter().map(|r| r.join("\0")).collect();
-                        let mut result: Vec<Vec<String>> = left_rows
+                        let right_set: std::collections::HashSet<Vec<Cell>> =
+                            right_rows.into_iter().collect();
+                        let mut result: Vec<Vec<Cell>> = left_rows
                             .into_iter()
-                            .filter(|r| !right_set.contains(&r.join("\0")))
+                            .filter(|r| !right_set.contains(r))
                             .collect();
                         if !all {
                             let mut seen = std::collections::HashSet::new();
-                            result.retain(|row| seen.insert(row.join("\0")));
+                            result.retain(|row| seen.insert(row.clone()));
                         }
                         result
                     }
@@ -495,6 +498,10 @@ impl SqlExecutor {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs(),
+            // This table is created by the typed-Row code, so its NULLs are
+            // JSON `null` and "NULL" is literal text. Old manifests lack the
+            // field and default to legacy.
+            row_format: crate::catalog::RowFormat::Typed,
         };
 
         // Inside a transaction the CREATE stages in the pending batch —
@@ -546,7 +553,11 @@ impl SqlExecutor {
             let rows = self.load_table_rows(&table);
             let mut batch = WriteBatch::new();
             for row in &rows {
-                let pk = row.get(&table.primary_key).cloned().unwrap_or_default();
+                let pk = row
+                    .get(&table.primary_key)
+                    .cloned()
+                    .flatten()
+                    .unwrap_or_default();
                 let key = format!("{}{}", table.row_prefix(), pk);
                 batch.delete(&key).map_err(|e| format!("{:?}", e))?;
             }
@@ -558,6 +569,117 @@ impl SqlExecutor {
         }
         self.catalog.drop_table(name)?;
         Ok(ExecResult::Ok(format!("DROP TABLE {}", name)))
+    }
+
+    /// The table definition as recorded at this statement's read point. The
+    /// catalog cache can lag a migration, and a stale `row_format` would
+    /// re-migrate rows that are already typed.
+    fn effective_table(&self, name: &str) -> Result<Option<TableDef>, String> {
+        let key = Catalog::catalog_key(name);
+        if let Some(overlay) = self.pending_overlay()
+            && let Some(staged) = overlay.get(&key)
+        {
+            return Ok(staged
+                .as_deref()
+                .and_then(|v| serde_json::from_str::<TableDef>(v).ok()));
+        }
+        let seq = self.snapshot_seq.unwrap_or_else(|| self.db.get_seq());
+        self.record_point_read(&key);
+        let end = format!("{key}\x7F");
+        Ok(self
+            .db
+            .scan(&key, &end, seq)
+            .map_err(|e| format!("{:?}", e))?
+            .into_iter()
+            .next()
+            .and_then(|(_, value)| serde_json::from_str::<TableDef>(&value).ok()))
+    }
+
+    /// Builds the batch that rewrites a legacy table's rows to the typed
+    /// encoding and records the new format in the catalog. The caller merges
+    /// this with its own writes and commits both together, so a statement
+    /// that fails validation leaves the table exactly as it was.
+    fn migration_batch(&self, table: &TableDef) -> Result<WriteBatch, String> {
+        let persisted = self.effective_table(&table.name)?;
+        // Already migrated: nothing to rewrite. Refresh this executor's
+        // cached copy so its own later reads decode rows as typed.
+        if let Some(persisted) = persisted
+            && persisted.row_format == crate::catalog::RowFormat::Typed
+        {
+            self.catalog.insert_staged(persisted);
+            return Ok(WriteBatch::new());
+        }
+
+        let prefix = table.row_prefix();
+        let end = format!("{}\u{7F}", prefix);
+        self.record_range_read(&prefix, &end);
+        let seq = self.snapshot_seq.unwrap_or_else(|| self.db.get_seq());
+        let mut stored = self
+            .db
+            .scan(&prefix, &end, seq)
+            .map_err(|e| format!("{:?}", e))?;
+
+        let overlay = self.pending_overlay();
+        if let Some(ov) = &overlay {
+            stored.retain(|(key, _)| !ov.contains_key(key.as_str()));
+            for (key, value) in ov {
+                let in_table = key.starts_with(prefix.as_str()) && key.len() > prefix.len();
+                if let (true, Some(serialized)) = (in_table, value)
+                    && serde_json::from_str::<Row>(serialized).is_ok()
+                {
+                    stored.push((key.clone(), serialized.clone()));
+                }
+            }
+        }
+
+        let mut batch = WriteBatch::new();
+        // The typed path keys and compares a numeric primary key canonically,
+        // so a legacy row stored at ...007 is re-keyed to ...7.
+        let mut canonical_keys: HashMap<String, &str> = HashMap::new();
+        for (key, serialized) in &stored {
+            let mut row =
+                crate::plan_exec::PlanExecutor::deserialize_row(serialized, table.row_format)
+                    .ok_or_else(|| {
+                        format!(
+                            "table '{}' holds a row that cannot be decoded; refusing to migrate it",
+                            table.name
+                        )
+                    })?;
+
+            let stored_suffix = key.strip_prefix(prefix.as_str()).unwrap_or_default();
+            let canonical_suffix = crate::volcano::canonicalize_pk_key(table, stored_suffix);
+            if let Some(first) = canonical_keys.insert(canonical_suffix.clone(), stored_suffix) {
+                return Err(format!(
+                    "primary key values '{first}' and '{stored_suffix}' in table '{}' both canonicalize to '{canonical_suffix}'",
+                    table.name
+                ));
+            }
+            if let Some(slot) = row.get_mut(&table.primary_key)
+                && let Some(pk) = slot
+            {
+                *pk = crate::volcano::canonicalize_pk_key(table, pk);
+            }
+
+            let typed = serde_json::to_string(&row).map_err(|e| format!("{}", e))?;
+            let canonical_key = format!("{prefix}{canonical_suffix}");
+            if &canonical_key != key {
+                batch.delete(key).map_err(|e| format!("{:?}", e))?;
+                batch
+                    .set(&canonical_key, typed)
+                    .map_err(|e| format!("{:?}", e))?;
+            } else if &typed != serialized {
+                batch.set(key, typed).map_err(|e| format!("{:?}", e))?;
+            }
+        }
+
+        let mut updated = table.clone();
+        updated.row_format = crate::catalog::RowFormat::Typed;
+        let (cat_key, cat_value) = Catalog::staged_create_entry(&updated)?;
+        batch
+            .set(&cat_key, cat_value)
+            .map_err(|e| format!("{:?}", e))?;
+        self.catalog.insert_staged(updated);
+        Ok(batch)
     }
 
     fn exec_insert(
@@ -572,6 +694,8 @@ impl SqlExecutor {
             .ok_or_else(|| format!("Table '{}' does not exist", table_name))?;
         self.record_catalog_read(table_name);
 
+        // Resolve and validate every column before touching storage: a
+        // failed statement must not leave a migrated table behind.
         let columns = if col_names.is_empty() {
             table
                 .column_names()
@@ -579,12 +703,12 @@ impl SqlExecutor {
                 .map(|s| s.to_string())
                 .collect::<Vec<_>>()
         } else {
-            col_names.to_vec()
+            let mut resolved = Vec::with_capacity(col_names.len());
+            for c in col_names {
+                resolved.push(resolve_column_name(&table, c)?.to_string());
+            }
+            resolved
         };
-
-        let mut batch = WriteBatch::new();
-        let mut count = 0;
-
         for row_vals in values {
             if row_vals.len() != columns.len() {
                 return Err(format!(
@@ -593,13 +717,54 @@ impl SqlExecutor {
                     row_vals.len()
                 ));
             }
+        }
 
-            let mut row_map = HashMap::new();
+        // Check canonical primary keys before building the batch. Numeric
+        // aliases such as `7` and `'007'` address the same typed key, and a
+        // multi-row INSERT must reject duplicates within the statement as
+        // well as conflicts with rows already visible to this executor.
+        let mut occupied_keys = std::collections::HashSet::new();
+        for row in self.load_table_rows(&table) {
+            let Some(pk) = row.get(&table.primary_key).cloned().flatten() else {
+                return Err(format!(
+                    "table '{}' contains a row without a primary key; refusing to insert",
+                    table.name
+                ));
+            };
+            let canonical = crate::volcano::canonicalize_pk_key(&table, &pk);
+            occupied_keys.insert(format!("{}{}", table.row_prefix(), canonical));
+        }
+
+        // The migration and the inserts commit in one batch, so a ROLLBACK
+        // (or a later failure) drops the row rewrites and the format flip
+        // together.
+        let mut batch = if table.row_format == crate::catalog::RowFormat::Legacy {
+            self.migration_batch(&table)?
+        } else {
+            WriteBatch::new()
+        };
+        let mut count = 0;
+
+        for row_vals in values {
+            let mut row_map = Row::new();
             let mut pk_val = String::new();
             for (i, col) in columns.iter().enumerate() {
-                let val = row_vals[i].as_string();
+                let val = match &row_vals[i] {
+                    SqlValue::Null => None,
+                    v => {
+                        let col_type = table
+                            .columns
+                            .iter()
+                            .find(|c| c.name.eq_ignore_ascii_case(col))
+                            .map(|c| &c.col_type);
+                        Some(match col_type {
+                            Some(t) => t.canonicalize(&v.as_string()),
+                            None => v.as_string(),
+                        })
+                    }
+                };
                 if col.eq_ignore_ascii_case(&table.primary_key) {
-                    pk_val = val.clone();
+                    pk_val = val.clone().unwrap_or_default();
                 }
                 row_map.insert(col.clone(), val);
             }
@@ -608,7 +773,14 @@ impl SqlExecutor {
                 return Err("Primary key value is required".into());
             }
 
-            let key = format!("{}{}", table.row_prefix(), pk_val);
+            let canonical_pk = crate::volcano::canonicalize_pk_key(&table, &pk_val);
+            let key = format!("{}{}", table.row_prefix(), canonical_pk);
+            if !occupied_keys.insert(key.clone()) {
+                return Err(format!(
+                    "duplicate key value violates primary key of table '{}'",
+                    table.name
+                ));
+            }
             let value = serde_json::to_string(&row_map).map_err(|e| format!("Serialize: {}", e))?;
             batch.set(&key, value).map_err(|e| format!("{:?}", e))?;
             count += 1;
@@ -656,7 +828,9 @@ impl SqlExecutor {
 
         results
             .into_iter()
-            .filter_map(|(_key, value)| serde_json::from_str::<Row>(&value).ok())
+            .filter_map(|(_key, value)| {
+                crate::plan_exec::PlanExecutor::deserialize_row(&value, table.row_format)
+            })
             .collect()
     }
 
@@ -695,22 +869,60 @@ impl SqlExecutor {
         // instead — including tables that were dropped (and not re-created)
         // earlier in this transaction.
         self.validate_from_tables(from)?;
+        self.validate_where_columns(from, where_clause)?;
+        self.validate_output_columns(from, columns, order_by, group_by)?;
+        self.validate_having_columns(from, group_by, having)?;
 
         // When OFFSET is present, fetch limit+offset rows from the pipeline,
         // then skip offset rows in post-processing.
         let effective_limit = match (limit, offset) {
-            (Some(l), Some(o)) => Some(l + o),
+            (Some(l), Some(o)) => Some(l.saturating_add(o)),
             _ => limit,
         };
 
+        let has_aggregation = !group_by.is_empty()
+            || columns
+                .iter()
+                .any(|column| matches!(column, SelectColumn::Aggregate(..)))
+            || having.is_some();
+
+        // The physical plan normally applies ORDER BY/LIMIT before its final
+        // projection. Window functions must see the complete filtered input,
+        // and HAVING must run before either ORDER BY or LIMIT. Aggregate rows
+        // also need to retain group/order/HAVING expressions that are not part
+        // of the visible SELECT list. Keep those values in the internal
+        // projection and defer the relevant post-processing until below.
+        let mut plan_columns = columns.to_vec();
+        if has_window || has_aggregation {
+            for item in order_by {
+                append_plan_column(&mut plan_columns, &item.column);
+            }
+        }
+        if has_aggregation {
+            for group in group_by {
+                append_plan_column(&mut plan_columns, group);
+            }
+            if let Some(having_expr) = having {
+                append_having_plan_columns(&mut plan_columns, having_expr);
+            }
+        }
+
         let stmt = SqlStatement::Select {
-            columns: columns.to_vec(),
+            columns: plan_columns,
             from: from.clone(),
             where_clause: where_clause.cloned(),
             group_by: group_by.to_vec(),
             having: having.cloned(),
-            order_by: order_by.to_vec(),
-            limit: effective_limit,
+            order_by: if having.is_some() {
+                Vec::new()
+            } else {
+                order_by.to_vec()
+            },
+            limit: if has_window || having.is_some() {
+                None
+            } else {
+                effective_limit
+            },
             offset: None, // offset handled in post-processing below
         };
 
@@ -719,7 +931,7 @@ impl SqlExecutor {
 
         match optimizer.optimize(&stmt) {
             Ok(plan) => {
-                use crate::volcano::{RowIterator, compile_plan_with_scan, eval_where};
+                use crate::volcano::{RowIterator, compile_plan_with_scan};
                 // Inside a transaction, scans read at the snapshot and
                 // overlay this transaction's staged writes (read-your-
                 // own-writes); outside one, plain autocommit scans.
@@ -757,16 +969,30 @@ impl SqlExecutor {
                     }
                 }
 
-                // HAVING: post-aggregate filter
+                let plan_types = plan.output_types(&self.catalog);
+
+                // HAVING is evaluated against the materialized aggregate rows
+                // before the outer ORDER BY/LIMIT. Aggregate and group
+                // expressions are retained in `plan_columns` above for this
+                // purpose, including expressions absent from SELECT.
                 if let Some(having_expr) = having {
-                    rows.retain(|row| eval_where(row, having_expr));
+                    rows.retain(|row| {
+                        crate::volcano::eval_where_typed(row, having_expr, &plan_types)
+                    });
                 }
 
                 if has_window {
-                    self.apply_window_functions(&mut rows, columns);
+                    self.apply_window_functions(&mut rows, columns, from);
+                    // Window evaluation temporarily orders the input by each
+                    // window's own key. SQL's outer ORDER BY is a separate
+                    // clause and must be restored after all window values
+                    // have been computed, before projection/limit are applied.
+                    crate::volcano::sort_rows(&mut rows, order_by, &plan_types);
+                } else if having.is_some() {
+                    crate::volcano::sort_rows(&mut rows, order_by, &plan_types);
                 }
 
-                let (col_names, mut result_rows) = self.project(&rows, columns)?;
+                let (col_names, mut result_rows) = self.project(&rows, columns, from)?;
 
                 // OFFSET: skip first N rows, then re-apply original LIMIT
                 if let Some(off) = offset {
@@ -796,15 +1022,14 @@ impl SqlExecutor {
     /// and converting to a plain IN(values) expression.
     fn resolve_subqueries(&self, expr: &WhereExpr) -> Result<WhereExpr, String> {
         match expr {
-            WhereExpr::InSubquery(col, sub_stmt) => {
-                // Execute the subquery
-                match self.execute(sub_stmt)? {
-                    ExecResult::Rows { rows, .. } => {
-                        // Extract first column from each row
-                        let values: Vec<SqlValue> = rows
-                            .into_iter()
-                            .filter_map(|row| row.into_iter().next())
-                            .map(|v| {
+            WhereExpr::InSubquery(col, sub_stmt) => match self.execute(sub_stmt)? {
+                ExecResult::Rows { rows, .. } => {
+                    let values: Vec<SqlValue> = rows
+                        .into_iter()
+                        .filter_map(|row| row.into_iter().next())
+                        .map(|cell| match cell {
+                            None => SqlValue::Null,
+                            Some(v) => {
                                 if let Ok(n) = v.parse::<i64>() {
                                     SqlValue::Integer(n)
                                 } else if let Ok(f) = v.parse::<f64>() {
@@ -812,13 +1037,13 @@ impl SqlExecutor {
                                 } else {
                                     SqlValue::Text(v)
                                 }
-                            })
-                            .collect();
-                        Ok(WhereExpr::In(col.clone(), values))
-                    }
-                    _ => Ok(WhereExpr::In(col.clone(), vec![])),
+                            }
+                        })
+                        .collect();
+                    Ok(WhereExpr::In(col.clone(), values))
                 }
-            }
+                _ => Ok(WhereExpr::In(col.clone(), vec![])),
+            },
             WhereExpr::And(left, right) => {
                 let l = self.resolve_subqueries(left)?;
                 let r = self.resolve_subqueries(right)?;
@@ -839,54 +1064,90 @@ impl SqlExecutor {
     }
 
     /// Window function post-processing (ROW_NUMBER, RANK, DENSE_RANK).
-    fn apply_window_functions(&self, rows: &mut [Row], columns: &[SelectColumn]) {
+    fn apply_window_functions(
+        &self,
+        rows: &mut [Row],
+        columns: &[SelectColumn],
+        from: &FromClause,
+    ) {
+        let col_types = self.column_types_for_from(from);
+
+        // Each window expression has its own ordering. Sort immediately
+        // before evaluating that expression, rather than sorting once and
+        // applying every function to the first window's order. The final
+        // query ORDER BY is restored by exec_select after this pass.
         for col in columns {
             if let SelectColumn::WindowFunc {
-                order_by: ob, desc, ..
+                func,
+                order_by: ob,
+                desc,
             } = col
             {
-                let ob = ob.clone();
-                rows.sort_by(|a, b| {
-                    let va = a.get(&ob).cloned().unwrap_or_default();
-                    let vb = b.get(&ob).cloned().unwrap_or_default();
-                    let cmp = smart_cmp(&va, &vb);
-                    if *desc { cmp.reverse() } else { cmp }
-                });
-                break;
-            }
-        }
-        for col in columns {
-            if let SelectColumn::WindowFunc {
-                func, order_by: ob, ..
-            } = col
-            {
-                let mut prev_val = String::new();
+                crate::volcano::sort_rows(
+                    rows,
+                    std::slice::from_ref(&OrderByItem {
+                        column: ob.clone(),
+                        desc: *desc,
+                    }),
+                    &col_types,
+                );
+                let mut prev_val: Option<String> = None;
+                // The first row always starts a new peer group, even when its
+                // value is NULL: `None != None` would otherwise call it a tie
+                // with the nonexistent previous row and rank it zero.
+                let mut have_prev = false;
                 let mut rank = 0usize;
                 let mut dense_rank = 0usize;
                 for (i, row) in rows.iter_mut().enumerate() {
-                    let cur_val = row.get(ob).cloned().unwrap_or_default();
+                    let cur_val = crate::volcano::row_lookup(row, ob).map(str::to_string);
+                    let new_peer = !have_prev || cur_val != prev_val;
                     match func {
                         WindowFuncType::RowNumber => {
-                            row.insert("row_number".into(), (i + 1).to_string());
+                            row.insert("row_number".into(), Some((i + 1).to_string()));
                         }
                         WindowFuncType::Rank => {
-                            if cur_val != prev_val {
+                            if new_peer {
                                 rank = i + 1;
                             }
-                            row.insert("rank".into(), rank.to_string());
+                            row.insert("rank".into(), Some(rank.to_string()));
                         }
                         WindowFuncType::DenseRank => {
-                            if cur_val != prev_val {
+                            if new_peer {
                                 dense_rank += 1;
                             }
-                            row.insert("dense_rank".into(), dense_rank.to_string());
+                            row.insert("dense_rank".into(), Some(dense_rank.to_string()));
                         }
                     }
                     prev_val = cur_val;
+                    have_prev = true;
                 }
-                break;
             }
         }
+    }
+
+    /// Build the declared type map used by filtering and sorting for every
+    /// table referenced by a statement. Bare names resolve to the leftmost
+    /// table, while qualified names retain their table prefix.
+    fn column_types_for_from(&self, from: &FromClause) -> crate::volcano::ColumnTypeMap {
+        let tables: Vec<String> = match from {
+            FromClause::Table(table) => vec![table.clone()],
+            FromClause::Join { left, right, .. } => vec![left.clone(), right.clone()],
+        };
+        let mut col_types = crate::volcano::ColumnTypeMap::new();
+        for table_name in tables {
+            if let Some(table) = self.catalog.get_table(&table_name) {
+                for column in &table.columns {
+                    col_types
+                        .entry(column.name.clone())
+                        .or_insert(column.col_type.clone());
+                    col_types.insert(
+                        format!("{table_name}.{}", column.name),
+                        column.col_type.clone(),
+                    );
+                }
+            }
+        }
+        col_types
     }
 
     /// Fallback execution path for queries the optimizer cannot handle.
@@ -903,16 +1164,251 @@ impl SqlExecutor {
                 self.record_catalog_read(name);
                 Ok(())
             }
-            FromClause::Join { left, right, .. } => {
+            FromClause::Join {
+                left,
+                right,
+                on_left,
+                on_right,
+                ..
+            } => {
                 for side in [left, right] {
                     if self.catalog.get_table(side).is_none() {
                         return Err(format!("Table '{}' does not exist", side));
                     }
                     self.record_catalog_read(side);
                 }
+                // An unknown ON column would otherwise read as a missing key
+                // and yield an empty or wrongly-bound outer join.
+                for (table, col) in [(left, on_left), (right, on_right)] {
+                    let table_def = self
+                        .catalog
+                        .get_table(table)
+                        .ok_or_else(|| format!("Table '{table}' does not exist"))?;
+                    let bare = col.rsplit('.').next().unwrap_or(col);
+                    if let Some((qual, _)) = col.split_once('.')
+                        && !qual.eq_ignore_ascii_case(table)
+                    {
+                        return Err(format!(
+                            "table \"{qual}\" is not in the FROM clause of this statement"
+                        ));
+                    }
+                    if !table_def.column_names().contains(&bare) {
+                        return Err(format!("column \"{col}\" does not exist"));
+                    }
+                }
                 Ok(())
             }
         }
+    }
+
+    fn validate_where_columns_of(
+        &self,
+        table_name: &str,
+        where_clause: Option<&WhereExpr>,
+    ) -> Result<(), String> {
+        let table = self
+            .catalog
+            .get_table(table_name)
+            .ok_or_else(|| format!("Table '{}' does not exist", table_name))?;
+        let cols: Vec<String> = table
+            .column_names()
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        for col in extract_where_columns(where_clause) {
+            // A qualified name must name THIS table.
+            if let Some((qual, bare)) = col.split_once('.') {
+                if !qual.eq_ignore_ascii_case(table_name) {
+                    return Err(format!(
+                        "table \"{qual}\" is not in the FROM clause of this statement"
+                    ));
+                }
+                if !cols.iter().any(|c| c == bare) {
+                    return Err(format!("column \"{col}\" does not exist"));
+                }
+            } else if !cols.iter().any(|c| c == &col) {
+                return Err(format!("column \"{col}\" does not exist"));
+            }
+        }
+        Ok(())
+    }
+
+    /// A WHERE clause naming a column the table does not have must be an
+    /// error, not an empty result: comparing a missing key yields "" and
+    /// silently matches nothing, which looks like a legitimate answer.
+    fn validate_where_columns(
+        &self,
+        from: &FromClause,
+        where_clause: Option<&WhereExpr>,
+    ) -> Result<(), String> {
+        let per_table = self.columns_per_table(from)?;
+        for col in extract_where_columns(where_clause) {
+            self.check_column_reference(&per_table, &col)?;
+        }
+        Ok(())
+    }
+
+    /// Validate HAVING references against the grouped result, not just the
+    /// base table. A grouped query may use a GROUP BY key or an aggregate
+    /// expression, but an unknown/non-grouped base column must fail rather
+    /// than silently evaluating against a missing aggregate-row key.
+    fn validate_having_columns(
+        &self,
+        from: &FromClause,
+        group_by: &[String],
+        having: Option<&WhereExpr>,
+    ) -> Result<(), String> {
+        let Some(having) = having else {
+            return Ok(());
+        };
+        let per_table = self.columns_per_table(from)?;
+        self.validate_having_expr(&per_table, group_by, having)
+    }
+
+    fn validate_having_expr(
+        &self,
+        per_table: &[(String, Vec<String>)],
+        group_by: &[String],
+        expr: &WhereExpr,
+    ) -> Result<(), String> {
+        match expr {
+            WhereExpr::Comparison { column, .. }
+            | WhereExpr::IsNull(column)
+            | WhereExpr::IsNotNull(column)
+            | WhereExpr::In(column, _)
+            | WhereExpr::InSubquery(column, _) => {
+                if let Some((_, target)) = parse_aggregate_reference(column) {
+                    if target != "*" {
+                        self.check_column_reference(per_table, &target)?;
+                    }
+                    return Ok(());
+                }
+
+                self.check_column_reference(per_table, column)?;
+                if !group_by
+                    .iter()
+                    .any(|group| same_column_reference(group, column))
+                {
+                    return Err(format!(
+                        "column \"{column}\" must appear in the GROUP BY clause or be used in an aggregate function"
+                    ));
+                }
+                Ok(())
+            }
+            WhereExpr::And(left, right) | WhereExpr::Or(left, right) => {
+                self.validate_having_expr(per_table, group_by, left)?;
+                self.validate_having_expr(per_table, group_by, right)
+            }
+            WhereExpr::Not(inner) => self.validate_having_expr(per_table, group_by, inner),
+        }
+    }
+
+    /// Reject an unqualified column that exists on both sides of a join.
+    ///
+    /// A bare name binds to whichever side hashed as the build table, so the
+    /// same query can read a different column when the planner swaps the join
+    /// order. Standard SQL calls this ambiguous; the error names both tables.
+    fn check_column_reference(
+        &self,
+        per_table: &[(String, Vec<String>)],
+        col: &str,
+    ) -> Result<(), String> {
+        let Some((qual, bare)) = col.split_once('.') else {
+            let owners: Vec<&str> = per_table
+                .iter()
+                .filter(|(_, cols)| cols.iter().any(|c| c == col))
+                .map(|(t, _)| t.as_str())
+                .collect();
+            if owners.len() > 1 {
+                return Err(format!(
+                    "column \"{}\" is ambiguous — it exists in tables {} and {}; qualify it as \"{}.{}\" or \"{}.{}\"",
+                    col, owners[0], owners[1], owners[0], col, owners[1], col
+                ));
+            }
+            if owners.is_empty() {
+                return Err(format!("column \"{col}\" does not exist"));
+            }
+            return Ok(());
+        };
+        match per_table.iter().find(|(t, _)| t.eq_ignore_ascii_case(qual)) {
+            Some((_, cols)) => {
+                if !cols.iter().any(|c| c == bare) {
+                    return Err(format!("column \"{col}\" does not exist"));
+                }
+                Ok(())
+            }
+            None => Err(format!(
+                "table \"{qual}\" is not in the FROM clause of this statement"
+            )),
+        }
+    }
+
+    /// Column lists per table in FROM order.
+    fn columns_per_table(&self, from: &FromClause) -> Result<Vec<(String, Vec<String>)>, String> {
+        let tables = match from {
+            FromClause::Table(t) => vec![t.clone()],
+            FromClause::Join { left, right, .. } => vec![left.clone(), right.clone()],
+        };
+        let mut per_table = Vec::with_capacity(tables.len());
+        for t in &tables {
+            let table = self
+                .catalog
+                .get_table(t)
+                .ok_or_else(|| format!("Table '{t}' does not exist"))?;
+            let names: Vec<String> = table
+                .column_names()
+                .into_iter()
+                .map(str::to_string)
+                .collect();
+            per_table.push((t.clone(), names));
+        }
+        Ok(per_table)
+    }
+
+    /// Validate the columns named by the SELECT list, ORDER BY and GROUP BY.
+    fn validate_output_columns(
+        &self,
+        from: &FromClause,
+        columns: &[SelectColumn],
+        order_by: &[OrderByItem],
+        group_by: &[String],
+    ) -> Result<(), String> {
+        let per_table = self.columns_per_table(from)?;
+        // `*` expands to every column, but it does not erase explicit
+        // columns that appear beside it. Validate every non-star item so
+        // `SELECT *, no_such_column` fails instead of silently dropping the
+        // bad reference.
+        for col in columns {
+            match col {
+                SelectColumn::Named(n) => self.check_column_reference(&per_table, n)?,
+                SelectColumn::Qualified(t, n) => {
+                    self.check_column_reference(&per_table, &format!("{t}.{n}"))?
+                }
+                SelectColumn::Aggregate(_, target) => {
+                    // COUNT(*) tallies rows and names no column.
+                    if target != "*" {
+                        self.check_column_reference(&per_table, target)?
+                    }
+                }
+                SelectColumn::WindowFunc { order_by: ob, .. } => {
+                    self.check_column_reference(&per_table, ob)?
+                }
+                SelectColumn::Star => {}
+            }
+        }
+        for item in order_by {
+            if let Some((_, target)) = parse_aggregate_reference(&item.column) {
+                if target != "*" {
+                    self.check_column_reference(&per_table, &target)?;
+                }
+            } else {
+                self.check_column_reference(&per_table, &item.column)?;
+            }
+        }
+        for g in group_by {
+            self.check_column_reference(&per_table, g)?;
+        }
+        Ok(())
     }
 
     fn exec_select_legacy(
@@ -929,7 +1425,7 @@ impl SqlExecutor {
                 let table = self
                     .catalog
                     .get_table(name)
-                    .ok_or_else(|| format!("Table '{}' not found", name))?;
+                    .ok_or_else(|| format!("Table '{}' does not exist", name))?;
                 self.record_catalog_read(name);
                 self.load_table_rows(&table)
             }
@@ -945,11 +1441,11 @@ impl SqlExecutor {
                 let lt = self
                     .catalog
                     .get_table(left)
-                    .ok_or_else(|| format!("Table '{}' not found", left))?;
+                    .ok_or_else(|| format!("Table '{}' does not exist", left))?;
                 let rt = self
                     .catalog
                     .get_table(right)
-                    .ok_or_else(|| format!("Table '{}' not found", right))?;
+                    .ok_or_else(|| format!("Table '{}' does not exist", right))?;
                 let left_rows = self.load_table_rows(&lt);
                 let right_rows = self.load_table_rows(&rt);
                 self.execute_join(
@@ -964,37 +1460,57 @@ impl SqlExecutor {
             }
         };
 
+        // Predicates compare by the column's affinity, and a qualified name
+        // resolves through the `table.column` key the join stores. The same
+        // types govern ORDER BY below, so they are built once here.
+        let from_tables: Vec<String> = match from {
+            FromClause::Table(t) => vec![t.clone()],
+            FromClause::Join { left, right, .. } => vec![left.clone(), right.clone()],
+        };
+        let mut col_types = crate::volcano::ColumnTypeMap::new();
+        for t in &from_tables {
+            if let Some(table) = self.catalog.get_table(t) {
+                for c in &table.columns {
+                    // Left wins a bare-key clash, matching execute_join.
+                    col_types
+                        .entry(c.name.clone())
+                        .or_insert(c.col_type.clone());
+                    col_types.insert(format!("{t}.{}", c.name), c.col_type.clone());
+                }
+            }
+        }
         if let Some(expr) = where_clause {
-            rows.retain(|row| eval_where(row, expr));
+            rows.retain(|row| eval_where_typed(row, expr, &col_types));
         }
 
         if !group_by.is_empty() {
-            return self.exec_group_by(&rows, columns, group_by, order_by, limit);
+            return self.exec_group_by(&rows, columns, group_by, order_by, limit, &col_types);
         }
 
         let has_agg = columns
             .iter()
             .any(|c| matches!(c, SelectColumn::Aggregate(..)));
         if has_agg {
-            return self.exec_aggregate_no_group(&rows, columns);
+            return self.exec_aggregate_no_group(&rows, columns, &col_types);
         }
 
-        for item in order_by.iter().rev() {
-            let col = item.column.clone();
-            let desc = item.desc;
-            rows.sort_by(|a, b| {
-                let va = a.get(&col).cloned().unwrap_or_default();
-                let vb = b.get(&col).cloned().unwrap_or_default();
-                let cmp = smart_cmp(&va, &vb);
-                if desc { cmp.reverse() } else { cmp }
-            });
+        if columns
+            .iter()
+            .any(|column| matches!(column, SelectColumn::WindowFunc { .. }))
+        {
+            self.apply_window_functions(&mut rows, columns, from);
         }
+
+        // Window evaluation temporarily orders rows by each window key. Apply
+        // the statement's outer ORDER BY after that pass, just as the
+        // optimized executor does.
+        crate::volcano::sort_rows(&mut rows, order_by, &col_types);
 
         if let Some(lim) = limit {
             rows.truncate(lim);
         }
 
-        let (col_names, result_rows) = self.project(&rows, columns)?;
+        let (col_names, result_rows) = self.project(&rows, columns, from)?;
         Ok(ExecResult::Rows {
             columns: col_names,
             rows: result_rows,
@@ -1019,17 +1535,30 @@ impl SqlExecutor {
 
         // Build hash index on right table
         let mut right_index: HashMap<String, Vec<&Row>> = HashMap::new();
+        let mut null_key_right_rows: Vec<&Row> = Vec::new();
         for r in right {
-            let key = r.get(on_right).cloned().unwrap_or_default();
-            right_index.entry(key).or_default().push(r);
+            match r.get(on_right).cloned().flatten() {
+                Some(key) => {
+                    right_index.entry(key).or_default().push(r);
+                }
+                None => null_key_right_rows.push(r),
+            }
         }
 
+        let mut matched_right_keys: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+
         for lr in left {
-            let join_key = lr.get(on_left).cloned().unwrap_or_default();
-            let matches = right_index.get(&join_key);
+            // A NULL left key matches nothing, but on a LEFT join the row is
+            // still preserved.
+            let join_key = lr.get(on_left).cloned().flatten();
+            let matches = join_key.as_deref().and_then(|k| right_index.get(k));
 
             match (matches, join_type) {
                 (Some(rights), _) => {
+                    if let Some(k) = join_key {
+                        matched_right_keys.insert(k);
+                    }
                     for rr in rights {
                         let mut combined = Row::new();
                         for (k, v) in lr {
@@ -1056,6 +1585,32 @@ impl SqlExecutor {
                 _ => {}
             }
         }
+
+        // A RIGHT JOIN preserves right rows that no left row matched,
+        // including those whose key is NULL.
+        if matches!(join_type, JoinType::Right) {
+            for (key, rows) in &right_index {
+                if matched_right_keys.contains(key) {
+                    continue;
+                }
+                for rr in rows {
+                    let mut combined = Row::new();
+                    for (k, v) in *rr {
+                        combined.insert(format!("{}.{}", right_name, k), v.clone());
+                        combined.insert(k.clone(), v.clone());
+                    }
+                    result.push(combined);
+                }
+            }
+            for rr in &null_key_right_rows {
+                let mut combined = Row::new();
+                for (k, v) in *rr {
+                    combined.insert(format!("{}.{}", right_name, k), v.clone());
+                    combined.insert(k.clone(), v.clone());
+                }
+                result.push(combined);
+            }
+        }
         result
     }
 
@@ -1066,19 +1621,20 @@ impl SqlExecutor {
         group_by: &[String],
         order_by: &[OrderByItem],
         limit: Option<usize>,
+        col_types: &ColumnTypeMap,
     ) -> Result<ExecResult, String> {
         let mut groups: HashMap<String, Vec<&Row>> = HashMap::new();
         for row in rows {
             let key: String = group_by
                 .iter()
-                .map(|g| row.get(g).cloned().unwrap_or_default())
+                .map(|g| crate::volcano::encode_key_part(crate::volcano::row_lookup(row, g)))
                 .collect::<Vec<_>>()
                 .join("|");
             groups.entry(key).or_default().push(row);
         }
 
         let mut col_names = Vec::new();
-        let mut result_rows = Vec::new();
+        let mut result_rows: Vec<Vec<Cell>> = Vec::new();
 
         for group_rows in groups.values() {
             let mut result_row = Vec::new();
@@ -1086,10 +1642,24 @@ impl SqlExecutor {
                 match col {
                     SelectColumn::Named(name) => {
                         col_names.push(name.clone());
-                        result_row.push(group_rows[0].get(name).cloned().unwrap_or_default());
+                        result_row.push(
+                            crate::volcano::row_lookup(group_rows[0], name).map(str::to_string),
+                        );
+                    }
+                    SelectColumn::Qualified(t, n) => {
+                        col_names.push(n.clone());
+                        let key = format!("{}.{}", t, n);
+                        result_row.push(
+                            crate::volcano::row_lookup(group_rows[0], &key).map(str::to_string),
+                        );
                     }
                     SelectColumn::Aggregate(func, target) => {
-                        let (name, val) = compute_aggregate(func, target, group_rows);
+                        let (name, val) = compute_aggregate(
+                            func,
+                            target,
+                            group_rows,
+                            crate::volcano::type_lookup(col_types, target),
+                        );
                         col_names.push(name);
                         result_row.push(val);
                     }
@@ -1113,14 +1683,20 @@ impl SqlExecutor {
         &self,
         rows: &[Row],
         columns: &[SelectColumn],
+        col_types: &ColumnTypeMap,
     ) -> Result<ExecResult, String> {
         let refs: Vec<&Row> = rows.iter().collect();
         let mut col_names = Vec::new();
-        let mut result_row = Vec::new();
+        let mut result_row: Vec<Cell> = Vec::new();
 
         for col in columns {
             if let SelectColumn::Aggregate(func, target) = col {
-                let (name, val) = compute_aggregate(func, target, &refs);
+                let (name, val) = compute_aggregate(
+                    func,
+                    target,
+                    &refs,
+                    crate::volcano::type_lookup(col_types, target),
+                );
                 col_names.push(name);
                 result_row.push(val);
             }
@@ -1135,23 +1711,55 @@ impl SqlExecutor {
         &self,
         rows: &[Row],
         columns: &[SelectColumn],
-    ) -> Result<(Vec<String>, Vec<Vec<String>>), String> {
+        from: &FromClause,
+    ) -> Result<(Vec<String>, Vec<Vec<Cell>>), String> {
         if columns.iter().any(|c| matches!(c, SelectColumn::Star)) {
-            if rows.is_empty() {
-                return Ok((vec![], vec![]));
+            // Expand per table in FROM order, reading each column by its
+            // qualified key. A join row carries both tables under
+            // `table.column`, so this emits every column of both tables
+            // instead of collapsing two same-named ones into a single
+            // bare key.
+            let mut names: Vec<String> = Vec::new();
+            let mut keys: Vec<String> = Vec::new();
+            for column in columns {
+                match column {
+                    SelectColumn::Star => {
+                        for (table, cols) in &self.columns_per_table(from)? {
+                            for col in cols {
+                                names.push(col.clone());
+                                keys.push(format!("{table}.{col}"));
+                            }
+                        }
+                    }
+                    SelectColumn::Named(name) => {
+                        names.push(name.clone());
+                        keys.push(name.clone());
+                    }
+                    SelectColumn::Qualified(table, name) => {
+                        names.push(name.clone());
+                        keys.push(format!("{table}.{name}"));
+                    }
+                    SelectColumn::Aggregate(func, target) => {
+                        let key = format!("{}({})", format!("{:?}", func).to_lowercase(), target);
+                        names.push(key.clone());
+                        keys.push(key);
+                    }
+                    SelectColumn::WindowFunc { func, .. } => {
+                        let name = match func {
+                            WindowFuncType::RowNumber => "row_number",
+                            WindowFuncType::Rank => "rank",
+                            WindowFuncType::DenseRank => "dense_rank",
+                        };
+                        names.push(name.to_string());
+                        keys.push(name.to_string());
+                    }
+                }
             }
-            let mut names: Vec<String> = rows[0]
-                .keys()
-                .filter(|k| !k.contains('.'))
-                .cloned()
-                .collect();
-            names.sort();
-            let result: Vec<Vec<String>> = rows
+            let result: Vec<Vec<Cell>> = rows
                 .iter()
                 .map(|r| {
-                    names
-                        .iter()
-                        .map(|n| r.get(n).cloned().unwrap_or("NULL".into()))
+                    keys.iter()
+                        .map(|k| crate::volcano::row_lookup(r, k).map(str::to_string))
                         .collect()
                 })
                 .collect();
@@ -1164,7 +1772,7 @@ impl SqlExecutor {
                 SelectColumn::Named(n) => names.push(n.clone()),
                 SelectColumn::Qualified(_, n) => names.push(n.clone()),
                 SelectColumn::Aggregate(f, t) => {
-                    names.push(format!("{:?}({})", f, t).to_lowercase())
+                    names.push(format!("{}({})", format!("{:?}", f).to_lowercase(), t))
                 }
                 SelectColumn::WindowFunc { func, .. } => {
                     let name = match func {
@@ -1178,27 +1786,34 @@ impl SqlExecutor {
             }
         }
 
-        let result: Vec<Vec<String>> = rows
+        let result: Vec<Vec<Cell>> = rows
             .iter()
             .map(|r| {
                 columns
                     .iter()
                     .map(|c| match c {
-                        SelectColumn::Named(n) => r.get(n).cloned().unwrap_or("NULL".into()),
-                        SelectColumn::Qualified(t, n) => r
-                            .get(&format!("{}.{}", t, n))
-                            .or_else(|| r.get(n))
+                        SelectColumn::Named(n) => r.get(n).cloned().flatten(),
+                        SelectColumn::Qualified(t, n) => {
+                            crate::volcano::row_lookup(r, &format!("{}.{}", t, n))
+                                .map(str::to_string)
+                        }
+                        SelectColumn::Aggregate(func, target) => r
+                            .get(&format!(
+                                "{}({})",
+                                format!("{:?}", func).to_lowercase(),
+                                target
+                            ))
                             .cloned()
-                            .unwrap_or("NULL".into()),
+                            .flatten(),
                         SelectColumn::WindowFunc { func, .. } => {
                             let key = match func {
                                 WindowFuncType::RowNumber => "row_number",
                                 WindowFuncType::Rank => "rank",
                                 WindowFuncType::DenseRank => "dense_rank",
                             };
-                            r.get(key).cloned().unwrap_or("NULL".into())
+                            r.get(key).cloned().flatten()
                         }
-                        _ => "NULL".into(),
+                        _ => None,
                     })
                     .collect()
             })
@@ -1216,27 +1831,104 @@ impl SqlExecutor {
         let table = self
             .catalog
             .get_table(table_name)
-            .ok_or_else(|| format!("Table '{}' not found", table_name))?;
+            .ok_or_else(|| format!("Table '{}' does not exist", table_name))?;
         self.record_catalog_read(table_name);
+        self.validate_where_columns_of(table_name, where_clause)?;
+        // Validate the assignments before filtering: a statement that
+        // matches no rows would otherwise skip the loop and silently accept
+        // an unknown column.
+        let assignments: Vec<(&str, &SqlValue)> = assignments
+            .iter()
+            .map(|(col, val)| Ok((resolve_column_name(&table, col)?, val)))
+            .collect::<Result<_, String>>()?;
         let mut rows = self.load_table_rows(&table);
-
-        if let Some(expr) = where_clause {
-            rows.retain(|row| eval_where(row, expr));
+        let mut available_keys = std::collections::HashSet::new();
+        for row in &rows {
+            let Some(pk) = row.get(&table.primary_key).cloned().flatten() else {
+                return Err(format!(
+                    "table '{}' contains a row without a primary key; refusing to update",
+                    table.name
+                ));
+            };
+            available_keys.insert(format!(
+                "{}{}",
+                table.row_prefix(),
+                crate::volcano::canonicalize_pk_key(&table, &pk)
+            ));
         }
 
-        let mut batch = WriteBatch::new();
+        if let Some(expr) = where_clause {
+            let col_types = column_types_of_table(&table);
+            rows.retain(|row| eval_where_typed(row, expr, &col_types));
+        }
+
+        // Remove the keys of rows this statement will rewrite. This permits a
+        // no-op update of a row's existing key while still detecting a move
+        // onto a key owned by an untouched row or another updated row.
+        let mut old_keys = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let pk = row
+                .get(&table.primary_key)
+                .cloned()
+                .flatten()
+                .ok_or_else(|| format!("primary key is NULL in table '{}'", table.name))?;
+            let old_key = format!(
+                "{}{}",
+                table.row_prefix(),
+                crate::volcano::canonicalize_pk_key(&table, &pk)
+            );
+            available_keys.remove(&old_key);
+            old_keys.push(old_key);
+        }
+
+        // The migration batch lands first so its rewrite of an untouched
+        // row loses to this statement's write of the same (canonical) key.
+        let mut batch = if table.row_format == crate::catalog::RowFormat::Legacy {
+            self.migration_batch(&table)?
+        } else {
+            WriteBatch::new()
+        };
         let count = rows.len();
-        for row in &mut rows {
-            for (col, val) in assignments {
-                row.insert(col.clone(), val.as_string());
+        for (row, old_key) in rows.iter_mut().zip(old_keys) {
+            for (resolved, val) in &assignments {
+                let stored = match val {
+                    SqlValue::Null => None,
+                    v => {
+                        let col = table.columns.iter().find(|c| c.name == *resolved);
+                        Some(match col {
+                            Some(c) => c.col_type.canonicalize(&v.as_string()),
+                            None => v.as_string(),
+                        })
+                    }
+                };
+                row.insert((*resolved).to_string(), stored);
             }
-            let pk = row.get(&table.primary_key).cloned().unwrap_or_default();
-            let key = format!("{}{}", table.row_prefix(), pk);
+            let pk = row
+                .get(&table.primary_key)
+                .cloned()
+                .flatten()
+                .ok_or_else(|| format!("primary key cannot be NULL in table '{}'", table.name))?;
+            // A legacy row may be stored under a non-canonical key ("007");
+            // the typed path addresses it as "7".
+            let key = format!(
+                "{}{}",
+                table.row_prefix(),
+                crate::volcano::canonicalize_pk_key(&table, &pk)
+            );
+            if !available_keys.insert(key.clone()) {
+                return Err(format!(
+                    "duplicate key value violates primary key of table '{}'",
+                    table.name
+                ));
+            }
+            if old_key != key {
+                batch.delete(&old_key).map_err(|e| format!("{:?}", e))?;
+            }
             let value = serde_json::to_string(&row).map_err(|e| format!("{}", e))?;
             batch.set(&key, value).map_err(|e| format!("{:?}", e))?;
         }
 
-        if count > 0 {
+        if !batch.is_empty() {
             self.stage_or_commit(batch)?;
         }
         Ok(ExecResult::Modified {
@@ -1253,23 +1945,39 @@ impl SqlExecutor {
         let table = self
             .catalog
             .get_table(table_name)
-            .ok_or_else(|| format!("Table '{}' not found", table_name))?;
+            .ok_or_else(|| format!("Table '{}' does not exist", table_name))?;
         self.record_catalog_read(table_name);
+        self.validate_where_columns_of(table_name, where_clause)?;
         let mut rows = self.load_table_rows(&table);
 
         if let Some(expr) = where_clause {
-            rows.retain(|row| eval_where(row, expr));
+            let col_types = column_types_of_table(&table);
+            rows.retain(|row| eval_where_typed(row, expr, &col_types));
         }
 
-        let mut batch = WriteBatch::new();
+        // Deletes commit after the migration's rewrites inside one batch, so
+        // a row the statement removes disappears even if migration moved it.
+        let mut batch = if table.row_format == crate::catalog::RowFormat::Legacy {
+            self.migration_batch(&table)?
+        } else {
+            WriteBatch::new()
+        };
         let count = rows.len();
         for row in &rows {
-            let pk = row.get(&table.primary_key).cloned().unwrap_or_default();
-            let key = format!("{}{}", table.row_prefix(), pk);
+            let pk = row
+                .get(&table.primary_key)
+                .cloned()
+                .flatten()
+                .unwrap_or_default();
+            let key = format!(
+                "{}{}",
+                table.row_prefix(),
+                crate::volcano::canonicalize_pk_key(&table, &pk)
+            );
             batch.delete(&key).map_err(|e| format!("{:?}", e))?;
         }
 
-        if count > 0 {
+        if !batch.is_empty() {
             self.stage_or_commit(batch)?;
         }
         Ok(ExecResult::Modified {
@@ -1279,97 +1987,118 @@ impl SqlExecutor {
     }
 }
 
-fn eval_where(row: &Row, expr: &WhereExpr) -> bool {
-    match expr {
-        WhereExpr::Comparison { column, op, value } => {
-            let row_val = row.get(column).cloned().unwrap_or_default();
-            let cmp_val = value.as_string();
-            match op {
-                CmpOp::Eq => row_val == cmp_val,
-                CmpOp::Ne => row_val != cmp_val,
-                CmpOp::Gt => smart_cmp(&row_val, &cmp_val) == std::cmp::Ordering::Greater,
-                CmpOp::Lt => smart_cmp(&row_val, &cmp_val) == std::cmp::Ordering::Less,
-                CmpOp::Gte => smart_cmp(&row_val, &cmp_val) != std::cmp::Ordering::Less,
-                CmpOp::Lte => smart_cmp(&row_val, &cmp_val) != std::cmp::Ordering::Greater,
-                CmpOp::Like => {
-                    let pattern = cmp_val.replace('%', ".*").replace('_', ".");
-                    regex::Regex::new(&format!("^{}$", pattern))
-                        .map(|r| r.is_match(&row_val))
-                        .unwrap_or(false)
-                }
-            }
-        }
-        WhereExpr::And(a, b) => eval_where(row, a) && eval_where(row, b),
-        WhereExpr::Or(a, b) => eval_where(row, a) || eval_where(row, b),
-        WhereExpr::Not(inner) => !eval_where(row, inner),
-        WhereExpr::IsNull(col) => row
-            .get(col)
-            .map(|v| v == "NULL" || v.is_empty())
-            .unwrap_or(true),
-        WhereExpr::IsNotNull(col) => row
-            .get(col)
-            .map(|v| v != "NULL" && !v.is_empty())
-            .unwrap_or(false),
-        WhereExpr::In(col, vals) => {
-            let row_val = row.get(col).cloned().unwrap_or_default();
-            vals.iter().any(|v| v.as_string() == row_val)
-        }
-        WhereExpr::InSubquery(_col, _sub) => {
-            // Subquery evaluation requires executor context;
-            // for simple eval_where we return true (handled at exec_select level)
-            true
-        }
+/// A table's column types keyed by both bare and qualified name, so a
+/// `WHERE t.col` predicate compares by the column's affinity rather than
+/// the literal's shape.
+fn column_types_of_table(table: &TableDef) -> crate::volcano::ColumnTypeMap {
+    let mut map = crate::volcano::ColumnTypeMap::new();
+    for c in &table.columns {
+        map.insert(c.name.clone(), c.col_type.clone());
+        map.insert(format!("{}.{}", table.name, c.name), c.col_type.clone());
     }
+    map
 }
 
-fn smart_cmp(a: &str, b: &str) -> std::cmp::Ordering {
-    if let (Ok(ai), Ok(bi)) = (a.parse::<f64>(), b.parse::<f64>()) {
-        ai.partial_cmp(&bi).unwrap_or(std::cmp::Ordering::Equal)
+/// Parse the canonical internal spelling used for aggregate result columns,
+/// such as `count(*)` or `sum(amount)` in HAVING and ORDER BY expressions.
+fn parse_aggregate_reference(reference: &str) -> Option<(AggFunc, String)> {
+    let (func, rest) = reference.split_once('(')?;
+    if !rest.ends_with(')') {
+        return None;
+    }
+    let target = &rest[..rest.len() - 1];
+    let func = match func.to_ascii_lowercase().as_str() {
+        "count" => AggFunc::Count,
+        "sum" => AggFunc::Sum,
+        "avg" => AggFunc::Avg,
+        "min" => AggFunc::Min,
+        "max" => AggFunc::Max,
+        _ => return None,
+    };
+    if target.is_empty() {
+        return None;
+    }
+    Some((func, target.to_string()))
+}
+
+/// Add a reference to the internal aggregate projection once. The final
+/// projection still uses the user's original SELECT list, so these entries
+/// are execution-only state for HAVING, sorting, and grouping.
+fn append_plan_column(columns: &mut Vec<SelectColumn>, reference: &str) {
+    let column = if let Some((func, target)) = parse_aggregate_reference(reference) {
+        SelectColumn::Aggregate(func, target)
+    } else if let Some((table, name)) = reference.split_once('.') {
+        SelectColumn::Qualified(table.to_string(), name.to_string())
     } else {
-        a.cmp(b)
+        SelectColumn::Named(reference.to_string())
+    };
+    if !columns.iter().any(|existing| existing == &column) {
+        columns.push(column);
     }
 }
 
-fn compute_aggregate(func: &AggFunc, target: &str, rows: &[&Row]) -> (String, String) {
-    let name = format!("{}({})", format!("{:?}", func).to_lowercase(), target);
-    match func {
-        AggFunc::Count => (name, rows.len().to_string()),
-        AggFunc::Sum => {
-            let sum: f64 = rows
-                .iter()
-                .filter_map(|r| r.get(target).and_then(|v| v.parse::<f64>().ok()))
-                .sum();
-            (name, sum.to_string())
+fn append_having_plan_columns(columns: &mut Vec<SelectColumn>, expr: &WhereExpr) {
+    match expr {
+        WhereExpr::Comparison { column, .. }
+        | WhereExpr::IsNull(column)
+        | WhereExpr::IsNotNull(column)
+        | WhereExpr::In(column, _)
+        | WhereExpr::InSubquery(column, _) => append_plan_column(columns, column),
+        WhereExpr::And(left, right) | WhereExpr::Or(left, right) => {
+            append_having_plan_columns(columns, left);
+            append_having_plan_columns(columns, right);
         }
-        AggFunc::Avg => {
-            let vals: Vec<f64> = rows
-                .iter()
-                .filter_map(|r| r.get(target).and_then(|v| v.parse::<f64>().ok()))
-                .collect();
-            let avg = if vals.is_empty() {
-                0.0
-            } else {
-                vals.iter().sum::<f64>() / vals.len() as f64
-            };
-            (name, format!("{:.2}", avg))
-        }
-        AggFunc::Min => {
-            let min = rows
-                .iter()
-                .filter_map(|r| r.get(target))
-                .min_by(|a, b| smart_cmp(a, b))
-                .cloned()
-                .unwrap_or_default();
-            (name, min)
-        }
-        AggFunc::Max => {
-            let max = rows
-                .iter()
-                .filter_map(|r| r.get(target))
-                .max_by(|a, b| smart_cmp(a, b))
-                .cloned()
-                .unwrap_or_default();
-            (name, max)
-        }
+        WhereExpr::Not(inner) => append_having_plan_columns(columns, inner),
     }
+}
+
+fn same_column_reference(left: &str, right: &str) -> bool {
+    if left == right {
+        return true;
+    }
+    let left_bare = left.rsplit('.').next().unwrap_or(left);
+    let right_bare = right.rsplit('.').next().unwrap_or(right);
+    left_bare == right_bare
+        && (left.split_once('.').is_none()
+            || right.split_once('.').is_none()
+            || left.split_once('.').zip(right.split_once('.')).is_some_and(
+                |((left_table, _), (right_table, _))| left_table.eq_ignore_ascii_case(right_table),
+            ))
+}
+
+/// Resolve a user-supplied column name to the table's declared spelling.
+/// Rows are keyed by the declared name; an unknown column is an error.
+fn resolve_column_name<'t>(table: &'t TableDef, col: &str) -> Result<&'t str, String> {
+    table
+        .columns
+        .iter()
+        .find(|c| c.name.eq_ignore_ascii_case(col))
+        .map(|c| c.name.as_str())
+        .ok_or_else(|| {
+            format!(
+                "column \"{}\" does not exist in table \"{}\"",
+                col, table.name
+            )
+        })
+}
+
+/// Renders one result row as protocol strings. This is the boundary where
+/// a SQL NULL becomes the text "NULL"; everything upstream keeps them apart.
+pub fn render_row(row: &[Cell]) -> Vec<String> {
+    row.iter()
+        .map(|cell| cell.clone().unwrap_or_else(|| "NULL".into()))
+        .collect()
+}
+
+fn eval_where(row: &Row, expr: &WhereExpr) -> bool {
+    crate::volcano::eval_where(row, expr)
+}
+
+fn compute_aggregate(
+    func: &AggFunc,
+    target: &str,
+    rows: &[&Row],
+    col_type: Option<&ColumnType>,
+) -> (String, Option<String>) {
+    crate::volcano::compute_aggregate(func, target, rows, col_type)
 }

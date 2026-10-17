@@ -45,8 +45,8 @@ fn quic_jwt_secret_required_in_production() {
 #[test]
 fn server_config_has_expected_defaults() {
     let cfg = ServerConfig::load_dev().unwrap();
-    assert!(!cfg.http_addr.is_empty(), "http_addr must be set");
-    assert!(!cfg.pgwire_addr.is_empty(), "pgwire_addr must be set");
-    assert!(!cfg.quic_addr.is_empty(), "quic_addr must be set");
-    assert!(!cfg.tcp_addr.is_empty(), "tcp_addr must be set");
+    assert_ne!(cfg.http_addr.len(), 0, "http_addr must be set");
+    assert_ne!(cfg.pgwire_addr.len(), 0, "pgwire_addr must be set");
+    assert_ne!(cfg.quic_addr.len(), 0, "quic_addr must be set");
+    assert_ne!(cfg.tcp_addr.len(), 0, "tcp_addr must be set");
 }

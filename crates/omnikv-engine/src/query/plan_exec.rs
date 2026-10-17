@@ -3,10 +3,14 @@
 //! Executes queries using the optimizer's physical plan tree.
 
 use crate::OmniKV;
-use crate::catalog::{Catalog, TableDef};
+use crate::catalog::ColumnType;
+use crate::catalog::{Catalog, RowFormat, TableDef};
 use crate::optimizer::{AccessMethod, PlanNode};
-use crate::sql::{AggFunc, CmpOp, JoinType, OrderByItem, SelectColumn, WhereExpr};
+use crate::sql::{AggFunc, JoinType, SelectColumn, WhereExpr};
 use crate::sql_exec::Row;
+use crate::volcano::{
+    ColumnTypeMap, eval_where_typed, legacy_pk_needs_scan, qualify_row, row_lookup, type_lookup,
+};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -25,11 +29,22 @@ pub struct NodeStats {
 pub struct PlanExecutor {
     pub db: Arc<OmniKV>,
     pub catalog: Arc<Catalog>,
+    types: ColumnTypeMap,
 }
 
 impl PlanExecutor {
     pub fn new(db: Arc<OmniKV>, catalog: Arc<Catalog>) -> Self {
-        Self { db, catalog }
+        Self {
+            db,
+            catalog,
+            types: ColumnTypeMap::new(),
+        }
+    }
+
+    pub fn for_plan(db: Arc<OmniKV>, catalog: Arc<Catalog>, plan: &PlanNode) -> Self {
+        let mut types = ColumnTypeMap::new();
+        collect_plan_types(plan, &catalog, &mut types);
+        Self { db, catalog, types }
     }
 
     /// Execute a plan node, returning rows.
@@ -47,6 +62,8 @@ impl PlanExecutor {
                 join_type,
                 on_left_col,
                 on_right_col,
+                left_table,
+                right_table,
                 ..
             } => {
                 let left_rows = self.execute_plan(left)?;
@@ -57,13 +74,15 @@ impl PlanExecutor {
                     on_left_col,
                     on_right_col,
                     join_type,
+                    left_table,
+                    right_table,
                 ))
             }
             PlanNode::Filter {
                 child, predicate, ..
             } => {
                 let mut rows = self.execute_plan(child)?;
-                rows.retain(|row| eval_where(row, predicate));
+                rows.retain(|row| eval_where_typed(row, predicate, &self.types));
                 Ok(rows)
             }
             PlanNode::Project { child, columns } => {
@@ -74,7 +93,8 @@ impl PlanExecutor {
                 child, order_by, ..
             } => {
                 let mut rows = self.execute_plan(child)?;
-                self.exec_sort(&mut rows, order_by);
+                let types = child.output_types(&self.catalog);
+                crate::volcano::sort_rows(&mut rows, order_by, &types);
                 Ok(rows)
             }
             PlanNode::Limit { child, count } => {
@@ -191,10 +211,20 @@ impl PlanExecutor {
         let table = self
             .catalog
             .get_table(table_name)
-            .ok_or_else(|| format!("Table '{}' not found", table_name))?;
+            .ok_or_else(|| format!("Table '{}' does not exist", table_name))?;
 
         let mut rows = match access {
+            AccessMethod::PkLookup { key_value } if legacy_pk_needs_scan(&table) => {
+                // A legacy numeric key may be stored as "007", which the
+                // canonical key range can never reach.
+                let key_value = crate::volcano::canonicalize_pk_key(&table, key_value);
+                let predicate = crate::volcano::pk_equality(&table, &key_value);
+                let mut scanned = self.load_table_rows(&table);
+                scanned.retain(|row| eval_where_typed(row, &predicate, &self.types));
+                scanned
+            }
             AccessMethod::PkLookup { key_value } => {
+                let key_value = crate::volcano::canonicalize_pk_key(&table, key_value);
                 let key = format!("{}{}", table.row_prefix(), key_value);
                 let end = format!("{}{}\x7F", table.row_prefix(), key_value);
                 let seq = self.db.get_seq();
@@ -202,17 +232,38 @@ impl PlanExecutor {
                     .scan(&key, &end, seq)
                     .unwrap_or_default()
                     .into_iter()
-                    .filter_map(|(_, value)| serde_json::from_str::<Row>(&value).ok())
+                    .filter_map(|(_, value)| Self::deserialize_row(&value, table.row_format))
                     .collect()
             }
             AccessMethod::IndexScan { .. } | AccessMethod::SeqScan => self.load_table_rows(&table),
         };
 
         if let Some(expr) = filter {
-            rows.retain(|row| eval_where(row, expr));
+            rows.retain(|row| eval_where_typed(row, expr, &self.types));
         }
 
         Ok(rows)
+    }
+
+    /// Map one stored value to a typed cell, per the table's row format:
+    /// [`RowFormat`] is the only signal that tells a stored "NULL" from the
+    /// user's literal text.
+    fn decode(v: Option<String>, format: RowFormat) -> Option<String> {
+        match format {
+            // Stored "NULL" is SQL NULL; the typed code never writes it.
+            RowFormat::Legacy => v.filter(|s| s != "NULL"),
+            // Stored "NULL" is the user's literal text; JSON null is NULL.
+            RowFormat::Typed => v,
+        }
+    }
+
+    pub fn deserialize_row(value: &str, format: RowFormat) -> Option<Row> {
+        let row: Row = serde_json::from_str(value).ok()?;
+        Some(
+            row.into_iter()
+                .map(|(k, v)| (k, Self::decode(v, format)))
+                .collect(),
+        )
     }
 
     fn load_table_rows(&self, table: &TableDef) -> Vec<Row> {
@@ -222,7 +273,7 @@ impl PlanExecutor {
             .scan(&prefix, &format!("{}\x7F", prefix), seq)
             .unwrap_or_default()
             .into_iter()
-            .filter_map(|(_, value)| serde_json::from_str::<Row>(&value).ok())
+            .filter_map(|(_, value)| Self::deserialize_row(&value, table.row_format))
             .collect()
     }
 
@@ -235,7 +286,7 @@ impl PlanExecutor {
             .unwrap_or_default()
             .into_iter()
             .filter_map(|(_, value)| {
-                let full: Row = serde_json::from_str(&value).ok()?;
+                let full: Row = Self::deserialize_row(&value, table.row_format)?;
                 if needed_cols.is_empty() {
                     return Some(full);
                 }
@@ -250,6 +301,10 @@ impl PlanExecutor {
 
     // ─── Hash Join ──────────────────────────────────────────────────────
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Each join side carries its own rows, key column, and table name; grouping them would hide which side a qualifier belongs to."
+    )]
     fn exec_hash_join(
         &self,
         build: &[Row],
@@ -257,51 +312,82 @@ impl PlanExecutor {
         build_col: &str,
         probe_col: &str,
         join_type: &JoinType,
+        build_table: &str,
+        probe_table: &str,
     ) -> Vec<Row> {
+        // Qualify each side's keys with its table name, exactly as the Volcano
+        // hash join does, so on an unmatched outer-join row a qualified lookup
+        // like right.id binds to the side that is present instead of falling
+        // back to the other table's bare id.
+        let build_prefix = format!("{build_table}.");
+        let probe_prefix = format!("{probe_table}.");
+        let build_key_type = crate::volcano::join_key_type(&self.catalog, build_table, build_col);
+        let probe_key_type = crate::volcano::join_key_type(&self.catalog, probe_table, probe_col);
         let mut hash_table: HashMap<String, Vec<&Row>> = HashMap::with_capacity(build.len());
+        let mut null_key_build_rows: Vec<&Row> = Vec::new();
         for row in build {
-            let key = row.get(build_col).cloned().unwrap_or_default();
-            hash_table.entry(key).or_default().push(row);
+            match row.get(build_col).cloned().flatten() {
+                Some(key) => {
+                    let key = crate::volcano::canonicalize_join_key(&key, build_key_type.as_ref());
+                    hash_table.entry(key).or_default().push(row);
+                }
+                None => null_key_build_rows.push(row),
+            }
         }
 
         let mut result = Vec::new();
+        // Matched keys, so the unmatched build rows can be emitted below.
+        let mut matched_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
         for probe_row in probe {
-            let key = probe_row.get(probe_col).cloned().unwrap_or_default();
-            match (hash_table.get(&key), join_type) {
+            // A NULL probe key matches nothing, but on a LEFT join the probe
+            // row is still preserved.
+            let key = probe_row
+                .get(probe_col)
+                .cloned()
+                .flatten()
+                .map(|k| crate::volcano::canonicalize_join_key(&k, probe_key_type.as_ref()));
+            match (key.as_deref().and_then(|k| hash_table.get(k)), join_type) {
                 (Some(matches), _) => {
+                    if matches!(join_type, JoinType::Right) {
+                        matched_keys.insert(key.unwrap());
+                    }
                     for build_row in matches {
                         let mut combined = Row::new();
                         for (k, v) in *build_row {
                             combined.insert(k.clone(), v.clone());
+                            combined.insert(format!("{build_prefix}{k}"), v.clone());
                         }
                         for (k, v) in probe_row {
+                            // Also store it qualified so a shared name isn't dropped.
+                            combined.insert(format!("{probe_prefix}{k}"), v.clone());
                             combined.entry(k.clone()).or_insert_with(|| v.clone());
                         }
                         result.push(combined);
                     }
                 }
                 (None, JoinType::Left) => {
-                    result.push(probe_row.clone());
+                    result.push(qualify_row(probe_row.clone(), &probe_prefix));
                 }
                 _ => {}
             }
         }
-        result
-    }
 
-    // ─── Sort ───────────────────────────────────────────────────────────
-
-    fn exec_sort(&self, rows: &mut [Row], order_by: &[OrderByItem]) {
-        for item in order_by.iter().rev() {
-            let col = item.column.clone();
-            let desc = item.desc;
-            rows.sort_by(|a, b| {
-                let va = a.get(&col).cloned().unwrap_or_default();
-                let vb = b.get(&col).cloned().unwrap_or_default();
-                let cmp = smart_cmp(&va, &vb);
-                if desc { cmp.reverse() } else { cmp }
-            });
+        // A RIGHT JOIN preserves build rows that no probe row matched,
+        // including those whose key is NULL.
+        if matches!(join_type, JoinType::Right) {
+            for (key, rows) in &hash_table {
+                if matched_keys.contains(key) {
+                    continue;
+                }
+                for build_row in rows {
+                    result.push(qualify_row((**build_row).clone(), &build_prefix));
+                }
+            }
+            for build_row in &null_key_build_rows {
+                result.push(qualify_row((**build_row).clone(), &build_prefix));
+            }
         }
+        result
     }
 
     // ─── Aggregate ──────────────────────────────────────────────────────
@@ -321,7 +407,8 @@ impl PlanExecutor {
             for col in columns {
                 if let SelectColumn::Aggregate(func, target) = col {
                     let refs: Vec<&Row> = rows.iter().collect();
-                    let (name, val) = compute_aggregate(func, target, &refs);
+                    let (name, val) =
+                        compute_aggregate(func, target, &refs, type_lookup(&self.types, target));
                     result.insert(name, val);
                 }
             }
@@ -332,7 +419,7 @@ impl PlanExecutor {
         for row in rows {
             let key: String = group_by
                 .iter()
-                .map(|g| row.get(g).cloned().unwrap_or_default())
+                .map(|g| crate::volcano::encode_key_part(row_lookup(row, g)))
                 .collect::<Vec<_>>()
                 .join("|");
             groups.entry(key).or_default().push(row);
@@ -344,12 +431,27 @@ impl PlanExecutor {
             for col in columns {
                 match col {
                     SelectColumn::Named(name) => {
-                        if let Some(val) = group_rows[0].get(name) {
-                            row.insert(name.clone(), val.clone());
-                        }
+                        row.insert(
+                            name.clone(),
+                            row_lookup(group_rows[0], name).map(str::to_string),
+                        );
+                    }
+                    SelectColumn::Qualified(t, n) => {
+                        let key = format!("{}.{}", t, n);
+                        row.insert(
+                            key.clone(),
+                            row_lookup(group_rows[0], &key).map(str::to_string),
+                        );
+                        row.entry(n.clone())
+                            .or_insert_with(|| row_lookup(group_rows[0], &key).map(str::to_string));
                     }
                     SelectColumn::Aggregate(func, target) => {
-                        let (name, val) = compute_aggregate(func, target, group_rows);
+                        let (name, val) = compute_aggregate(
+                            func,
+                            target,
+                            group_rows,
+                            type_lookup(&self.types, target),
+                        );
                         row.insert(name, val);
                     }
                     _ => {}
@@ -364,7 +466,48 @@ impl PlanExecutor {
 
     fn exec_project(&self, rows: &[Row], columns: &[SelectColumn]) -> Vec<Row> {
         if columns.iter().any(|c| matches!(c, SelectColumn::Star)) {
-            return rows.to_vec();
+            return rows
+                .iter()
+                .map(|row| {
+                    let mut projected = row.clone();
+                    // A star keeps the full row, but explicit columns beside
+                    // it still need validation and must not disappear from
+                    // the plan-driven projection.
+                    for col in columns {
+                        match col {
+                            SelectColumn::Named(name) => {
+                                if let Some(value) = row_lookup(row, name) {
+                                    projected.insert(name.clone(), Some(value.to_string()));
+                                }
+                            }
+                            SelectColumn::Qualified(table, name) => {
+                                let key = format!("{table}.{name}");
+                                projected
+                                    .insert(key.clone(), row_lookup(row, &key).map(str::to_string));
+                            }
+                            SelectColumn::Aggregate(func, target) => {
+                                let key =
+                                    format!("{}({})", format!("{:?}", func).to_lowercase(), target);
+                                if let Some(value) = row.get(&key) {
+                                    projected.insert(key, value.clone());
+                                }
+                            }
+                            SelectColumn::WindowFunc { func, .. } => {
+                                let key = match func {
+                                    crate::sql::WindowFuncType::RowNumber => "row_number",
+                                    crate::sql::WindowFuncType::Rank => "rank",
+                                    crate::sql::WindowFuncType::DenseRank => "dense_rank",
+                                };
+                                if let Some(value) = row.get(key) {
+                                    projected.insert(key.to_string(), value.clone());
+                                }
+                            }
+                            SelectColumn::Star => {}
+                        }
+                    }
+                    projected
+                })
+                .collect();
         }
         rows.iter()
             .map(|row| {
@@ -372,24 +515,28 @@ impl PlanExecutor {
                 for col in columns {
                     match col {
                         SelectColumn::Named(n) => {
-                            if let Some(v) = row.get(n) {
-                                projected.insert(n.clone(), v.clone());
+                            if let Some(v) = crate::volcano::row_lookup(row, n) {
+                                projected.insert(n.clone(), Some(v.to_string()));
                             }
                         }
                         SelectColumn::Qualified(t, n) => {
                             let key = format!("{}.{}", t, n);
-                            let val = row
-                                .get(&key)
-                                .or_else(|| row.get(n))
-                                .cloned()
-                                .unwrap_or_default();
-                            projected.insert(n.clone(), val);
+                            let val = crate::volcano::row_lookup(row, &key).map(str::to_string);
+                            projected.insert(key, val.clone());
+                            projected.entry(n.clone()).or_insert(val);
                         }
                         SelectColumn::Aggregate(func, target) => {
                             let name =
                                 format!("{}({})", format!("{:?}", func).to_lowercase(), target);
                             if let Some(v) = row.get(&name) {
                                 projected.insert(name, v.clone());
+                            }
+                        }
+                        SelectColumn::WindowFunc { order_by: ob, .. } => {
+                            // The window's sort key is read after this
+                            // projection, so it has to survive it.
+                            if let Some(v) = crate::volcano::row_lookup(row, ob) {
+                                projected.insert(ob.clone(), Some(v.to_string()));
                             }
                         }
                         _ => {}
@@ -401,100 +548,44 @@ impl PlanExecutor {
     }
 }
 
-// ─── Shared helpers ─────────────────────────────────────────────────────────
-
-fn eval_where(row: &Row, expr: &WhereExpr) -> bool {
-    match expr {
-        WhereExpr::Comparison { column, op, value } => {
-            let row_val = row.get(column).cloned().unwrap_or_default();
-            let cmp_val = value.as_string();
-            match op {
-                CmpOp::Eq => row_val == cmp_val,
-                CmpOp::Ne => row_val != cmp_val,
-                CmpOp::Gt => smart_cmp(&row_val, &cmp_val) == std::cmp::Ordering::Greater,
-                CmpOp::Lt => smart_cmp(&row_val, &cmp_val) == std::cmp::Ordering::Less,
-                CmpOp::Gte => smart_cmp(&row_val, &cmp_val) != std::cmp::Ordering::Less,
-                CmpOp::Lte => smart_cmp(&row_val, &cmp_val) != std::cmp::Ordering::Greater,
-                CmpOp::Like => {
-                    let pattern = cmp_val.replace('%', ".*").replace('_', ".");
-                    regex::Regex::new(&format!("^{}$", pattern))
-                        .map(|r| r.is_match(&row_val))
-                        .unwrap_or(false)
+fn collect_plan_types(plan: &PlanNode, catalog: &Catalog, types: &mut ColumnTypeMap) {
+    match plan {
+        PlanNode::Scan { table, .. } => {
+            if let Some(table_def) = catalog.get_table(table) {
+                for c in &table_def.columns {
+                    types.insert(c.name.clone(), c.col_type.clone());
+                    types.insert(format!("{}.{}", table_def.name, c.name), c.col_type.clone());
                 }
             }
         }
-        WhereExpr::And(a, b) => eval_where(row, a) && eval_where(row, b),
-        WhereExpr::Or(a, b) => eval_where(row, a) || eval_where(row, b),
-        WhereExpr::Not(inner) => !eval_where(row, inner),
-        WhereExpr::IsNull(col) => row
-            .get(col)
-            .map(|v| v == "NULL" || v.is_empty())
-            .unwrap_or(true),
-        WhereExpr::IsNotNull(col) => row
-            .get(col)
-            .map(|v| v != "NULL" && !v.is_empty())
-            .unwrap_or(false),
-        WhereExpr::In(col, vals) => {
-            let row_val = row.get(col).cloned().unwrap_or_default();
-            vals.iter().any(|v| v.as_string() == row_val)
+        PlanNode::HashJoin { left, right, .. } => {
+            collect_plan_types(left, catalog, types);
+            collect_plan_types(right, catalog, types);
         }
-        WhereExpr::InSubquery(_, _) => true,
-    }
-}
-
-fn smart_cmp(a: &str, b: &str) -> std::cmp::Ordering {
-    if let (Ok(ai), Ok(bi)) = (a.parse::<f64>(), b.parse::<f64>()) {
-        ai.partial_cmp(&bi).unwrap_or(std::cmp::Ordering::Equal)
-    } else {
-        a.cmp(b)
-    }
-}
-
-fn compute_aggregate(func: &AggFunc, target: &str, rows: &[&Row]) -> (String, String) {
-    let name = format!("{}({})", format!("{:?}", func).to_lowercase(), target);
-    match func {
-        AggFunc::Count => (name, rows.len().to_string()),
-        AggFunc::Sum => {
-            let sum: f64 = rows
-                .iter()
-                .filter_map(|r| r.get(target).and_then(|v| v.parse::<f64>().ok()))
-                .sum();
-            (name, sum.to_string())
-        }
-        AggFunc::Avg => {
-            let vals: Vec<f64> = rows
-                .iter()
-                .filter_map(|r| r.get(target).and_then(|v| v.parse::<f64>().ok()))
-                .collect();
-            let avg = if vals.is_empty() {
-                0.0
-            } else {
-                vals.iter().sum::<f64>() / vals.len() as f64
-            };
-            (name, format!("{:.2}", avg))
-        }
-        AggFunc::Min => {
-            let min = rows
-                .iter()
-                .filter_map(|r| r.get(target))
-                .min_by(|a, b| smart_cmp(a, b))
-                .cloned()
-                .unwrap_or_default();
-            (name, min)
-        }
-        AggFunc::Max => {
-            let max = rows
-                .iter()
-                .filter_map(|r| r.get(target))
-                .max_by(|a, b| smart_cmp(a, b))
-                .cloned()
-                .unwrap_or_default();
-            (name, max)
+        PlanNode::Filter { child, .. }
+        | PlanNode::Project { child, .. }
+        | PlanNode::Sort { child, .. }
+        | PlanNode::Limit { child, .. }
+        | PlanNode::Aggregate { child, .. } => {
+            collect_plan_types(child, catalog, types);
         }
     }
 }
 
-// ─── Plan Cache (LRU) ───────────────────────────────────────────────────
+// ─── Shared helpers ─────────────────────────────────────────────────────────
+
+fn eval_where(row: &Row, expr: &WhereExpr) -> bool {
+    crate::volcano::eval_where(row, expr)
+}
+
+fn compute_aggregate(
+    func: &AggFunc,
+    target: &str,
+    rows: &[&Row],
+    col_type: Option<&ColumnType>,
+) -> (String, Option<String>) {
+    crate::volcano::compute_aggregate(func, target, rows, col_type)
+}
 
 /// LRU plan cache — avoids re-optimizing identical queries.
 pub struct PlanCache {
@@ -534,6 +625,35 @@ impl PlanCache {
     pub fn invalidate(&self) {
         if let Ok(mut cache) = self.cache.lock() {
             cache.clear();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::catalog::RowFormat;
+
+    #[test]
+    fn legacy_sentinel_is_null_but_typed_text_is_text() {
+        // The two row formats share the exact same byte pattern for a stored
+        // "NULL"; only the table's recorded format decides what it means.
+        let stored = r#"{"id":"1","v":"NULL"}"#;
+        let legacy = PlanExecutor::deserialize_row(stored, RowFormat::Legacy).unwrap();
+        assert!(legacy.get("v").is_some_and(|o| o.is_none()));
+        let typed = PlanExecutor::deserialize_row(stored, RowFormat::Typed).unwrap();
+        assert_eq!(typed.get("v").and_then(|o| o.as_deref()), Some("NULL"));
+    }
+
+    #[test]
+    fn json_null_is_null_in_both_formats() {
+        let stored = r#"{"id":"2","v":null}"#;
+        for fmt in [RowFormat::Legacy, RowFormat::Typed] {
+            let row = PlanExecutor::deserialize_row(stored, fmt).unwrap();
+            assert!(
+                row.get("v").is_some_and(|o| o.is_none()),
+                "JSON null is NULL"
+            );
         }
     }
 }
