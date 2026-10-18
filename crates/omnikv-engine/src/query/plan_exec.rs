@@ -30,6 +30,7 @@ pub struct PlanExecutor {
     pub db: Arc<OmniKV>,
     pub catalog: Arc<Catalog>,
     types: ColumnTypeMap,
+    scan_seq: Option<u64>,
 }
 
 impl PlanExecutor {
@@ -38,13 +39,35 @@ impl PlanExecutor {
             db,
             catalog,
             types: ColumnTypeMap::new(),
+            scan_seq: None,
         }
     }
 
     pub fn for_plan(db: Arc<OmniKV>, catalog: Arc<Catalog>, plan: &PlanNode) -> Self {
         let mut types = ColumnTypeMap::new();
         collect_plan_types(plan, &catalog, &mut types);
-        Self { db, catalog, types }
+        Self {
+            db,
+            catalog,
+            types,
+            scan_seq: None,
+        }
+    }
+
+    /// Builds a plan executor pinned to the caller's statement snapshot.
+    pub fn for_plan_at(
+        db: Arc<OmniKV>,
+        catalog: Arc<Catalog>,
+        plan: &PlanNode,
+        scan_seq: u64,
+    ) -> Self {
+        let mut executor = Self::for_plan(db, catalog, plan);
+        executor.scan_seq = Some(scan_seq);
+        executor
+    }
+
+    fn read_seq(&self) -> u64 {
+        self.scan_seq.unwrap_or_else(|| self.db.get_seq())
     }
 
     /// Execute a plan node, returning rows.
@@ -227,7 +250,7 @@ impl PlanExecutor {
                 let key_value = crate::volcano::canonicalize_pk_key(&table, key_value);
                 let key = format!("{}{}", table.row_prefix(), key_value);
                 let end = format!("{}{}\x7F", table.row_prefix(), key_value);
-                let seq = self.db.get_seq();
+                let seq = self.read_seq();
                 self.db
                     .scan(&key, &end, seq)
                     .unwrap_or_default()
@@ -268,7 +291,7 @@ impl PlanExecutor {
 
     fn load_table_rows(&self, table: &TableDef) -> Vec<Row> {
         let prefix = table.row_prefix();
-        let seq = self.db.get_seq();
+        let seq = self.read_seq();
         self.db
             .scan(&prefix, &format!("{}\x7F", prefix), seq)
             .unwrap_or_default()
@@ -280,7 +303,7 @@ impl PlanExecutor {
     /// Load only specific columns (column pruning).
     pub fn load_table_rows_pruned(&self, table: &TableDef, needed_cols: &[String]) -> Vec<Row> {
         let prefix = table.row_prefix();
-        let seq = self.db.get_seq();
+        let seq = self.read_seq();
         self.db
             .scan(&prefix, &format!("{}\x7F", prefix), seq)
             .unwrap_or_default()

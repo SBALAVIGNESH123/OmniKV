@@ -64,11 +64,23 @@ pub fn gather_stats(
     index_catalog: Option<&IndexCatalog>,
     db: &crate::OmniKV,
 ) -> std::collections::HashMap<String, TableStats> {
+    gather_stats_at(catalog, index_catalog, db, db.get_seq())
+}
+
+/// Collects table statistics from a caller-selected MVCC sequence. Query
+/// planning must use the same read point as execution; otherwise a stale
+/// catalog or a concurrent write can change estimates and row-format
+/// decoding halfway through one statement.
+pub fn gather_stats_at(
+    catalog: &Catalog,
+    index_catalog: Option<&IndexCatalog>,
+    db: &crate::OmniKV,
+    seq: u64,
+) -> std::collections::HashMap<String, TableStats> {
     let mut stats = std::collections::HashMap::new();
     for table_name in catalog.list_tables() {
         if let Some(table) = catalog.get_table(&table_name) {
             let prefix = table.row_prefix();
-            let seq = db.get_seq();
             let row_count = db
                 .scan(&prefix, &format!("{}\x7F", prefix), seq)
                 .map(|r| r.len() as u64)

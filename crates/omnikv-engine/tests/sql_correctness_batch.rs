@@ -5,7 +5,8 @@ use omni_engine::OmniKV;
 use omni_engine::catalog::Catalog;
 use omni_engine::sql::*;
 use omni_engine::sql_exec::*;
-use std::sync::Arc;
+use std::sync::{Arc, Barrier};
+use std::thread;
 
 fn create_env(prefix: &str) -> SqlExecutor {
     let dir = tempfile::tempdir().unwrap();
@@ -756,6 +757,164 @@ fn stale_catalog_does_not_remigrate_typed_rows() {
         vec![["2"]],
         "the typed literal text must survive a stale executor's write"
     );
+}
+
+/// A stale executor must refresh the persisted row format before a read too;
+/// otherwise a typed literal "NULL" is decoded as a legacy SQL NULL.
+#[test]
+fn stale_catalog_select_uses_persisted_row_format() {
+    let e = legacy_env("stale_catalog_select", "legacy_t", "");
+
+    let other = SqlExecutor::new(e.db.clone(), Arc::new(Catalog::new(e.db.clone())));
+    exec(&other, "INSERT INTO legacy_t (id, v) VALUES (2, 'NULL')");
+
+    assert_eq!(
+        rows(&e, "SELECT id FROM legacy_t WHERE v = 'NULL'"),
+        vec![["2"]],
+        "a stale SELECT must preserve typed literal text"
+    );
+    assert_eq!(
+        rows(&e, "SELECT id FROM legacy_t WHERE v IS NULL"),
+        Vec::<Vec<String>>::new(),
+        "a typed literal must not match IS NULL through a stale catalog"
+    );
+}
+
+/// The per-table SQL lock must cover the uniqueness check and commit, not
+/// merely the legacy migration. Two concurrent autocommit INSERTs for one
+/// typed primary key therefore produce one success and one duplicate-key
+/// error rather than silently letting the later version win.
+#[test]
+fn concurrent_autocommit_insert_preserves_primary_key_uniqueness() {
+    let e = create_env("concurrent_pk");
+    exec(&e, "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)");
+
+    let barrier = Arc::new(Barrier::new(3));
+    let mut workers = Vec::new();
+    for value in ["first", "second"] {
+        let db = e.db.clone();
+        let catalog = Arc::new(Catalog::new(db.clone()));
+        let executor = SqlExecutor::new(db, catalog);
+        let barrier = barrier.clone();
+        let value = value.to_string();
+        workers.push(thread::spawn(move || {
+            barrier.wait();
+            executor.execute(
+                &parse_sql(&format!("INSERT INTO t (id, v) VALUES (1, '{value}')"))
+                    .expect("parse concurrent insert"),
+            )
+        }));
+    }
+    barrier.wait();
+
+    let results: Vec<_> = workers
+        .into_iter()
+        .map(|worker| worker.join().expect("concurrent insert worker panicked"))
+        .collect();
+    let summaries: Vec<String> = results
+        .iter()
+        .map(|result| match result {
+            Ok(ExecResult::Modified { command, .. }) => command.clone(),
+            Ok(ExecResult::Rows { .. }) => "rows".into(),
+            Ok(ExecResult::Ok(message)) => message.clone(),
+            Err(error) => error.clone(),
+        })
+        .collect();
+    assert_eq!(
+        results.iter().filter(|result| result.is_ok()).count(),
+        1,
+        "exactly one insert may claim the primary key: {summaries:?}"
+    );
+    assert_eq!(
+        results
+            .iter()
+            .filter(|result| result
+                .as_ref()
+                .is_err_and(|error| error.contains("duplicate key")))
+            .count(),
+        1,
+        "the losing insert must report a duplicate-key error: {summaries:?}"
+    );
+    assert_eq!(rows(&e, "SELECT COUNT(*) FROM t"), vec![vec!["1"]]);
+}
+
+/// Two SQL writers that both see a legacy catalog must serialize the
+/// migration itself. Both inserts should succeed, while the old sentinel
+/// remains SQL NULL and a typed literal "NULL" remains text.
+#[test]
+fn concurrent_legacy_migrations_are_serialized() {
+    let e = legacy_env("concurrent_legacy", "legacy_t", "");
+    let mut seed = omni_engine::WriteBatch::new();
+    seed.set(
+        "\u{0}T\u{0}legacy_t\u{0}1",
+        "{\"id\":\"1\",\"v\":\"NULL\"}".to_string(),
+    )
+    .unwrap();
+    e.db.commit_batch(&seed).unwrap();
+
+    let barrier = Arc::new(Barrier::new(3));
+    let mut workers = Vec::new();
+    for (id, value) in [("2", "NULL"), ("3", "other")] {
+        let db = e.db.clone();
+        let catalog = Arc::new(Catalog::new(db.clone()));
+        let executor = SqlExecutor::new(db, catalog);
+        let barrier = barrier.clone();
+        workers.push(thread::spawn(move || {
+            barrier.wait();
+            executor.execute(
+                &parse_sql(&format!(
+                    "INSERT INTO legacy_t (id, v) VALUES ({id}, '{value}')"
+                ))
+                .expect("parse concurrent legacy insert"),
+            )
+        }));
+    }
+    barrier.wait();
+
+    for worker in workers {
+        assert!(
+            worker
+                .join()
+                .expect("concurrent legacy worker panicked")
+                .is_ok(),
+            "both serialized legacy migrations must succeed"
+        );
+    }
+
+    assert_eq!(
+        sorted(rows(&e, "SELECT id FROM legacy_t WHERE v = 'NULL'")),
+        vec![vec!["2"]]
+    );
+    assert_eq!(
+        rows(&e, "SELECT id FROM legacy_t WHERE v IS NULL"),
+        vec![vec!["1"]]
+    );
+}
+
+/// A long-lived executor must not resurrect a table after another executor
+/// drops it. The DML target is re-resolved while holding the same per-table
+/// lock used by DROP TABLE.
+#[test]
+fn stale_catalog_dml_rejects_dropped_table() {
+    let e = legacy_env("stale_after_drop", "legacy_t", "");
+    let other = SqlExecutor::new(e.db.clone(), Arc::new(Catalog::new(e.db.clone())));
+    exec(&other, "DROP TABLE legacy_t");
+
+    let error = err(&e, "INSERT INTO legacy_t (id, v) VALUES (1, 'x')");
+    assert!(
+        error.contains("does not exist"),
+        "a stale executor must not recreate a dropped table: {error}"
+    );
+    assert_eq!(
+        rows(&e, "SHOW TABLES"),
+        Vec::<Vec<String>>::new(),
+        "the dropped table must remain absent"
+    );
+
+    // The same stale executor must be able to create the name again after the
+    // persisted DROP, rather than failing against its obsolete cache entry.
+    exec(&e, "CREATE TABLE legacy_t (id INTEGER PRIMARY KEY, v TEXT)");
+    assert_eq!(rows(&e, "SHOW TABLES"), vec![vec!["legacy_t"]]);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

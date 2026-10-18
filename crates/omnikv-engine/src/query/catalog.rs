@@ -331,4 +331,21 @@ impl Catalog {
             .expect("catalog cache RwLock poisoned: fatal invariant");
         cache.keys().cloned().collect()
     }
+
+    /// Lists the catalog as of a caller-selected MVCC sequence. Long-lived
+    /// executors may have a cache from before a concurrent CREATE or DROP;
+    /// SHOW TABLES must report the statement's persisted view instead of that
+    /// stale cache.
+    pub fn list_tables_at(&self, seq: u64) -> Vec<String> {
+        self.db
+            .scan(CATALOG_PREFIX, &format!("{}\x7F", CATALOG_PREFIX), seq)
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|(_, value)| {
+                serde_json::from_str::<TableDef>(&value)
+                    .ok()
+                    .map(|table| table.name.to_lowercase())
+            })
+            .collect()
+    }
 }

@@ -81,7 +81,7 @@ fn create_backup_internal(
         .write()
         .map_err(|_| "storage transition lock poisoned while creating backup".to_string())?;
 
-    db.compact_sstables()
+    db.compact_sstables_locked()
         .map_err(|e| format!("Flush active memtable before backup: {e}"))?;
     db.sync_all()
         .map_err(|e| format!("Sync storage before backup: {e}"))?;

@@ -8,7 +8,7 @@ use arc_swap::ArcSwap;
 use crossbeam_skiplist::SkipMap;
 use memmap2::{Mmap, MmapOptions};
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::hash::{Hash, Hasher};
 use std::io::{BufWriter, ErrorKind, Read, Write};
@@ -1159,6 +1159,11 @@ pub struct OmniKV {
     pub(crate) heap_file: Mutex<File>,
     pub(crate) heap_offset: AtomicU64,
     pub(crate) wal: Mutex<wal::WriteAheadLog>,
+    /// Per-table SQL write locks. The guard spans the read/check/transform/
+    /// commit sequence so autocommit DML cannot race uniqueness checks,
+    /// legacy-row migration, or DROP TABLE for the same table. Different
+    /// tables remain independent.
+    pub(crate) sql_table_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     write_mutex: Mutex<()>,
     pub(crate) manifest_path: String,
     pub(crate) wal_path: String,
@@ -1206,6 +1211,26 @@ pub struct OmniKV {
     // all mmap-bearing roots and files are released before the database LOCK
     // file is unlocked and closed.
     db_lock: DatabaseLock,
+}
+
+/// RAII registration for a storage read snapshot. Keeping the registration
+/// coupled to the sequence prevents compaction from discarding versions while
+/// a statement still needs them, including when statement execution unwinds.
+pub(crate) struct SnapshotGuard {
+    db: Arc<OmniKV>,
+    sequence: u64,
+}
+
+impl SnapshotGuard {
+    pub(crate) fn sequence(&self) -> u64 {
+        self.sequence
+    }
+}
+
+impl Drop for SnapshotGuard {
+    fn drop(&mut self) {
+        self.db.unregister_snapshot(self.sequence);
+    }
 }
 
 impl OmniKV {
@@ -1265,6 +1290,7 @@ impl OmniKV {
             heap_file: Mutex::new(recovered.heap_file),
             heap_offset: AtomicU64::new(recovered.heap_offset),
             wal: Mutex::new(recovered.wal),
+            sql_table_locks: Mutex::new(HashMap::new()),
             write_mutex: Mutex::new(()),
             manifest_path: manifest_path.to_string(),
             wal_path: wal_path.to_string(),
@@ -1565,7 +1591,41 @@ impl OmniKV {
         self.global_seq.load(Ordering::SeqCst)
     }
 
+    /// Returns the process-local SQL lock for one table. The caller keeps the
+    /// returned `Arc` alive while locking it, so removing a table from the
+    /// catalog cannot invalidate a lock that another statement is waiting on.
+    pub(crate) fn sql_table_lock(&self, table_name: &str) -> Result<Arc<Mutex<()>>, OmniError> {
+        let mut locks = self
+            .sql_table_locks
+            .lock()
+            .map_err(|_| OmniError::LockPoisoned("sql_table_locks".into()))?;
+        Ok(locks
+            .entry(table_name.to_lowercase())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone())
+    }
+
+    /// Captures a committed read point and pins its historical versions until
+    /// the returned guard is dropped. SQL autocommit statements use this for
+    /// statement-level snapshot consistency and compaction safety.
+    pub(crate) fn snapshot_guard(self: &Arc<Self>) -> SnapshotGuard {
+        SnapshotGuard {
+            db: self.clone(),
+            sequence: self.snapshot(),
+        }
+    }
+
     pub fn snapshot(&self) -> u64 {
+        // Writers hold the transition read lock from sequence reservation
+        // through memtable publication. Take the exclusive side while
+        // choosing a snapshot so the returned sequence is a fully published
+        // commit point rather than a range reserved by an in-flight batch.
+        // The lock is held only for the sequence/pin operation; readers use
+        // the retained MVCC history after it is released.
+        let _transition_guard = self
+            .transition_guard
+            .write()
+            .expect("FATAL: transition lock poisoned");
         let seq = self.get_seq().saturating_sub(1);
         let mut snaps = self
             .active_snapshots
@@ -2532,6 +2592,17 @@ impl OmniKV {
 
     /// Flushes the active memtable to disk as an L0 SSTable.
     pub fn compact_sstables(&self) -> Result<(), OmniError> {
+        let _topology_guard = self
+            .transition_guard
+            .read()
+            .map_err(|_| OmniError::LockPoisoned("transition_guard".into()))?;
+        self.compact_sstables_locked()
+    }
+
+    /// Compacts the active memtable while the caller already holds the
+    /// transition barrier. Backup creation uses this form while holding the
+    /// barrier exclusively; reacquiring the read side there would deadlock.
+    pub(crate) fn compact_sstables_locked(&self) -> Result<(), OmniError> {
         let started_at = std::time::Instant::now();
         let mut stats = CompactionStats::default();
         let (frozen_idx, frozen_arc) = {
@@ -2657,6 +2728,10 @@ impl OmniKV {
     pub fn compact_l0_to_l1(&self) -> Result<(), OmniError> {
         let started_at = std::time::Instant::now();
         let mut stats = CompactionStats::default();
+        let _topology_guard = self
+            .transition_guard
+            .read()
+            .map_err(|_| OmniError::LockPoisoned("transition_guard".into()))?;
         let _guard = self
             .write_mutex
             .lock()
@@ -2789,6 +2864,10 @@ impl OmniKV {
     pub fn compact_l1_to_l2(&self) -> Result<(), OmniError> {
         let started_at = std::time::Instant::now();
         let mut stats = CompactionStats::default();
+        let _topology_guard = self
+            .transition_guard
+            .read()
+            .map_err(|_| OmniError::LockPoisoned("transition_guard".into()))?;
         let _guard = self
             .write_mutex
             .lock()
@@ -2935,6 +3014,10 @@ impl OmniKV {
     pub fn run_garbage_collection(&self) -> Result<(), OmniError> {
         let started_at = std::time::Instant::now();
         let mut stats = CompactionStats::default();
+        let _topology_guard = self
+            .transition_guard
+            .read()
+            .map_err(|_| OmniError::LockPoisoned("transition_guard".into()))?;
         let _guard = self
             .write_mutex
             .lock()

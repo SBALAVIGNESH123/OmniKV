@@ -17,6 +17,55 @@ use std::sync::Arc;
 /// `None` is a SQL NULL; `Some("NULL")` is the literal text.
 pub type Row = HashMap<String, Option<String>>;
 
+#[cfg(test)]
+struct MigrationCatalogHook {
+    table: String,
+    armed: std::sync::atomic::AtomicBool,
+    entered: std::sync::mpsc::Sender<()>,
+    release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+}
+
+#[cfg(test)]
+static MIGRATION_CATALOG_HOOK: std::sync::OnceLock<
+    std::sync::Mutex<Option<Arc<MigrationCatalogHook>>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+static MIGRATION_TEST_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+fn migration_catalog_hook_slot() -> &'static std::sync::Mutex<Option<Arc<MigrationCatalogHook>>> {
+    MIGRATION_CATALOG_HOOK.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+#[cfg(test)]
+fn migration_test_lock() -> &'static std::sync::Mutex<()> {
+    MIGRATION_TEST_LOCK.get_or_init(|| std::sync::Mutex::new(()))
+}
+
+#[cfg(test)]
+fn pause_after_migration_catalog_scan(table: &str) {
+    let hook = migration_catalog_hook_slot()
+        .lock()
+        .expect("migration catalog hook lock")
+        .clone();
+    let Some(hook) = hook else {
+        return;
+    };
+    if hook.table.eq_ignore_ascii_case(table)
+        && hook.armed.swap(false, std::sync::atomic::Ordering::SeqCst)
+    {
+        hook.entered
+            .send(())
+            .expect("migration hook entry receiver");
+        hook.release
+            .lock()
+            .expect("migration hook release lock")
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("migration hook release signal");
+    }
+}
+
 /// One cell of an output row. NULL stays `None` until the wire boundary
 /// renders it, so subqueries and set operations never confuse the two.
 pub type Cell = Option<String>;
@@ -40,6 +89,12 @@ pub struct SqlExecutor {
     /// If set, all reads use this MVCC snapshot instead of the current seq.
     /// Used by PgWire transaction blocks for snapshot isolation.
     snapshot_seq: Option<u64>,
+    /// Read point captured for the outermost statement. Nested subqueries
+    /// reuse it so one SQL statement cannot mix MVCC snapshots.
+    statement_seq: std::cell::RefCell<Option<u64>>,
+    /// Retention pin paired with `statement_seq` for autocommit statements.
+    /// Explicit transaction snapshots are owned by `TransactionManager`.
+    statement_snapshot: std::cell::RefCell<Option<crate::SnapshotGuard>>,
     /// SSI read dependencies collected by this statement's scans — the
     /// read counterpart of `pending_batch`. The wire core drains them
     /// into the open transaction alongside the staged writes, so any
@@ -63,12 +118,25 @@ pub struct SqlExecutor {
     slow_query_threshold: std::time::Duration,
 }
 
+struct StatementScope<'a> {
+    executor: &'a SqlExecutor,
+}
+
+impl Drop for StatementScope<'_> {
+    fn drop(&mut self) {
+        *self.executor.statement_seq.borrow_mut() = None;
+        self.executor.statement_snapshot.borrow_mut().take();
+    }
+}
+
 impl SqlExecutor {
     pub fn new(db: Arc<OmniKV>, catalog: Arc<Catalog>) -> Self {
         Self {
             db,
             catalog,
             snapshot_seq: None,
+            statement_seq: std::cell::RefCell::new(None),
+            statement_snapshot: std::cell::RefCell::new(None),
             pending_reads: std::cell::RefCell::new(None),
             pending_batch: std::cell::RefCell::new(None),
             query_timeout: Some(std::time::Duration::from_secs(30)),
@@ -83,6 +151,8 @@ impl SqlExecutor {
             db,
             catalog,
             snapshot_seq: Some(seq),
+            statement_seq: std::cell::RefCell::new(None),
+            statement_snapshot: std::cell::RefCell::new(None),
             pending_reads: std::cell::RefCell::new(None),
             pending_batch: std::cell::RefCell::new(None),
             query_timeout: Some(std::time::Duration::from_secs(30)),
@@ -127,6 +197,8 @@ impl SqlExecutor {
             db,
             catalog,
             snapshot_seq: Some(read_seq),
+            statement_seq: std::cell::RefCell::new(None),
+            statement_snapshot: std::cell::RefCell::new(None),
             pending_reads: std::cell::RefCell::new(Some(crate::volcano::ReadCollector::default())),
             pending_batch: std::cell::RefCell::new(Some(pending)),
             query_timeout: Some(std::time::Duration::from_secs(30)),
@@ -162,6 +234,83 @@ impl SqlExecutor {
     /// a concurrent CREATE/DROP of the same name aborts this COMMIT.
     fn record_catalog_read(&self, table_name: &str) {
         self.record_point_read(&Catalog::staged_drop_key(table_name));
+    }
+
+    /// The one MVCC read point for the current statement. Explicit
+    /// transactions already carry a fixed snapshot; autocommit statements
+    /// capture the current sequence once and thread it through all reads.
+    fn statement_read_seq(&self) -> u64 {
+        if let Some(snapshot) = self.statement_snapshot.borrow().as_ref() {
+            snapshot.sequence()
+        } else {
+            self.snapshot_seq.unwrap_or_else(|| self.db.get_seq())
+        }
+    }
+
+    /// Begins the outermost statement scope. The RAII scope clears the
+    /// per-statement state on both normal `Result` errors and panics.
+    fn begin_statement_scope(&self) -> StatementScope<'_> {
+        if let Some(seq) = self.snapshot_seq {
+            *self.statement_seq.borrow_mut() = Some(seq);
+        } else {
+            let snapshot = self.db.snapshot_guard();
+            let seq = snapshot.sequence();
+            *self.statement_snapshot.borrow_mut() = Some(snapshot);
+            *self.statement_seq.borrow_mut() = Some(seq);
+        }
+        StatementScope { executor: self }
+    }
+
+    /// After waiting for another legacy migration, refresh an autocommit
+    /// statement's read point so it cannot apply a stale migration batch over
+    /// the migration that just completed. Explicit transactions retain their
+    /// original snapshot by design.
+    fn refresh_statement_seq_after_migration_lock(&self) -> u64 {
+        if self.snapshot_seq.is_some() {
+            return self.statement_read_seq();
+        }
+        let snapshot = self.db.snapshot_guard();
+        let seq = snapshot.sequence();
+        *self.statement_snapshot.borrow_mut() = Some(snapshot);
+        *self.statement_seq.borrow_mut() = Some(seq);
+        seq
+    }
+
+    /// Acquires the SQL-layer lock for one table. Autocommit DML holds this
+    /// from its first visibility check through commit; DDL uses the same lock
+    /// so a stale cached definition cannot resurrect a dropped table.
+    fn table_lock(&self, table_name: &str) -> Result<Arc<std::sync::Mutex<()>>, String> {
+        self.db
+            .sql_table_lock(table_name)
+            .map_err(|e| format!("{:?}", e))
+    }
+
+    /// Reconcile a cached legacy definition with the catalog at this
+    /// statement's read point before decoding rows. A stale executor may have
+    /// been created before another executor completed the migration; using the
+    /// persisted definition here prevents the preflight scan from decoding
+    /// typed rows with legacy NULL rules.
+    fn effective_dml_table(&self, table: &TableDef, seq: u64) -> Result<TableDef, String> {
+        let persisted = self
+            .effective_table(&table.name, seq)?
+            .ok_or_else(|| format!("Table '{}' does not exist", table.name))?;
+        self.catalog.insert_staged(persisted.clone());
+        Ok(persisted)
+    }
+
+    /// Resolves a DML target after the per-table SQL lock is held. The cached
+    /// catalog is only a hint: an executor can outlive a CREATE or DROP done
+    /// by another executor, so the persisted definition at this statement's
+    /// read point is authoritative.
+    fn resolve_dml_table(&self, table_name: &str, seq: u64) -> Result<TableDef, String> {
+        if let Some(cached) = self.catalog.get_table(table_name) {
+            return self.effective_dml_table(&cached, seq);
+        }
+        let persisted = self
+            .effective_table(table_name, seq)?
+            .ok_or_else(|| format!("Table '{}' does not exist", table_name))?;
+        self.catalog.insert_staged(persisted.clone());
+        Ok(persisted)
     }
 
     /// Whether this executor stages writes into a pending batch (created
@@ -249,6 +398,11 @@ impl SqlExecutor {
 
     pub fn execute(&self, stmt: &SqlStatement) -> Result<ExecResult, String> {
         let start = std::time::Instant::now();
+        let _statement_scope = if self.statement_seq.borrow().is_none() {
+            Some(self.begin_statement_scope())
+        } else {
+            None
+        };
 
         // A transactional executor's catalog overlay: staged DDL from
         // earlier statements in the block becomes visible to this
@@ -263,14 +417,13 @@ impl SqlExecutor {
             self.catalog.apply_txn_overlay(&staged);
         }
 
-        // Check timeout before execution
-        if let Some(timeout) = self.query_timeout
+        let result = if let Some(timeout) = self.query_timeout
             && timeout.is_zero()
         {
-            return Err("Query timeout is zero".into());
-        }
-
-        let result = self.execute_inner(stmt);
+            Err("Query timeout is zero".into())
+        } else {
+            self.execute_inner(stmt)
+        };
 
         // Slow query logging
         let elapsed = start.elapsed();
@@ -333,7 +486,13 @@ impl SqlExecutor {
                 where_clause,
             } => self.exec_delete(table, where_clause.as_ref()),
             SqlStatement::ShowTables => {
-                let tables = self.catalog.list_tables();
+                let tables = if self.is_transactional() {
+                    // The transaction-local catalog cache includes staged DDL;
+                    // a persisted-only scan would hide read-your-own-DDL.
+                    self.catalog.list_tables()
+                } else {
+                    self.catalog.list_tables_at(self.statement_read_seq())
+                };
                 let rows: Vec<Vec<Cell>> = tables.into_iter().map(|t| vec![Some(t)]).collect();
                 Ok(ExecResult::Rows {
                     columns: vec!["table_name".into()],
@@ -341,8 +500,14 @@ impl SqlExecutor {
                 })
             }
             SqlStatement::Explain(inner) => {
+                self.refresh_statement_catalog_for(inner, self.statement_read_seq())?;
                 // Use the cost-based optimizer for real EXPLAIN output
-                let stats = crate::optimizer::gather_stats(&self.catalog, None, &self.db);
+                let stats = crate::optimizer::gather_stats_at(
+                    &self.catalog,
+                    None,
+                    &self.db,
+                    self.statement_read_seq(),
+                );
                 let optimizer = crate::optimizer::Optimizer::new(stats);
                 match optimizer.optimize(inner) {
                     Ok(plan) => {
@@ -363,15 +528,22 @@ impl SqlExecutor {
                 }
             }
             SqlStatement::ExplainAnalyze(inner) => {
+                self.refresh_statement_catalog_for(inner, self.statement_read_seq())?;
                 // Run the query through the plan executor and collect stats
-                let stats = crate::optimizer::gather_stats(&self.catalog, None, &self.db);
+                let stats = crate::optimizer::gather_stats_at(
+                    &self.catalog,
+                    None,
+                    &self.db,
+                    self.statement_read_seq(),
+                );
                 let optimizer = crate::optimizer::Optimizer::new(stats);
                 match optimizer.optimize(inner) {
                     Ok(plan) => {
-                        let plan_exec = crate::plan_exec::PlanExecutor::for_plan(
+                        let plan_exec = crate::plan_exec::PlanExecutor::for_plan_at(
                             self.db.clone(),
                             self.catalog.clone(),
                             &plan,
+                            self.statement_read_seq(),
                         );
                         match plan_exec.explain_analyze(&plan) {
                             Ok((_rows, node_stats)) => {
@@ -469,8 +641,17 @@ impl SqlExecutor {
         cols: &[SqlColumnDef],
         if_not_exists: bool,
     ) -> Result<ExecResult, String> {
-        if if_not_exists && self.catalog.get_table(name).is_some() {
-            return Ok(ExecResult::Ok("Table already exists".into()));
+        let table_lock = self.table_lock(name)?;
+        let _table_guard = table_lock
+            .lock()
+            .map_err(|_| "SQL table lock poisoned".to_string())?;
+        let seq = self.refresh_statement_seq_after_migration_lock();
+        let persisted = self.effective_table(name, seq)?;
+        if persisted.is_some() {
+            if if_not_exists {
+                return Ok(ExecResult::Ok("Table already exists".into()));
+            }
+            return Err(format!("Table '{}' already exists", name));
         }
 
         let mut pk = None;
@@ -514,9 +695,6 @@ impl SqlExecutor {
             // autocommit path (Catalog::create_table checks the cache):
             // staging would silently overwrite the existing definition
             // at COMMIT instead of failing the statement.
-            if self.catalog.get_table(name).is_some() {
-                return Err(format!("Table '{}' already exists", name));
-            }
             self.record_catalog_read(name);
             let (cat_key, cat_value) = Catalog::staged_create_entry(&table)?;
             let mut batch = WriteBatch::new();
@@ -528,24 +706,35 @@ impl SqlExecutor {
             return Ok(ExecResult::Ok(format!("CREATE TABLE {}", name)));
         }
 
+        // The cache may still contain a definition from a table that another
+        // executor dropped. We resolved the persisted catalog under the
+        // table lock above, so clear that stale entry before Catalog's own
+        // duplicate check.
+        self.catalog.remove_staged(name);
         self.catalog.create_table(table)?;
         Ok(ExecResult::Ok(format!("CREATE TABLE {}", name)))
     }
 
     fn exec_drop_table(&self, name: &str, if_exists: bool) -> Result<ExecResult, String> {
-        if if_exists && self.catalog.get_table(name).is_none() {
-            return Ok(ExecResult::Ok("Table does not exist".into()));
-        }
+        let table_lock = self.table_lock(name)?;
+        let _table_guard = table_lock
+            .lock()
+            .map_err(|_| "SQL table lock poisoned".to_string())?;
+        let seq = self.refresh_statement_seq_after_migration_lock();
+        let table = self.effective_table(name, seq)?;
+        let Some(table) = table else {
+            if if_exists {
+                return Ok(ExecResult::Ok("Table does not exist".into()));
+            }
+            return Err(format!("Table '{}' does not exist", name));
+        };
+        self.catalog.insert_staged(table.clone());
         // Inside a transaction the DROP stages: the catalog entry's
         // delete and the row deletes all land in the pending batch —
         // applied atomically at COMMIT, discarded by ROLLBACK — and the
         // statement's own cache forgets the table for this block's later
         // statements. Outside one, the catalog's autocommit path handles.
         if self.is_transactional() {
-            let table = self
-                .catalog
-                .get_table(name)
-                .ok_or_else(|| format!("Table '{}' does not exist", name))?;
             self.record_catalog_read(name);
             // The table's own rows go through the normal DML staging: the
             // row reads use this statement's snapshot+overlay, so only
@@ -574,7 +763,7 @@ impl SqlExecutor {
     /// The table definition as recorded at this statement's read point. The
     /// catalog cache can lag a migration, and a stale `row_format` would
     /// re-migrate rows that are already typed.
-    fn effective_table(&self, name: &str) -> Result<Option<TableDef>, String> {
+    fn effective_table(&self, name: &str, seq: u64) -> Result<Option<TableDef>, String> {
         let key = Catalog::catalog_key(name);
         if let Some(overlay) = self.pending_overlay()
             && let Some(staged) = overlay.get(&key)
@@ -583,7 +772,6 @@ impl SqlExecutor {
                 .as_deref()
                 .and_then(|v| serde_json::from_str::<TableDef>(v).ok()));
         }
-        let seq = self.snapshot_seq.unwrap_or_else(|| self.db.get_seq());
         self.record_point_read(&key);
         let end = format!("{key}\x7F");
         Ok(self
@@ -599,13 +787,18 @@ impl SqlExecutor {
     /// encoding and records the new format in the catalog. The caller merges
     /// this with its own writes and commits both together, so a statement
     /// that fails validation leaves the table exactly as it was.
-    fn migration_batch(&self, table: &TableDef) -> Result<WriteBatch, String> {
-        let persisted = self.effective_table(&table.name)?;
+    fn migration_batch(&self, table: &TableDef, seq: u64) -> Result<WriteBatch, String> {
+        // Use one read point for the catalog format and the rows. An
+        // autocommit executor can otherwise observe a concurrent migration
+        // between these two reads and decode typed rows with legacy rules.
+        let persisted = self
+            .effective_table(&table.name, seq)?
+            .ok_or_else(|| format!("Table '{}' does not exist", table.name))?;
+        #[cfg(test)]
+        pause_after_migration_catalog_scan(&table.name);
         // Already migrated: nothing to rewrite. Refresh this executor's
         // cached copy so its own later reads decode rows as typed.
-        if let Some(persisted) = persisted
-            && persisted.row_format == crate::catalog::RowFormat::Typed
-        {
+        if persisted.row_format == crate::catalog::RowFormat::Typed {
             self.catalog.insert_staged(persisted);
             return Ok(WriteBatch::new());
         }
@@ -613,7 +806,6 @@ impl SqlExecutor {
         let prefix = table.row_prefix();
         let end = format!("{}\u{7F}", prefix);
         self.record_range_read(&prefix, &end);
-        let seq = self.snapshot_seq.unwrap_or_else(|| self.db.get_seq());
         let mut stored = self
             .db
             .scan(&prefix, &end, seq)
@@ -678,7 +870,6 @@ impl SqlExecutor {
         batch
             .set(&cat_key, cat_value)
             .map_err(|e| format!("{:?}", e))?;
-        self.catalog.insert_staged(updated);
         Ok(batch)
     }
 
@@ -688,11 +879,13 @@ impl SqlExecutor {
         col_names: &[String],
         values: &[Vec<SqlValue>],
     ) -> Result<ExecResult, String> {
-        let table = self
-            .catalog
-            .get_table(table_name)
-            .ok_or_else(|| format!("Table '{}' does not exist", table_name))?;
+        let table_lock = self.table_lock(table_name)?;
+        let _table_guard = table_lock
+            .lock()
+            .map_err(|_| "SQL table lock poisoned".to_string())?;
         self.record_catalog_read(table_name);
+        let read_seq = self.refresh_statement_seq_after_migration_lock();
+        let table = self.resolve_dml_table(table_name, read_seq)?;
 
         // Resolve and validate every column before touching storage: a
         // failed statement must not leave a migrated table behind.
@@ -724,7 +917,7 @@ impl SqlExecutor {
         // multi-row INSERT must reject duplicates within the statement as
         // well as conflicts with rows already visible to this executor.
         let mut occupied_keys = std::collections::HashSet::new();
-        for row in self.load_table_rows(&table) {
+        for row in self.load_table_rows_at(&table, read_seq) {
             let Some(pk) = row.get(&table.primary_key).cloned().flatten() else {
                 return Err(format!(
                     "table '{}' contains a row without a primary key; refusing to insert",
@@ -739,7 +932,7 @@ impl SqlExecutor {
         // (or a later failure) drops the row rewrites and the format flip
         // together.
         let mut batch = if table.row_format == crate::catalog::RowFormat::Legacy {
-            self.migration_batch(&table)?
+            self.migration_batch(&table, read_seq)?
         } else {
             WriteBatch::new()
         };
@@ -787,6 +980,11 @@ impl SqlExecutor {
         }
 
         self.stage_or_commit(batch)?;
+        if table.row_format == crate::catalog::RowFormat::Legacy {
+            let mut migrated = table.clone();
+            migrated.row_format = crate::catalog::RowFormat::Typed;
+            self.catalog.insert_staged(migrated);
+        }
         Ok(ExecResult::Modified {
             count,
             command: format!("INSERT 0 {}", count),
@@ -794,6 +992,10 @@ impl SqlExecutor {
     }
 
     fn load_table_rows(&self, table: &TableDef) -> Vec<Row> {
+        self.load_table_rows_at(table, self.statement_read_seq())
+    }
+
+    fn load_table_rows_at(&self, table: &TableDef, seq: u64) -> Vec<Row> {
         let prefix = table.row_prefix();
         // Every read of a table's rows is a range read of its prefix —
         // recorded for SSI so a concurrent write inside the prefix
@@ -801,8 +1003,6 @@ impl SqlExecutor {
         // protection). Autocommit executors collect nothing (their
         // collector is None — nothing to abort).
         self.record_range_read(&prefix, &format!("{}\x7F", prefix));
-        // Use transaction snapshot if available, otherwise current seq (autocommit)
-        let seq = self.snapshot_seq.unwrap_or_else(|| self.db.get_seq());
         let mut results = self
             .db
             .scan(&prefix, &format!("{}\x7F", prefix), seq)
@@ -849,6 +1049,8 @@ impl SqlExecutor {
         limit: Option<usize>,
         offset: Option<usize>,
     ) -> Result<ExecResult, String> {
+        self.refresh_from_tables(from, self.statement_read_seq())?;
+
         // ═══ Pre-process: resolve subqueries in WHERE clause ═══
         let resolved_where = if let Some(expr) = where_clause {
             Some(self.resolve_subqueries(expr)?)
@@ -926,29 +1128,34 @@ impl SqlExecutor {
             offset: None, // offset handled in post-processing below
         };
 
-        let stats = crate::optimizer::gather_stats(&self.catalog, None, &self.db);
+        let stats = crate::optimizer::gather_stats_at(
+            &self.catalog,
+            None,
+            &self.db,
+            self.statement_read_seq(),
+        );
         let optimizer = crate::optimizer::Optimizer::new(stats);
 
         match optimizer.optimize(&stmt) {
             Ok(plan) => {
                 use crate::volcano::{RowIterator, compile_plan_with_scan};
-                // Inside a transaction, scans read at the snapshot and
-                // overlay this transaction's staged writes (read-your-
-                // own-writes); outside one, plain autocommit scans.
-                let scan_ctx = self
-                    .pending_overlay()
-                    .map(|overlay| crate::volcano::ScanContext {
-                        scan_seq: self.snapshot_seq.unwrap_or_else(|| self.db.get_seq()),
-                        overlay,
-                        reads: self.pending_reads.borrow().as_ref().map(|_| {
-                            std::sync::Arc::new(std::sync::Mutex::new(
-                                crate::volcano::ReadCollector::default(),
-                            ))
-                        }),
-                    });
-                let iter_reads = scan_ctx.as_ref().map(|ctx| ctx.reads.clone());
+                // Every scan in one SQL statement uses the same read point.
+                // Explicit transactions use their fixed snapshot; autocommit
+                // statements use the sequence captured by `execute`. The
+                // empty overlay is harmless and lets the same scan context
+                // serve both modes.
+                let scan_ctx = crate::volcano::ScanContext {
+                    scan_seq: self.statement_read_seq(),
+                    overlay: self.pending_overlay().unwrap_or_default(),
+                    reads: self.pending_reads.borrow().as_ref().map(|_| {
+                        std::sync::Arc::new(std::sync::Mutex::new(
+                            crate::volcano::ReadCollector::default(),
+                        ))
+                    }),
+                };
+                let iter_reads = scan_ctx.reads.clone();
                 let mut iter =
-                    compile_plan_with_scan(&plan, &self.db, &self.catalog, scan_ctx.as_ref());
+                    compile_plan_with_scan(&plan, &self.db, &self.catalog, Some(&scan_ctx));
 
                 let mut rows: Vec<Row> = Vec::new();
                 while let Some(row) = iter.next_row() {
@@ -959,7 +1166,6 @@ impl SqlExecutor {
                 // the shared collector; fold them into the executor's
                 // pending reads so the wire core drains one set.
                 if let Some(reads) = iter_reads
-                    && let Some(reads) = reads
                     && let Ok(collected) = reads.lock()
                 {
                     let mut slot = self.pending_reads.borrow_mut();
@@ -1148,6 +1354,41 @@ impl SqlExecutor {
             }
         }
         col_types
+    }
+
+    /// Refreshes every table definition used by this statement from the same
+    /// MVCC point as its row scans. A long-lived executor's cached catalog is
+    /// intentionally not authoritative for autocommit SQL.
+    fn refresh_from_tables(&self, from: &FromClause, seq: u64) -> Result<(), String> {
+        let tables: Vec<&str> = match from {
+            FromClause::Table(table) => vec![table],
+            FromClause::Join { left, right, .. } => vec![left, right],
+        };
+        for table_name in tables {
+            self.record_catalog_read(table_name);
+            let table = self
+                .effective_table(table_name, seq)?
+                .ok_or_else(|| format!("Table '{}' does not exist", table_name))?;
+            self.catalog.insert_staged(table);
+        }
+        Ok(())
+    }
+
+    /// Refreshes all table definitions needed by a plan-shaped statement,
+    /// including nested set-operation branches used by EXPLAIN. This keeps
+    /// planning and EXPLAIN ANALYZE on the same catalog snapshot as execution.
+    fn refresh_statement_catalog_for(&self, stmt: &SqlStatement, seq: u64) -> Result<(), String> {
+        match stmt {
+            SqlStatement::Select { from, .. } => self.refresh_from_tables(from, seq),
+            SqlStatement::SetOp { left, right, .. } => {
+                self.refresh_statement_catalog_for(left, seq)?;
+                self.refresh_statement_catalog_for(right, seq)
+            }
+            SqlStatement::Explain(inner) | SqlStatement::ExplainAnalyze(inner) => {
+                self.refresh_statement_catalog_for(inner, seq)
+            }
+            _ => Ok(()),
+        }
     }
 
     /// Fallback execution path for queries the optimizer cannot handle.
@@ -1828,11 +2069,13 @@ impl SqlExecutor {
         assignments: &[(String, SqlValue)],
         where_clause: Option<&WhereExpr>,
     ) -> Result<ExecResult, String> {
-        let table = self
-            .catalog
-            .get_table(table_name)
-            .ok_or_else(|| format!("Table '{}' does not exist", table_name))?;
+        let table_lock = self.table_lock(table_name)?;
+        let _table_guard = table_lock
+            .lock()
+            .map_err(|_| "SQL table lock poisoned".to_string())?;
         self.record_catalog_read(table_name);
+        let read_seq = self.refresh_statement_seq_after_migration_lock();
+        let table = self.resolve_dml_table(table_name, read_seq)?;
         self.validate_where_columns_of(table_name, where_clause)?;
         // Validate the assignments before filtering: a statement that
         // matches no rows would otherwise skip the loop and silently accept
@@ -1841,7 +2084,7 @@ impl SqlExecutor {
             .iter()
             .map(|(col, val)| Ok((resolve_column_name(&table, col)?, val)))
             .collect::<Result<_, String>>()?;
-        let mut rows = self.load_table_rows(&table);
+        let mut rows = self.load_table_rows_at(&table, read_seq);
         let mut available_keys = std::collections::HashSet::new();
         for row in &rows {
             let Some(pk) = row.get(&table.primary_key).cloned().flatten() else {
@@ -1884,7 +2127,7 @@ impl SqlExecutor {
         // The migration batch lands first so its rewrite of an untouched
         // row loses to this statement's write of the same (canonical) key.
         let mut batch = if table.row_format == crate::catalog::RowFormat::Legacy {
-            self.migration_batch(&table)?
+            self.migration_batch(&table, read_seq)?
         } else {
             WriteBatch::new()
         };
@@ -1930,6 +2173,11 @@ impl SqlExecutor {
 
         if !batch.is_empty() {
             self.stage_or_commit(batch)?;
+            if table.row_format == crate::catalog::RowFormat::Legacy {
+                let mut migrated = table.clone();
+                migrated.row_format = crate::catalog::RowFormat::Typed;
+                self.catalog.insert_staged(migrated);
+            }
         }
         Ok(ExecResult::Modified {
             count,
@@ -1942,13 +2190,15 @@ impl SqlExecutor {
         table_name: &str,
         where_clause: Option<&WhereExpr>,
     ) -> Result<ExecResult, String> {
-        let table = self
-            .catalog
-            .get_table(table_name)
-            .ok_or_else(|| format!("Table '{}' does not exist", table_name))?;
+        let table_lock = self.table_lock(table_name)?;
+        let _table_guard = table_lock
+            .lock()
+            .map_err(|_| "SQL table lock poisoned".to_string())?;
         self.record_catalog_read(table_name);
+        let read_seq = self.refresh_statement_seq_after_migration_lock();
+        let table = self.resolve_dml_table(table_name, read_seq)?;
         self.validate_where_columns_of(table_name, where_clause)?;
-        let mut rows = self.load_table_rows(&table);
+        let mut rows = self.load_table_rows_at(&table, read_seq);
 
         if let Some(expr) = where_clause {
             let col_types = column_types_of_table(&table);
@@ -1958,7 +2208,7 @@ impl SqlExecutor {
         // Deletes commit after the migration's rewrites inside one batch, so
         // a row the statement removes disappears even if migration moved it.
         let mut batch = if table.row_format == crate::catalog::RowFormat::Legacy {
-            self.migration_batch(&table)?
+            self.migration_batch(&table, read_seq)?
         } else {
             WriteBatch::new()
         };
@@ -1979,6 +2229,11 @@ impl SqlExecutor {
 
         if !batch.is_empty() {
             self.stage_or_commit(batch)?;
+            if table.row_format == crate::catalog::RowFormat::Legacy {
+                let mut migrated = table.clone();
+                migrated.row_format = crate::catalog::RowFormat::Typed;
+                self.catalog.insert_staged(migrated);
+            }
         }
         Ok(ExecResult::Modified {
             count,
@@ -2101,4 +2356,398 @@ fn compute_aggregate(
     col_type: Option<&ColumnType>,
 ) -> (String, Option<String>) {
     crate::volcano::compute_aggregate(func, target, rows, col_type)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::catalog::{Column, RowFormat};
+    use crate::sql::parse_sql;
+    use std::sync::{Arc, Barrier, mpsc::channel};
+    use std::time::Duration;
+
+    fn legacy_table() -> TableDef {
+        TableDef {
+            name: "legacy_t".into(),
+            columns: vec![
+                Column {
+                    name: "id".into(),
+                    col_type: ColumnType::Integer,
+                    nullable: false,
+                    primary_key: true,
+                    default: None,
+                },
+                Column {
+                    name: "v".into(),
+                    col_type: ColumnType::Text,
+                    nullable: true,
+                    primary_key: false,
+                    default: None,
+                },
+            ],
+            primary_key: "id".into(),
+            created_at: 1,
+            row_format: RowFormat::Legacy,
+        }
+    }
+
+    fn rows(executor: &SqlExecutor, sql: &str) -> Vec<Vec<Cell>> {
+        match executor.execute(&parse_sql(sql).expect("parse test query")) {
+            Ok(ExecResult::Rows { rows, .. }) => rows,
+            _ => panic!("expected rows for {sql:?}"),
+        }
+    }
+
+    /// The catalog and row scan in one migration must use the same MVCC
+    /// sequence. A commit that lands between them may contain typed rows;
+    /// decoding those rows with legacy rules silently turns literal "NULL"
+    /// text into SQL NULL.
+    #[test]
+    fn migration_uses_one_read_sequence_for_catalog_and_rows() {
+        let _test_guard = migration_test_lock().lock().expect("migration test lock");
+        let dir = tempfile::tempdir().expect("temporary database directory");
+        let manifest = dir.path().join("manifest.json");
+        let wal = dir.path().join("wal.bin");
+        let db = OmniKV::open(
+            manifest.to_str().expect("manifest path"),
+            wal.to_str().expect("wal path"),
+        )
+        .expect("open database");
+
+        let legacy = legacy_table();
+        let typed = TableDef {
+            row_format: RowFormat::Typed,
+            ..legacy.clone()
+        };
+        let mut initial = WriteBatch::new();
+        let (catalog_key, legacy_manifest) =
+            Catalog::staged_create_entry(&legacy).expect("serialize legacy catalog");
+        initial
+            .set(&catalog_key, legacy_manifest)
+            .expect("stage legacy catalog");
+        initial
+            .set(
+                "\u{0}T\u{0}legacy_t\u{0}1",
+                r#"{"id":"1","v":"NULL"}"#.to_string(),
+            )
+            .expect("stage legacy row");
+        db.commit_batch(&initial).expect("commit legacy database");
+
+        // Pause the migrating executor after it has read Legacy from the
+        // catalog but before it scans rows. The direct batch below simulates
+        // another executor completing the migration in that exact window.
+        let (entered_tx, entered_rx) = channel();
+        let (release_tx, release_rx) = channel();
+        let hook = Arc::new(MigrationCatalogHook {
+            table: "legacy_t".into(),
+            armed: std::sync::atomic::AtomicBool::new(true),
+            entered: entered_tx,
+            release: std::sync::Mutex::new(release_rx),
+        });
+        *migration_catalog_hook_slot()
+            .lock()
+            .expect("migration hook lock") = Some(hook);
+
+        let worker_db = db.clone();
+        let worker = std::thread::spawn(move || {
+            let executor =
+                SqlExecutor::new(worker_db.clone(), Arc::new(Catalog::new(worker_db.clone())));
+            executor.execute(
+                &parse_sql("INSERT INTO legacy_t (id, v) VALUES (3, 'x')")
+                    .expect("parse migration write"),
+            )
+        });
+
+        let entered = entered_rx.recv_timeout(Duration::from_secs(1)).is_ok();
+
+        // This is a fully typed row: under RowFormat::Typed, the literal
+        // string "NULL" must remain text rather than becoming JSON null.
+        if entered {
+            let mut concurrent = WriteBatch::new();
+            let (_, typed_manifest) =
+                Catalog::staged_create_entry(&typed).expect("serialize typed catalog");
+            concurrent
+                .set(&catalog_key, typed_manifest)
+                .expect("stage typed catalog");
+            concurrent
+                .set(
+                    "\u{0}T\u{0}legacy_t\u{0}2",
+                    r#"{"id":"2","v":"NULL"}"#.to_string(),
+                )
+                .expect("stage typed row");
+            db.commit_batch(&concurrent)
+                .expect("commit concurrent typed migration");
+        }
+        release_tx.send(()).expect("release migration worker");
+        worker
+            .join()
+            .expect("migration worker did not panic")
+            .expect("migration write failed");
+        *migration_catalog_hook_slot()
+            .lock()
+            .expect("migration hook lock") = None;
+        assert!(
+            entered,
+            "migration worker did not reach the synchronization hook"
+        );
+
+        let verifier = SqlExecutor::new(db.clone(), Arc::new(Catalog::new(db)));
+        assert_eq!(
+            rows(&verifier, "SELECT id FROM legacy_t WHERE v = 'NULL'"),
+            vec![vec![Some("2".into())]],
+            "the concurrent typed literal must not be decoded with legacy NULL rules"
+        );
+        assert_eq!(
+            rows(&verifier, "SELECT id FROM legacy_t WHERE v IS NULL"),
+            vec![vec![Some("1".into())]],
+            "the original legacy NULL must remain SQL NULL after migration"
+        );
+    }
+
+    /// Two SQL writers with stale legacy catalogs must serialize the first
+    /// migration. The second writer waits for the table lock, refreshes its
+    /// snapshot, and writes a typed literal instead of attempting a second
+    /// legacy rewrite.
+    #[test]
+    fn concurrent_legacy_migrations_serialize_per_table() {
+        let _test_guard = migration_test_lock().lock().expect("migration test lock");
+        let dir = tempfile::tempdir().expect("temporary database directory");
+        let manifest = dir.path().join("manifest.json");
+        let wal = dir.path().join("wal.bin");
+        let db = OmniKV::open(
+            manifest.to_str().expect("manifest path"),
+            wal.to_str().expect("wal path"),
+        )
+        .expect("open database");
+
+        let legacy = legacy_table();
+        let mut initial = WriteBatch::new();
+        let (catalog_key, legacy_manifest) =
+            Catalog::staged_create_entry(&legacy).expect("serialize legacy catalog");
+        initial
+            .set(&catalog_key, legacy_manifest)
+            .expect("stage legacy catalog");
+        initial
+            .set(
+                "\u{0}T\u{0}legacy_t\u{0}1",
+                r#"{"id":"1","v":"NULL"}"#.to_string(),
+            )
+            .expect("stage legacy row");
+        db.commit_batch(&initial).expect("commit legacy database");
+
+        let first = SqlExecutor::new(db.clone(), Arc::new(Catalog::new(db.clone())));
+        let second = SqlExecutor::new(db.clone(), Arc::new(Catalog::new(db.clone())));
+        let (entered_tx, entered_rx) = channel();
+        let (release_tx, release_rx) = channel();
+        let hook = Arc::new(MigrationCatalogHook {
+            table: "legacy_t".into(),
+            armed: std::sync::atomic::AtomicBool::new(true),
+            entered: entered_tx,
+            release: std::sync::Mutex::new(release_rx),
+        });
+        *migration_catalog_hook_slot()
+            .lock()
+            .expect("migration hook lock") = Some(hook.clone());
+
+        let first_thread = std::thread::spawn(move || {
+            first.execute(
+                &parse_sql("INSERT INTO legacy_t (id, v) VALUES (3, 'x')")
+                    .expect("parse first migration"),
+            )
+        });
+        let first_entered = entered_rx.recv_timeout(Duration::from_secs(1)).is_ok();
+
+        let (ready_tx, ready_rx) = channel();
+        let (done_tx, done_rx) = channel();
+        let second_thread = std::thread::spawn(move || {
+            ready_tx.send(()).expect("signal second writer");
+            let result = second.execute(
+                &parse_sql("INSERT INTO legacy_t (id, v) VALUES (4, 'NULL')")
+                    .expect("parse second migration"),
+            );
+            done_tx.send(()).expect("signal second completion");
+            result
+        });
+        ready_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("second writer did not start");
+        let completed_before_release =
+            first_entered && done_rx.recv_timeout(Duration::from_millis(100)).is_ok();
+
+        release_tx.send(()).expect("release first migration");
+        first_thread
+            .join()
+            .expect("first migration worker panicked")
+            .expect("first migration failed");
+        second_thread
+            .join()
+            .expect("second migration worker panicked")
+            .expect("second migration failed");
+        *migration_catalog_hook_slot()
+            .lock()
+            .expect("migration hook lock") = None;
+
+        assert!(
+            first_entered,
+            "first migration worker did not reach the synchronization hook"
+        );
+        assert!(
+            !completed_before_release,
+            "the second writer completed while the first writer held the table lock"
+        );
+        let verifier = SqlExecutor::new(db.clone(), Arc::new(Catalog::new(db)));
+        assert_eq!(
+            rows(&verifier, "SELECT id FROM legacy_t WHERE v = 'NULL'"),
+            vec![vec![Some("4".into())]],
+            "the second writer must use typed NULL-literal semantics"
+        );
+        assert_eq!(
+            rows(&verifier, "SELECT id FROM legacy_t WHERE v IS NULL"),
+            vec![vec![Some("1".into())]],
+            "the original legacy NULL must remain SQL NULL"
+        );
+    }
+
+    /// Autocommit primary-key validation is serialized with the commit, so
+    /// two concurrent inserts cannot both observe the key as unoccupied.
+    #[test]
+    fn concurrent_autocommit_inserts_reject_duplicate_primary_key() {
+        let dir = tempfile::tempdir().expect("temporary database directory");
+        let manifest = dir.path().join("manifest.json");
+        let wal = dir.path().join("wal.bin");
+        let db = OmniKV::open(
+            manifest.to_str().expect("manifest path"),
+            wal.to_str().expect("wal path"),
+        )
+        .expect("open database");
+        let setup = SqlExecutor::new(db.clone(), Arc::new(Catalog::new(db.clone())));
+        setup
+            .execute(
+                &parse_sql("CREATE TABLE unique_t (id INTEGER PRIMARY KEY, v TEXT)")
+                    .expect("parse create"),
+            )
+            .expect("create table");
+
+        let first = SqlExecutor::new(db.clone(), Arc::new(Catalog::new(db.clone())));
+        let second = SqlExecutor::new(db.clone(), Arc::new(Catalog::new(db.clone())));
+        let start = Arc::new(Barrier::new(3));
+        let first_start = start.clone();
+        let first_thread = std::thread::spawn(move || {
+            first_start.wait();
+            first.execute(
+                &parse_sql("INSERT INTO unique_t (id, v) VALUES (1, 'a')")
+                    .expect("parse first insert"),
+            )
+        });
+        let second_start = start.clone();
+        let second_thread = std::thread::spawn(move || {
+            second_start.wait();
+            second.execute(
+                &parse_sql("INSERT INTO unique_t (id, v) VALUES (1, 'b')")
+                    .expect("parse second insert"),
+            )
+        });
+        start.wait();
+
+        let first_result = first_thread
+            .join()
+            .expect("first duplicate insert worker panicked");
+        let second_result = second_thread
+            .join()
+            .expect("second duplicate insert worker panicked");
+        let error = match (first_result, second_result) {
+            (Err(error), Ok(_)) | (Ok(_), Err(error)) => error,
+            (Ok(_), Ok(_)) => panic!("both duplicate inserts committed"),
+            (Err(first_error), Err(second_error)) => {
+                panic!("both duplicate inserts failed: {first_error}; {second_error}")
+            }
+        };
+        assert!(
+            error.contains("duplicate key"),
+            "the losing insert must report a duplicate key: {error}"
+        );
+
+        let verifier = SqlExecutor::new(db.clone(), Arc::new(Catalog::new(db)));
+        assert_eq!(
+            rows(&verifier, "SELECT id FROM unique_t"),
+            vec![vec![Some("1".into())]],
+            "the primary key must have one visible row"
+        );
+    }
+
+    /// A storage failure after migration planning must not make the executor's
+    /// cache claim that the legacy catalog was committed as typed.
+    #[test]
+    fn failed_migration_commit_does_not_update_catalog_cache() {
+        let dir = tempfile::tempdir().expect("temporary database directory");
+        let manifest = dir.path().join("manifest.json");
+        let wal = dir.path().join("wal.bin");
+        let db = OmniKV::open(
+            manifest.to_str().expect("manifest path"),
+            wal.to_str().expect("wal path"),
+        )
+        .expect("open database");
+
+        let legacy = legacy_table();
+        let mut initial = WriteBatch::new();
+        let (catalog_key, legacy_manifest) =
+            Catalog::staged_create_entry(&legacy).expect("serialize legacy catalog");
+        initial
+            .set(&catalog_key, legacy_manifest)
+            .expect("stage legacy catalog");
+        initial
+            .set(
+                "\u{0}T\u{0}legacy_t\u{0}1",
+                r#"{"id":"1","v":"NULL"}"#.to_string(),
+            )
+            .expect("stage legacy row");
+        for i in 0..3 {
+            let mut batch = WriteBatch::new();
+            batch
+                .set(&format!("\u{0}ZSTALL\u{0}{i}"), format!("value-{i}"))
+                .expect("stage stall marker");
+            db.commit_batch(&batch).expect("commit stall marker");
+            db.compact_sstables().expect("flush stall marker");
+        }
+        assert_eq!(db.sstable_count(), 3, "the test must reach write stall");
+        db.set_compaction_policy(crate::CompactionPolicy {
+            l0_compaction_trigger: 1,
+            l1_compaction_trigger: 1,
+            l0_write_stall_threshold: 4,
+            write_stall_wait_attempts: 0,
+            write_stall_wait_ms: 0,
+        })
+        .expect("set preflight write policy");
+        db.commit_batch(&initial).expect("commit legacy database");
+        db.set_compaction_policy(crate::CompactionPolicy {
+            l0_compaction_trigger: 1,
+            l1_compaction_trigger: 1,
+            l0_write_stall_threshold: 3,
+            write_stall_wait_attempts: 0,
+            write_stall_wait_ms: 0,
+        })
+        .expect("set write-stall test policy");
+
+        let executor = SqlExecutor::new(db.clone(), Arc::new(Catalog::new(db.clone())));
+        let error = match executor.execute(
+            &parse_sql("INSERT INTO legacy_t (id, v) VALUES (2, 'x')")
+                .expect("parse failed migration"),
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("the configured write stall must reject the migration commit"),
+        };
+        assert!(
+            error.contains("WriteStall"),
+            "unexpected storage error: {error}"
+        );
+        assert_eq!(
+            executor
+                .catalog
+                .get_table("legacy_t")
+                .expect("cached legacy table")
+                .row_format,
+            RowFormat::Legacy,
+            "a failed commit must not update the catalog cache"
+        );
+    }
 }
