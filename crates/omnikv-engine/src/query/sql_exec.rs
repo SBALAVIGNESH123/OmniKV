@@ -279,7 +279,10 @@ impl SqlExecutor {
     /// Acquires the SQL-layer lock for one table. Autocommit DML holds this
     /// from its first visibility check through commit; DDL uses the same lock
     /// so a stale cached definition cannot resurrect a dropped table.
-    fn table_lock(&self, table_name: &str) -> Result<Arc<std::sync::Mutex<()>>, String> {
+    fn table_lock(
+        &self,
+        table_name: &str,
+    ) -> Result<Arc<crate::storage::core::SqlTableLock>, String> {
         self.db
             .sql_table_lock(table_name)
             .map_err(|e| format!("{:?}", e))
@@ -486,13 +489,13 @@ impl SqlExecutor {
                 where_clause,
             } => self.exec_delete(table, where_clause.as_ref()),
             SqlStatement::ShowTables => {
-                let tables = if self.is_transactional() {
-                    // The transaction-local catalog cache includes staged DDL;
-                    // a persisted-only scan would hide read-your-own-DDL.
-                    self.catalog.list_tables()
-                } else {
-                    self.catalog.list_tables_at(self.statement_read_seq())
-                };
+                // Read storage even inside transactions: the cache cannot
+                // represent read/decode errors. Merge staged DDL for the
+                // transaction's read-your-own-CREATE/DROP visibility.
+                let tables = self.catalog.list_tables_with_overlay_at(
+                    self.statement_read_seq(),
+                    self.pending_overlay().as_ref(),
+                )?;
                 let rows: Vec<Vec<Cell>> = tables.into_iter().map(|t| vec![Some(t)]).collect();
                 Ok(ExecResult::Rows {
                     columns: vec!["table_name".into()],

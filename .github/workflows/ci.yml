@@ -119,6 +119,8 @@ jobs:
       run: cargo test -p omnikv-engine --test sql_layer --locked -- --test-threads=1
     - name: SQL correctness regression batch
       run: cargo test -p omnikv-engine --test sql_correctness_batch --locked -- --test-threads=1
+    - name: SHOW TABLES catalog integrity regressions
+      run: cargo test -p omnikv-engine --test show_tables_errors --locked -- --test-threads=1
     - name: SQL maturity matrix
       run: cargo test -p omnikv-engine --test sql_maturity_matrix --locked -- --test-threads=1
     - name: SQL v3 feature coverage

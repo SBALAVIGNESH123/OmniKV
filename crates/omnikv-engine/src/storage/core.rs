@@ -18,7 +18,7 @@ use std::os::unix::fs::FileExt;
 use std::os::windows::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock, Weak};
 
 pub struct FnvHasher(u64);
 impl Default for FnvHasher {
@@ -856,27 +856,32 @@ pub struct ScanIterator<'a> {
     read_buffer: PooledScanBuffer,
 }
 
-impl Iterator for ScanIterator<'_> {
-    type Item = (String, String);
-
-    fn next(&mut self) -> Option<Self::Item> {
+impl ScanIterator<'_> {
+    fn try_next(&mut self) -> Result<Option<(String, String)>, OmniError> {
         for candidate in self.candidates.by_ref() {
             if candidate.length == 0 || (candidate.expiry > 0 && candidate.expiry <= self.now) {
                 continue;
             }
             let key = key_to_string(&candidate.key);
-            let value = self
-                .db
-                .read_from_heap_into(
-                    candidate.offset,
-                    candidate.length,
-                    candidate.crc,
-                    self.read_buffer.as_mut_vec(),
-                )
-                .ok()?;
-            return Some((key, value));
+            let value = self.db.read_from_heap_into(
+                candidate.offset,
+                candidate.length,
+                candidate.crc,
+                self.read_buffer.as_mut_vec(),
+            )?;
+            return Ok(Some((key, value)));
         }
-        None
+        Ok(None)
+    }
+}
+
+impl Iterator for ScanIterator<'_> {
+    type Item = (String, String);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        // Preserve the legacy infallible iterator contract. Collected scans
+        // use try_next directly so a heap error cannot become partial success.
+        self.try_next().ok().flatten()
     }
 }
 
@@ -1148,6 +1153,73 @@ pub(crate) struct RecoveredStorage {
     pub max_seq: u64,
 }
 
+#[derive(Default)]
+struct SqlTableLockRegistry {
+    locks: Mutex<HashMap<String, Weak<SqlTableLock>>>,
+}
+
+impl SqlTableLockRegistry {
+    fn get(self: &Arc<Self>, table_name: &str) -> Result<Arc<SqlTableLock>, OmniError> {
+        let name = table_name.to_lowercase();
+        let mut locks = self
+            .locks
+            .lock()
+            .map_err(|_| OmniError::LockPoisoned("sql_table_locks".into()))?;
+
+        // Upgrade under the registry mutex so every holder and waiter shares
+        // one allocation. Only a dead weak entry may be replaced. Do not drop
+        // an upgraded Arc here: its last drop re-enters this registry.
+        let lock = match locks.get(&name).and_then(Weak::upgrade) {
+            Some(lock) => lock,
+            None => {
+                let lock = Arc::new(SqlTableLock {
+                    mutex: Mutex::new(()),
+                    name: name.clone(),
+                    registry: Arc::downgrade(self),
+                });
+                locks.insert(name, Arc::downgrade(&lock));
+                lock
+            }
+        };
+        drop(locks);
+        Ok(lock)
+    }
+}
+
+pub(crate) struct SqlTableLock {
+    mutex: Mutex<()>,
+    name: String,
+    registry: Weak<SqlTableLockRegistry>,
+}
+
+impl SqlTableLock {
+    pub(crate) fn lock(&self) -> std::sync::LockResult<MutexGuard<'_, ()>> {
+        self.mutex.lock()
+    }
+}
+
+impl Drop for SqlTableLock {
+    fn drop(&mut self) {
+        let Some(registry) = self.registry.upgrade() else {
+            return;
+        };
+        let Ok(mut locks) = registry.locks.lock() else {
+            return;
+        };
+
+        // A new lock for the same table may have replaced this dead weak
+        // entry concurrently. Only remove the entry if it still points at
+        // this exact allocation. Compare the weak pointer without upgrading:
+        // dropping a temporary Arc here could recursively lock the registry.
+        let is_this_lock = locks
+            .get(&self.name)
+            .is_some_and(|lock| std::ptr::eq(lock.as_ptr(), std::ptr::from_ref(self)));
+        if is_this_lock {
+            locks.remove(&self.name);
+        }
+    }
+}
+
 pub struct OmniKV {
     // ── Single atomic topology root (replaced atomically during snapshot install) ──
     // Reads: load roots once, work on stable Arc handles — zero locking needed.
@@ -1162,8 +1234,9 @@ pub struct OmniKV {
     /// Per-table SQL write locks. The guard spans the read/check/transform/
     /// commit sequence so autocommit DML cannot race uniqueness checks,
     /// legacy-row migration, or DROP TABLE for the same table. Different
-    /// tables remain independent.
-    pub(crate) sql_table_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    /// tables remain independent. The registry stores weak references and
+    /// each lock removes its own entry when the final statement releases it.
+    sql_table_locks: Arc<SqlTableLockRegistry>,
     write_mutex: Mutex<()>,
     pub(crate) manifest_path: String,
     pub(crate) wal_path: String,
@@ -1290,7 +1363,7 @@ impl OmniKV {
             heap_file: Mutex::new(recovered.heap_file),
             heap_offset: AtomicU64::new(recovered.heap_offset),
             wal: Mutex::new(recovered.wal),
-            sql_table_locks: Mutex::new(HashMap::new()),
+            sql_table_locks: Arc::new(SqlTableLockRegistry::default()),
             write_mutex: Mutex::new(()),
             manifest_path: manifest_path.to_string(),
             wal_path: wal_path.to_string(),
@@ -1594,15 +1667,8 @@ impl OmniKV {
     /// Returns the process-local SQL lock for one table. The caller keeps the
     /// returned `Arc` alive while locking it, so removing a table from the
     /// catalog cannot invalidate a lock that another statement is waiting on.
-    pub(crate) fn sql_table_lock(&self, table_name: &str) -> Result<Arc<Mutex<()>>, OmniError> {
-        let mut locks = self
-            .sql_table_locks
-            .lock()
-            .map_err(|_| OmniError::LockPoisoned("sql_table_locks".into()))?;
-        Ok(locks
-            .entry(table_name.to_lowercase())
-            .or_insert_with(|| Arc::new(Mutex::new(())))
-            .clone())
+    pub(crate) fn sql_table_lock(&self, table_name: &str) -> Result<Arc<SqlTableLock>, OmniError> {
+        self.sql_table_locks.get(table_name)
     }
 
     /// Captures a committed read point and pins its historical versions until
@@ -1759,6 +1825,8 @@ impl OmniKV {
         min_seq
     }
 
+    /// Collects the complete visible range, or returns the first heap read error.
+    /// Unlike the legacy `scan_iter`, errors cannot yield a successful prefix.
     pub fn scan(
         &self,
         start_key: &str,
@@ -1766,8 +1834,9 @@ impl OmniKV {
         read_seq: u64,
     ) -> Result<Vec<(String, String)>, OmniError> {
         let mut results = Vec::new();
-        for (k_str, val) in self.scan_iter(start_key, end_key, read_seq)? {
-            results.push((k_str, val));
+        let mut iter = self.scan_iter_inner(start_key, end_key, read_seq)?;
+        while let Some(entry) = iter.try_next()? {
+            results.push(entry);
         }
         Ok(results)
     }
@@ -2348,12 +2417,24 @@ impl OmniKV {
     /// (memtable, frozen memtables, L0, L1, base), deduplicates by key keeping
     /// only the newest version visible at `read_seq`, then lazily reads values
     /// from the heap only when consumed.
+    ///
+    /// This compatibility iterator cannot report lazy heap errors: `next`
+    /// returns `None` on a read failure. Use `scan` for an all-or-error result.
     pub fn scan_iter(
         &self,
         start_key: &str,
         end_key: &str,
         read_seq: u64,
     ) -> Result<impl Iterator<Item = (String, String)> + '_, OmniError> {
+        self.scan_iter_inner(start_key, end_key, read_seq)
+    }
+
+    fn scan_iter_inner(
+        &self,
+        start_key: &str,
+        end_key: &str,
+        read_seq: u64,
+    ) -> Result<ScanIterator<'_>, OmniError> {
         let start_key = string_to_key(start_key);
         let end_key = string_to_key(end_key);
         let now = std::time::SystemTime::now()
@@ -2415,11 +2496,13 @@ impl OmniKV {
         let sstables = self.roots.load().sstables.clone();
         for (mmap, _, _) in sstables.iter().rev() {
             let reader = SSTableReader::from_mmap(mmap.clone());
+            // Sparse-index seeks may rewind before start_key; enforce both
+            // inclusive bounds before collecting any persisted candidate.
             for rec in reader.iter_from(&start_key) {
                 if rec.key > end_key {
                     break;
                 }
-                if rec.is_valid() && rec.seq <= read_seq {
+                if rec.key >= start_key && rec.is_valid() && rec.seq <= read_seq {
                     candidates.push(ScanCandidate {
                         key: rec.key,
                         seq: rec.seq,
@@ -2440,7 +2523,7 @@ impl OmniKV {
                 if rec.key > end_key {
                     break;
                 }
-                if rec.is_valid() && rec.seq <= read_seq {
+                if rec.key >= start_key && rec.is_valid() && rec.seq <= read_seq {
                     candidates.push(ScanCandidate {
                         key: rec.key,
                         seq: rec.seq,
@@ -2460,7 +2543,7 @@ impl OmniKV {
             if rec.key > end_key {
                 break;
             }
-            if rec.is_valid() && rec.seq <= read_seq {
+            if rec.key >= start_key && rec.is_valid() && rec.seq <= read_seq {
                 candidates.push(ScanCandidate {
                     key: rec.key,
                     seq: rec.seq,
@@ -3345,6 +3428,289 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
+    fn scan_reports_heap_errors_and_returns_its_pooled_buffer() {
+        let dir = TempDir::new().expect("tempdir");
+        let manifest = dir.path().join("manifest");
+        let wal = dir.path().join("wal");
+        let db = OmniKV::open(
+            manifest.to_str().expect("UTF-8 manifest path"),
+            wal.to_str().expect("UTF-8 WAL path"),
+        )
+        .expect("open");
+        let mut batch = WriteBatch::new();
+        batch
+            .set("a_valid", "value".into())
+            .expect("stage valid value");
+        db.commit_batch(&batch).expect("commit valid value");
+        db.insert_replica_record(
+            b"z_unreadable".to_vec(),
+            db.get_seq() + 1,
+            u64::MAX / 2,
+            1,
+            0,
+            0,
+        );
+        let seq = db.get_seq();
+
+        // Existing lazy callers retain their (String, String) item type and
+        // legacy stop-on-error behavior. Only strict collection reports it.
+        let legacy: Vec<(String, String)> = db
+            .scan_iter("a", "z\x7F", seq)
+            .expect("create legacy scan")
+            .collect();
+        assert_eq!(legacy, [("a_valid".into(), "value".into())]);
+        assert_eq!(db.scan_buffer_pool_available(), 1);
+
+        assert!(matches!(
+            db.scan("a", "z\x7F", seq),
+            Err(OmniError::IoError(_))
+        ));
+        assert_eq!(
+            db.scan_buffer_pool_available(),
+            1,
+            "a failed scan must return its one reusable heap buffer"
+        );
+    }
+
+    #[test]
+    fn scan_preserves_snapshot_range_ttl_and_tombstone_selection() {
+        let dir = TempDir::new().expect("tempdir");
+        let manifest = dir.path().join("manifest");
+        let wal = dir.path().join("wal");
+        let db = OmniKV::open(
+            manifest.to_str().expect("UTF-8 manifest path"),
+            wal.to_str().expect("UTF-8 WAL path"),
+        )
+        .expect("open");
+        let insert_value = |key: &str, seq, value: &str| {
+            let offset = db
+                .append_to_heap(value.as_bytes())
+                .expect("append test value");
+            db.insert_replica_record(
+                key.as_bytes().to_vec(),
+                seq,
+                offset,
+                UNCOMPRESSED_FLAG | value.len() as u64,
+                crc32fast::hash(value.as_bytes()),
+                0,
+            );
+        };
+        for key in ["b", "c", "d", "e", "f"] {
+            insert_value(key, 10, "old");
+        }
+        let unreadable = u64::MAX / 2;
+        db.insert_replica_record(b"b".to_vec(), 20, unreadable, 1, 0, 0);
+        insert_value("b", 30, "new");
+        db.insert_replica_record(b"c".to_vec(), 30, unreadable, 0, 0, 0);
+        db.insert_replica_record(b"d".to_vec(), 30, unreadable, 1, 0, 1);
+        db.insert_replica_record(b"e".to_vec(), 40, unreadable, 1, 0, 0);
+        for key in [b"a", b"z"] {
+            db.insert_replica_record(key.to_vec(), 30, unreadable, 1, 0, 0);
+        }
+
+        let current: Vec<(String, String)> = vec![
+            ("b".into(), "new".into()),
+            ("e".into(), "old".into()),
+            ("f".into(), "old".into()),
+        ];
+        assert_eq!(
+            db.scan("b", "f", 30).expect("scan current visible values"),
+            current
+        );
+        assert_eq!(
+            db.scan_iter("b", "f", 30)
+                .expect("create legacy scan")
+                .collect::<Vec<_>>(),
+            current
+        );
+        let historical: Vec<(String, String)> = ["b", "c", "d", "e", "f"]
+            .into_iter()
+            .map(|key| (key.to_string(), "old".into()))
+            .collect();
+        assert_eq!(
+            db.scan("b", "f", 10).expect("scan historical values"),
+            historical
+        );
+        assert_eq!(
+            db.scan("g", "y", 30).expect("scan empty range"),
+            Vec::<(String, String)>::new()
+        );
+        assert_eq!(db.scan_buffer_pool_available(), 1);
+    }
+
+    #[derive(Clone, Copy)]
+    enum ScanTestTier {
+        L0,
+        L1,
+        Base,
+    }
+
+    fn check_persisted_scan_bounds(tier: ScanTestTier, unreadable_prefix: bool) {
+        let dir = TempDir::new().expect("tempdir");
+        let manifest = dir.path().join("manifest");
+        let wal = dir.path().join("wal");
+        let db = OmniKV::open(
+            manifest.to_str().expect("UTF-8 manifest path"),
+            wal.to_str().expect("UTF-8 WAL path"),
+        )
+        .expect("open");
+        let insert_value = |key: &str, seq, value: &str| {
+            let offset = db
+                .append_to_heap(value.as_bytes())
+                .expect("append test value");
+            db.insert_replica_record(
+                key.as_bytes().to_vec(),
+                seq,
+                offset,
+                UNCOMPRESSED_FLAG | value.len() as u64,
+                crc32fast::hash(value.as_bytes()),
+                0,
+            );
+        };
+        let unreadable = u64::MAX / 2;
+        if unreadable_prefix {
+            db.insert_replica_record(b"a".to_vec(), 10, unreadable, 1, 0, 0);
+        } else {
+            insert_value("a", 10, "outside");
+        }
+        for key in ["b", "c", "d", "e", "f"] {
+            insert_value(key, 10, "old");
+        }
+        let snapshot = db.snapshot();
+        assert_eq!(snapshot, 10);
+        db.insert_replica_record(b"b".to_vec(), 20, unreadable, 1, 0, 0);
+        insert_value("b", 30, "new");
+        db.insert_replica_record(b"c".to_vec(), 30, unreadable, 0, 0, 0);
+        db.insert_replica_record(b"d".to_vec(), 30, unreadable, 1, 0, 1);
+        db.insert_replica_record(b"e".to_vec(), 40, unreadable, 1, 0, 0);
+        db.insert_replica_record(b"z".to_vec(), 30, unreadable, 1, 0, 0);
+
+        // Use real compaction outputs, with the snapshot pin retaining history
+        // and deletion markers through L1 and base compaction.
+        db.compact_sstables().expect("flush test values into L0");
+        if matches!(tier, ScanTestTier::L1 | ScanTestTier::Base) {
+            db.compact_l0_to_l1().expect("compact test values into L1");
+        }
+        if matches!(tier, ScanTestTier::Base) {
+            db.compact_l1_to_l2()
+                .expect("compact test values into base");
+        }
+        assert_eq!(db.memtable_size(), 0);
+        let roots = db.roots.load();
+        assert!(roots.frozen_memtables.is_empty());
+        assert_eq!(
+            roots.sstables.len(),
+            usize::from(matches!(tier, ScanTestTier::L0))
+        );
+        assert_eq!(
+            roots.l1_sstables.len(),
+            usize::from(matches!(tier, ScanTestTier::L1))
+        );
+        let mmap = match tier {
+            ScanTestTier::L0 => roots.sstables[0].0.clone(),
+            ScanTestTier::L1 => roots.l1_sstables[0].0.clone(),
+            ScanTestTier::Base => roots.base_mmap.clone(),
+        };
+        let reader = SSTableReader::from_mmap(mmap);
+        assert_eq!(
+            reader
+                .iter_from(b"b")
+                .next()
+                .expect("persisted prefix record")
+                .key,
+            b"a",
+            "the sparse-index seek must start before the requested bound"
+        );
+
+        let current: Vec<(String, String)> = vec![
+            ("b".into(), "new".into()),
+            ("e".into(), "old".into()),
+            ("f".into(), "old".into()),
+        ];
+        assert_eq!(
+            db.scan("b", "f", 30)
+                .expect("scan persisted visible values"),
+            current
+        );
+        let legacy: Vec<(String, String)> = db
+            .scan_iter("b", "f", 30)
+            .expect("create persisted legacy scan")
+            .collect();
+        assert_eq!(legacy, current);
+        let historical: Vec<(String, String)> = ["b", "c", "d", "e", "f"]
+            .into_iter()
+            .map(|key| (key.to_string(), "old".into()))
+            .collect();
+        assert_eq!(
+            db.scan("b", "f", snapshot)
+                .expect("scan persisted historical values"),
+            historical
+        );
+        assert_eq!(
+            db.scan("b", "b", 30)
+                .expect("scan inclusive start endpoint"),
+            [("b".into(), "new".into())]
+        );
+        assert_eq!(
+            db.scan("f", "f", 30).expect("scan inclusive end endpoint"),
+            [("f".into(), "old".into())]
+        );
+        for (start, end) in [("g", "y"), ("g", "g"), ("f", "b"), ("c", "c")] {
+            assert!(
+                db.scan(start, end, 30)
+                    .expect("scan empty persisted range")
+                    .is_empty(),
+                "{start}..={end}"
+            );
+            assert!(
+                db.scan_iter(start, end, 30)
+                    .expect("create empty persisted scan")
+                    .next()
+                    .is_none()
+            );
+        }
+
+        // Filtering an unrelated unreadable prefix must not mask errors when
+        // that payload (or another unreadable version) is inside the range.
+        assert!(matches!(db.scan("b", "f", 20), Err(OmniError::IoError(_))));
+        if unreadable_prefix {
+            assert!(matches!(db.scan("a", "f", 30), Err(OmniError::IoError(_))));
+        }
+        assert_eq!(db.scan_buffer_pool_available(), 1);
+        db.unregister_snapshot(snapshot);
+    }
+
+    #[test]
+    fn scan_persisted_l0_respects_start_bound() {
+        check_persisted_scan_bounds(ScanTestTier::L0, false);
+    }
+
+    #[test]
+    fn scan_persisted_l1_respects_start_bound() {
+        check_persisted_scan_bounds(ScanTestTier::L1, false);
+    }
+
+    #[test]
+    fn scan_persisted_base_respects_start_bound() {
+        check_persisted_scan_bounds(ScanTestTier::Base, false);
+    }
+
+    #[test]
+    fn scan_persisted_l0_skips_unreadable_prefix() {
+        check_persisted_scan_bounds(ScanTestTier::L0, true);
+    }
+
+    #[test]
+    fn scan_persisted_l1_skips_unreadable_prefix() {
+        check_persisted_scan_bounds(ScanTestTier::L1, true);
+    }
+
+    #[test]
+    fn scan_persisted_base_skips_unreadable_prefix() {
+        check_persisted_scan_bounds(ScanTestTier::Base, true);
+    }
+
+    #[test]
     fn cleanup_obsolete_file_treats_not_found_as_benign() {
         let outcome = cleanup_obsolete_file_with(
             Path::new("already-gone.sst"),
@@ -3428,6 +3794,203 @@ mod tests {
             metrics_prometheus::render_metrics().contains("omnikv_compaction_latency_seconds"),
             "empty compaction should still emit compaction metrics"
         );
+    }
+
+    const SQL_TABLE_LOCK_TEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+    fn run_sql_table_lock_test(test: impl FnOnce() + Send + 'static) {
+        use std::sync::mpsc::{self, RecvTimeoutError};
+
+        // A regression in Drop can deadlock even a single-threaded caller.
+        // Keep the entire scenario off the test thread, including teardown.
+        let (done_tx, done_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            test();
+            let _ = done_tx.send(());
+        });
+        assert_ne!(
+            done_rx.recv_timeout(SQL_TABLE_LOCK_TEST_TIMEOUT),
+            Err(RecvTimeoutError::Timeout),
+            "SQL table-lock scenario timed out (possible deadlock)"
+        );
+        if let Err(panic) = worker.join() {
+            std::panic::resume_unwind(panic);
+        }
+    }
+
+    #[test]
+    fn sql_table_lock_registry_reclaims_released_entries() {
+        run_sql_table_lock_test(|| {
+            let dir = TempDir::new().expect("tempdir");
+            let manifest = dir.path().join("manifest").to_string_lossy().to_string();
+            let wal = dir.path().join("wal").to_string_lossy().to_string();
+            let db = OmniKV::open(&manifest, &wal).expect("open");
+
+            let lock = db
+                .sql_table_lock("ephemeral_table")
+                .expect("create SQL table lock");
+            assert!(
+                db.sql_table_locks
+                    .locks
+                    .lock()
+                    .expect("table-lock registry")
+                    .contains_key("ephemeral_table")
+            );
+
+            drop(lock);
+
+            assert!(
+                !db.sql_table_locks
+                    .locks
+                    .lock()
+                    .expect("table-lock registry")
+                    .contains_key("ephemeral_table"),
+                "released table locks must not leave registry entries behind"
+            );
+        });
+    }
+
+    #[test]
+    fn sql_table_lock_registry_shares_case_insensitive_holders_and_waiters() {
+        run_sql_table_lock_test(|| {
+            use std::sync::{TryLockError, mpsc};
+
+            let registry = Arc::new(SqlTableLockRegistry::default());
+            let owner = registry.get("Orders").expect("owner lock");
+            let owner_guard = owner.lock().expect("owner guard");
+            let (waiting_tx, waiting_rx) = mpsc::channel();
+            let (acquired_tx, acquired_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel();
+            let waiter_registry = registry.clone();
+            let waiter = std::thread::spawn(move || {
+                let lock = waiter_registry.get("ORDERS").expect("waiter lock");
+                assert!(matches!(
+                    lock.mutex.try_lock(),
+                    Err(TryLockError::WouldBlock)
+                ));
+                waiting_tx
+                    .send(Arc::downgrade(&lock))
+                    .expect("waiter ready");
+                let _guard = lock.lock().expect("waiter guard");
+                acquired_tx.send(()).expect("waiter acquired");
+                release_rx
+                    .recv_timeout(SQL_TABLE_LOCK_TEST_TIMEOUT)
+                    .expect("release waiter");
+            });
+
+            let waiting_lock = waiting_rx
+                .recv_timeout(SQL_TABLE_LOCK_TEST_TIMEOUT)
+                .expect("waiter must reach the held lock");
+            let peer = registry.get("oRdErS").expect("peer lock");
+            assert!(Arc::ptr_eq(&owner, &peer));
+            assert!(Weak::ptr_eq(&waiting_lock, &Arc::downgrade(&peer)));
+            drop(peer);
+            drop(owner_guard);
+            drop(owner);
+
+            // The original holder is gone, but the waiter's Arc must keep
+            // the entry alive before and after it acquires the mutex.
+            let next = registry.get("orders").expect("next lock");
+            assert!(Weak::ptr_eq(&waiting_lock, &Arc::downgrade(&next)));
+            acquired_rx
+                .recv_timeout(SQL_TABLE_LOCK_TEST_TIMEOUT)
+                .expect("waiter must acquire after owner releases");
+            assert!(matches!(
+                next.mutex.try_lock(),
+                Err(TryLockError::WouldBlock)
+            ));
+            drop(next);
+            release_tx.send(()).expect("release waiter");
+            waiter.join().expect("waiter completed");
+            assert!(registry.locks.lock().expect("registry").is_empty());
+        });
+    }
+
+    #[test]
+    fn sql_table_lock_registry_reclaims_high_churn_names() {
+        run_sql_table_lock_test(|| {
+            let registry = Arc::new(SqlTableLockRegistry::default());
+            let survivor = registry.get("survivor").expect("surviving lock");
+            for round in 0..64 {
+                let locks: Vec<_> = (0..64)
+                    .map(|index| {
+                        registry
+                            .get(&format!("ephemeral_{round}_{index}"))
+                            .expect("churn lock")
+                    })
+                    .collect();
+                assert_eq!(registry.locks.lock().expect("registry").len(), 65);
+                drop(locks);
+                assert_eq!(
+                    registry.locks.lock().expect("registry").len(),
+                    1,
+                    "only the live survivor should remain after round {round}"
+                );
+            }
+            drop(survivor);
+            assert!(registry.locks.lock().expect("registry").is_empty());
+        });
+    }
+
+    #[test]
+    fn sql_table_lock_registry_last_release_preserves_replacement_serialization() {
+        run_sql_table_lock_test(|| {
+            use std::sync::TryLockError;
+
+            let registry = Arc::new(SqlTableLockRegistry::default());
+            let old = registry.get("orders").expect("old lock");
+            let old_weak = Arc::downgrade(&old);
+            let mut entries = registry.locks.lock().expect("registry");
+            let teardown = std::thread::spawn(move || drop(old));
+
+            // Force the last Arc to disappear while its destructor cannot
+            // take the registry mutex. Poll the count, never upgrade here:
+            // dropping an upgraded last Arc under `entries` would deadlock.
+            let deadline = std::time::Instant::now() + SQL_TABLE_LOCK_TEST_TIMEOUT;
+            while old_weak.strong_count() != 0 {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "last release timed out"
+                );
+                std::thread::yield_now();
+            }
+            assert!(Weak::ptr_eq(
+                entries.get("orders").expect("old entry still present"),
+                &old_weak
+            ));
+
+            // Model a lookup replacing that now-dead weak entry before the
+            // old destructor obtains the mutex. No live lock is replaced.
+            let replacement = Arc::new(SqlTableLock {
+                mutex: Mutex::new(()),
+                name: "orders".into(),
+                registry: Arc::downgrade(&registry),
+            });
+            entries.insert("orders".into(), Arc::downgrade(&replacement));
+            drop(entries);
+            teardown.join().expect("old destructor completed");
+
+            assert!(Weak::ptr_eq(
+                registry
+                    .locks
+                    .lock()
+                    .expect("registry")
+                    .get("orders")
+                    .expect("old destructor must preserve the replacement"),
+                &Arc::downgrade(&replacement)
+            ));
+            let guard = replacement.lock().expect("replacement guard");
+            let next = registry.get("ORDERS").expect("next lock");
+            assert!(Arc::ptr_eq(&replacement, &next));
+            assert!(matches!(
+                next.mutex.try_lock(),
+                Err(TryLockError::WouldBlock)
+            ));
+            drop(guard);
+            drop(next);
+            drop(replacement);
+            assert!(registry.locks.lock().expect("registry").is_empty());
+        });
     }
 
     #[test]

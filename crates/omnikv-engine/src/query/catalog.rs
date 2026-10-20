@@ -5,7 +5,7 @@
 
 use crate::{OmniError, OmniKV, WriteBatch};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -335,16 +335,47 @@ impl Catalog {
     /// Lists the catalog as of a caller-selected MVCC sequence. Long-lived
     /// executors may have a cache from before a concurrent CREATE or DROP;
     /// SHOW TABLES must report the statement's persisted view instead of that
-    /// stale cache.
-    pub fn list_tables_at(&self, seq: u64) -> Vec<String> {
-        self.db
+    /// stale cache. An unreadable payload or malformed definition fails the
+    /// entire listing rather than silently omitting tables.
+    pub fn list_tables_at(&self, seq: u64) -> Result<Vec<String>, String> {
+        self.list_tables_with_overlay_at(seq, None)
+    }
+
+    /// Lists a transaction's snapshot with its own staged catalog writes.
+    /// Decode after merging so staged CREATE/DROP entries take precedence over
+    /// their persisted definitions, while errors cannot be hidden by the cache.
+    pub(crate) fn list_tables_with_overlay_at(
+        &self,
+        seq: u64,
+        overlay: Option<&HashMap<String, Option<String>>>,
+    ) -> Result<Vec<String>, String> {
+        let mut entries: BTreeMap<_, _> = self
+            .db
             .scan(CATALOG_PREFIX, &format!("{}\x7F", CATALOG_PREFIX), seq)
-            .unwrap_or_default()
+            .map_err(|e| format!("Catalog scan failed: {e:?}"))?
             .into_iter()
-            .filter_map(|(_, value)| {
+            .collect();
+        if let Some(overlay) = overlay {
+            for (key, value) in overlay {
+                if !key.starts_with(CATALOG_PREFIX) {
+                    continue;
+                }
+                match value {
+                    Some(value) => {
+                        entries.insert(key.clone(), value.clone());
+                    }
+                    None => {
+                        entries.remove(key);
+                    }
+                }
+            }
+        }
+        entries
+            .into_iter()
+            .map(|(key, value)| {
                 serde_json::from_str::<TableDef>(&value)
-                    .ok()
                     .map(|table| table.name.to_lowercase())
+                    .map_err(|e| format!("Catalog entry {key:?} is invalid: {e}"))
             })
             .collect()
     }
