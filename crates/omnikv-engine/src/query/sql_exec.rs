@@ -505,12 +505,12 @@ impl SqlExecutor {
             SqlStatement::Explain(inner) => {
                 self.refresh_statement_catalog_for(inner, self.statement_read_seq())?;
                 // Use the cost-based optimizer for real EXPLAIN output
-                let stats = crate::optimizer::gather_stats_at(
+                let stats = crate::optimizer::gather_stats_at_checked(
                     &self.catalog,
                     None,
                     &self.db,
                     self.statement_read_seq(),
-                );
+                )?;
                 let optimizer = crate::optimizer::Optimizer::new(stats);
                 match optimizer.optimize(inner) {
                     Ok(plan) => {
@@ -533,12 +533,12 @@ impl SqlExecutor {
             SqlStatement::ExplainAnalyze(inner) => {
                 self.refresh_statement_catalog_for(inner, self.statement_read_seq())?;
                 // Run the query through the plan executor and collect stats
-                let stats = crate::optimizer::gather_stats_at(
+                let stats = crate::optimizer::gather_stats_at_checked(
                     &self.catalog,
                     None,
                     &self.db,
                     self.statement_read_seq(),
-                );
+                )?;
                 let optimizer = crate::optimizer::Optimizer::new(stats);
                 match optimizer.optimize(inner) {
                     Ok(plan) => {
@@ -562,10 +562,7 @@ impl SqlExecutor {
                                     rows: output,
                                 })
                             }
-                            Err(e) => Ok(ExecResult::Rows {
-                                columns: vec!["QUERY PLAN (ANALYZE)".into()],
-                                rows: vec![vec![Some(format!("Error: {}", e))]],
-                            }),
+                            Err(e) => Err(e),
                         }
                     }
                     Err(_) => Ok(ExecResult::Rows {
@@ -742,7 +739,7 @@ impl SqlExecutor {
             // The table's own rows go through the normal DML staging: the
             // row reads use this statement's snapshot+overlay, so only
             // rows that exist for this transaction are deleted.
-            let rows = self.load_table_rows(&table);
+            let rows = self.load_table_rows(&table)?;
             let mut batch = WriteBatch::new();
             for row in &rows {
                 let pk = row
@@ -920,7 +917,7 @@ impl SqlExecutor {
         // multi-row INSERT must reject duplicates within the statement as
         // well as conflicts with rows already visible to this executor.
         let mut occupied_keys = std::collections::HashSet::new();
-        for row in self.load_table_rows_at(&table, read_seq) {
+        for row in self.load_table_rows_at(&table, read_seq)? {
             let Some(pk) = row.get(&table.primary_key).cloned().flatten() else {
                 return Err(format!(
                     "table '{}' contains a row without a primary key; refusing to insert",
@@ -994,11 +991,11 @@ impl SqlExecutor {
         })
     }
 
-    fn load_table_rows(&self, table: &TableDef) -> Vec<Row> {
+    fn load_table_rows(&self, table: &TableDef) -> Result<Vec<Row>, String> {
         self.load_table_rows_at(table, self.statement_read_seq())
     }
 
-    fn load_table_rows_at(&self, table: &TableDef, seq: u64) -> Vec<Row> {
+    fn load_table_rows_at(&self, table: &TableDef, seq: u64) -> Result<Vec<Row>, String> {
         let prefix = table.row_prefix();
         // Every read of a table's rows is a range read of its prefix —
         // recorded for SSI so a concurrent write inside the prefix
@@ -1009,7 +1006,7 @@ impl SqlExecutor {
         let mut results = self
             .db
             .scan(&prefix, &format!("{}\x7F", prefix), seq)
-            .unwrap_or_default();
+            .map_err(|error| format!("storage scan failed for table '{}': {error}", table.name))?;
 
         // Read-your-own-writes: staged rows replace their stored copies,
         // staged deletes hide stored rows. Only this table's key range is
@@ -1019,20 +1016,21 @@ impl SqlExecutor {
             for (key, value) in &overlay {
                 let in_table = key.starts_with(prefix.as_str()) && key.len() > prefix.len();
                 if let (true, Some(serialized)) = (in_table, value) {
-                    // Validate the staged row still deserializes; invalid
-                    // staged data is skipped (it could never have been
-                    // produced by a successful DML statement).
-                    if serde_json::from_str::<Row>(serialized).is_ok() {
-                        results.push((key.clone(), serialized.clone()));
-                    }
+                    results.push((key.clone(), serialized.clone()));
                 }
             }
         }
 
         results
             .into_iter()
-            .filter_map(|(_key, value)| {
-                crate::plan_exec::PlanExecutor::deserialize_row(&value, table.row_format)
+            .map(|(_key, value)| {
+                crate::plan_exec::PlanExecutor::deserialize_row_checked(&value, table.row_format)
+                    .map_err(|error| {
+                        format!(
+                            "table '{}' holds a row that cannot be decoded: {error}",
+                            table.name
+                        )
+                    })
             })
             .collect()
     }
@@ -1131,12 +1129,12 @@ impl SqlExecutor {
             offset: None, // offset handled in post-processing below
         };
 
-        let stats = crate::optimizer::gather_stats_at(
+        let stats = crate::optimizer::gather_stats_at_checked(
             &self.catalog,
             None,
             &self.db,
             self.statement_read_seq(),
-        );
+        )?;
         let optimizer = crate::optimizer::Optimizer::new(stats);
 
         match optimizer.optimize(&stmt) {
@@ -1160,8 +1158,9 @@ impl SqlExecutor {
                 let mut iter =
                     compile_plan_with_scan(&plan, &self.db, &self.catalog, Some(&scan_ctx));
 
+                iter.check_error()?;
                 let mut rows: Vec<Row> = Vec::new();
-                while let Some(row) = iter.next_row() {
+                while let Some(row) = iter.try_next_row()? {
                     rows.push(row);
                 }
 
@@ -1671,7 +1670,7 @@ impl SqlExecutor {
                     .get_table(name)
                     .ok_or_else(|| format!("Table '{}' does not exist", name))?;
                 self.record_catalog_read(name);
-                self.load_table_rows(&table)
+                self.load_table_rows(&table)?
             }
             FromClause::Join {
                 left,
@@ -1690,8 +1689,8 @@ impl SqlExecutor {
                     .catalog
                     .get_table(right)
                     .ok_or_else(|| format!("Table '{}' does not exist", right))?;
-                let left_rows = self.load_table_rows(&lt);
-                let right_rows = self.load_table_rows(&rt);
+                let left_rows = self.load_table_rows(&lt)?;
+                let right_rows = self.load_table_rows(&rt)?;
                 self.execute_join(
                     &left_rows,
                     &right_rows,
@@ -2087,7 +2086,7 @@ impl SqlExecutor {
             .iter()
             .map(|(col, val)| Ok((resolve_column_name(&table, col)?, val)))
             .collect::<Result<_, String>>()?;
-        let mut rows = self.load_table_rows_at(&table, read_seq);
+        let mut rows = self.load_table_rows_at(&table, read_seq)?;
         let mut available_keys = std::collections::HashSet::new();
         for row in &rows {
             let Some(pk) = row.get(&table.primary_key).cloned().flatten() else {
@@ -2201,7 +2200,7 @@ impl SqlExecutor {
         let read_seq = self.refresh_statement_seq_after_migration_lock();
         let table = self.resolve_dml_table(table_name, read_seq)?;
         self.validate_where_columns_of(table_name, where_clause)?;
-        let mut rows = self.load_table_rows_at(&table, read_seq);
+        let mut rows = self.load_table_rows_at(&table, read_seq)?;
 
         if let Some(expr) = where_clause {
             let col_types = column_types_of_table(&table);

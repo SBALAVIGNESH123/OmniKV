@@ -242,7 +242,7 @@ impl PlanExecutor {
                 // canonical key range can never reach.
                 let key_value = crate::volcano::canonicalize_pk_key(&table, key_value);
                 let predicate = crate::volcano::pk_equality(&table, &key_value);
-                let mut scanned = self.load_table_rows(&table);
+                let mut scanned = self.load_table_rows(&table)?;
                 scanned.retain(|row| eval_where_typed(row, &predicate, &self.types));
                 scanned
             }
@@ -253,12 +253,23 @@ impl PlanExecutor {
                 let seq = self.read_seq();
                 self.db
                     .scan(&key, &end, seq)
-                    .unwrap_or_default()
+                    .map_err(|error| {
+                        format!(
+                            "storage PK lookup failed for table '{}': {error}",
+                            table.name
+                        )
+                    })?
                     .into_iter()
-                    .filter_map(|(_, value)| Self::deserialize_row(&value, table.row_format))
-                    .collect()
+                    .map(|(_, value)| {
+                        Self::deserialize_row_checked(&value, table.row_format).map_err(|error| {
+                            format!("table '{}' row decode failed: {error}", table.name)
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?
             }
-            AccessMethod::IndexScan { .. } | AccessMethod::SeqScan => self.load_table_rows(&table),
+            AccessMethod::IndexScan { .. } | AccessMethod::SeqScan => {
+                self.load_table_rows(&table)?
+            }
         };
 
         if let Some(expr) = filter {
@@ -280,44 +291,73 @@ impl PlanExecutor {
         }
     }
 
-    pub fn deserialize_row(value: &str, format: RowFormat) -> Option<Row> {
-        let row: Row = serde_json::from_str(value).ok()?;
-        Some(
-            row.into_iter()
-                .map(|(k, v)| (k, Self::decode(v, format)))
-                .collect(),
-        )
+    pub(crate) fn deserialize_row_checked(value: &str, format: RowFormat) -> Result<Row, String> {
+        let row: Row = serde_json::from_str(value)
+            .map_err(|error| format!("invalid stored row JSON: {error}"))?;
+        Ok(row
+            .into_iter()
+            .map(|(k, v)| (k, Self::decode(v, format)))
+            .collect())
     }
 
-    fn load_table_rows(&self, table: &TableDef) -> Vec<Row> {
+    pub fn deserialize_row(value: &str, format: RowFormat) -> Option<Row> {
+        Self::deserialize_row_checked(value, format).ok()
+    }
+
+    fn load_table_rows(&self, table: &TableDef) -> Result<Vec<Row>, String> {
         let prefix = table.row_prefix();
         let seq = self.read_seq();
-        self.db
+        let stored = self
+            .db
             .scan(&prefix, &format!("{}\x7F", prefix), seq)
-            .unwrap_or_default()
+            .map_err(|error| format!("storage scan failed for table '{}': {error}", table.name))?;
+        stored
             .into_iter()
-            .filter_map(|(_, value)| Self::deserialize_row(&value, table.row_format))
+            .map(|(_, value)| {
+                Self::deserialize_row_checked(&value, table.row_format)
+                    .map_err(|error| format!("table '{}' row decode failed: {error}", table.name))
+            })
             .collect()
     }
 
     /// Load only specific columns (column pruning).
+    ///
+    /// This compatibility wrapper preserves the original infallible public
+    /// API. New SQL execution paths should use
+    /// [`Self::load_table_rows_pruned_checked`] so storage and decode errors
+    /// remain visible to callers.
     pub fn load_table_rows_pruned(&self, table: &TableDef, needed_cols: &[String]) -> Vec<Row> {
+        self.load_table_rows_pruned_checked(table, needed_cols)
+            .unwrap_or_default()
+    }
+
+    /// Fallible column-pruned load used by correctness-sensitive callers.
+    pub fn load_table_rows_pruned_checked(
+        &self,
+        table: &TableDef,
+        needed_cols: &[String],
+    ) -> Result<Vec<Row>, String> {
         let prefix = table.row_prefix();
         let seq = self.read_seq();
-        self.db
+        let stored = self
+            .db
             .scan(&prefix, &format!("{}\x7F", prefix), seq)
-            .unwrap_or_default()
+            .map_err(|error| format!("storage scan failed for table '{}': {error}", table.name))?;
+        stored
             .into_iter()
-            .filter_map(|(_, value)| {
-                let full: Row = Self::deserialize_row(&value, table.row_format)?;
+            .map(|(_, value)| {
+                let full =
+                    Self::deserialize_row_checked(&value, table.row_format).map_err(|error| {
+                        format!("table '{}' row decode failed: {error}", table.name)
+                    })?;
                 if needed_cols.is_empty() {
-                    return Some(full);
+                    return Ok(full);
                 }
                 let pruned: Row = full
                     .into_iter()
                     .filter(|(k, _)| needed_cols.iter().any(|c| c.eq_ignore_ascii_case(k)))
                     .collect();
-                Some(pruned)
+                Ok(pruned)
             })
             .collect()
     }

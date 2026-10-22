@@ -47,6 +47,21 @@ pub trait RowIterator {
     /// Returns the next row, or None when exhausted.
     fn next_row(&mut self) -> Option<Row>;
 
+    /// Returns the next row, or the storage/decoding error encountered while
+    /// producing it. The infallible [`Self::next_row`] method remains the
+    /// compatibility primitive for existing custom iterators; its default
+    /// implementation treats those iterators as infallible.
+    fn try_next_row(&mut self) -> Result<Option<Row>, String> {
+        Ok(self.next_row())
+    }
+
+    /// Check for an error discovered while constructing or buffering an
+    /// operator, without consuming a row. Existing custom iterators are
+    /// infallible by default, preserving the public compatibility contract.
+    fn check_error(&self) -> Result<(), String> {
+        Ok(())
+    }
+
     /// Fill `out` with up to `max_rows` rows and return the number appended.
     ///
     /// Implementations must return `0` only when exhausted or when
@@ -77,6 +92,15 @@ pub trait RowIterator {
         }
         rows
     }
+
+    /// Collect all remaining rows, preserving storage and decoding errors.
+    fn try_collect_all(&mut self) -> Result<Vec<Row>, String> {
+        let mut rows = Vec::new();
+        while let Some(row) = self.try_next_row()? {
+            rows.push(row);
+        }
+        Ok(rows)
+    }
 }
 
 /// Default batch size for the chunked volcano path.
@@ -97,6 +121,7 @@ pub const DEFAULT_ROW_CHUNK_SIZE: usize = 1024;
 pub struct SeqScanIter {
     rows: Vec<Row>,
     pos: usize,
+    error: Option<String>,
 }
 
 /// A transaction's uncommitted writes as seen by scans inside that
@@ -147,36 +172,69 @@ impl SeqScanIter {
         {
             collector.record_range(&prefix, &format!("{}\x7F", prefix));
         }
-        let mut rows: Vec<Row> = db
-            .scan(&prefix, &format!("{}\x7F", prefix), scan_seq)
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|(key, value)| {
-                if let Some(ov) = overlay {
-                    // The overlay owns this key — written or deleted by
-                    // this transaction. Skip the stored copy; the overlay
-                    // copy is applied below.
-                    if ov.contains_key(key.as_str()) {
-                        return None;
-                    }
+        let stored = match db.scan(&prefix, &format!("{}\x7F", prefix), scan_seq) {
+            Ok(stored) => stored,
+            Err(error) => {
+                return Self {
+                    rows: Vec::new(),
+                    pos: 0,
+                    error: Some(format!(
+                        "storage scan failed for table '{}': {error}",
+                        table.name
+                    )),
+                };
+            }
+        };
+        let mut rows = Vec::with_capacity(stored.len());
+        for (key, value) in stored {
+            if let Some(ov) = overlay {
+                // The overlay owns this key — written or deleted by
+                // this transaction. Skip the stored copy; the overlay
+                // copy is applied below.
+                if ov.contains_key(key.as_str()) {
+                    continue;
                 }
-                crate::plan_exec::PlanExecutor::deserialize_row(&value, table.row_format)
-            })
-            .collect();
-        if let Some(ov) = overlay {
-            for (key, value) in ov {
-                let in_table = key.starts_with(prefix.as_str()) && key.len() > prefix.len();
-                if let (true, Some(serialized)) = (in_table, value)
-                    && let Some(row) = crate::plan_exec::PlanExecutor::deserialize_row(
-                        serialized,
-                        RowFormat::Typed,
-                    )
-                {
-                    rows.push(row);
+            }
+            match crate::plan_exec::PlanExecutor::deserialize_row_checked(&value, table.row_format)
+            {
+                Ok(row) => rows.push(row),
+                Err(error) => {
+                    return Self {
+                        rows,
+                        pos: 0,
+                        error: Some(format!("table '{}' row decode failed: {error}", table.name)),
+                    };
                 }
             }
         }
-        Self { rows, pos: 0 }
+        if let Some(ov) = overlay {
+            for (key, value) in ov {
+                let in_table = key.starts_with(prefix.as_str()) && key.len() > prefix.len();
+                if let (true, Some(serialized)) = (in_table, value) {
+                    match crate::plan_exec::PlanExecutor::deserialize_row_checked(
+                        serialized,
+                        RowFormat::Typed,
+                    ) {
+                        Ok(row) => rows.push(row),
+                        Err(error) => {
+                            return Self {
+                                rows,
+                                pos: 0,
+                                error: Some(format!(
+                                    "table '{}' staged row decode failed: {error}",
+                                    table.name
+                                )),
+                            };
+                        }
+                    }
+                }
+            }
+        }
+        Self {
+            rows,
+            pos: 0,
+            error: None,
+        }
     }
 }
 
@@ -189,6 +247,17 @@ impl RowIterator for SeqScanIter {
         } else {
             None
         }
+    }
+
+    fn try_next_row(&mut self) -> Result<Option<Row>, String> {
+        if let Some(error) = &self.error {
+            return Err(error.clone());
+        }
+        Ok(self.next_row())
+    }
+
+    fn check_error(&self) -> Result<(), String> {
+        self.error.clone().map_or(Ok(()), Err)
     }
 
     fn reset(&mut self) {
@@ -213,6 +282,7 @@ impl RowIterator for SeqScanIter {
 pub struct PkLookupIter {
     row: Option<Row>,
     consumed: bool,
+    error: Option<String>,
 }
 
 impl PkLookupIter {
@@ -237,12 +307,17 @@ impl PkLookupIter {
             match ov.get(key.as_str()) {
                 // Buffered write: read our own uncommitted row.
                 Some(Some(serialized)) => {
+                    let (row, error) = match crate::plan_exec::PlanExecutor::deserialize_row_checked(
+                        serialized,
+                        RowFormat::Typed,
+                    ) {
+                        Ok(row) => (Some(row), None),
+                        Err(error) => (None, Some(format!("staged row decode failed: {error}"))),
+                    };
                     return Self {
-                        row: crate::plan_exec::PlanExecutor::deserialize_row(
-                            serialized,
-                            RowFormat::Typed,
-                        ),
+                        row,
                         consumed: false,
+                        error,
                     };
                 }
                 // Buffered delete: the row is gone for this transaction.
@@ -250,6 +325,7 @@ impl PkLookupIter {
                     return Self {
                         row: None,
                         consumed: false,
+                        error: None,
                     };
                 }
                 None => {}
@@ -260,17 +336,32 @@ impl PkLookupIter {
         {
             collector.record_point(&key);
         }
-        let row = db
-            .scan(&key, &end, scan_seq)
-            .unwrap_or_default()
-            .into_iter()
-            .next()
-            .and_then(|(_, value)| {
-                crate::plan_exec::PlanExecutor::deserialize_row(&value, table.row_format)
-            });
+        let (row, error) = match db.scan(&key, &end, scan_seq) {
+            Ok(rows) => match rows.into_iter().next() {
+                Some((_, value)) => match crate::plan_exec::PlanExecutor::deserialize_row_checked(
+                    &value,
+                    table.row_format,
+                ) {
+                    Ok(row) => (Some(row), None),
+                    Err(error) => (
+                        None,
+                        Some(format!("table '{}' row decode failed: {error}", table.name)),
+                    ),
+                },
+                None => (None, None),
+            },
+            Err(error) => (
+                None,
+                Some(format!(
+                    "storage PK lookup failed for table '{}': {error}",
+                    table.name
+                )),
+            ),
+        };
         Self {
             row,
             consumed: false,
+            error,
         }
     }
 }
@@ -283,6 +374,17 @@ impl RowIterator for PkLookupIter {
         } else {
             None
         }
+    }
+
+    fn try_next_row(&mut self) -> Result<Option<Row>, String> {
+        if let Some(error) = &self.error {
+            return Err(error.clone());
+        }
+        Ok(self.next_row())
+    }
+
+    fn check_error(&self) -> Result<(), String> {
+        self.error.clone().map_or(Ok(()), Err)
     }
 
     fn reset(&mut self) {
@@ -344,6 +446,21 @@ impl RowIterator for FilterIter {
         }
     }
 
+    fn try_next_row(&mut self) -> Result<Option<Row>, String> {
+        loop {
+            let Some(row) = self.child.try_next_row()? else {
+                return Ok(None);
+            };
+            if eval_where_typed(&row, &self.predicate, &self.col_types) {
+                return Ok(Some(row));
+            }
+        }
+    }
+
+    fn check_error(&self) -> Result<(), String> {
+        self.child.check_error()
+    }
+
     fn next_chunk(&mut self, max_rows: usize, out: &mut Vec<Row>) -> usize {
         let start_len = out.len();
         if max_rows == 0 {
@@ -391,6 +508,17 @@ impl RowIterator for ProjectIter {
     fn next_row(&mut self) -> Option<Row> {
         let row = self.child.next_row()?;
         Some(project_row(row, &self.columns))
+    }
+
+    fn try_next_row(&mut self) -> Result<Option<Row>, String> {
+        Ok(self
+            .child
+            .try_next_row()?
+            .map(|row| project_row(row, &self.columns)))
+    }
+
+    fn check_error(&self) -> Result<(), String> {
+        self.child.check_error()
     }
 
     fn next_chunk(&mut self, max_rows: usize, out: &mut Vec<Row>) -> usize {
@@ -474,6 +602,21 @@ impl RowIterator for LimitIter {
         Some(row)
     }
 
+    fn try_next_row(&mut self) -> Result<Option<Row>, String> {
+        if self.emitted >= self.limit {
+            return Ok(None);
+        }
+        let Some(row) = self.child.try_next_row()? else {
+            return Ok(None);
+        };
+        self.emitted += 1;
+        Ok(Some(row))
+    }
+
+    fn check_error(&self) -> Result<(), String> {
+        self.child.check_error()
+    }
+
     fn next_chunk(&mut self, max_rows: usize, out: &mut Vec<Row>) -> usize {
         if max_rows == 0 || self.emitted >= self.limit {
             return 0;
@@ -493,6 +636,7 @@ impl RowIterator for LimitIter {
 pub struct SortIter {
     sorted: Vec<Row>,
     pos: usize,
+    error: Option<String>,
 }
 
 impl SortIter {
@@ -501,11 +645,17 @@ impl SortIter {
         order_by: Vec<OrderByItem>,
         types: ColumnTypeMap,
     ) -> Self {
-        let mut rows = child.collect_all();
-        sort_rows(&mut rows, &order_by, &types);
+        let (mut rows, error) = match child.try_collect_all() {
+            Ok(rows) => (rows, None),
+            Err(error) => (Vec::new(), Some(error)),
+        };
+        if error.is_none() {
+            sort_rows(&mut rows, &order_by, &types);
+        }
         Self {
             sorted: rows,
             pos: 0,
+            error,
         }
     }
 }
@@ -519,6 +669,17 @@ impl RowIterator for SortIter {
         } else {
             None
         }
+    }
+
+    fn try_next_row(&mut self) -> Result<Option<Row>, String> {
+        if let Some(error) = &self.error {
+            return Err(error.clone());
+        }
+        Ok(self.next_row())
+    }
+
+    fn check_error(&self) -> Result<(), String> {
+        self.error.clone().map_or(Ok(()), Err)
     }
 
     fn next_chunk(&mut self, max_rows: usize, out: &mut Vec<Row>) -> usize {
@@ -560,6 +721,7 @@ pub struct HashJoinIter {
     right_unmatched_pos: usize,
     probe_exhausted: bool,
     probe_key_type: Option<ColumnType>,
+    error: Option<String>,
 }
 
 impl HashJoinIter {
@@ -581,7 +743,15 @@ impl HashJoinIter {
         // Build phase: materialize build side into hash table
         let mut hash_table: HashMap<String, Vec<Row>> = HashMap::new();
         let mut null_key_build_rows: Vec<Row> = Vec::new();
-        while let Some(row) = build.next_row() {
+        let mut error = None;
+        let build_rows = match build.try_collect_all() {
+            Ok(rows) => rows,
+            Err(build_error) => {
+                error = Some(build_error);
+                Vec::new()
+            }
+        };
+        for row in build_rows {
             let Some(key) = row.get(&build_col).cloned().flatten() else {
                 null_key_build_rows.push(row);
                 continue;
@@ -605,6 +775,7 @@ impl HashJoinIter {
             right_unmatched_pos: 0,
             probe_exhausted: false,
             probe_key_type,
+            error,
         }
     }
 }
@@ -624,14 +795,17 @@ pub(crate) fn qualify_row(row: Row, prefix: &str) -> Row {
     out
 }
 
-impl RowIterator for HashJoinIter {
-    fn next_row(&mut self) -> Option<Row> {
+impl HashJoinIter {
+    fn next_row_result(&mut self) -> Result<Option<Row>, String> {
+        if let Some(error) = &self.error {
+            return Err(error.clone());
+        }
         loop {
             // First, drain any buffered matches
             if self.match_pos < self.current_matches.len() {
                 let row = self.current_matches[self.match_pos].clone();
                 self.match_pos += 1;
-                return Some(row);
+                return Ok(Some(row));
             }
 
             // For RIGHT JOIN: after probe exhausted, emit unmatched build rows
@@ -639,13 +813,13 @@ impl RowIterator for HashJoinIter {
                 if self.right_unmatched_pos < self.right_unmatched.len() {
                     let row = self.right_unmatched[self.right_unmatched_pos].clone();
                     self.right_unmatched_pos += 1;
-                    return Some(row);
+                    return Ok(Some(row));
                 }
-                return None;
+                return Ok(None);
             }
 
             // Get next probe row
-            let probe_row = match self.probe.next_row() {
+            let probe_row = match self.probe.try_next_row()? {
                 Some(r) => r,
                 None => {
                     // Probe exhausted — for RIGHT JOIN, collect unmatched build rows
@@ -710,12 +884,30 @@ impl RowIterator for HashJoinIter {
     }
 }
 
+impl RowIterator for HashJoinIter {
+    fn next_row(&mut self) -> Option<Row> {
+        self.next_row_result().ok().flatten()
+    }
+
+    fn try_next_row(&mut self) -> Result<Option<Row>, String> {
+        self.next_row_result()
+    }
+
+    fn check_error(&self) -> Result<(), String> {
+        if let Some(error) = &self.error {
+            return Err(error.clone());
+        }
+        self.probe.check_error()
+    }
+}
+
 // ─── Aggregate Iterator ─────────────────────────────────────────────────────
 
 /// Materializes child, groups, computes aggregates, streams result groups.
 pub struct AggregateIter {
     result: Vec<Row>,
     pos: usize,
+    error: Option<String>,
 }
 
 impl AggregateIter {
@@ -725,7 +917,18 @@ impl AggregateIter {
         agg_columns: Vec<SelectColumn>,
         types: ColumnTypeMap,
     ) -> Self {
-        let all_rows = child.collect_all();
+        let (all_rows, error) = match child.try_collect_all() {
+            Ok(rows) => (rows, None),
+            Err(error) => (Vec::new(), Some(error)),
+        };
+
+        if let Some(error) = error {
+            return Self {
+                result: Vec::new(),
+                pos: 0,
+                error: Some(error),
+            };
+        }
 
         if group_by.is_empty()
             && agg_columns
@@ -745,6 +948,7 @@ impl AggregateIter {
             return Self {
                 result: vec![row],
                 pos: 0,
+                error: None,
             };
         }
 
@@ -784,7 +988,11 @@ impl AggregateIter {
             result.push(row);
         }
 
-        Self { result, pos: 0 }
+        Self {
+            result,
+            pos: 0,
+            error: None,
+        }
     }
 }
 
@@ -797,6 +1005,17 @@ impl RowIterator for AggregateIter {
         } else {
             None
         }
+    }
+
+    fn try_next_row(&mut self) -> Result<Option<Row>, String> {
+        if let Some(error) = &self.error {
+            return Err(error.clone());
+        }
+        Ok(self.next_row())
+    }
+
+    fn check_error(&self) -> Result<(), String> {
+        self.error.clone().map_or(Ok(()), Err)
     }
 
     fn next_chunk(&mut self, max_rows: usize, out: &mut Vec<Row>) -> usize {

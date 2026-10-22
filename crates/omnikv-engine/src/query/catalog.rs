@@ -218,21 +218,20 @@ impl Catalog {
         // Delete all rows
         let prefix = table.row_prefix();
         let seq = self.db.get_seq();
-        if let Ok(rows) = self.db.scan(&prefix, &format!("{}\x7F", prefix), seq) {
-            let mut batch = WriteBatch::new();
-            for (key, _) in &rows {
-                let _ = batch.delete(key);
-            }
-            if !rows.is_empty() {
-                self.db
-                    .commit_batch(&batch)
-                    .map_err(|e| format!("{:?}", e))?;
-            }
-        }
+        let rows = self
+            .db
+            .scan(&prefix, &format!("{}\x7F", prefix), seq)
+            .map_err(|e| format!("{:?}", e))?;
 
-        // Delete catalog entry
-        let cat_key = format!("{}{}", CATALOG_PREFIX, name_lower);
+        // Delete the table rows and catalog entry in one atomic batch. The
+        // scan above must succeed before we build the batch, so corruption
+        // cannot turn DROP into a schema-only delete; one commit also avoids
+        // leaving orphaned rows if the second of two commits would fail.
         let mut batch = WriteBatch::new();
+        for (key, _) in &rows {
+            batch.delete(key).map_err(|e| format!("{:?}", e))?;
+        }
+        let cat_key = format!("{}{}", CATALOG_PREFIX, name_lower);
         batch.delete(&cat_key).map_err(|e| format!("{:?}", e))?;
         self.db
             .commit_batch(&batch)

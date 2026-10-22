@@ -77,19 +77,34 @@ pub fn gather_stats_at(
     db: &crate::OmniKV,
     seq: u64,
 ) -> std::collections::HashMap<String, TableStats> {
+    gather_stats_at_checked(catalog, index_catalog, db, seq).unwrap_or_default()
+}
+
+/// Collects statistics at a caller-selected MVCC sequence and preserves
+/// storage/decode failures. SQL planning uses this checked form so a corrupt
+/// table cannot be treated as an empty or default-sized table merely because
+/// statistics collection failed.
+pub fn gather_stats_at_checked(
+    catalog: &Catalog,
+    index_catalog: Option<&IndexCatalog>,
+    db: &crate::OmniKV,
+    seq: u64,
+) -> Result<std::collections::HashMap<String, TableStats>, String> {
     let mut stats = std::collections::HashMap::new();
     for table_name in catalog.list_tables() {
         if let Some(table) = catalog.get_table(&table_name) {
             let prefix = table.row_prefix();
-            let row_count = db
+            let sample = db
                 .scan(&prefix, &format!("{}\x7F", prefix), seq)
-                .map(|r| r.len() as u64)
-                .unwrap_or(0);
+                .map_err(|error| {
+                    format!(
+                        "storage statistics scan failed for table '{}': {error}",
+                        table.name
+                    )
+                })?;
+            let row_count = sample.len() as u64;
 
             let avg_row_bytes = if row_count > 0 {
-                let sample = db
-                    .scan(&prefix, &format!("{}\x7F", prefix), seq)
-                    .unwrap_or_default();
                 let total: u64 = sample.iter().take(100).map(|(_, v)| v.len() as u64).sum();
                 let sampled = sample.len().min(100) as u64;
                 total.checked_div(sampled).unwrap_or(128)
@@ -109,9 +124,6 @@ pub fn gather_stats_at(
             // Build histograms from sampled data
             let mut histograms = Vec::new();
             if row_count > 0 {
-                let sample = db
-                    .scan(&prefix, &format!("{}\x7F", prefix), seq)
-                    .unwrap_or_default();
                 let mut col_values: std::collections::HashMap<
                     String,
                     std::collections::HashSet<String>,
@@ -122,15 +134,21 @@ pub fn gather_stats_at(
                 for (_, value) in sample.iter().take(sample_size) {
                     // Decode with the table's own row format: a typed row
                     // carries NULL as a JSON null, a legacy one as "NULL".
-                    if let Some(row) =
-                        crate::plan_exec::PlanExecutor::deserialize_row(value, table.row_format)
-                    {
-                        for (col, val) in &row {
-                            match val {
-                                None => *col_nulls.entry(col.clone()).or_default() += 1,
-                                Some(v) => {
-                                    col_values.entry(col.clone()).or_default().insert(v.clone());
-                                }
+                    let row = crate::plan_exec::PlanExecutor::deserialize_row_checked(
+                        value,
+                        table.row_format,
+                    )
+                    .map_err(|error| {
+                        format!(
+                            "table '{}' row decode failed during statistics collection: {error}",
+                            table.name
+                        )
+                    })?;
+                    for (col, val) in &row {
+                        match val {
+                            None => *col_nulls.entry(col.clone()).or_default() += 1,
+                            Some(v) => {
+                                col_values.entry(col.clone()).or_default().insert(v.clone());
                             }
                         }
                     }
@@ -163,7 +181,7 @@ pub fn gather_stats_at(
             );
         }
     }
-    stats
+    Ok(stats)
 }
 
 // ─── Query Plan Nodes ───────────────────────────────────────────────────────
