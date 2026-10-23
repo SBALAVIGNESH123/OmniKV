@@ -17,6 +17,7 @@ fn table_stats(indexes: Vec<IndexDefinition>) -> HashMap<String, TableStats> {
             avg_row_bytes: 256,
             indexes,
             histograms: vec![],
+            primary_key: "id".to_string(),
         },
     )])
 }

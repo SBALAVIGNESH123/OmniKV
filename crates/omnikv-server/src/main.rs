@@ -1548,49 +1548,185 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn tcp_authenticated_session_completing_lines_is_not_cut() {
-        // The counterpart of the dribble test: a client that keeps
-        // finishing lines keeps getting served. The paused clock
-        // auto-advances whenever the runtime is idle, so this has to send
-        // the whole batch in one segment — the moment the handler parks
-        // between commands the mock clock would jump to the idle
-        // deadline regardless of the reset, which makes an await-per-
-        // command arrangement unable to tell "cut for stalling" from
-        // "clock moved while parked". A single pipelined write keeps the
-        // handler busy and lets every line complete.
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream};
+        use tokio::time::{Duration, Instant, sleep, timeout};
+
+        async fn complete_line_after(
+            client: &mut BufReader<DuplexStream>,
+            command: &str,
+            gap: Duration,
+        ) -> String {
+            timeout(gap + Duration::from_secs(1), async {
+                client
+                    .get_mut()
+                    .write_all(command.as_bytes())
+                    .await
+                    .expect("write command body to the duplex session");
+                if !gap.is_zero() {
+                    // With in-memory I/O, the runnable handler consumes the
+                    // body before the paused clock advances to this sleep.
+                    sleep(gap).await;
+                }
+                client
+                    .get_mut()
+                    .write_all(b"\n")
+                    .await
+                    .expect("complete the duplex command line");
+                let mut reply = String::new();
+                let bytes = client
+                    .read_line(&mut reply)
+                    .await
+                    .expect("read the completed command's reply");
+                assert_ne!(
+                    bytes, 0,
+                    "session closed before replying to a completed line"
+                );
+                reply
+            })
+            .await
+            .expect("a completed duplex line must receive its reply within the simulated gap")
+        }
+
+        // Real sockets can leave OS readiness pending while the paused
+        // clock jumps to a session deadline. Duplex I/O wakes the handler
+        // and client causally; each reply acknowledges a completed line
+        // before the next simulated gap starts.
         let secret = "unit-test-secret-0123456789abcdef";
         let db = test_db();
-        let mut s = session(db, secret, Arc::new(TcpAuthFailures::new())).await;
+        let (client, server) = tokio::io::duplex(4096);
+        let mut client = BufReader::new(client);
+        let handle = tokio::spawn(async move {
+            handle_tcp_connection(
+                server,
+                TEST_PEER.parse().expect("parse the synthetic session peer"),
+                db,
+                secret.to_string(),
+                test_limiter(),
+                Arc::new(TcpAuthFailures::new()),
+            )
+            .await;
+        });
 
         let token = token_for(secret, "write");
-        s.send(&format!("AUTH {token}\n")).await;
-
-        // More commands than one idle window would tolerate, all
-        // completed: every one earns its reply, and the session survives
-        // to serve the next.
-        let batch: String = (0..8).fold(String::new(), |mut acc, i| {
-            acc.push_str(&format!("SET k{i} v{i}\n"));
-            acc
-        });
-        let replies = s.send(&batch).await;
         assert_eq!(
-            replies.len(),
-            8,
-            "completing client lost replies: {replies:?}"
+            complete_line_after(&mut client, &format!("AUTH {token}"), Duration::ZERO).await,
+            "OK: authenticated as test\n",
+            "authenticate before exercising the idle and line deadlines"
         );
-        for r in &replies {
+
+        // Each incomplete line lasts less than the idle timeout, but all
+        // eight together span more than the absolute line deadline. Only
+        // completing lines, rather than receiving bytes, resets that clock.
+        let gap = TCP_IDLE_TIMEOUT / 2;
+        let started = Instant::now();
+        for i in 0..8 {
+            let reply = complete_line_after(&mut client, &format!("SET k{i} v{i}"), gap).await;
             assert!(
-                r.starts_with("OK"),
-                "completing client was errored: {replies:?}"
+                reply.starts_with("OK: seq="),
+                "completed SET k{i} was not acknowledged: {reply:?}"
+            );
+        }
+        assert!(
+            started.elapsed() > TCP_LINE_DEADLINE,
+            "completed commands must keep the session alive beyond one line deadline"
+        );
+
+        assert_eq!(
+            complete_line_after(&mut client, "GET k0", gap).await,
+            "OK: v0\n",
+            "a later GET must still be served after completing lines"
+        );
+        assert_eq!(
+            started.elapsed(),
+            gap * 9,
+            "only the explicit inter-fragment gaps may advance the paused clock"
+        );
+
+        drop(client);
+        timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("the duplex session must exit promptly after client EOF")
+            .expect("the duplex session task must not panic");
+    }
+
+    #[tokio::test]
+    async fn tcp_authenticated_session_completing_lines_over_real_socket() {
+        use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+        use tokio::time::{Duration, timeout};
+
+        async fn request<R, W>(reader: &mut R, writer: &mut W, command: &str) -> String
+        where
+            R: AsyncBufRead + Unpin,
+            W: AsyncWrite + Unpin,
+        {
+            writer
+                .write_all(command.as_bytes())
+                .await
+                .expect("write command to the real TCP session");
+            writer
+                .write_all(b"\n")
+                .await
+                .expect("complete command on the real TCP session");
+            writer
+                .flush()
+                .await
+                .expect("flush command to the real TCP session");
+
+            let mut reply = String::new();
+            let bytes = timeout(Duration::from_secs(5), reader.read_line(&mut reply))
+                .await
+                .expect("real TCP session reply timed out")
+                .expect("read reply from the real TCP session");
+            assert_ne!(
+                bytes, 0,
+                "real TCP session closed before replying to {command:?}"
+            );
+            reply.trim().to_string()
+        }
+
+        // The paused-time duplex test above owns deterministic deadline
+        // coverage. This companion deliberately uses the existing
+        // loopback TcpStream fixture, so the same successful flow also
+        // crosses OS readiness and socket buffering without mock-clock
+        // scheduling being part of the assertion.
+        let secret = "unit-test-secret-0123456789abcdef";
+        let Session { client, handle } =
+            session(test_db(), secret, Arc::new(TcpAuthFailures::new())).await;
+        let (read_half, mut write_half) = client.into_split();
+        let mut reader = BufReader::new(read_half);
+
+        let token = token_for(secret, "write");
+        assert_eq!(
+            request(&mut reader, &mut write_half, &format!("AUTH {token}")).await,
+            "OK: authenticated as test",
+            "real TCP authentication must succeed before data commands"
+        );
+
+        for i in 0..8 {
+            let reply = request(
+                &mut reader,
+                &mut write_half,
+                &format!("SET real-socket-k{i} real-socket-v{i}"),
+            )
+            .await;
+            assert!(
+                reply.starts_with("OK: seq="),
+                "real TCP SET real-socket-k{i} was not acknowledged: {reply:?}"
             );
         }
 
-        // The session is still alive: a later command still gets served.
-        let later = s.send("GET k0\n").await;
         assert_eq!(
-            later,
-            vec!["OK: v0"],
-            "session died after completing lines: {later:?}"
+            request(&mut reader, &mut write_half, "GET real-socket-k0").await,
+            "OK: real-socket-v0",
+            "real TCP session must serve a later GET after completed SET lines"
         );
+
+        drop(reader);
+        drop(write_half);
+        timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("the real TCP session must exit promptly after client EOF")
+            .expect("the real TCP session task must not panic");
     }
 
     #[test]

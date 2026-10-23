@@ -1123,6 +1123,20 @@ fn pgwire_transaction_ddl_rolls_back_with_transaction() {
     );
     let _ = read_ready_status(&mut stream);
 
+    // DML reaches the same table through its own error path, which used to
+    // phrase a missing table as "not found" and map to XX000.
+    for q in ["UPDATE rolled SET id = 1", "DELETE FROM rolled"] {
+        send_query(&mut stream, q).expect("dml on missing table");
+        let (msg_type, body) = read_message(&mut stream).expect("error frame");
+        assert_eq!(msg_type, b'E', "{q} must fail");
+        let text = String::from_utf8_lossy(&body);
+        assert!(
+            text.contains("42P01"),
+            "{q} must report 42P01, got {text:?}"
+        );
+        let _ = read_ready_status(&mut stream);
+    }
+
     // Committed CREATE persists.
     send_query(&mut stream, "BEGIN").expect("begin");
     read_command_complete(&mut stream);
@@ -1563,6 +1577,47 @@ fn pgwire_extended_protocol_parameter_binding_substitutes_values() {
         "injection payload must bind as inert data and match nothing"
     );
     let _ = read_ready_status(&mut stream);
+}
+
+#[test]
+fn pgwire_sql_null_is_a_negative_length_and_literal_null_is_text() {
+    let addr = spawn_pgwire_server().expect("spawn server");
+    let mut stream = TcpStream::connect(&addr).expect("connect");
+    complete_handshake(&mut stream).expect("handshake");
+
+    send_query(
+        &mut stream,
+        "CREATE TABLE t (id INT PRIMARY KEY, null_value TEXT, text_value TEXT)",
+    )
+    .expect("create table");
+    assert_eq!(read_command_complete(&mut stream), "CREATE TABLE t");
+    assert_eq!(read_ready_status(&mut stream), b'I');
+
+    send_query(&mut stream, "INSERT INTO t VALUES (1, NULL, 'NULL')")
+        .expect("insert null and literal text");
+    assert_eq!(read_command_complete(&mut stream), "INSERT 0 1");
+    assert_eq!(read_ready_status(&mut stream), b'I');
+
+    send_query(&mut stream, "SELECT null_value, text_value FROM t").expect("select values");
+    let row = read_until_type(&mut stream, b'D');
+    assert_eq!(
+        i16::from_be_bytes([row[0], row[1]]),
+        2,
+        "the SELECT must return both fields"
+    );
+    assert_eq!(
+        i32::from_be_bytes(row[2..6].try_into().expect("null field length")),
+        -1,
+        "SQL NULL must use PostgreSQL's -1 field length"
+    );
+    assert_eq!(
+        i32::from_be_bytes(row[6..10].try_into().expect("text field length")),
+        4,
+        "literal text NULL must retain its four-byte payload"
+    );
+    assert_eq!(&row[10..14], b"NULL");
+    assert_eq!(read_command_complete(&mut stream), "SELECT 1");
+    assert_eq!(read_ready_status(&mut stream), b'I');
 }
 
 #[test]

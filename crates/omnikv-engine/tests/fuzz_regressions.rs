@@ -33,7 +33,7 @@ fn corpus_bytes(target: &str) -> Vec<Vec<u8>> {
             })
         })
         .collect::<Vec<_>>();
-    assert!(!bytes.is_empty(), "expected checked-in corpus for {target}");
+    assert_ne!(bytes.len(), 0, "expected checked-in corpus for {target}");
     bytes
 }
 

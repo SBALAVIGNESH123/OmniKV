@@ -8,7 +8,7 @@ use arc_swap::ArcSwap;
 use crossbeam_skiplist::SkipMap;
 use memmap2::{Mmap, MmapOptions};
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::hash::{Hash, Hasher};
 use std::io::{BufWriter, ErrorKind, Read, Write};
@@ -18,7 +18,7 @@ use std::os::unix::fs::FileExt;
 use std::os::windows::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock, Weak};
 
 pub struct FnvHasher(u64);
 impl Default for FnvHasher {
@@ -170,6 +170,56 @@ fn cleanup_obsolete_file(path: impl AsRef<Path>, context: &'static str) -> Clean
 fn cleanup_obsolete_sstable_pair(path: &str, context: &'static str) {
     cleanup_obsolete_file(path, context);
     cleanup_obsolete_file(path.replace(".sst", ".bloom"), context);
+}
+
+/// Return the Bloom sidecar path for a base file. Base files use `.bin` in a
+/// fresh database and `.sst` after L1-to-base compaction, so replacing only
+/// `.bin` would make a reopen treat the SSTable itself as the Bloom file.
+pub(crate) fn bloom_path_for_base(path: &str) -> String {
+    let extension_is = |expected: &str| {
+        Path::new(path)
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case(expected))
+    };
+    if extension_is("sst") || extension_is("bin") {
+        Path::new(path)
+            .with_extension("bloom")
+            .to_string_lossy()
+            .into_owned()
+    } else {
+        format!("{path}.bloom")
+    }
+}
+
+fn cleanup_obsolete_base_pair(path: &str, context: &'static str) {
+    cleanup_obsolete_file(path, context);
+    cleanup_obsolete_file(bloom_path_for_base(path), context);
+}
+
+/// Removes newly-created compaction outputs if publication fails. A failed
+/// compaction must not leave orphaned data or Bloom sidecars that accumulate
+/// across retries and eventually exhaust the database volume.
+struct CompactionOutputGuard {
+    paths: Vec<String>,
+}
+
+impl CompactionOutputGuard {
+    fn new(paths: Vec<String>) -> Self {
+        Self { paths }
+    }
+
+    fn disarm(&mut self) {
+        self.paths.clear();
+    }
+}
+
+impl Drop for CompactionOutputGuard {
+    fn drop(&mut self) {
+        for path in &self.paths {
+            let _ = std::fs::remove_file(path);
+        }
+    }
 }
 
 fn cleanup_obsolete_file_with<F>(
@@ -411,12 +461,46 @@ pub struct BloomFilter {
     num_hashes: usize,
 }
 
+/// Atomically publish a small metadata file after its contents have reached
+/// stable storage. Readers either see the previous complete file or the new
+/// complete file; they never observe a partially-written JSON sidecar.
+fn atomic_replace(path: &str, content: &[u8]) -> Result<(), OmniError> {
+    let tmp_path = format!("{path}.tmp");
+    let result = (|| {
+        let mut file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&tmp_path)?;
+        file.write_all(content)?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&tmp_path, path)?;
+
+        // On Unix, syncing the directory makes the rename durable across a
+        // sudden power loss as well as making the file contents durable.
+        #[cfg(unix)]
+        if let Some(parent) = Path::new(path)
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            File::open(parent)?.sync_all()?;
+        }
+
+        Ok::<(), OmniError>(())
+    })();
+
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp_path);
+    }
+    result
+}
+
 impl BloomFilter {
     pub fn save(&self, path: &str) -> Result<(), OmniError> {
         let content = serde_json::to_string(self)
             .map_err(|e| OmniError::IoError(format!("Bloom filter serialize: {}", e)))?;
-        std::fs::write(path, content)?;
-        Ok(())
+        atomic_replace(path, content.as_bytes())
     }
 
     pub fn load(path: &str) -> Result<Self, OmniError> {
@@ -657,13 +741,7 @@ impl Manifest {
         to_save.format_version = MANIFEST_FORMAT_VERSION;
         let content = serde_json::to_string(&to_save)
             .map_err(|e| OmniError::IoError(format!("Manifest serialize: {}", e)))?;
-        let tmp_path = format!("{}.tmp", path);
-        std::fs::write(&tmp_path, content)?;
-        if let Ok(file) = std::fs::OpenOptions::new().write(true).open(&tmp_path) {
-            let _ = file.sync_all();
-        }
-        std::fs::rename(&tmp_path, path)?;
-        Ok(())
+        atomic_replace(path, content.as_bytes())
     }
 }
 
@@ -778,27 +856,32 @@ pub struct ScanIterator<'a> {
     read_buffer: PooledScanBuffer,
 }
 
-impl Iterator for ScanIterator<'_> {
-    type Item = (String, String);
-
-    fn next(&mut self) -> Option<Self::Item> {
+impl ScanIterator<'_> {
+    fn try_next(&mut self) -> Result<Option<(String, String)>, OmniError> {
         for candidate in self.candidates.by_ref() {
             if candidate.length == 0 || (candidate.expiry > 0 && candidate.expiry <= self.now) {
                 continue;
             }
             let key = key_to_string(&candidate.key);
-            let value = self
-                .db
-                .read_from_heap_into(
-                    candidate.offset,
-                    candidate.length,
-                    candidate.crc,
-                    self.read_buffer.as_mut_vec(),
-                )
-                .ok()?;
-            return Some((key, value));
+            let value = self.db.read_from_heap_into(
+                candidate.offset,
+                candidate.length,
+                candidate.crc,
+                self.read_buffer.as_mut_vec(),
+            )?;
+            return Ok(Some((key, value)));
         }
-        None
+        Ok(None)
+    }
+}
+
+impl Iterator for ScanIterator<'_> {
+    type Item = (String, String);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        // Preserve the legacy infallible iterator contract. Collected scans
+        // use try_next directly so a heap error cannot become partial success.
+        self.try_next().ok().flatten()
     }
 }
 
@@ -1070,6 +1153,73 @@ pub(crate) struct RecoveredStorage {
     pub max_seq: u64,
 }
 
+#[derive(Default)]
+struct SqlTableLockRegistry {
+    locks: Mutex<HashMap<String, Weak<SqlTableLock>>>,
+}
+
+impl SqlTableLockRegistry {
+    fn get(self: &Arc<Self>, table_name: &str) -> Result<Arc<SqlTableLock>, OmniError> {
+        let name = table_name.to_lowercase();
+        let mut locks = self
+            .locks
+            .lock()
+            .map_err(|_| OmniError::LockPoisoned("sql_table_locks".into()))?;
+
+        // Upgrade under the registry mutex so every holder and waiter shares
+        // one allocation. Only a dead weak entry may be replaced. Do not drop
+        // an upgraded Arc here: its last drop re-enters this registry.
+        let lock = match locks.get(&name).and_then(Weak::upgrade) {
+            Some(lock) => lock,
+            None => {
+                let lock = Arc::new(SqlTableLock {
+                    mutex: Mutex::new(()),
+                    name: name.clone(),
+                    registry: Arc::downgrade(self),
+                });
+                locks.insert(name, Arc::downgrade(&lock));
+                lock
+            }
+        };
+        drop(locks);
+        Ok(lock)
+    }
+}
+
+pub(crate) struct SqlTableLock {
+    mutex: Mutex<()>,
+    name: String,
+    registry: Weak<SqlTableLockRegistry>,
+}
+
+impl SqlTableLock {
+    pub(crate) fn lock(&self) -> std::sync::LockResult<MutexGuard<'_, ()>> {
+        self.mutex.lock()
+    }
+}
+
+impl Drop for SqlTableLock {
+    fn drop(&mut self) {
+        let Some(registry) = self.registry.upgrade() else {
+            return;
+        };
+        let Ok(mut locks) = registry.locks.lock() else {
+            return;
+        };
+
+        // A new lock for the same table may have replaced this dead weak
+        // entry concurrently. Only remove the entry if it still points at
+        // this exact allocation. Compare the weak pointer without upgrading:
+        // dropping a temporary Arc here could recursively lock the registry.
+        let is_this_lock = locks
+            .get(&self.name)
+            .is_some_and(|lock| std::ptr::eq(lock.as_ptr(), std::ptr::from_ref(self)));
+        if is_this_lock {
+            locks.remove(&self.name);
+        }
+    }
+}
+
 pub struct OmniKV {
     // ── Single atomic topology root (replaced atomically during snapshot install) ──
     // Reads: load roots once, work on stable Arc handles — zero locking needed.
@@ -1081,6 +1231,12 @@ pub struct OmniKV {
     pub(crate) heap_file: Mutex<File>,
     pub(crate) heap_offset: AtomicU64,
     pub(crate) wal: Mutex<wal::WriteAheadLog>,
+    /// Per-table SQL write locks. The guard spans the read/check/transform/
+    /// commit sequence so autocommit DML cannot race uniqueness checks,
+    /// legacy-row migration, or DROP TABLE for the same table. Different
+    /// tables remain independent. The registry stores weak references and
+    /// each lock removes its own entry when the final statement releases it.
+    sql_table_locks: Arc<SqlTableLockRegistry>,
     write_mutex: Mutex<()>,
     pub(crate) manifest_path: String,
     pub(crate) wal_path: String,
@@ -1119,10 +1275,35 @@ pub struct OmniKV {
     /// [`crate::transaction::SsiHistory`].
     pub(crate) ssi_history: std::sync::Arc<crate::transaction::SsiHistory>,
 
+    // Monotonic per-instance counter for compaction output filenames. The
+    // wall clock alone is not unique: two flushes in the same millisecond
+    // collide, and create_new(true) then fails with EEXIST.
+    file_seq: std::sync::atomic::AtomicU64,
+
     // Must be declared last: Rust drops struct fields in declaration order, so
     // all mmap-bearing roots and files are released before the database LOCK
     // file is unlocked and closed.
     db_lock: DatabaseLock,
+}
+
+/// RAII registration for a storage read snapshot. Keeping the registration
+/// coupled to the sequence prevents compaction from discarding versions while
+/// a statement still needs them, including when statement execution unwinds.
+pub(crate) struct SnapshotGuard {
+    db: Arc<OmniKV>,
+    sequence: u64,
+}
+
+impl SnapshotGuard {
+    pub(crate) fn sequence(&self) -> u64 {
+        self.sequence
+    }
+}
+
+impl Drop for SnapshotGuard {
+    fn drop(&mut self) {
+        self.db.unregister_snapshot(self.sequence);
+    }
 }
 
 impl OmniKV {
@@ -1182,6 +1363,7 @@ impl OmniKV {
             heap_file: Mutex::new(recovered.heap_file),
             heap_offset: AtomicU64::new(recovered.heap_offset),
             wal: Mutex::new(recovered.wal),
+            sql_table_locks: Arc::new(SqlTableLockRegistry::default()),
             write_mutex: Mutex::new(()),
             manifest_path: manifest_path.to_string(),
             wal_path: wal_path.to_string(),
@@ -1197,6 +1379,9 @@ impl OmniKV {
             transition_guard: RwLock::new(()),
             cluster_gateway: std::sync::OnceLock::new(),
             ssi_history: std::sync::Arc::new(crate::transaction::SsiHistory::default()),
+            // Start from a process-unique seed so reopening a database does
+            // not immediately reuse the previous instance's token sequence.
+            file_seq: std::sync::atomic::AtomicU64::new(rand::random()),
             db_lock,
         }))
     }
@@ -1204,6 +1389,43 @@ impl OmniKV {
     // ── Topology accessor helpers ─────────────────────────────────────────────
     // These load a stable root snapshot once. Callers work on Arc handles with no locking.
     // Compaction and reads use these; snapshot install bypasses them and swaps roots directly.
+
+    /// A per-instance token unique across concurrent and back-to-back
+    /// compactions. The random seed also avoids immediately reusing the
+    /// previous instance's token sequence after a reopen.
+    fn next_file_token(&self) -> u64 {
+        self.file_seq
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Creates a compaction output with an exclusive create. The token makes
+    /// normal output names unique; retrying on `AlreadyExists` makes that
+    /// guarantee hold even if a previous process used the same random seed or
+    /// left an output file behind after a crash.
+    fn create_unique_output<F>(&self, mut path_for_token: F) -> Result<(String, File), OmniError>
+    where
+        F: FnMut(u64) -> String,
+    {
+        const MAX_ATTEMPTS: usize = 32;
+
+        for _ in 0..MAX_ATTEMPTS {
+            let path = path_for_token(self.next_file_token());
+            match OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .read(true)
+                .open(&path)
+            {
+                Ok(file) => return Ok((path, file)),
+                Err(err) if err.kind() == ErrorKind::AlreadyExists => {}
+                Err(err) => return Err(err.into()),
+            }
+        }
+
+        Err(OmniError::IoError(
+            "unable to allocate a unique compaction output path after 32 attempts".into(),
+        ))
+    }
 
     #[inline]
     pub fn load_roots(&self) -> arc_swap::Guard<Arc<StorageRoots>> {
@@ -1308,7 +1530,7 @@ impl OmniKV {
         let base_mmap = Arc::new(unsafe { MmapOptions::new().map(&base_file)? });
 
         let reader = SSTableReader::from_mmap(base_mmap.clone());
-        let base_bloom_path = manifest.base_path.replace(".bin", ".bloom");
+        let base_bloom_path = bloom_path_for_base(&manifest.base_path);
         let base_bloom = match BloomFilter::load(&base_bloom_path) {
             Ok(b) => b,
             Err(_) => {
@@ -1442,7 +1664,34 @@ impl OmniKV {
         self.global_seq.load(Ordering::SeqCst)
     }
 
+    /// Returns the process-local SQL lock for one table. The caller keeps the
+    /// returned `Arc` alive while locking it, so removing a table from the
+    /// catalog cannot invalidate a lock that another statement is waiting on.
+    pub(crate) fn sql_table_lock(&self, table_name: &str) -> Result<Arc<SqlTableLock>, OmniError> {
+        self.sql_table_locks.get(table_name)
+    }
+
+    /// Captures a committed read point and pins its historical versions until
+    /// the returned guard is dropped. SQL autocommit statements use this for
+    /// statement-level snapshot consistency and compaction safety.
+    pub(crate) fn snapshot_guard(self: &Arc<Self>) -> SnapshotGuard {
+        SnapshotGuard {
+            db: self.clone(),
+            sequence: self.snapshot(),
+        }
+    }
+
     pub fn snapshot(&self) -> u64 {
+        // Writers hold the transition read lock from sequence reservation
+        // through memtable publication. Take the exclusive side while
+        // choosing a snapshot so the returned sequence is a fully published
+        // commit point rather than a range reserved by an in-flight batch.
+        // The lock is held only for the sequence/pin operation; readers use
+        // the retained MVCC history after it is released.
+        let _transition_guard = self
+            .transition_guard
+            .write()
+            .expect("FATAL: transition lock poisoned");
         let seq = self.get_seq().saturating_sub(1);
         let mut snaps = self
             .active_snapshots
@@ -1576,6 +1825,8 @@ impl OmniKV {
         min_seq
     }
 
+    /// Collects the complete visible range, or returns the first heap read error.
+    /// Unlike the legacy `scan_iter`, errors cannot yield a successful prefix.
     pub fn scan(
         &self,
         start_key: &str,
@@ -1583,8 +1834,9 @@ impl OmniKV {
         read_seq: u64,
     ) -> Result<Vec<(String, String)>, OmniError> {
         let mut results = Vec::new();
-        for (k_str, val) in self.scan_iter(start_key, end_key, read_seq)? {
-            results.push((k_str, val));
+        let mut iter = self.scan_iter_inner(start_key, end_key, read_seq)?;
+        while let Some(entry) = iter.try_next()? {
+            results.push(entry);
         }
         Ok(results)
     }
@@ -2165,12 +2417,24 @@ impl OmniKV {
     /// (memtable, frozen memtables, L0, L1, base), deduplicates by key keeping
     /// only the newest version visible at `read_seq`, then lazily reads values
     /// from the heap only when consumed.
+    ///
+    /// This compatibility iterator cannot report lazy heap errors: `next`
+    /// returns `None` on a read failure. Use `scan` for an all-or-error result.
     pub fn scan_iter(
         &self,
         start_key: &str,
         end_key: &str,
         read_seq: u64,
     ) -> Result<impl Iterator<Item = (String, String)> + '_, OmniError> {
+        self.scan_iter_inner(start_key, end_key, read_seq)
+    }
+
+    fn scan_iter_inner(
+        &self,
+        start_key: &str,
+        end_key: &str,
+        read_seq: u64,
+    ) -> Result<ScanIterator<'_>, OmniError> {
         let start_key = string_to_key(start_key);
         let end_key = string_to_key(end_key);
         let now = std::time::SystemTime::now()
@@ -2232,11 +2496,13 @@ impl OmniKV {
         let sstables = self.roots.load().sstables.clone();
         for (mmap, _, _) in sstables.iter().rev() {
             let reader = SSTableReader::from_mmap(mmap.clone());
+            // Sparse-index seeks may rewind before start_key; enforce both
+            // inclusive bounds before collecting any persisted candidate.
             for rec in reader.iter_from(&start_key) {
                 if rec.key > end_key {
                     break;
                 }
-                if rec.is_valid() && rec.seq <= read_seq {
+                if rec.key >= start_key && rec.is_valid() && rec.seq <= read_seq {
                     candidates.push(ScanCandidate {
                         key: rec.key,
                         seq: rec.seq,
@@ -2257,7 +2523,7 @@ impl OmniKV {
                 if rec.key > end_key {
                     break;
                 }
-                if rec.is_valid() && rec.seq <= read_seq {
+                if rec.key >= start_key && rec.is_valid() && rec.seq <= read_seq {
                     candidates.push(ScanCandidate {
                         key: rec.key,
                         seq: rec.seq,
@@ -2277,7 +2543,7 @@ impl OmniKV {
             if rec.key > end_key {
                 break;
             }
-            if rec.is_valid() && rec.seq <= read_seq {
+            if rec.key >= start_key && rec.is_valid() && rec.seq <= read_seq {
                 candidates.push(ScanCandidate {
                     key: rec.key,
                     seq: rec.seq,
@@ -2409,6 +2675,17 @@ impl OmniKV {
 
     /// Flushes the active memtable to disk as an L0 SSTable.
     pub fn compact_sstables(&self) -> Result<(), OmniError> {
+        let _topology_guard = self
+            .transition_guard
+            .read()
+            .map_err(|_| OmniError::LockPoisoned("transition_guard".into()))?;
+        self.compact_sstables_locked()
+    }
+
+    /// Compacts the active memtable while the caller already holds the
+    /// transition barrier. Backup creation uses this form while holding the
+    /// barrier exclusively; reacquiring the read side there would deadlock.
+    pub(crate) fn compact_sstables_locked(&self) -> Result<(), OmniError> {
         let started_at = std::time::Instant::now();
         let mut stats = CompactionStats::default();
         let (frozen_idx, frozen_arc) = {
@@ -2474,20 +2751,19 @@ impl OmniKV {
             bloom.add(h.finish());
         }
 
-        let sst_path = format!(
-            "{}_l0_0_{}.sst",
-            self.manifest_path,
-            std::time::UNIX_EPOCH
-                .elapsed()
-                .unwrap_or_default()
-                .as_millis()
-        );
-        let _ = bloom.save(&sst_path.replace(".sst", ".bloom"));
-        let file = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .read(true)
-            .open(&sst_path)?;
+        let (sst_path, file) = self.create_unique_output(|token| {
+            format!(
+                "{}_l0_0_{}_{}.sst",
+                self.manifest_path,
+                std::time::UNIX_EPOCH
+                    .elapsed()
+                    .unwrap_or_default()
+                    .as_millis(),
+                token
+            )
+        })?;
+        let mut output_guard =
+            CompactionOutputGuard::new(vec![sst_path.clone(), sst_path.replace(".sst", ".bloom")]);
 
         let mut writer = SSTableWriter::new(&file);
         for rec in &records {
@@ -2496,6 +2772,7 @@ impl OmniKV {
         writer.finish()?;
 
         file.sync_all()?;
+        bloom.save(&sst_path.replace(".sst", ".bloom"))?;
 
         // SAFETY: The new L0 SSTable is fully written, flushed, and fsynced
         // before this read-only mapping is created. After publication, OmniKV
@@ -2517,6 +2794,7 @@ impl OmniKV {
             sstables: Arc::new(sstables),
             ..r.clone()
         });
+        output_guard.disarm();
 
         self.remove_frozen_memtable(frozen_idx)?;
         stats.record(
@@ -2533,6 +2811,10 @@ impl OmniKV {
     pub fn compact_l0_to_l1(&self) -> Result<(), OmniError> {
         let started_at = std::time::Instant::now();
         let mut stats = CompactionStats::default();
+        let _topology_guard = self
+            .transition_guard
+            .read()
+            .map_err(|_| OmniError::LockPoisoned("transition_guard".into()))?;
         let _guard = self
             .write_mutex
             .lock()
@@ -2607,26 +2889,26 @@ impl OmniKV {
             bloom.add(h.finish());
         }
 
-        let sst_path = format!(
-            "{}_l1_{}.sst",
-            self.manifest_path,
-            std::time::UNIX_EPOCH
-                .elapsed()
-                .unwrap_or_default()
-                .as_millis()
-        );
-        let _ = bloom.save(&sst_path.replace(".sst", ".bloom"));
-        let file = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .read(true)
-            .open(&sst_path)?;
+        let (sst_path, file) = self.create_unique_output(|token| {
+            format!(
+                "{}_l1_{}_{}.sst",
+                self.manifest_path,
+                std::time::UNIX_EPOCH
+                    .elapsed()
+                    .unwrap_or_default()
+                    .as_millis(),
+                token
+            )
+        })?;
+        let mut output_guard =
+            CompactionOutputGuard::new(vec![sst_path.clone(), sst_path.replace(".sst", ".bloom")]);
         let mut writer = SSTableWriter::new(&file);
         for rec in &records {
             writer.append(rec)?;
         }
         writer.finish()?;
         file.sync_all()?;
+        bloom.save(&sst_path.replace(".sst", ".bloom"))?;
 
         // SAFETY: The new L1 SSTable is fully materialized and synced before
         // mapping. Compaction installs the mapping via an atomic root swap and
@@ -2648,6 +2930,7 @@ impl OmniKV {
             sstables: Arc::new(Vec::new()),
             ..r.clone()
         });
+        output_guard.disarm();
 
         let old_paths: Vec<String> = sstables.iter().map(|(_, _, p)| p.clone()).collect();
         std::thread::spawn(move || {
@@ -2664,6 +2947,10 @@ impl OmniKV {
     pub fn compact_l1_to_l2(&self) -> Result<(), OmniError> {
         let started_at = std::time::Instant::now();
         let mut stats = CompactionStats::default();
+        let _topology_guard = self
+            .transition_guard
+            .read()
+            .map_err(|_| OmniError::LockPoisoned("transition_guard".into()))?;
         let _guard = self
             .write_mutex
             .lock()
@@ -2737,26 +3024,28 @@ impl OmniKV {
             bloom.add(h.finish());
         }
 
-        let new_base_path = format!(
-            "{}_base_{}.sst",
-            self.manifest_path,
-            std::time::UNIX_EPOCH
-                .elapsed()
-                .unwrap_or_default()
-                .as_millis()
-        );
-        let file = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .read(true)
-            .open(&new_base_path)?;
-
+        let (new_base_path, file) = self.create_unique_output(|token| {
+            format!(
+                "{}_base_{}_{}.sst",
+                self.manifest_path,
+                std::time::UNIX_EPOCH
+                    .elapsed()
+                    .unwrap_or_default()
+                    .as_millis(),
+                token
+            )
+        })?;
+        let mut output_guard = CompactionOutputGuard::new(vec![
+            new_base_path.clone(),
+            new_base_path.replace(".sst", ".bloom"),
+        ]);
         let mut writer = SSTableWriter::new(&file);
         for rec in &records {
             writer.append(rec)?;
         }
         writer.finish()?;
         file.sync_all()?;
+        bloom.save(&new_base_path.replace(".sst", ".bloom"))?;
 
         // SAFETY: The replacement base SSTable is complete and fsynced before
         // mapping. Existing readers retain Arc-owned mappings for old files,
@@ -2785,6 +3074,7 @@ impl OmniKV {
             manifest: Arc::new(manifest),
             ..r.clone()
         });
+        output_guard.disarm();
 
         let old_paths: Vec<String> = l1_sstables_snap[..num_l1_merged]
             .iter()
@@ -2792,7 +3082,7 @@ impl OmniKV {
             .collect();
         std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_secs(5));
-            cleanup_obsolete_file(&old_base_path, "l1_to_base_cleanup");
+            cleanup_obsolete_base_pair(&old_base_path, "l1_to_base_cleanup");
             for path in old_paths {
                 cleanup_obsolete_sstable_pair(&path, "l1_to_base_cleanup");
             }
@@ -2807,6 +3097,10 @@ impl OmniKV {
     pub fn run_garbage_collection(&self) -> Result<(), OmniError> {
         let started_at = std::time::Instant::now();
         let mut stats = CompactionStats::default();
+        let _topology_guard = self
+            .transition_guard
+            .read()
+            .map_err(|_| OmniError::LockPoisoned("transition_guard".into()))?;
         let _guard = self
             .write_mutex
             .lock()
@@ -2890,33 +3184,39 @@ impl OmniKV {
             }
         }
 
-        let new_heap_path = format!(
-            "{}_heap_compacted_{}.bin",
-            self.manifest_path,
-            std::time::UNIX_EPOCH
-                .elapsed()
-                .unwrap_or_default()
-                .as_millis()
-        );
-        let new_base_path = format!(
-            "{}_database_compacted_{}.bin",
-            self.manifest_path,
-            std::time::UNIX_EPOCH
-                .elapsed()
-                .unwrap_or_default()
-                .as_millis()
-        );
-
-        let new_heap_file = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .read(true)
-            .open(&new_heap_path)?;
-        let new_base_file = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .read(true)
-            .open(&new_base_path)?;
+        let (new_heap_path, new_heap_file) = self.create_unique_output(|token| {
+            format!(
+                "{}_heap_compacted_{}_{}.bin",
+                self.manifest_path,
+                std::time::UNIX_EPOCH
+                    .elapsed()
+                    .unwrap_or_default()
+                    .as_millis(),
+                token
+            )
+        })?;
+        let (new_base_path, new_base_file) = match self.create_unique_output(|token| {
+            format!(
+                "{}_database_compacted_{}_{}.bin",
+                self.manifest_path,
+                std::time::UNIX_EPOCH
+                    .elapsed()
+                    .unwrap_or_default()
+                    .as_millis(),
+                token
+            )
+        }) {
+            Ok(output) => output,
+            Err(err) => {
+                let _ = std::fs::remove_file(&new_heap_path);
+                return Err(err);
+            }
+        };
+        let mut output_guard = CompactionOutputGuard::new(vec![
+            new_heap_path.clone(),
+            new_base_path.clone(),
+            bloom_path_for_base(&new_base_path),
+        ]);
 
         let mut new_heap_writer = BufWriter::new(&new_heap_file);
         let mut base_sst_writer = SSTableWriter::new(&new_base_file);
@@ -2992,17 +3292,17 @@ impl OmniKV {
         let new_base_mmap = unsafe { MmapOptions::new().map(&new_base_file)? };
 
         let new_heap_reader = OpenOptions::new().read(true).open(&new_heap_path)?;
-        let manifest_for_roots = {
-            let old_manifest = self.roots.load().manifest.clone().as_ref().clone();
-            let mut manifest = old_manifest.clone();
-            manifest.heap_path = new_heap_path.clone();
-            manifest.base_path = new_base_path.clone();
-            manifest.sstables.clear();
-            manifest.l1_sstables.clear();
-            manifest.save(&self.manifest_path)?;
-            manifest
-        };
-        let _ = bloom.save(&new_base_path.replace(".bin", ".bloom"));
+        // Capture the pre-GC manifest before publishing the replacement
+        // topology. Cleanup must delete these obsolete files, never the new
+        // paths that are about to become the active roots.
+        let old_manifest = self.roots.load().manifest.clone().as_ref().clone();
+        let mut manifest_for_roots = old_manifest.clone();
+        manifest_for_roots.heap_path = new_heap_path.clone();
+        manifest_for_roots.base_path = new_base_path.clone();
+        manifest_for_roots.sstables.clear();
+        manifest_for_roots.l1_sstables.clear();
+        bloom.save(&bloom_path_for_base(&new_base_path))?;
+        manifest_for_roots.save(&self.manifest_path)?;
 
         let cur = self.roots.load();
         self.roots.store(Arc::new(StorageRoots {
@@ -3015,6 +3315,7 @@ impl OmniKV {
             memtable: cur.memtable.clone(),
             frozen_memtables: cur.frozen_memtables.clone(),
         }));
+        output_guard.disarm();
         self.block_cache.invalidate_all();
 
         let mut heap_lock = self
@@ -3030,12 +3331,10 @@ impl OmniKV {
         // These entries are harmless duplicates that will be deduplicated
         // during the next compaction cycle.
 
-        let old_manifest = self.roots.load().manifest.clone();
-
         std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_secs(5));
             cleanup_obsolete_file(&old_manifest.heap_path, "heap_gc_cleanup");
-            cleanup_obsolete_file(&old_manifest.base_path, "heap_gc_cleanup");
+            cleanup_obsolete_base_pair(&old_manifest.base_path, "heap_gc_cleanup");
             for p in old_manifest
                 .sstables
                 .iter()
@@ -3129,6 +3428,289 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
+    fn scan_reports_heap_errors_and_returns_its_pooled_buffer() {
+        let dir = TempDir::new().expect("tempdir");
+        let manifest = dir.path().join("manifest");
+        let wal = dir.path().join("wal");
+        let db = OmniKV::open(
+            manifest.to_str().expect("UTF-8 manifest path"),
+            wal.to_str().expect("UTF-8 WAL path"),
+        )
+        .expect("open");
+        let mut batch = WriteBatch::new();
+        batch
+            .set("a_valid", "value".into())
+            .expect("stage valid value");
+        db.commit_batch(&batch).expect("commit valid value");
+        db.insert_replica_record(
+            b"z_unreadable".to_vec(),
+            db.get_seq() + 1,
+            u64::MAX / 2,
+            1,
+            0,
+            0,
+        );
+        let seq = db.get_seq();
+
+        // Existing lazy callers retain their (String, String) item type and
+        // legacy stop-on-error behavior. Only strict collection reports it.
+        let legacy: Vec<(String, String)> = db
+            .scan_iter("a", "z\x7F", seq)
+            .expect("create legacy scan")
+            .collect();
+        assert_eq!(legacy, [("a_valid".into(), "value".into())]);
+        assert_eq!(db.scan_buffer_pool_available(), 1);
+
+        assert!(matches!(
+            db.scan("a", "z\x7F", seq),
+            Err(OmniError::IoError(_))
+        ));
+        assert_eq!(
+            db.scan_buffer_pool_available(),
+            1,
+            "a failed scan must return its one reusable heap buffer"
+        );
+    }
+
+    #[test]
+    fn scan_preserves_snapshot_range_ttl_and_tombstone_selection() {
+        let dir = TempDir::new().expect("tempdir");
+        let manifest = dir.path().join("manifest");
+        let wal = dir.path().join("wal");
+        let db = OmniKV::open(
+            manifest.to_str().expect("UTF-8 manifest path"),
+            wal.to_str().expect("UTF-8 WAL path"),
+        )
+        .expect("open");
+        let insert_value = |key: &str, seq, value: &str| {
+            let offset = db
+                .append_to_heap(value.as_bytes())
+                .expect("append test value");
+            db.insert_replica_record(
+                key.as_bytes().to_vec(),
+                seq,
+                offset,
+                UNCOMPRESSED_FLAG | value.len() as u64,
+                crc32fast::hash(value.as_bytes()),
+                0,
+            );
+        };
+        for key in ["b", "c", "d", "e", "f"] {
+            insert_value(key, 10, "old");
+        }
+        let unreadable = u64::MAX / 2;
+        db.insert_replica_record(b"b".to_vec(), 20, unreadable, 1, 0, 0);
+        insert_value("b", 30, "new");
+        db.insert_replica_record(b"c".to_vec(), 30, unreadable, 0, 0, 0);
+        db.insert_replica_record(b"d".to_vec(), 30, unreadable, 1, 0, 1);
+        db.insert_replica_record(b"e".to_vec(), 40, unreadable, 1, 0, 0);
+        for key in [b"a", b"z"] {
+            db.insert_replica_record(key.to_vec(), 30, unreadable, 1, 0, 0);
+        }
+
+        let current: Vec<(String, String)> = vec![
+            ("b".into(), "new".into()),
+            ("e".into(), "old".into()),
+            ("f".into(), "old".into()),
+        ];
+        assert_eq!(
+            db.scan("b", "f", 30).expect("scan current visible values"),
+            current
+        );
+        assert_eq!(
+            db.scan_iter("b", "f", 30)
+                .expect("create legacy scan")
+                .collect::<Vec<_>>(),
+            current
+        );
+        let historical: Vec<(String, String)> = ["b", "c", "d", "e", "f"]
+            .into_iter()
+            .map(|key| (key.to_string(), "old".into()))
+            .collect();
+        assert_eq!(
+            db.scan("b", "f", 10).expect("scan historical values"),
+            historical
+        );
+        assert_eq!(
+            db.scan("g", "y", 30).expect("scan empty range"),
+            Vec::<(String, String)>::new()
+        );
+        assert_eq!(db.scan_buffer_pool_available(), 1);
+    }
+
+    #[derive(Clone, Copy)]
+    enum ScanTestTier {
+        L0,
+        L1,
+        Base,
+    }
+
+    fn check_persisted_scan_bounds(tier: ScanTestTier, unreadable_prefix: bool) {
+        let dir = TempDir::new().expect("tempdir");
+        let manifest = dir.path().join("manifest");
+        let wal = dir.path().join("wal");
+        let db = OmniKV::open(
+            manifest.to_str().expect("UTF-8 manifest path"),
+            wal.to_str().expect("UTF-8 WAL path"),
+        )
+        .expect("open");
+        let insert_value = |key: &str, seq, value: &str| {
+            let offset = db
+                .append_to_heap(value.as_bytes())
+                .expect("append test value");
+            db.insert_replica_record(
+                key.as_bytes().to_vec(),
+                seq,
+                offset,
+                UNCOMPRESSED_FLAG | value.len() as u64,
+                crc32fast::hash(value.as_bytes()),
+                0,
+            );
+        };
+        let unreadable = u64::MAX / 2;
+        if unreadable_prefix {
+            db.insert_replica_record(b"a".to_vec(), 10, unreadable, 1, 0, 0);
+        } else {
+            insert_value("a", 10, "outside");
+        }
+        for key in ["b", "c", "d", "e", "f"] {
+            insert_value(key, 10, "old");
+        }
+        let snapshot = db.snapshot();
+        assert_eq!(snapshot, 10);
+        db.insert_replica_record(b"b".to_vec(), 20, unreadable, 1, 0, 0);
+        insert_value("b", 30, "new");
+        db.insert_replica_record(b"c".to_vec(), 30, unreadable, 0, 0, 0);
+        db.insert_replica_record(b"d".to_vec(), 30, unreadable, 1, 0, 1);
+        db.insert_replica_record(b"e".to_vec(), 40, unreadable, 1, 0, 0);
+        db.insert_replica_record(b"z".to_vec(), 30, unreadable, 1, 0, 0);
+
+        // Use real compaction outputs, with the snapshot pin retaining history
+        // and deletion markers through L1 and base compaction.
+        db.compact_sstables().expect("flush test values into L0");
+        if matches!(tier, ScanTestTier::L1 | ScanTestTier::Base) {
+            db.compact_l0_to_l1().expect("compact test values into L1");
+        }
+        if matches!(tier, ScanTestTier::Base) {
+            db.compact_l1_to_l2()
+                .expect("compact test values into base");
+        }
+        assert_eq!(db.memtable_size(), 0);
+        let roots = db.roots.load();
+        assert!(roots.frozen_memtables.is_empty());
+        assert_eq!(
+            roots.sstables.len(),
+            usize::from(matches!(tier, ScanTestTier::L0))
+        );
+        assert_eq!(
+            roots.l1_sstables.len(),
+            usize::from(matches!(tier, ScanTestTier::L1))
+        );
+        let mmap = match tier {
+            ScanTestTier::L0 => roots.sstables[0].0.clone(),
+            ScanTestTier::L1 => roots.l1_sstables[0].0.clone(),
+            ScanTestTier::Base => roots.base_mmap.clone(),
+        };
+        let reader = SSTableReader::from_mmap(mmap);
+        assert_eq!(
+            reader
+                .iter_from(b"b")
+                .next()
+                .expect("persisted prefix record")
+                .key,
+            b"a",
+            "the sparse-index seek must start before the requested bound"
+        );
+
+        let current: Vec<(String, String)> = vec![
+            ("b".into(), "new".into()),
+            ("e".into(), "old".into()),
+            ("f".into(), "old".into()),
+        ];
+        assert_eq!(
+            db.scan("b", "f", 30)
+                .expect("scan persisted visible values"),
+            current
+        );
+        let legacy: Vec<(String, String)> = db
+            .scan_iter("b", "f", 30)
+            .expect("create persisted legacy scan")
+            .collect();
+        assert_eq!(legacy, current);
+        let historical: Vec<(String, String)> = ["b", "c", "d", "e", "f"]
+            .into_iter()
+            .map(|key| (key.to_string(), "old".into()))
+            .collect();
+        assert_eq!(
+            db.scan("b", "f", snapshot)
+                .expect("scan persisted historical values"),
+            historical
+        );
+        assert_eq!(
+            db.scan("b", "b", 30)
+                .expect("scan inclusive start endpoint"),
+            [("b".into(), "new".into())]
+        );
+        assert_eq!(
+            db.scan("f", "f", 30).expect("scan inclusive end endpoint"),
+            [("f".into(), "old".into())]
+        );
+        for (start, end) in [("g", "y"), ("g", "g"), ("f", "b"), ("c", "c")] {
+            assert!(
+                db.scan(start, end, 30)
+                    .expect("scan empty persisted range")
+                    .is_empty(),
+                "{start}..={end}"
+            );
+            assert!(
+                db.scan_iter(start, end, 30)
+                    .expect("create empty persisted scan")
+                    .next()
+                    .is_none()
+            );
+        }
+
+        // Filtering an unrelated unreadable prefix must not mask errors when
+        // that payload (or another unreadable version) is inside the range.
+        assert!(matches!(db.scan("b", "f", 20), Err(OmniError::IoError(_))));
+        if unreadable_prefix {
+            assert!(matches!(db.scan("a", "f", 30), Err(OmniError::IoError(_))));
+        }
+        assert_eq!(db.scan_buffer_pool_available(), 1);
+        db.unregister_snapshot(snapshot);
+    }
+
+    #[test]
+    fn scan_persisted_l0_respects_start_bound() {
+        check_persisted_scan_bounds(ScanTestTier::L0, false);
+    }
+
+    #[test]
+    fn scan_persisted_l1_respects_start_bound() {
+        check_persisted_scan_bounds(ScanTestTier::L1, false);
+    }
+
+    #[test]
+    fn scan_persisted_base_respects_start_bound() {
+        check_persisted_scan_bounds(ScanTestTier::Base, false);
+    }
+
+    #[test]
+    fn scan_persisted_l0_skips_unreadable_prefix() {
+        check_persisted_scan_bounds(ScanTestTier::L0, true);
+    }
+
+    #[test]
+    fn scan_persisted_l1_skips_unreadable_prefix() {
+        check_persisted_scan_bounds(ScanTestTier::L1, true);
+    }
+
+    #[test]
+    fn scan_persisted_base_skips_unreadable_prefix() {
+        check_persisted_scan_bounds(ScanTestTier::Base, true);
+    }
+
+    #[test]
     fn cleanup_obsolete_file_treats_not_found_as_benign() {
         let outcome = cleanup_obsolete_file_with(
             Path::new("already-gone.sst"),
@@ -3212,6 +3794,203 @@ mod tests {
             metrics_prometheus::render_metrics().contains("omnikv_compaction_latency_seconds"),
             "empty compaction should still emit compaction metrics"
         );
+    }
+
+    const SQL_TABLE_LOCK_TEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+    fn run_sql_table_lock_test(test: impl FnOnce() + Send + 'static) {
+        use std::sync::mpsc::{self, RecvTimeoutError};
+
+        // A regression in Drop can deadlock even a single-threaded caller.
+        // Keep the entire scenario off the test thread, including teardown.
+        let (done_tx, done_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            test();
+            let _ = done_tx.send(());
+        });
+        assert_ne!(
+            done_rx.recv_timeout(SQL_TABLE_LOCK_TEST_TIMEOUT),
+            Err(RecvTimeoutError::Timeout),
+            "SQL table-lock scenario timed out (possible deadlock)"
+        );
+        if let Err(panic) = worker.join() {
+            std::panic::resume_unwind(panic);
+        }
+    }
+
+    #[test]
+    fn sql_table_lock_registry_reclaims_released_entries() {
+        run_sql_table_lock_test(|| {
+            let dir = TempDir::new().expect("tempdir");
+            let manifest = dir.path().join("manifest").to_string_lossy().to_string();
+            let wal = dir.path().join("wal").to_string_lossy().to_string();
+            let db = OmniKV::open(&manifest, &wal).expect("open");
+
+            let lock = db
+                .sql_table_lock("ephemeral_table")
+                .expect("create SQL table lock");
+            assert!(
+                db.sql_table_locks
+                    .locks
+                    .lock()
+                    .expect("table-lock registry")
+                    .contains_key("ephemeral_table")
+            );
+
+            drop(lock);
+
+            assert!(
+                !db.sql_table_locks
+                    .locks
+                    .lock()
+                    .expect("table-lock registry")
+                    .contains_key("ephemeral_table"),
+                "released table locks must not leave registry entries behind"
+            );
+        });
+    }
+
+    #[test]
+    fn sql_table_lock_registry_shares_case_insensitive_holders_and_waiters() {
+        run_sql_table_lock_test(|| {
+            use std::sync::{TryLockError, mpsc};
+
+            let registry = Arc::new(SqlTableLockRegistry::default());
+            let owner = registry.get("Orders").expect("owner lock");
+            let owner_guard = owner.lock().expect("owner guard");
+            let (waiting_tx, waiting_rx) = mpsc::channel();
+            let (acquired_tx, acquired_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel();
+            let waiter_registry = registry.clone();
+            let waiter = std::thread::spawn(move || {
+                let lock = waiter_registry.get("ORDERS").expect("waiter lock");
+                assert!(matches!(
+                    lock.mutex.try_lock(),
+                    Err(TryLockError::WouldBlock)
+                ));
+                waiting_tx
+                    .send(Arc::downgrade(&lock))
+                    .expect("waiter ready");
+                let _guard = lock.lock().expect("waiter guard");
+                acquired_tx.send(()).expect("waiter acquired");
+                release_rx
+                    .recv_timeout(SQL_TABLE_LOCK_TEST_TIMEOUT)
+                    .expect("release waiter");
+            });
+
+            let waiting_lock = waiting_rx
+                .recv_timeout(SQL_TABLE_LOCK_TEST_TIMEOUT)
+                .expect("waiter must reach the held lock");
+            let peer = registry.get("oRdErS").expect("peer lock");
+            assert!(Arc::ptr_eq(&owner, &peer));
+            assert!(Weak::ptr_eq(&waiting_lock, &Arc::downgrade(&peer)));
+            drop(peer);
+            drop(owner_guard);
+            drop(owner);
+
+            // The original holder is gone, but the waiter's Arc must keep
+            // the entry alive before and after it acquires the mutex.
+            let next = registry.get("orders").expect("next lock");
+            assert!(Weak::ptr_eq(&waiting_lock, &Arc::downgrade(&next)));
+            acquired_rx
+                .recv_timeout(SQL_TABLE_LOCK_TEST_TIMEOUT)
+                .expect("waiter must acquire after owner releases");
+            assert!(matches!(
+                next.mutex.try_lock(),
+                Err(TryLockError::WouldBlock)
+            ));
+            drop(next);
+            release_tx.send(()).expect("release waiter");
+            waiter.join().expect("waiter completed");
+            assert!(registry.locks.lock().expect("registry").is_empty());
+        });
+    }
+
+    #[test]
+    fn sql_table_lock_registry_reclaims_high_churn_names() {
+        run_sql_table_lock_test(|| {
+            let registry = Arc::new(SqlTableLockRegistry::default());
+            let survivor = registry.get("survivor").expect("surviving lock");
+            for round in 0..64 {
+                let locks: Vec<_> = (0..64)
+                    .map(|index| {
+                        registry
+                            .get(&format!("ephemeral_{round}_{index}"))
+                            .expect("churn lock")
+                    })
+                    .collect();
+                assert_eq!(registry.locks.lock().expect("registry").len(), 65);
+                drop(locks);
+                assert_eq!(
+                    registry.locks.lock().expect("registry").len(),
+                    1,
+                    "only the live survivor should remain after round {round}"
+                );
+            }
+            drop(survivor);
+            assert!(registry.locks.lock().expect("registry").is_empty());
+        });
+    }
+
+    #[test]
+    fn sql_table_lock_registry_last_release_preserves_replacement_serialization() {
+        run_sql_table_lock_test(|| {
+            use std::sync::TryLockError;
+
+            let registry = Arc::new(SqlTableLockRegistry::default());
+            let old = registry.get("orders").expect("old lock");
+            let old_weak = Arc::downgrade(&old);
+            let mut entries = registry.locks.lock().expect("registry");
+            let teardown = std::thread::spawn(move || drop(old));
+
+            // Force the last Arc to disappear while its destructor cannot
+            // take the registry mutex. Poll the count, never upgrade here:
+            // dropping an upgraded last Arc under `entries` would deadlock.
+            let deadline = std::time::Instant::now() + SQL_TABLE_LOCK_TEST_TIMEOUT;
+            while old_weak.strong_count() != 0 {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "last release timed out"
+                );
+                std::thread::yield_now();
+            }
+            assert!(Weak::ptr_eq(
+                entries.get("orders").expect("old entry still present"),
+                &old_weak
+            ));
+
+            // Model a lookup replacing that now-dead weak entry before the
+            // old destructor obtains the mutex. No live lock is replaced.
+            let replacement = Arc::new(SqlTableLock {
+                mutex: Mutex::new(()),
+                name: "orders".into(),
+                registry: Arc::downgrade(&registry),
+            });
+            entries.insert("orders".into(), Arc::downgrade(&replacement));
+            drop(entries);
+            teardown.join().expect("old destructor completed");
+
+            assert!(Weak::ptr_eq(
+                registry
+                    .locks
+                    .lock()
+                    .expect("registry")
+                    .get("orders")
+                    .expect("old destructor must preserve the replacement"),
+                &Arc::downgrade(&replacement)
+            ));
+            let guard = replacement.lock().expect("replacement guard");
+            let next = registry.get("ORDERS").expect("next lock");
+            assert!(Arc::ptr_eq(&replacement, &next));
+            assert!(matches!(
+                next.mutex.try_lock(),
+                Err(TryLockError::WouldBlock)
+            ));
+            drop(guard);
+            drop(next);
+            drop(replacement);
+            assert!(registry.locks.lock().expect("registry").is_empty());
+        });
     }
 
     #[test]

@@ -28,7 +28,12 @@ fn exec_sql(executor: &SqlExecutor, sql: &str) -> ExecResult {
 
 fn exec_rows(executor: &SqlExecutor, sql: &str) -> (Vec<String>, Vec<Vec<String>>) {
     match exec_sql(executor, sql) {
-        ExecResult::Rows { columns, rows } => (columns, rows),
+        ExecResult::Rows { columns, rows } => (
+            columns,
+            rows.into_iter()
+                .map(|r| omni_engine::sql_exec::render_row(&r))
+                .collect(),
+        ),
         _ => panic!("Expected Rows result for: {sql}"),
     }
 }
@@ -249,8 +254,8 @@ fn test_multiple_aggregates() {
     assert_eq!(cols.len(), 4);
     assert_eq!(rows.len(), 1);
     // Aggregates without GROUP BY: verify non-empty results
-    assert!(!rows[0][0].is_empty(), "COUNT should have a value");
-    assert!(!rows[0][1].is_empty(), "SUM should have a value");
+    assert_ne!(rows[0][0].len(), 0, "COUNT should have a value");
+    assert_ne!(rows[0][1].len(), 0, "SUM should have a value");
 
     println!("✅ AGGREGATES: Multiple aggregates in one query");
 }
@@ -274,7 +279,7 @@ fn test_explain_analyze() {
         cols[0].contains("QUERY PLAN"),
         "Column should contain QUERY PLAN"
     );
-    assert!(!rows.is_empty());
+    assert!(!rows.is_empty(), "EXPLAIN ANALYZE must produce a plan");
 
     // Should contain timing info
     let plan_text: String = rows
@@ -379,7 +384,7 @@ fn test_config_defaults() {
     let config = omni_engine::config::ServerConfig::load_dev().unwrap();
     assert!(config.http_addr.contains(':'));
     assert!(config.pgwire_addr.contains(':'));
-    assert!(!config.jwt_secret.is_empty());
+    assert_ne!(config.jwt_secret.len(), 0);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

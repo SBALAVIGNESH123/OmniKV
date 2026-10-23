@@ -455,7 +455,7 @@ fn test_scan_empty_range() {
     let (db, _dir) = create_temp_db("scanempty");
 
     let results = db.scan("zzz_", "zzz_z", db.get_seq()).unwrap();
-    assert!(results.is_empty());
+    assert_eq!(results.len(), 0);
 
     println!("✅ OPS 44b: Scan on empty range returns empty");
 }

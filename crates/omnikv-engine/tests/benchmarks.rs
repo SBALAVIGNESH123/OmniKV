@@ -15,7 +15,8 @@ use omni_engine::sql::{AggFunc, CmpOp, SelectColumn, SqlValue, WhereExpr};
 use omni_engine::sql_exec::Row;
 use omni_engine::transaction::TransactionManager;
 use omni_engine::volcano::{
-    AggregateIter, DEFAULT_ROW_CHUNK_SIZE, FilterIter, LimitIter, ProjectIter, RowIterator,
+    AggregateIter, ColumnTypeMap, DEFAULT_ROW_CHUNK_SIZE, FilterIter, LimitIter, ProjectIter,
+    RowIterator,
 };
 use omni_engine::{OmniKV, WriteBatch};
 use std::sync::Arc;
@@ -119,13 +120,13 @@ fn synthetic_rows(count: usize) -> Vec<Row> {
     (0..count)
         .map(|i| {
             let mut row = Row::new();
-            row.insert("id".into(), i.to_string());
+            row.insert("id".into(), Some(i.to_string()));
             row.insert(
                 "kind".into(),
-                if i % 3 == 0 { "hot" } else { "cold" }.into(),
+                Some(if i % 3 == 0 { "hot" } else { "cold" }.into()),
             );
-            row.insert("bucket".into(), format!("b{}", i % 16));
-            row.insert("payload".into(), format!("payload-{i:08}"));
+            row.insert("bucket".into(), Some(format!("b{}", i % 16)));
+            row.insert("payload".into(), Some(format!("payload-{i:08}")));
             row
         })
         .collect()
@@ -176,6 +177,7 @@ fn aggregate_pipeline(rows: &[Row]) -> Box<dyn RowIterator> {
             SelectColumn::Named("bucket".into()),
             SelectColumn::Aggregate(AggFunc::Count, "id".into()),
         ],
+        ColumnTypeMap::new(),
     ))
 }
 
@@ -224,7 +226,9 @@ fn consume_chunked(mut iter: Box<dyn RowIterator>) -> DispatchResult {
 }
 
 fn row_checksum(row: &Row) -> u64 {
-    row.values().map(|v| v.len() as u64).sum()
+    row.values()
+        .filter_map(|v| v.as_ref().map(|s| s.len() as u64))
+        .sum()
 }
 
 fn bench_dispatch_pipeline(

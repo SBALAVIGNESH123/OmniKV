@@ -5,7 +5,7 @@
 
 use crate::{OmniError, OmniKV, WriteBatch};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -48,6 +48,30 @@ impl ColumnType {
             Self::Json => 114,       // JSON
         }
     }
+
+    /// A numeric column orders by value, so "7" and "007" are one key.
+    pub fn is_numeric(&self) -> bool {
+        matches!(self, Self::Integer | Self::Float)
+    }
+
+    /// Canonical form for a value of this type: a numeric payload prints as
+    /// its number, anything else is kept verbatim. `1.50` and `1.5` parse to
+    /// the same f64, so the trailing zero is not information the type holds;
+    /// keeping typed digits is a `NUMERIC` type's job, which this engine does
+    /// not have.
+    pub fn canonicalize(&self, value: &str) -> String {
+        match self {
+            Self::Integer => value
+                .parse::<i128>()
+                .map(|n| n.to_string())
+                .unwrap_or_else(|_| value.to_string()),
+            Self::Float => value
+                .parse::<f64>()
+                .map(|f| f.to_string())
+                .unwrap_or_else(|_| value.to_string()),
+            _ => value.to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -59,12 +83,31 @@ pub struct Column {
     pub default: Option<String>,
 }
 
+/// How a table's rows encode a SQL NULL on disk.
+///
+/// A stored "NULL" is a SQL NULL under [`Legacy`](Self::Legacy) and the
+/// user's literal text under [`Typed`](Self::Typed); the bytes are identical,
+/// so the table records which one its rows use and the decoders consult it.
+/// Manifests without the field read back as [`Legacy`](Self::Legacy).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum RowFormat {
+    /// NULL is the literal string "NULL"; older databases only.
+    #[default]
+    Legacy,
+    /// NULL is a JSON `null`; "NULL" is the user's literal text.
+    Typed,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TableDef {
     pub name: String,
     pub columns: Vec<Column>,
     pub primary_key: String,
     pub created_at: u64,
+    /// How this table's rows encode NULL. Defaults to legacy for tables
+    /// deserialized from a manifest written before the field existed.
+    #[serde(default)]
+    pub row_format: RowFormat,
 }
 
 impl TableDef {
@@ -95,12 +138,25 @@ impl Catalog {
             db,
             cache: std::sync::RwLock::new(HashMap::new()),
         };
-        cat.load_all();
+        cat.load_all(None);
         cat
     }
 
-    fn load_all(&self) {
-        let seq = self.db.get_seq();
+    /// Loads table definitions as they were at `seq`. A transaction reading
+    /// at an older snapshot must also see the older schema: a table another
+    /// connection migrated in the meantime would otherwise decode this
+    /// transaction's rows under the wrong NULL encoding.
+    pub fn at_snapshot(db: Arc<OmniKV>, seq: u64) -> Self {
+        let cat = Self {
+            db,
+            cache: std::sync::RwLock::new(HashMap::new()),
+        };
+        cat.load_all(Some(seq));
+        cat
+    }
+
+    fn load_all(&self, seq: Option<u64>) {
+        let seq = seq.unwrap_or_else(|| self.db.get_seq());
         if let Ok(results) = self
             .db
             .scan(CATALOG_PREFIX, &format!("{}\x7F", CATALOG_PREFIX), seq)
@@ -162,21 +218,20 @@ impl Catalog {
         // Delete all rows
         let prefix = table.row_prefix();
         let seq = self.db.get_seq();
-        if let Ok(rows) = self.db.scan(&prefix, &format!("{}\x7F", prefix), seq) {
-            let mut batch = WriteBatch::new();
-            for (key, _) in &rows {
-                let _ = batch.delete(key);
-            }
-            if !rows.is_empty() {
-                self.db
-                    .commit_batch(&batch)
-                    .map_err(|e| format!("{:?}", e))?;
-            }
-        }
+        let rows = self
+            .db
+            .scan(&prefix, &format!("{}\x7F", prefix), seq)
+            .map_err(|e| format!("{:?}", e))?;
 
-        // Delete catalog entry
-        let cat_key = format!("{}{}", CATALOG_PREFIX, name_lower);
+        // Delete the table rows and catalog entry in one atomic batch. The
+        // scan above must succeed before we build the batch, so corruption
+        // cannot turn DROP into a schema-only delete; one commit also avoids
+        // leaving orphaned rows if the second of two commits would fail.
         let mut batch = WriteBatch::new();
+        for (key, _) in &rows {
+            batch.delete(key).map_err(|e| format!("{:?}", e))?;
+        }
+        let cat_key = format!("{}{}", CATALOG_PREFIX, name_lower);
         batch.delete(&cat_key).map_err(|e| format!("{:?}", e))?;
         self.db
             .commit_batch(&batch)
@@ -194,13 +249,18 @@ impl Catalog {
     /// the transactional executor stages exactly this pair so the SSI
     /// engine applies it at COMMIT and a ROLLBACK discards it.
     pub fn staged_create_entry(table: &TableDef) -> Result<(String, String), String> {
-        let key = format!("{}{}", CATALOG_PREFIX, table.name.to_lowercase());
+        let key = Self::catalog_key(&table.name);
         let value = serde_json::to_string(table).map_err(|e| format!("Serialize: {}", e))?;
         Ok((key, value))
     }
 
     /// The storage key a DROP TABLE deletes from the catalog.
     pub fn staged_drop_key(name: &str) -> String {
+        Self::catalog_key(name)
+    }
+
+    /// The single key under which a table's definition is stored.
+    pub fn catalog_key(name: &str) -> String {
         format!("{}{}", CATALOG_PREFIX, name.to_lowercase())
     }
 
@@ -269,5 +329,53 @@ impl Catalog {
             .read()
             .expect("catalog cache RwLock poisoned: fatal invariant");
         cache.keys().cloned().collect()
+    }
+
+    /// Lists the catalog as of a caller-selected MVCC sequence. Long-lived
+    /// executors may have a cache from before a concurrent CREATE or DROP;
+    /// SHOW TABLES must report the statement's persisted view instead of that
+    /// stale cache. An unreadable payload or malformed definition fails the
+    /// entire listing rather than silently omitting tables.
+    pub fn list_tables_at(&self, seq: u64) -> Result<Vec<String>, String> {
+        self.list_tables_with_overlay_at(seq, None)
+    }
+
+    /// Lists a transaction's snapshot with its own staged catalog writes.
+    /// Decode after merging so staged CREATE/DROP entries take precedence over
+    /// their persisted definitions, while errors cannot be hidden by the cache.
+    pub(crate) fn list_tables_with_overlay_at(
+        &self,
+        seq: u64,
+        overlay: Option<&HashMap<String, Option<String>>>,
+    ) -> Result<Vec<String>, String> {
+        let mut entries: BTreeMap<_, _> = self
+            .db
+            .scan(CATALOG_PREFIX, &format!("{}\x7F", CATALOG_PREFIX), seq)
+            .map_err(|e| format!("Catalog scan failed: {e:?}"))?
+            .into_iter()
+            .collect();
+        if let Some(overlay) = overlay {
+            for (key, value) in overlay {
+                if !key.starts_with(CATALOG_PREFIX) {
+                    continue;
+                }
+                match value {
+                    Some(value) => {
+                        entries.insert(key.clone(), value.clone());
+                    }
+                    None => {
+                        entries.remove(key);
+                    }
+                }
+            }
+        }
+        entries
+            .into_iter()
+            .map(|(key, value)| {
+                serde_json::from_str::<TableDef>(&value)
+                    .map(|table| table.name.to_lowercase())
+                    .map_err(|e| format!("Catalog entry {key:?} is invalid: {e}"))
+            })
+            .collect()
     }
 }
