@@ -27,6 +27,7 @@ omni.toml
 
 # Python scripts
 *.py
+!scripts/ci_all_integration_tests.py
 
 # WAL files
 wal.bin

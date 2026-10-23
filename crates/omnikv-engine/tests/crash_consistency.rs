@@ -11,6 +11,8 @@
 use std::fs;
 use std::io::Write;
 
+#[cfg(feature = "failpoints")]
+use omni_engine::failpoints::FailRegistry;
 use omni_engine::{OmniKV, WriteBatch};
 use tempfile::TempDir;
 
@@ -33,6 +35,29 @@ fn write_and_close(manifest: &str, wal: &str, key: &str, value: &str) {
     batch.set(key, value.to_string()).expect("batch.set");
     db.commit_batch(&batch).expect("commit_batch");
     db.sync_all().expect("sync_all");
+}
+
+#[cfg(feature = "failpoints")]
+#[test]
+fn armed_wal_sync_fails_the_commit_instead_of_acknowledging_durability() {
+    let dir = TempDir::new().unwrap();
+    let (manifest, wal) = fresh_db_paths(&dir);
+    let db = OmniKV::open(&manifest, &wal).expect("open must succeed");
+    let registry = FailRegistry::new();
+    registry.reset();
+    registry.arm("wal::sync");
+
+    let mut batch = WriteBatch::new();
+    batch
+        .set("failpoint-key", "value".to_string())
+        .expect("batch.set");
+    let result = db.commit_batch(&batch);
+
+    registry.reset();
+    assert!(
+        result.is_err(),
+        "a WAL sync failure must be returned instead of acknowledging the commit"
+    );
 }
 
 // ---------------------------------------------------------------------------

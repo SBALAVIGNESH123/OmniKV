@@ -1885,6 +1885,8 @@ impl OmniKV {
                 pos += n as u64;
             }
         }
+        crate::failpoints::maybe_fail("heap::sync_data")
+            .map_err(|e| OmniError::IoError(format!("heap failure point: {e}")))?;
         heap.sync_data()?;
         self.heap_offset
             .store(offset + data.len() as u64, Ordering::SeqCst);
@@ -1915,6 +1917,8 @@ impl OmniKV {
             .heap_file
             .lock()
             .map_err(|_| OmniError::LockPoisoned("heap_file".into()))?;
+        crate::failpoints::maybe_fail("heap::sync_all")
+            .map_err(|e| OmniError::IoError(format!("heap failure point: {e}")))?;
         heap.sync_all()?;
         Ok(())
     }
@@ -2191,9 +2195,12 @@ impl OmniKV {
             .lock()
             .map_err(|_| OmniError::LockPoisoned("wal lock".into()))?;
 
-        let result = heap
-            .sync_data()
-            .map_err(|e| OmniError::IoError(format!("group commit heap fsync failed: {e}")))
+        let result = crate::failpoints::maybe_fail("heap::sync_data")
+            .map_err(|e| OmniError::IoError(format!("heap failure point: {e}")))
+            .and_then(|()| {
+                heap.sync_data()
+                    .map_err(|e| OmniError::IoError(format!("group commit heap fsync failed: {e}")))
+            })
             .and_then(|()| {
                 wal.sync()
                     .map_err(|e| OmniError::IoError(format!("group commit wal fsync failed: {e}")))
