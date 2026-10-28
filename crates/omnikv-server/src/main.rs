@@ -193,6 +193,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         bootstrap_admin_key: cfg.bootstrap_admin_key.clone(),
         manifest_path,
         wal_path,
+        backup_dir: cfg.storage.backup_dir.clone(),
         rate_limiter: rate_limiter.clone(),
         cluster_gateway: cluster.as_ref().map(|c| c.gateway.clone()),
         cluster_node_id: cfg.raft.node_id,

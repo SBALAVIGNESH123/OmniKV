@@ -1,13 +1,13 @@
 //! QUIC/HTTP3 Binary Transport
 //!
-//! High-performance binary protocol over QUIC for inter-node
-//! Raft consensus and cluster communication. Uses Quinn for
-//! UDP-based, TLS 1.3 encrypted transport.
+//! High-performance binary protocol over QUIC for client data operations.
+//! Consensus RPCs use the authenticated Raft HTTP transport instead. Uses
+//! Quinn for UDP-based, TLS 1.3 encrypted transport.
 
 use omni_engine::hardening::RateLimiter;
 use omni_engine::metrics_prometheus;
 use omni_engine::{OmniKV, WriteBatch};
-use quinn::{ClientConfig, Endpoint, ServerConfig};
+use quinn::{ClientConfig, Endpoint, RecvStream, ServerConfig};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use std::sync::Arc;
 
@@ -20,8 +20,6 @@ pub enum OpCode {
     Scan = 0x04,
     Ping = 0x10,
     Pong = 0x11,
-    RaftAppend = 0x20,
-    RaftVote = 0x21,
 }
 
 impl OpCode {
@@ -33,12 +31,19 @@ impl OpCode {
             0x04 => Some(Self::Scan),
             0x10 => Some(Self::Ping),
             0x11 => Some(Self::Pong),
-            0x20 => Some(Self::RaftAppend),
-            0x21 => Some(Self::RaftVote),
             _ => None,
         }
     }
 }
+
+/// Maximum bytes in one QUIC request frame, including the length-prefixed
+/// authentication header and binary command payload. This is deliberately
+/// above the engine's 10 MiB value limit so a valid maximum-sized SET can be
+/// represented without making the transport an accidental second limit.
+pub const MAX_QUIC_FRAME_BYTES: usize = 16 * 1024 * 1024;
+const QUIC_FRAME_LENGTH_BYTES: usize = 4;
+const QUIC_AUTH_LENGTH_BYTES: usize = 2;
+const MAX_QUIC_AUTH_BYTES: usize = 4096;
 
 /// The certificate and private key a listener presents. Operator-supplied
 /// Generate self-signed TLS certificates for QUIC.
@@ -188,22 +193,17 @@ pub async fn run_quic_server(endpoint: Endpoint, db: Arc<OmniKV>, rate_limiter: 
                         let secret = jwt_secret.clone();
                         let rate_limiter = rate_limiter.clone();
                         tokio::spawn(async move {
-                            let mut buf = vec![0u8; 65536];
-                            match recv.read(&mut buf).await {
-                                Ok(Some(n)) if n > 0 => {
-                                    // First frame must begin with "AUTH <token>\n"
-                                    // followed by the actual command bytes.
-                                    let response = handle_authenticated_request(
-                                        &db,
-                                        &buf[..n],
-                                        &secret,
-                                        &rate_limiter,
-                                    );
-                                    let _ = send.write_all(&response).await;
-                                    let _ = send.finish();
-                                }
-                                _ => {}
-                            }
+                            let response = match read_quic_frame(&mut recv).await {
+                                Ok(frame) => handle_authenticated_request(
+                                    &db,
+                                    &frame,
+                                    &secret,
+                                    &rate_limiter,
+                                ),
+                                Err(error) => format!("ERR {error}\n").into_bytes(),
+                            };
+                            let _ = send.write_all(&response).await;
+                            let _ = send.finish();
                         });
                     }
                 }
@@ -215,16 +215,56 @@ pub async fn run_quic_server(endpoint: Endpoint, db: Arc<OmniKV>, rate_limiter: 
     }
 }
 
-/// Handle a single binary protocol request.
-/// Validate the QUIC auth token and dispatch the binary request.
+/// Read exactly one length-prefixed request frame from a QUIC stream.
 ///
-/// Every QUIC binary stream must start with:
-///   `AUTH <jwt-token>\n`
-/// followed immediately by the command bytes.
-/// Returns an error response frame if auth fails.
+/// QUIC stream reads are allowed to split an application frame at any byte
+/// boundary. The old one-read implementation treated a partial read as a
+/// complete request and silently capped every request at 64 KiB. This helper
+/// reads the fixed length first, validates the explicit cap before allocating,
+/// and then loops until the whole frame arrives.
+async fn read_quic_frame(recv: &mut RecvStream) -> Result<Vec<u8>, String> {
+    let mut length_bytes = [0u8; QUIC_FRAME_LENGTH_BYTES];
+    read_quic_exact(recv, &mut length_bytes).await?;
+    let frame_len = u32::from_le_bytes(length_bytes) as usize;
+
+    validate_quic_frame_length(frame_len)?;
+
+    let mut frame = vec![0u8; frame_len];
+    read_quic_exact(recv, &mut frame).await?;
+    Ok(frame)
+}
+
+fn validate_quic_frame_length(frame_len: usize) -> Result<(), String> {
+    if frame_len < QUIC_AUTH_LENGTH_BYTES + 1 {
+        return Err("INVALID_FRAME".to_string());
+    }
+    if frame_len > MAX_QUIC_FRAME_BYTES {
+        return Err("FRAME_TOO_LARGE".to_string());
+    }
+    Ok(())
+}
+
+async fn read_quic_exact(recv: &mut RecvStream, buf: &mut [u8]) -> Result<(), String> {
+    let mut offset = 0;
+    while offset < buf.len() {
+        match recv.read(&mut buf[offset..]).await {
+            Ok(Some(0) | None) => return Err("TRUNCATED_FRAME".to_string()),
+            Ok(Some(read)) => offset += read,
+            Err(error) => return Err(format!("READ_ERROR: {error}")),
+        }
+    }
+    Ok(())
+}
+
+/// Handle a single length-prefixed binary protocol request body.
+///
+/// The body format is `[auth_len:u16][auth_token][opcode][payload...]`.
+/// Length-prefixing the token keeps authentication framing independent from
+/// binary payload bytes; a token or value can never be split on an accidental
+/// newline.
 fn handle_authenticated_request(
     db: &Arc<OmniKV>,
-    buf: &[u8],
+    frame: &[u8],
     jwt_secret: &str,
     rate_limiter: &RateLimiter,
 ) -> Vec<u8> {
@@ -233,28 +273,26 @@ fn handle_authenticated_request(
         return b"ERR AUTH_NOT_CONFIGURED\n".to_vec();
     }
 
-    // Split "AUTH <token>\n" header from payload
-    let newline = buf.iter().position(|&b| b == b'\n');
-    let newline_pos = match newline {
-        Some(pos) => pos,
-        None => {
-            tracing::warn!("QUIC request missing auth header");
-            return b"ERR MISSING_AUTH_HEADER\n".to_vec();
-        }
+    if frame.len() < QUIC_AUTH_LENGTH_BYTES + 1 {
+        return b"ERR INVALID_FRAME\n".to_vec();
+    }
+
+    let auth_len = u16::from_le_bytes([frame[0], frame[1]]) as usize;
+    if auth_len == 0 || auth_len > MAX_QUIC_AUTH_BYTES {
+        return b"ERR INVALID_AUTH_HEADER\n".to_vec();
+    }
+
+    let auth_start = QUIC_AUTH_LENGTH_BYTES;
+    let payload_start = auth_start + auth_len;
+    if payload_start >= frame.len() {
+        return b"ERR INVALID_FRAME\n".to_vec();
+    }
+
+    let token = match std::str::from_utf8(&frame[auth_start..payload_start]) {
+        Ok(token) if !token.is_empty() => token,
+        Ok(_) => return b"ERR MISSING_AUTH_TOKEN\n".to_vec(),
+        Err(_) => return b"ERR INVALID_AUTH_HEADER\n".to_vec(),
     };
-
-    let header = &buf[..newline_pos];
-    let payload = &buf[newline_pos + 1..];
-
-    if !header.starts_with(b"AUTH ") {
-        tracing::warn!("QUIC request missing AUTH prefix");
-        return b"ERR MISSING_AUTH_HEADER\n".to_vec();
-    }
-
-    let token = std::str::from_utf8(&header[5..]).unwrap_or("").trim();
-    if token.is_empty() {
-        return b"ERR MISSING_AUTH_TOKEN\n".to_vec();
-    }
 
     let claims = match crate::auth::verify_token(token, jwt_secret) {
         Ok(claims) => claims,
@@ -269,25 +307,24 @@ fn handle_authenticated_request(
         return format!("ERR RATE_LIMITED retry_after_ms={retry_after_ms}\n").into_bytes();
     }
 
-    if payload.is_empty() {
-        return b"ERR EMPTY_PAYLOAD\n".to_vec();
-    }
-
-    handle_binary_request(db, payload)
+    handle_binary_request(db, &frame[payload_start..])
 }
 
-fn acquire_quic_request_permit(rate_limiter: &RateLimiter, identity: &str) -> Result<(), u64> {
-    rate_limiter
-        .try_acquire(identity)
-        .map(|_| ())
-        .inspect_err(|_| {
-            metrics_prometheus::record_rate_limit_rejection("quic");
-        })
+fn invalid_utf8_response() -> Vec<u8> {
+    b"ERR INVALID_UTF8\n".to_vec()
+}
+
+fn invalid_frame_response() -> Vec<u8> {
+    b"ERR INVALID_FRAME\n".to_vec()
+}
+
+fn decode_utf8_payload(payload: &[u8]) -> Result<&str, Vec<u8>> {
+    std::str::from_utf8(payload).map_err(|_| invalid_utf8_response())
 }
 
 fn handle_binary_request(db: &Arc<OmniKV>, data: &[u8]) -> Vec<u8> {
     if data.is_empty() {
-        return vec![0xFF]; // Error: empty request
+        return invalid_frame_response();
     }
 
     let op = data[0];
@@ -297,9 +334,12 @@ fn handle_binary_request(db: &Arc<OmniKV>, data: &[u8]) -> Vec<u8> {
         Some(OpCode::Ping) => vec![OpCode::Pong as u8],
 
         Some(OpCode::Get) => {
-            let key = String::from_utf8_lossy(payload);
+            let key = match decode_utf8_payload(payload) {
+                Ok(key) => key,
+                Err(response) => return response,
+            };
             let seq = db.get_seq();
-            match db.find(&key, seq) {
+            match db.find(key, seq) {
                 Ok(Some(val)) => {
                     let mut resp = vec![0x00]; // Success
                     resp.extend_from_slice(val.as_bytes());
@@ -313,18 +353,24 @@ fn handle_binary_request(db: &Arc<OmniKV>, data: &[u8]) -> Vec<u8> {
         Some(OpCode::Set) => {
             // Payload format: [key_len: u16][key][value]
             if payload.len() < 2 {
-                return vec![0xFF];
+                return invalid_frame_response();
             }
             let key_len = u16::from_le_bytes([payload[0], payload[1]]) as usize;
             if payload.len() < 2 + key_len {
-                return vec![0xFF];
+                return invalid_frame_response();
             }
 
-            let key = String::from_utf8_lossy(&payload[2..2 + key_len]).to_string();
-            let value = String::from_utf8_lossy(&payload[2 + key_len..]).to_string();
+            let key = match decode_utf8_payload(&payload[2..2 + key_len]) {
+                Ok(key) => key,
+                Err(response) => return response,
+            };
+            let value = match decode_utf8_payload(&payload[2 + key_len..]) {
+                Ok(value) => value,
+                Err(response) => return response,
+            };
 
             let mut batch = WriteBatch::new();
-            if batch.set(&key, value).is_ok() {
+            if batch.set(key, value.to_string()).is_ok() {
                 match db.commit_batch(&batch) {
                     Ok(seq) => {
                         let mut resp = vec![0x00];
@@ -339,9 +385,12 @@ fn handle_binary_request(db: &Arc<OmniKV>, data: &[u8]) -> Vec<u8> {
         }
 
         Some(OpCode::Delete) => {
-            let key = String::from_utf8_lossy(payload);
+            let key = match decode_utf8_payload(payload) {
+                Ok(key) => key,
+                Err(response) => return response,
+            };
             let mut batch = WriteBatch::new();
-            if batch.delete(&key).is_ok() {
+            if batch.delete(key).is_ok() {
                 match db.commit_batch(&batch) {
                     Ok(_) => vec![0x00],
                     Err(_) => vec![0xFF],
@@ -351,8 +400,19 @@ fn handle_binary_request(db: &Arc<OmniKV>, data: &[u8]) -> Vec<u8> {
             }
         }
 
-        _ => vec![0xFF], // Unknown opcode
+        Some(OpCode::Scan) => b"ERR UNSUPPORTED_OPCODE\n".to_vec(),
+        None => b"ERR UNKNOWN_OPCODE\n".to_vec(),
+        Some(OpCode::Pong) => b"ERR INVALID_OPCODE\n".to_vec(),
     }
+}
+
+fn acquire_quic_request_permit(rate_limiter: &RateLimiter, identity: &str) -> Result<(), u64> {
+    rate_limiter
+        .try_acquire(identity)
+        .map(|_| ())
+        .inspect_err(|_| {
+            metrics_prometheus::record_rate_limit_rejection("quic");
+        })
 }
 
 #[cfg(test)]
@@ -371,13 +431,22 @@ mod tests {
         (db, dir)
     }
 
+    fn authenticated_frame(token: &str, payload: &[u8]) -> Vec<u8> {
+        let token = token.as_bytes();
+        let token_len = u16::try_from(token.len()).expect("test token must fit in u16");
+        let mut frame = Vec::with_capacity(2 + token.len() + payload.len());
+        frame.extend_from_slice(&token_len.to_le_bytes());
+        frame.extend_from_slice(token);
+        frame.extend_from_slice(payload);
+        frame
+    }
+
     #[test]
     fn quic_rate_limiter_rejects_abusive_authenticated_streams() {
         let (db, _dir) = open_temp_db();
         let secret = "0123456789abcdef0123456789abcdef";
         let token = crate::auth::generate_token("client-a", "write", secret, 60).expect("token");
-        let mut frame = format!("AUTH {token}\n").into_bytes();
-        frame.push(OpCode::Ping as u8);
+        let frame = authenticated_frame(&token, &[OpCode::Ping as u8]);
         let rate_limiter = RateLimiter::new(0.01, 1, 10);
 
         assert_eq!(
@@ -386,6 +455,47 @@ mod tests {
         );
         let second = handle_authenticated_request(&db, &frame, secret, &rate_limiter);
         assert!(String::from_utf8_lossy(&second).starts_with("ERR RATE_LIMITED"));
+    }
+
+    #[test]
+    fn invalid_utf8_is_rejected_instead_of_lossily_rewritten() {
+        let (db, _dir) = open_temp_db();
+        let secret = "0123456789abcdef0123456789abcdef";
+        let token = crate::auth::generate_token("client-a", "write", secret, 60).expect("token");
+        let frame = authenticated_frame(&token, &[OpCode::Get as u8, 0xff]);
+        let rate_limiter = RateLimiter::new(100.0, 10, 10);
+
+        assert_eq!(
+            handle_authenticated_request(&db, &frame, secret, &rate_limiter),
+            b"ERR INVALID_UTF8\n"
+        );
+    }
+
+    #[test]
+    fn raft_opcodes_are_rejected_as_unknown_on_the_client_transport() {
+        let (db, _dir) = open_temp_db();
+        let secret = "0123456789abcdef0123456789abcdef";
+        let token = crate::auth::generate_token("client-a", "write", secret, 60).expect("token");
+        let frame = authenticated_frame(&token, &[0x20]);
+        let rate_limiter = RateLimiter::new(100.0, 10, 10);
+
+        assert_eq!(
+            handle_authenticated_request(&db, &frame, secret, &rate_limiter),
+            b"ERR UNKNOWN_OPCODE\n"
+        );
+    }
+
+    #[test]
+    fn frame_length_validation_is_explicit_and_bounded() {
+        assert_eq!(
+            validate_quic_frame_length(2),
+            Err("INVALID_FRAME".to_string())
+        );
+        assert_eq!(
+            validate_quic_frame_length(MAX_QUIC_FRAME_BYTES + 1),
+            Err("FRAME_TOO_LARGE".to_string())
+        );
+        assert!(validate_quic_frame_length(3).is_ok());
     }
 }
 

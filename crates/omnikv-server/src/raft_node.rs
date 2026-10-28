@@ -35,6 +35,7 @@ pub struct ClusterNode {
     pub gateway: Arc<ClusterGateway>,
     pub raft_listener: tokio::net::TcpListener,
     pub raft_addr: SocketAddr,
+    pub auth_token: String,
 }
 
 /// Builds the openraft config with the engine defaults plus the
@@ -113,7 +114,7 @@ fn boot_rt(
         OmniRaft::new(
             node_id,
             config,
-            OmniNetwork::new(),
+            OmniNetwork::new(cfg.raft.auth_token.clone()),
             log_store,
             state_machine,
         )
@@ -181,6 +182,7 @@ fn boot_rt(
         gateway,
         raft_listener,
         raft_addr,
+        auth_token: cfg.raft.auth_token.clone(),
     }))
 }
 
@@ -218,6 +220,7 @@ pub fn boot_cluster_node(
 pub async fn serve_raft_rpc(node: ClusterNode) -> std::io::Result<()> {
     let app = build_raft_router(RaftState {
         raft: node.raft.clone(),
+        auth_token: node.auth_token.clone(),
     });
     tracing::info!("Raft consensus listener on {}", node.raft_addr);
     axum::serve(node.raft_listener, app).await

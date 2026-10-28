@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 
 pub const DEV_JWT_SECRET: &str = "dev-secret-do-not-use-in-production";
 pub const DEV_BOOTSTRAP_ADMIN_KEY: &str = "dev-bootstrap-admin-key-do-not-use-in-production";
+pub const DEV_RAFT_AUTH_TOKEN: &str = "dev-raft-peer-token-do-not-use-in-production";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
@@ -101,7 +102,7 @@ impl StorageConfig {
 /// `peers` are the OTHER nodes' raft addresses ("host:port"), used only
 /// at bootstrap to seed cluster membership; a node joining an existing
 /// cluster learns the full membership from the leader.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RaftConfig {
     /// This node's cluster ID (openraft NodeId). 1-based.
@@ -121,10 +122,33 @@ pub struct RaftConfig {
     /// The other initial members, "host:port" per entry. Empty means
     /// single-node cluster when raft_addr is set.
     pub peers: Vec<String>,
+    /// Shared bearer token required on every peer RPC. This authenticates
+    /// consensus callers before deserializing or executing an RPC.
+    #[serde(default = "default_raft_auth_token")]
+    pub auth_token: String,
     /// Override election/heartbeat tuning (defaults suit tests and LANs).
     pub heartbeat_interval_ms: Option<u64>,
     pub election_timeout_min_ms: Option<u64>,
     pub election_timeout_max_ms: Option<u64>,
+}
+
+fn default_raft_auth_token() -> String {
+    DEV_RAFT_AUTH_TOKEN.into()
+}
+
+impl Default for RaftConfig {
+    fn default() -> Self {
+        Self {
+            node_id: None,
+            raft_addr: None,
+            advertise_addr: None,
+            peers: Vec::new(),
+            auth_token: default_raft_auth_token(),
+            heartbeat_interval_ms: None,
+            election_timeout_min_ms: None,
+            election_timeout_max_ms: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -453,6 +477,9 @@ impl ServerConfig {
                 .map(str::to_string)
                 .collect();
         }
+        if let Ok(v) = std::env::var("OMNIKV_RAFT_AUTH_TOKEN") {
+            self.raft.auth_token = v;
+        }
         if let Ok(v) = std::env::var("OMNIKV_RAFT_HEARTBEAT_MS") {
             self.raft.heartbeat_interval_ms = Some(
                 v.parse()
@@ -482,6 +509,26 @@ impl ServerConfig {
             return Err(ConfigError(
                 "raft.node_id and raft.raft_addr must be set together (OMNIKV_NODE_ID / OMNIKV_RAFT_ADDR)".into(),
             ));
+        }
+        if self.raft.node_id.is_some() {
+            if self.raft.auth_token.trim().is_empty() {
+                return Err(ConfigError(
+                    "cluster mode requires OMNIKV_RAFT_AUTH_TOKEN to authenticate peer RPCs".into(),
+                ));
+            }
+            if self.mode == ServerMode::Production {
+                if self.raft.auth_token == DEV_RAFT_AUTH_TOKEN {
+                    return Err(ConfigError(
+                        "production cluster mode requires a non-default Raft peer auth token"
+                            .into(),
+                    ));
+                }
+                if self.raft.auth_token.len() < 32 {
+                    return Err(ConfigError(
+                        "Raft peer auth token must be at least 32 characters in production".into(),
+                    ));
+                }
+            }
         }
         if self.raft.election_timeout_min_ms.unwrap_or(0)
             > self.raft.election_timeout_max_ms.unwrap_or(u64::MAX)

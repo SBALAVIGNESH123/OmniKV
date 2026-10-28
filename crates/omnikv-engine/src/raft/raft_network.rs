@@ -18,16 +18,17 @@ use crate::raft_impl::{OmniNode, OmniTypeConfig};
 /// docs/configuration.md).
 pub struct OmniNetwork {
     client: reqwest::Client,
+    auth_token: String,
 }
 
 impl Default for OmniNetwork {
     fn default() -> Self {
-        Self::new()
+        Self::new(crate::config::DEV_RAFT_AUTH_TOKEN)
     }
 }
 
 impl OmniNetwork {
-    pub fn new() -> Self {
+    pub fn new(auth_token: impl Into<String>) -> Self {
         Self {
             client: reqwest::Client::builder()
                 .pool_max_idle_per_host(32)
@@ -38,6 +39,7 @@ impl OmniNetwork {
                 .tcp_nodelay(true)
                 .build()
                 .expect("Failed to build Raft HTTP client"),
+            auth_token: auth_token.into(),
         }
     }
 }
@@ -45,6 +47,7 @@ impl OmniNetwork {
 pub struct OmniNetworkConnection {
     client: reqwest::Client,
     target: OmniNode,
+    auth_token: String,
 }
 
 #[expect(
@@ -58,6 +61,7 @@ impl RaftNetworkFactory<OmniTypeConfig> for OmniNetwork {
         OmniNetworkConnection {
             client: self.client.clone(),
             target: node.clone(),
+            auth_token: self.auth_token.clone(),
         }
     }
 }
@@ -72,6 +76,7 @@ impl RaftNetwork<OmniTypeConfig> for OmniNetworkConnection {
         let resp = self
             .client
             .post(&url)
+            .header("x-omnikv-raft-auth", &self.auth_token)
             .json(&req)
             .send()
             .await
@@ -96,6 +101,7 @@ impl RaftNetwork<OmniTypeConfig> for OmniNetworkConnection {
         let resp = self
             .client
             .post(&url)
+            .header("x-omnikv-raft-auth", &self.auth_token)
             .json(&req)
             .send()
             .await
@@ -117,6 +123,7 @@ impl RaftNetwork<OmniTypeConfig> for OmniNetworkConnection {
         let resp = self
             .client
             .post(&url)
+            .header("x-omnikv-raft-auth", &self.auth_token)
             .json(&req)
             .send()
             .await

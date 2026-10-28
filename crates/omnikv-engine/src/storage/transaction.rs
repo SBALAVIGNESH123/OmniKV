@@ -297,6 +297,36 @@ impl SsiHistory {
         self.committed_txns.lock().map(|c| c.len()).unwrap_or(0)
     }
 
+    /// Checks whether a distributed prepare would conflict with a committed
+    /// write that became visible after its snapshot. Distributed transactions
+    /// currently carry writes only (no predicate/read-set payload), so this
+    /// deliberately performs the write-write portion of SSI at prepare time.
+    pub(crate) fn check_write_conflicts(
+        &self,
+        read_seq: u64,
+        write_keys: &[String],
+    ) -> Option<String> {
+        let committed = self
+            .committed_txns
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        committed
+            .iter()
+            .filter(|entry| entry.commit_seq > read_seq)
+            .flat_map(|entry| {
+                write_keys
+                    .iter()
+                    .filter(|key| entry.write_keys.contains(*key))
+                    .map(move |key| {
+                        format!(
+                            "SSI CONFLICT (WW): key '{}' written by txn {} at seq {}",
+                            key, entry.txn_id, entry.commit_seq
+                        )
+                    })
+            })
+            .next()
+    }
+
     /// A serializable snapshot of the committed history, for a raft
     /// snapshot envelope. A node that installs that snapshot replays these
     /// so it keeps detecting conflicts against commits the snapshot

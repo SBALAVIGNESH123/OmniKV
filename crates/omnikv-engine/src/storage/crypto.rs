@@ -104,7 +104,7 @@ fn decrypt_v1(data: &[u8], passphrase: &str) -> Result<Vec<u8>, String> {
     }
 
     let key_bytes = derive_key(passphrase, V1_FIXED_SALT)?;
-    decrypt_with_key(&key_bytes, &data[1..1 + NONCE_LEN], &data[1 + NONCE_LEN..])
+    decrypt_with_key(&key_bytes, &data[1..=NONCE_LEN], &data[1 + NONCE_LEN..])
 }
 
 fn decrypt_v2(data: &[u8], passphrase: &str) -> Result<Vec<u8>, String> {
@@ -177,7 +177,7 @@ mod tests {
 
         assert_eq!(first[0], ENCRYPTION_VERSION);
         assert_eq!(second[0], ENCRYPTION_VERSION);
-        assert_ne!(&first[1..1 + SALT_LEN], &second[1..1 + SALT_LEN]);
+        assert_ne!(&first[1..=SALT_LEN], &second[1..=SALT_LEN]);
         assert_eq!(decrypt(&first, passphrase).unwrap(), b"payload");
         assert_eq!(decrypt(&second, passphrase).unwrap(), b"payload");
     }

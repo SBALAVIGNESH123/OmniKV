@@ -24,6 +24,7 @@ use omni_engine::metrics_prometheus;
 use omni_engine::{OmniError, OmniKV, WriteBatch};
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
+use std::path::{Component, Path as FsPath, PathBuf};
 use std::sync::Arc;
 use tower_http::cors::CorsLayer;
 
@@ -52,6 +53,7 @@ pub struct AppState {
     pub bootstrap_admin_key: String,
     pub manifest_path: String,
     pub wal_path: String,
+    pub backup_dir: String,
     pub rate_limiter: Arc<RateLimiter>,
     /// The cluster write gateway when this server booted as a Raft
     /// member. `None` = single-node mode.
@@ -272,6 +274,23 @@ pub fn build_router(state: AppState) -> Router {
             require_backup,
         ));
 
+    let restore_routes = Router::new()
+        .route("/admin/restore", axum::routing::post(restore_handler))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_restore,
+        ));
+
+    let cluster_routes = Router::new()
+        .route(
+            "/cluster/status",
+            axum::routing::get(cluster_status_handler),
+        )
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_cluster,
+        ));
+
     let admin_routes = Router::new()
         .route("/metrics", axum::routing::get(metrics_handler))
         .route("/admin/compact", axum::routing::post(compact_handler))
@@ -280,14 +299,12 @@ pub fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/health", axum::routing::get(health_handler))
         .route("/ready", axum::routing::get(ready_handler))
-        .route(
-            "/cluster/status",
-            axum::routing::get(cluster_status_handler),
-        )
         .route("/auth/token", axum::routing::post(token_handler))
         .merge(read_routes)
         .merge(write_routes)
         .merge(backup_routes)
+        .merge(restore_routes)
+        .merge(cluster_routes)
         .merge(admin_routes)
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -398,6 +415,30 @@ async fn require_backup(
     next: middleware::Next,
 ) -> Result<Response, Response> {
     require_role(state, req, next, RequiredRole::Backup).await
+}
+
+#[expect(
+    clippy::result_large_err,
+    reason = "Axum middleware convention returns Result<Response, Response>; boxing the error side would obscure the handler contract for no runtime benefit."
+)]
+async fn require_restore(
+    State(state): State<AppState>,
+    req: Request<Body>,
+    next: middleware::Next,
+) -> Result<Response, Response> {
+    require_role(state, req, next, RequiredRole::Restore).await
+}
+
+#[expect(
+    clippy::result_large_err,
+    reason = "Axum middleware convention returns Result<Response, Response>; boxing the error side would obscure the handler contract for no runtime benefit."
+)]
+async fn require_cluster(
+    State(state): State<AppState>,
+    req: Request<Body>,
+    next: middleware::Next,
+) -> Result<Response, Response> {
+    require_role(state, req, next, RequiredRole::Cluster).await
 }
 
 #[expect(
@@ -787,7 +828,22 @@ async fn backup_handler(
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis();
-    let backup_path = format!("backup_{}.tar.gz", timestamp);
+    let backup_dir = FsPath::new(&state.backup_dir);
+    if let Err(error) = std::fs::create_dir_all(backup_dir) {
+        audit_claims_event(
+            "backup.created",
+            AuditOutcome::Failure,
+            &claims,
+            "/admin/backup",
+            "backup_directory_unavailable",
+        );
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            ApiResponse::<String>::err(&sanitize_err(&error)),
+        );
+    }
+    let backup_path = backup_dir.join(format!("backup_{timestamp}.tar.gz"));
+    let backup_path = backup_path.to_string_lossy().into_owned();
 
     match omni_engine::backup::create_backup_with_wal(
         &state.db,
@@ -795,7 +851,12 @@ async fn backup_handler(
         &state.wal_path,
         &backup_path,
     ) {
-        Ok(path) => {
+        Ok(_) => {
+            let backup_name = FsPath::new(&backup_path)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or_default()
+                .to_string();
             audit_claims_event(
                 "backup.created",
                 AuditOutcome::Success,
@@ -803,7 +864,7 @@ async fn backup_handler(
                 "/admin/backup",
                 "backup_created",
             );
-            (StatusCode::OK, ApiResponse::ok(path))
+            (StatusCode::OK, ApiResponse::ok(backup_name))
         }
         Err(e) => {
             audit_claims_event(
@@ -816,6 +877,171 @@ async fn backup_handler(
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 ApiResponse::<String>::err(&sanitize_err(&e)),
+            )
+        }
+    }
+}
+
+#[derive(Deserialize)]
+pub struct RestoreRequest {
+    /// Backup filename relative to the configured backup directory.
+    pub backup_path: String,
+    /// Restore directory relative to the database data directory.
+    pub restore_dir: Option<String>,
+}
+
+fn resolve_safe_child(root: &FsPath, requested: &str, label: &str) -> Result<PathBuf, String> {
+    let path = FsPath::new(requested);
+    if path.as_os_str().is_empty()
+        || path.is_absolute()
+        || path.components().any(|component| {
+            matches!(
+                component,
+                Component::CurDir
+                    | Component::ParentDir
+                    | Component::RootDir
+                    | Component::Prefix(_)
+            )
+        })
+    {
+        return Err(format!("{label} must stay inside its configured root"));
+    }
+
+    let root = root
+        .canonicalize()
+        .map_err(|e| format!("cannot resolve configured {label} directory: {e}"))?;
+    let candidate = root.join(path);
+
+    // `candidate` may not exist yet (restore creates its destination), so
+    // canonicalizing only the final path is insufficient: an existing
+    // symlink in an intermediate component could otherwise escape `root`.
+    let mut existing_parent = candidate.as_path();
+    while !existing_parent.exists() {
+        existing_parent = existing_parent
+            .parent()
+            .ok_or_else(|| format!("cannot resolve {label} inside its configured root"))?;
+    }
+    let canonical_parent = existing_parent
+        .canonicalize()
+        .map_err(|e| format!("cannot resolve {label} parent: {e}"))?;
+    if !canonical_parent.starts_with(&root) {
+        return Err(format!("{label} escapes its configured root"));
+    }
+
+    if candidate.exists() {
+        let canonical = candidate
+            .canonicalize()
+            .map_err(|e| format!("cannot resolve {label}: {e}"))?;
+        if !canonical.starts_with(&root) {
+            return Err(format!("{label} escapes its configured root"));
+        }
+        Ok(canonical)
+    } else {
+        Ok(candidate)
+    }
+}
+
+async fn restore_handler(
+    State(state): State<AppState>,
+    Extension(claims): Extension<crate::auth::Claims>,
+    Json(req): Json<RestoreRequest>,
+) -> impl IntoResponse {
+    let backup_root = FsPath::new(&state.backup_dir);
+    let data_root = FsPath::new(&state.manifest_path)
+        .parent()
+        .unwrap_or_else(|| FsPath::new("."));
+    if !backup_root.is_dir() {
+        audit_claims_event(
+            "restore.started",
+            AuditOutcome::Failure,
+            &claims,
+            "/admin/restore",
+            "backup_directory_not_found",
+        );
+        return (
+            StatusCode::NOT_FOUND,
+            ApiResponse::<String>::err("backup not found"),
+        );
+    }
+    let backup_path = match resolve_safe_child(backup_root, &req.backup_path, "backup path") {
+        Ok(path) => path,
+        Err(error) => {
+            audit_claims_event(
+                "restore.started",
+                AuditOutcome::Denied,
+                &claims,
+                "/admin/restore",
+                "unsafe_backup_path",
+            );
+            return (StatusCode::BAD_REQUEST, ApiResponse::<String>::err(&error));
+        }
+    };
+    let restore_dir_name = req.restore_dir.as_deref().unwrap_or("restore").to_string();
+    let restore_dir = match resolve_safe_child(data_root, &restore_dir_name, "restore directory") {
+        Ok(path) => path,
+        Err(error) => {
+            audit_claims_event(
+                "restore.started",
+                AuditOutcome::Denied,
+                &claims,
+                "/admin/restore",
+                "unsafe_restore_path",
+            );
+            return (StatusCode::BAD_REQUEST, ApiResponse::<String>::err(&error));
+        }
+    };
+
+    if !backup_path.is_file() {
+        audit_claims_event(
+            "restore.started",
+            AuditOutcome::Failure,
+            &claims,
+            "/admin/restore",
+            "backup_not_found",
+        );
+        return (
+            StatusCode::NOT_FOUND,
+            ApiResponse::<String>::err("backup not found"),
+        );
+    }
+    if restore_dir.exists() {
+        audit_claims_event(
+            "restore.started",
+            AuditOutcome::Denied,
+            &claims,
+            "/admin/restore",
+            "restore_target_exists",
+        );
+        return (
+            StatusCode::CONFLICT,
+            ApiResponse::<String>::err("restore directory already exists"),
+        );
+    }
+
+    let backup_path = backup_path.to_string_lossy().into_owned();
+    let restore_dir = restore_dir.to_string_lossy().into_owned();
+    match omni_engine::backup::restore_backup(&backup_path, &restore_dir) {
+        Ok(()) => {
+            audit_claims_event(
+                "restore.completed",
+                AuditOutcome::Success,
+                &claims,
+                "/admin/restore",
+                "restore_completed",
+            );
+            (StatusCode::OK, ApiResponse::ok(restore_dir_name))
+        }
+        Err(error) => {
+            audit_claims_event(
+                "restore.completed",
+                AuditOutcome::Failure,
+                &claims,
+                "/admin/restore",
+                "restore_failed",
+            );
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ApiResponse::<String>::err(&sanitize_err(&error)),
             )
         }
     }
@@ -993,6 +1219,7 @@ mod tests {
             bootstrap_admin_key,
             manifest_path: manifest.to_string_lossy().to_string(),
             wal_path: wal.to_string_lossy().to_string(),
+            backup_dir: dir.path().join("backups").to_string_lossy().to_string(),
             rate_limiter: Arc::new(RateLimiter::new(1000.0, 100, 10_000)),
             cluster_gateway: None,
             cluster_node_id: None,
@@ -1238,7 +1465,7 @@ mod tests {
 
     #[tokio::test]
     async fn backup_token_can_create_backup_but_cannot_compact() {
-        let (router, _dir, secret) = test_router();
+        let (router, dir, secret) = test_router();
         let token =
             crate::auth::generate_token("backup-bot", "backup", &secret, 60).expect("backup token");
 
@@ -1257,9 +1484,11 @@ mod tests {
 
         assert_eq!(backup_response.status(), StatusCode::OK);
         let body = response_json(backup_response).await;
-        let backup_path = body["data"].as_str().expect("backup path in response");
-        assert!(backup_path.starts_with("backup_"));
-        assert!(backup_path.ends_with(".tar.gz"));
+        let backup_name = body["data"].as_str().expect("backup name in response");
+        assert!(backup_name.starts_with("backup_"));
+        assert!(backup_name.ends_with(".tar.gz"));
+        let backup_path = dir.path().join("backups").join(backup_name);
+        assert!(backup_path.exists());
         let _ = std::fs::remove_file(backup_path);
 
         let compact_response = router
@@ -1275,6 +1504,151 @@ mod tests {
             .expect("compact response");
 
         assert_eq!(compact_response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn restore_token_can_restore_but_cannot_create_backup() {
+        let (router, dir, secret) = test_router();
+        let backup_token =
+            crate::auth::generate_token("backup-bot", "backup", &secret, 60).expect("backup token");
+        let restore_token = crate::auth::generate_token("restore-bot", "restore", &secret, 60)
+            .expect("restore token");
+
+        let backup_response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/admin/backup")
+                    .header(header::AUTHORIZATION, format!("Bearer {backup_token}"))
+                    .body(Body::empty())
+                    .expect("backup request"),
+            )
+            .await
+            .expect("backup response");
+        assert_eq!(backup_response.status(), StatusCode::OK);
+        let backup_name = response_json(backup_response).await["data"]
+            .as_str()
+            .expect("backup name")
+            .to_string();
+
+        let restore_response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/admin/restore")
+                    .header(header::AUTHORIZATION, format!("Bearer {restore_token}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "backup_path": backup_name.clone(),
+                            "restore_dir": "restored"
+                        })
+                        .to_string(),
+                    ))
+                    .expect("restore request"),
+            )
+            .await
+            .expect("restore response");
+        assert_eq!(restore_response.status(), StatusCode::OK);
+        assert_eq!(response_json(restore_response).await["data"], "restored");
+        assert!(dir.path().join("restored/manifest.json").exists());
+
+        let restore_again = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/admin/restore")
+                    .header(header::AUTHORIZATION, format!("Bearer {restore_token}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "backup_path": backup_name,
+                            "restore_dir": "restored"
+                        })
+                        .to_string(),
+                    ))
+                    .expect("restore request"),
+            )
+            .await
+            .expect("restore response");
+        assert_eq!(restore_again.status(), StatusCode::CONFLICT);
+
+        let backup_denied = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/admin/backup")
+                    .header(header::AUTHORIZATION, format!("Bearer {restore_token}"))
+                    .body(Body::empty())
+                    .expect("backup request"),
+            )
+            .await
+            .expect("backup response");
+        assert_eq!(backup_denied.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn restore_rejects_paths_outside_configured_roots() {
+        let (router, dir, secret) = test_router();
+        std::fs::create_dir_all(dir.path().join("backups")).expect("backup directory");
+        let restore_token = crate::auth::generate_token("restore-bot", "restore", &secret, 60)
+            .expect("restore token");
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/admin/restore")
+                    .header(header::AUTHORIZATION, format!("Bearer {restore_token}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "backup_path": "../outside.tar.gz",
+                            "restore_dir": "restored"
+                        })
+                        .to_string(),
+                    ))
+                    .expect("restore request"),
+            )
+            .await
+            .expect("restore response");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            response_json(response).await["error"],
+            "backup path must stay inside its configured root"
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_reports_missing_backup_without_exposing_a_path() {
+        let (router, _dir, secret) = test_router();
+        let restore_token = crate::auth::generate_token("restore-bot", "restore", &secret, 60)
+            .expect("restore token");
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/admin/restore")
+                    .header(header::AUTHORIZATION, format!("Bearer {restore_token}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "backup_path": "missing.tar.gz",
+                            "restore_dir": "restored"
+                        })
+                        .to_string(),
+                    ))
+                    .expect("restore request"),
+            )
+            .await
+            .expect("restore response");
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(response_json(response).await["error"], "backup not found");
     }
 
     #[tokio::test]
@@ -1448,6 +1822,7 @@ mod tests {
             bootstrap_admin_key: "bootstrap-admin-key-0123456789abcdef".to_string(),
             manifest_path: manifest.to_string_lossy().to_string(),
             wal_path: wal.to_string_lossy().to_string(),
+            backup_dir: dir.path().join("backups").to_string_lossy().to_string(),
             rate_limiter: Arc::new(RateLimiter::new(0.01, 1, 10)),
             cluster_gateway: None,
             cluster_node_id: None,

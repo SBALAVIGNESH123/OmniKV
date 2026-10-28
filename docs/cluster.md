@@ -26,6 +26,7 @@ OMNIKV_RAFT_ADDR=0.0.0.0:9090  # the BIND address for the peer listener
 # When the bind address is a wildcard, peers also need the routable
 # address to DIAL — see "Bind vs advertised address" below.
 OMNIKV_RAFT_ADVERTISE_ADDR=node-1.example:9090
+OMNIKV_RAFT_AUTH_TOKEN="a-random-32-byte-or-longer-shared-secret"
 ```
 
 Optional tuning (defaults suit tests and LANs):
@@ -38,6 +39,11 @@ OMNIKV_RAFT_ELECTION_MAX_MS=3000
 
 A server started **without** these variables is a fully independent
 single-node engine — no consensus machinery runs at all.
+
+Every cluster member must use the same `OMNIKV_RAFT_AUTH_TOKEN`. Peer RPCs
+without this credential are rejected before request deserialization or Raft
+execution. Development mode supplies a clearly insecure test default; never
+use that value in production.
 
 ## Bootstrap
 
@@ -141,10 +147,11 @@ applied state:
   node you wrote to (and after a failover, until you reconnect to the
   new leader).
 
-For topology (not data), `GET /cluster/status` is a public endpoint
-(same posture as `/health`) reporting `mode`, `node_id`, `leader_id`,
-`term`, `last_applied_index`, and the member list — the shape the
-failover smoke and monitoring dashboards watch.
+For topology (not data), `GET /cluster/status` requires a `cluster` or `admin`
+JWT and reports `mode`, `node_id`, `leader_id`, `term`, `last_applied_index`,
+and the member list. `/health` and `/ready` remain public liveness endpoints;
+topology is protected because member addresses and leadership state are
+operationally sensitive.
 
 ## Failover
 
@@ -159,13 +166,11 @@ Writes sent to a follower during a leaderless window fail with
 
 ## Known limitations
 
-- **Peer traffic is plaintext HTTP.** The raft listener is a dedicated
-  port following etcd's peer-port model: client TLS never terminates
-  there, and consensus nodes authenticate by cluster membership. Keep
-  it on a trusted network — the compose demos publish only the client
-  ports to the host and leave the consensus port on the private compose
-  network, so nothing off-network can reach it. Mutual TLS for peer
-  traffic is not implemented yet.
+- **Peer traffic is authenticated plaintext HTTP.** The dedicated Raft
+  listener requires the shared `OMNIKV_RAFT_AUTH_TOKEN` before it accepts an
+  RPC. This prevents unauthenticated injection, but does not provide
+  confidentiality or replay protection; keep the port on a trusted/private
+  network. Mutual TLS for peer traffic is not implemented yet.
 - **One write in flight cluster-wide.** The flight lock trades write
   throughput for a gap-free serialization point. Pipelined proposals
   are not implemented yet.

@@ -248,6 +248,20 @@ impl IndexManager {
         fields: Vec<(String, IndexFieldType)>,
         unique: bool,
     ) -> Result<IndexId, OmniError> {
+        if name.trim().is_empty() || collection.trim().is_empty() || fields.is_empty() {
+            return Err(OmniError::IoError(
+                "index name, collection, and fields must not be empty".into(),
+            ));
+        }
+        let mut field_names = std::collections::HashSet::new();
+        if fields
+            .iter()
+            .any(|(field, _)| field.trim().is_empty() || !field_names.insert(field))
+        {
+            return Err(OmniError::IoError(
+                "index fields must be non-empty and unique".into(),
+            ));
+        }
         let mut catalog = self
             .catalog
             .lock()
@@ -307,10 +321,8 @@ impl IndexManager {
         let prefix = build_index_scan_prefix(id);
         let end = format!("{}\x7f", prefix);
         let seq = self.db.get_seq();
-        if let Ok(entries) = self.db.scan_iter(&prefix, &end, seq) {
-            for (key, _) in entries {
-                batch.delete(&key)?;
-            }
+        for (key, _) in self.db.scan(&prefix, &end, seq)? {
+            batch.delete(&key)?;
         }
 
         self.db.commit_batch(&batch)?;
@@ -369,22 +381,20 @@ impl IndexManager {
                 let prefix = build_exact_index_value_prefix(idx_def.id, &encoded_values);
                 let end = format!("{}\x7f", prefix);
                 let seq = self.db.get_seq();
-                if let Ok(existing) = self.db.scan_iter(&prefix, &end, seq) {
-                    for (existing_key, _) in existing {
-                        // Extract the primary key from the existing index entry
-                        if let Some(existing_pk) = existing_key.rsplit('\x00').next()
-                            && existing_pk != primary_key
-                        {
-                            return Err(OmniError::IoError(format!(
-                                "UNIQUE CONSTRAINT VIOLATION: index '{}' on {:?}",
-                                idx_def.name,
-                                idx_def
-                                    .fields
-                                    .iter()
-                                    .map(|(f, _)| f.as_str())
-                                    .collect::<Vec<_>>()
-                            )));
-                        }
+                for (existing_key, _) in self.db.scan(&prefix, &end, seq)? {
+                    // Extract the primary key from the existing index entry
+                    if let Some(existing_pk) = existing_key.rsplit('\x00').next()
+                        && existing_pk != primary_key
+                    {
+                        return Err(OmniError::IoError(format!(
+                            "UNIQUE CONSTRAINT VIOLATION: index '{}' on {:?}",
+                            idx_def.name,
+                            idx_def
+                                .fields
+                                .iter()
+                                .map(|(f, _)| f.as_str())
+                                .collect::<Vec<_>>()
+                        )));
                     }
                 }
             }
@@ -471,10 +481,8 @@ impl IndexManager {
         let seq = self.db.get_seq();
 
         let mut results = Vec::new();
-        if let Ok(iter) = self.db.scan_iter(&prefix, &end, seq) {
-            for (_, pk) in iter {
-                results.push(pk);
-            }
+        for (_, pk) in self.db.scan(&prefix, &end, seq)? {
+            results.push(pk);
         }
 
         Ok(results)
@@ -507,17 +515,20 @@ impl IndexManager {
         let start_encoded = encode_index_value(start_value, ft);
         let end_encoded = encode_index_value(end_value, ft);
 
-        let start_key = build_index_value_prefix(idx_def.id, &[start_encoded]);
-        // Use the end value prefix + \xff\xff to capture all entries at the end value
-        // (including all possible primary key suffixes after the \x00 separator)
-        let end_key = format!("{}~~", build_index_value_prefix(idx_def.id, &[end_encoded]));
+        let start_key = build_exact_index_value_prefix(idx_def.id, &[start_encoded]);
+        // The exact-value separator sorts before all hex bytes, so appending
+        // a maximal Unicode scalar includes every primary-key suffix for the
+        // end value while excluding longer values that merely share its
+        // encoded prefix.
+        let end_key = format!(
+            "{}\u{10ffff}",
+            build_exact_index_value_prefix(idx_def.id, &[end_encoded])
+        );
         let seq = self.db.get_seq();
 
         let mut results = Vec::new();
-        if let Ok(iter) = self.db.scan_iter(&start_key, &end_key, seq) {
-            for (_, pk) in iter {
-                results.push(pk);
-            }
+        for (_, pk) in self.db.scan(&start_key, &end_key, seq)? {
+            results.push(pk);
         }
 
         Ok(results)
@@ -546,18 +557,16 @@ impl IndexManager {
         let mut count = 0;
         let mut batch = WriteBatch::new();
 
-        if let Ok(iter) = self.db.scan_iter(&collection_prefix, &collection_end, seq) {
-            for (key, value) in iter {
-                if let Ok(doc) = serde_json::from_str::<serde_json::Value>(&value) {
-                    let pk = key.strip_prefix(&collection_prefix).unwrap_or(&key);
-                    self.index_document(&idx_def.collection, pk, &doc, &mut batch)?;
-                    count += 1;
+        for (key, value) in self.db.scan(&collection_prefix, &collection_end, seq)? {
+            if let Ok(doc) = serde_json::from_str::<serde_json::Value>(&value) {
+                let pk = key.strip_prefix(&collection_prefix).unwrap_or(&key);
+                self.index_document(&idx_def.collection, pk, &doc, &mut batch)?;
+                count += 1;
 
-                    // Commit in batches of 1000 to avoid huge memory usage
-                    if count % 1000 == 0 {
-                        self.db.commit_batch(&batch)?;
-                        batch = WriteBatch::new();
-                    }
+                // Commit in batches of 1000 to avoid huge memory usage
+                if count % 1000 == 0 {
+                    self.db.commit_batch(&batch)?;
+                    batch = WriteBatch::new();
                 }
             }
         }

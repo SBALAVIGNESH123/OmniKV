@@ -1828,6 +1828,21 @@ fn test_2pc_coordinator_lifecycle() {
 }
 
 #[test]
+fn test_2pc_coordinator_sequence_resumes_after_reopen() {
+    let (db, _dir) = create_test_db();
+    let coordinator = TwoPhaseCoordinator::new(7, db.clone(), 5000);
+    let first = coordinator.begin();
+    assert_eq!(first, (7, 1));
+    coordinator
+        .add_write(first, 8, "sequence_key".into(), Some("value".into()), 0)
+        .unwrap();
+    coordinator.prepare(first).unwrap();
+
+    let reopened_coordinator = TwoPhaseCoordinator::new(7, db, 5000);
+    assert_eq!(reopened_coordinator.begin(), (7, 2));
+}
+
+#[test]
 fn test_2pc_single_node_commit() {
     let (db, _dir) = create_test_db();
     let coord = TwoPhaseCoordinator::new(1, db.clone(), 5000);
@@ -1986,10 +2001,12 @@ fn test_2pc_timeout_detection() {
     // Wait for timeout
     std::thread::sleep(std::time::Duration::from_millis(50));
 
-    let _timed_out = coord.check_timeouts();
-    // created_at is second-granular, so assert only that the txn stays
-    // active until explicitly aborted.
-    assert_eq!(coord.active_count(), 1); // still active until explicitly aborted
+    let timed_out = coord.check_timeouts();
+    assert!(
+        timed_out.contains(&txn_id),
+        "a millisecond timeout should expire after the wait"
+    );
+    assert_eq!(coord.active_count(), 1); // remains active until explicitly aborted
 }
 
 #[test]
