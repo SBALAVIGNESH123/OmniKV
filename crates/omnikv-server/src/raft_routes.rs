@@ -9,8 +9,10 @@
 //! and returns the serialized response.
 
 use axum::Json;
+use axum::extract::Request;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
+use axum::middleware::{self, Next};
 use axum::response::IntoResponse;
 
 use omni_engine::raft_impl::{OmniRaft, TypeConfig};
@@ -29,17 +31,28 @@ pub fn build_raft_router(state: RaftState) -> axum::Router {
         .route("/raft/append", axum::routing::post(raft_append_handler))
         .route("/raft/vote", axum::routing::post(raft_vote_handler))
         .route("/raft/snapshot", axum::routing::post(raft_snapshot_handler))
+        .route_layer(middleware::from_fn_with_state(
+            state.auth_token.clone(),
+            authenticate_peer,
+        ))
         .with_state(state)
+}
+
+async fn authenticate_peer(
+    State(expected): State<String>,
+    request: Request,
+    next: Next,
+) -> axum::response::Response {
+    if let Err(response) = authorize_peer(request.headers(), &expected) {
+        return response;
+    }
+    next.run(request).await
 }
 
 async fn raft_append_handler(
     State(state): State<RaftState>,
-    headers: HeaderMap,
     Json(req): Json<AppendEntriesRequest<TypeConfig>>,
 ) -> impl IntoResponse {
-    if let Err(response) = authorize_peer(&headers, &state.auth_token) {
-        return response;
-    }
     match state.raft.append_entries(req).await {
         Ok(resp) => Json(resp).into_response(),
         Err(e) => (
@@ -52,12 +65,8 @@ async fn raft_append_handler(
 
 async fn raft_vote_handler(
     State(state): State<RaftState>,
-    headers: HeaderMap,
     Json(req): Json<VoteRequest<u64>>,
 ) -> impl IntoResponse {
-    if let Err(response) = authorize_peer(&headers, &state.auth_token) {
-        return response;
-    }
     match state.raft.vote(req).await {
         Ok(resp) => Json(resp).into_response(),
         Err(e) => (
@@ -70,12 +79,8 @@ async fn raft_vote_handler(
 
 async fn raft_snapshot_handler(
     State(state): State<RaftState>,
-    headers: HeaderMap,
     Json(req): Json<InstallSnapshotRequest<TypeConfig>>,
 ) -> impl IntoResponse {
-    if let Err(response) = authorize_peer(&headers, &state.auth_token) {
-        return response;
-    }
     match state.raft.install_snapshot(req).await {
         Ok(resp) => Json(resp).into_response(),
         Err(e) => (
@@ -106,6 +111,28 @@ fn authorize_peer(headers: &HeaderMap, expected: &str) -> Result<(), axum::respo
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn peer_auth_runs_before_json_deserialization() {
+        let app = axum::Router::new()
+            .route(
+                "/raft/vote",
+                axum::routing::post(|Json(_): Json<serde_json::Value>| async {}),
+            )
+            .route_layer(middleware::from_fn_with_state(
+                "shared-peer-secret".to_string(),
+                authenticate_peer,
+            ));
+        let request = axum::http::Request::builder()
+            .uri("/raft/vote")
+            .method("POST")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from("not JSON"))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
 
     #[test]
     fn peer_auth_rejects_missing_and_wrong_credentials() {

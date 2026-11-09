@@ -9,7 +9,8 @@ use crate::optimizer::{AccessMethod, PlanNode};
 use crate::sql::{AggFunc, JoinType, SelectColumn, WhereExpr};
 use crate::sql_exec::Row;
 use crate::volcano::{
-    ColumnTypeMap, eval_where_typed, legacy_pk_needs_scan, qualify_row, row_lookup, type_lookup,
+    ColumnTypeMap, RowIterator, eval_where_typed, legacy_pk_needs_scan, qualify_row, row_lookup,
+    type_lookup,
 };
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -267,9 +268,19 @@ impl PlanExecutor {
                     })
                     .collect::<Result<Vec<_>, _>>()?
             }
-            AccessMethod::IndexScan { .. } | AccessMethod::SeqScan => {
-                self.load_table_rows(&table)?
+            AccessMethod::IndexScan { index_name, .. } => {
+                let mut iter = crate::volcano::IndexScanIter::with_scan(
+                    &self.db,
+                    &self.catalog,
+                    &table,
+                    index_name,
+                    filter,
+                    self.read_seq(),
+                    None,
+                );
+                iter.try_collect_all()?
             }
+            AccessMethod::SeqScan => self.load_table_rows(&table)?,
         };
 
         if let Some(expr) = filter {

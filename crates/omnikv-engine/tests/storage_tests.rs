@@ -33,6 +33,28 @@ fn test_basic_set_get() {
 }
 
 #[test]
+fn test_exact_snapshot_sequence_is_consistent_before_and_after_flush() {
+    let (db, _dir) = create_test_db();
+    let mut batch = WriteBatch::new();
+    batch.set("exact_snapshot_key", "value".into()).unwrap();
+    db.commit_batch(&batch).unwrap();
+
+    let exact_seq = db.get_seq_for_key("exact_snapshot_key", db.get_seq());
+    assert_eq!(
+        db.find("exact_snapshot_key", exact_seq).unwrap(),
+        Some("value".into()),
+        "the active memtable must include a record at the read boundary"
+    );
+
+    db.compact_sstables().unwrap();
+    assert_eq!(
+        db.find("exact_snapshot_key", exact_seq).unwrap(),
+        Some("value".into()),
+        "the SSTable path must use the same inclusive boundary"
+    );
+}
+
+#[test]
 fn test_database_lock_rejects_second_open_until_drop() {
     let dir = TempDir::new().expect("tempdir");
     let manifest = dir
@@ -2075,4 +2097,45 @@ fn test_2pc_recovery_log() {
     let commit_key = format!("__2PC_LOG__/{}_{}/COMMIT", txn_id.0, txn_id.1);
     let commit_entry = db.find(&commit_key, seq).unwrap();
     assert!(commit_entry.is_some(), "COMMIT log should exist");
+}
+
+#[test]
+fn test_2pc_terminal_decisions_cannot_be_reversed_after_recovery() {
+    let (db, _dir) = create_test_db();
+    let participant = TwoPhaseParticipant::new(2, db.clone());
+    let aborted = (1, 101);
+    let committed = (1, 102);
+    let writes = vec![DistWrite {
+        node_id: 2,
+        key: "decision_key".into(),
+        value: Some("value".into()),
+        ttl: 0,
+    }];
+    assert!(matches!(
+        participant.prepare(aborted, &writes).vote,
+        Vote::Commit
+    ));
+    participant.abort(aborted).unwrap();
+    assert!(
+        participant.commit(aborted).is_err(),
+        "ABORT must be terminal"
+    );
+    assert_eq!(db.find("decision_key", db.get_seq()).unwrap(), None);
+
+    assert!(matches!(
+        participant.prepare(committed, &writes).vote,
+        Vote::Commit
+    ));
+    let sequence = participant.commit(committed).unwrap();
+    assert!(
+        participant.abort(committed).is_err(),
+        "COMMIT must be terminal"
+    );
+    let recovered = TwoPhaseParticipant::new(2, db.clone());
+    assert_eq!(recovered.commit(committed).unwrap(), sequence);
+    assert!(recovered.commit(aborted).is_err());
+    assert_eq!(
+        db.find("decision_key", db.get_seq()).unwrap(),
+        Some("value".into())
+    );
 }

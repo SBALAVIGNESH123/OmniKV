@@ -24,7 +24,7 @@
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
-use crate::secondary_index::{IndexFieldType, IndexManager};
+use crate::secondary_index::{IndexFieldType, IndexManager, collection_row_ranges};
 use crate::{OmniError, OmniKV, WriteBatch};
 
 /// Prefix for schema metadata stored in OmniKV.
@@ -330,6 +330,21 @@ impl SchemaManager {
     // Internal
     // ═══════════════════════════════════════════════════════════════
 
+    /// Serializes schema work with SQL DML for the affected collection.
+    /// DML holds the same process-local lock from its visibility read through
+    /// commit, so a backfill's fixed snapshot cannot miss a row that races it.
+    fn with_collection_lock<T>(
+        &self,
+        collection: &str,
+        operation: impl FnOnce() -> Result<T, OmniError>,
+    ) -> Result<T, OmniError> {
+        let lock = self.db.sql_table_lock(collection)?;
+        let _guard = lock
+            .lock()
+            .map_err(|_| OmniError::LockPoisoned("schema collection".into()))?;
+        operation()
+    }
+
     /// Executes a single schema operation.
     fn execute_op(&self, op: &SchemaOp) -> Result<(), OmniError> {
         match op {
@@ -338,28 +353,39 @@ impl SchemaManager {
                 collection,
                 fields,
                 unique,
-            } => {
-                self.index_manager
-                    .create_index(name, collection, fields.clone(), *unique)?;
-                // Online rebuild: index existing documents in batches
-                self.index_manager.rebuild_index(name)?;
+            } => self.with_collection_lock(collection, || {
+                self.index_manager.create_index_locked(
+                    name,
+                    collection,
+                    fields.clone(),
+                    *unique,
+                )?;
+                // Rebuild while the collection lock is held, so no SQL DML
+                // can create rows that escape the initial index population.
+                self.index_manager.rebuild_index_locked(name)?;
                 Ok(())
-            }
+            }),
             SchemaOp::DropIndex { name } => self.index_manager.drop_index(name),
             SchemaOp::AddField {
                 collection,
                 field_name,
                 default_value,
-            } => self.backfill_field(collection, field_name, Some(default_value)),
+            } => self.with_collection_lock(collection, || {
+                self.backfill_field(collection, field_name, Some(default_value))
+            }),
             SchemaOp::RemoveField {
                 collection,
                 field_name,
-            } => self.backfill_field(collection, field_name, None),
+            } => self.with_collection_lock(collection, || {
+                self.backfill_field(collection, field_name, None)
+            }),
             SchemaOp::RenameField {
                 collection,
                 old_name,
                 new_name,
-            } => self.rename_field_online(collection, old_name, new_name),
+            } => self.with_collection_lock(collection, || {
+                self.rename_field_online(collection, old_name, new_name)
+            }),
         }
     }
 
@@ -371,43 +397,54 @@ impl SchemaManager {
         field_name: &str,
         default_value: Option<&serde_json::Value>,
     ) -> Result<(), OmniError> {
-        let prefix = format!("{}:", collection);
-        let end = format!("{}:~", collection);
+        self.index_manager.refresh_catalog()?;
         let seq = self.db.get_seq();
 
         let mut batch = WriteBatch::new();
         let mut count = 0;
 
-        for (key, value) in self.db.scan(&prefix, &end, seq)? {
-            let Ok(mut doc) = serde_json::from_str::<serde_json::Value>(&value) else {
-                continue;
-            };
-            let Some(obj) = doc.as_object_mut() else {
-                continue;
-            };
-            let changed = match default_value {
-                Some(val) if !obj.contains_key(field_name) => {
-                    obj.insert(field_name.to_string(), val.clone());
-                    true
-                }
-                Some(_) => false,
-                None => obj.remove(field_name).is_some(),
-            };
-            if changed {
-                let updated =
-                    serde_json::to_string(&doc).map_err(|e| OmniError::IoError(e.to_string()))?;
-                batch.set(&key, updated)?;
-                count += 1;
+        for (prefix, end) in collection_row_ranges(collection) {
+            for (key, value) in self.db.scan(&prefix, &end, seq)? {
+                let Ok(mut doc) = serde_json::from_str::<serde_json::Value>(&value) else {
+                    continue;
+                };
+                let old_doc = doc.clone();
+                let Some(obj) = doc.as_object_mut() else {
+                    continue;
+                };
+                let changed = match default_value {
+                    Some(val) if !obj.contains_key(field_name) => {
+                        obj.insert(field_name.to_string(), val.clone());
+                        true
+                    }
+                    Some(_) => false,
+                    None => obj.remove(field_name).is_some(),
+                };
+                if changed {
+                    let updated = serde_json::to_string(&doc)
+                        .map_err(|e| OmniError::IoError(e.to_string()))?;
+                    let primary_key = key.strip_prefix(&prefix).unwrap_or(&key);
+                    self.index_manager.replace_document_indexes(
+                        collection,
+                        primary_key,
+                        &old_doc,
+                        primary_key,
+                        &doc,
+                        &mut batch,
+                    )?;
+                    batch.set(&key, updated)?;
+                    count += 1;
 
-                // Commit in batches of 500
-                if count % 500 == 0 {
-                    self.db.commit_batch(&batch)?;
-                    batch = WriteBatch::new();
+                    // Commit in batches of 500.
+                    if count % 500 == 0 && !batch.is_empty() {
+                        self.db.commit_batch(&batch)?;
+                        batch = WriteBatch::new();
+                    }
                 }
             }
         }
 
-        if !batch.buffered_writes.is_empty() {
+        if !batch.is_empty() {
             self.db.commit_batch(&batch)?;
         }
 
@@ -421,41 +458,52 @@ impl SchemaManager {
         old_name: &str,
         new_name: &str,
     ) -> Result<(), OmniError> {
-        let prefix = format!("{}:", collection);
-        let end = format!("{}:~", collection);
+        self.index_manager.refresh_catalog()?;
         let seq = self.db.get_seq();
 
         let mut batch = WriteBatch::new();
         let mut count = 0;
 
-        for (key, value) in self.db.scan(&prefix, &end, seq)? {
-            let Ok(mut doc) = serde_json::from_str::<serde_json::Value>(&value) else {
-                continue;
-            };
-            let Some(obj) = doc.as_object_mut() else {
-                continue;
-            };
-            if let Some(val) = obj.remove(old_name) {
-                if obj.contains_key(new_name) {
-                    return Err(OmniError::IoError(format!(
-                        "cannot rename field '{}' to '{}' because the destination exists",
-                        old_name, new_name
-                    )));
-                }
-                obj.insert(new_name.to_string(), val);
-                let updated =
-                    serde_json::to_string(&doc).map_err(|e| OmniError::IoError(e.to_string()))?;
-                batch.set(&key, updated)?;
-                count += 1;
+        for (prefix, end) in collection_row_ranges(collection) {
+            for (key, value) in self.db.scan(&prefix, &end, seq)? {
+                let Ok(mut doc) = serde_json::from_str::<serde_json::Value>(&value) else {
+                    continue;
+                };
+                let old_doc = doc.clone();
+                let Some(obj) = doc.as_object_mut() else {
+                    continue;
+                };
+                if let Some(val) = obj.remove(old_name) {
+                    if obj.contains_key(new_name) {
+                        return Err(OmniError::IoError(format!(
+                            "cannot rename field '{}' to '{}' because the destination exists",
+                            old_name, new_name
+                        )));
+                    }
+                    obj.insert(new_name.to_string(), val);
+                    let updated = serde_json::to_string(&doc)
+                        .map_err(|e| OmniError::IoError(e.to_string()))?;
+                    let primary_key = key.strip_prefix(&prefix).unwrap_or(&key);
+                    self.index_manager.replace_document_indexes(
+                        collection,
+                        primary_key,
+                        &old_doc,
+                        primary_key,
+                        &doc,
+                        &mut batch,
+                    )?;
+                    batch.set(&key, updated)?;
+                    count += 1;
 
-                if count % 500 == 0 {
-                    self.db.commit_batch(&batch)?;
-                    batch = WriteBatch::new();
+                    if count % 500 == 0 && !batch.is_empty() {
+                        self.db.commit_batch(&batch)?;
+                        batch = WriteBatch::new();
+                    }
                 }
             }
         }
 
-        if !batch.buffered_writes.is_empty() {
+        if !batch.is_empty() {
             self.db.commit_batch(&batch)?;
         }
 

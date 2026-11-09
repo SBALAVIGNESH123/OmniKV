@@ -340,25 +340,25 @@ impl SqlExecutor {
         let mut pending_slot = self.pending_batch.borrow_mut();
         match pending_slot.as_mut() {
             Some(pending) => {
+                let mut merged = WriteBatch {
+                    buffered_writes: pending.buffered_writes.clone(),
+                    buffered_deletes: pending.buffered_deletes.clone(),
+                };
                 for (key, value, ttl) in batch.buffered_writes {
-                    pending.buffered_writes.retain(|(k, _, _)| *k != key);
-                    pending.buffered_deletes.retain(|k| *k != key);
+                    merged.buffered_writes.retain(|(k, _, _)| *k != key);
+                    merged.buffered_deletes.retain(|k| *k != key);
                     let key_str = String::from_utf8_lossy(&key).into_owned();
-                    if ttl > 0 {
-                        pending
-                            .set_with_ttl(&key_str, value, ttl)
-                            .map_err(|e| format!("{:?}", e))?;
-                    } else {
-                        pending
-                            .set(&key_str, value)
-                            .map_err(|e| format!("{:?}", e))?;
-                    }
+                    merged
+                        .set_with_expiry(&key_str, value, ttl)
+                        .map_err(|e| format!("{:?}", e))?;
                 }
                 for key in batch.buffered_deletes {
-                    pending.buffered_writes.retain(|(k, _, _)| *k != key);
+                    merged.buffered_writes.retain(|(k, _, _)| *k != key);
+                    merged.buffered_deletes.retain(|existing| *existing != key);
                     let key_str = String::from_utf8_lossy(&key).into_owned();
-                    pending.delete(&key_str).map_err(|e| format!("{:?}", e))?;
+                    merged.delete(&key_str).map_err(|e| format!("{:?}", e))?;
                 }
+                *pending = merged;
                 Ok(())
             }
             None => self
@@ -367,6 +367,43 @@ impl SqlExecutor {
                 .map(|_| ())
                 .map_err(|e| format!("{:?}", e)),
         }
+    }
+
+    /// Include earlier statements' index mutations in uniqueness checks and
+    /// replacements. A new statement's data batch alone cannot see a unique
+    /// value inserted or removed earlier in this same transaction.
+    fn seed_pending_indexes(&self, batch: &mut WriteBatch) -> Result<(), String> {
+        let pending = self.pending_batch.borrow();
+        let Some(pending) = pending.as_ref() else {
+            return Ok(());
+        };
+        for (key, value, expiry) in &pending.buffered_writes {
+            if key.starts_with(b"\x00IDX\x00")
+                && !batch
+                    .buffered_writes
+                    .iter()
+                    .any(|(local, _, _)| local == key)
+                && !batch.buffered_deletes.contains(key)
+            {
+                let key = std::str::from_utf8(key).map_err(|error| error.to_string())?;
+                batch
+                    .set_with_expiry(key, value.clone(), *expiry)
+                    .map_err(|error| error.to_string())?;
+            }
+        }
+        for key in &pending.buffered_deletes {
+            if key.starts_with(b"\x00IDX\x00")
+                && !batch
+                    .buffered_writes
+                    .iter()
+                    .any(|(local, _, _)| local == key)
+                && !batch.buffered_deletes.contains(key)
+            {
+                let key = std::str::from_utf8(key).map_err(|error| error.to_string())?;
+                batch.delete(key).map_err(|error| error.to_string())?;
+            }
+        }
+        Ok(())
     }
 
     /// The staged writes of this transaction as an overlay storage key →
@@ -406,6 +443,15 @@ impl SqlExecutor {
         } else {
             None
         };
+
+        // Index definitions are durable MVCC metadata just like table
+        // definitions. Refresh the shared manager at this statement's read
+        // point so long-lived executors see newly-created indexes while an
+        // explicit transaction cannot use an index created after its snapshot.
+        self.catalog
+            .index_manager()
+            .refresh_catalog_at(self.statement_read_seq())
+            .map_err(|error| format!("index catalog read failed: {error}"))?;
 
         // A transactional executor's catalog overlay: staged DDL from
         // earlier statements in the block becomes visible to this
@@ -937,6 +983,8 @@ impl SqlExecutor {
             WriteBatch::new()
         };
         let mut count = 0;
+        self.seed_pending_indexes(&mut batch)?;
+        let index_manager = self.catalog.index_manager();
 
         for row_vals in values {
             let mut row_map = Row::new();
@@ -976,6 +1024,11 @@ impl SqlExecutor {
             }
             let value = serde_json::to_string(&row_map).map_err(|e| format!("Serialize: {}", e))?;
             batch.set(&key, value).map_err(|e| format!("{:?}", e))?;
+            let document = serde_json::to_value(&row_map)
+                .map_err(|e| format!("Serialize index document: {e}"))?;
+            index_manager
+                .index_document(&table.name, &canonical_pk, &document, &mut batch)
+                .map_err(|e| format!("Index maintenance failed: {e}"))?;
             count += 1;
         }
 
@@ -1129,9 +1182,14 @@ impl SqlExecutor {
             offset: None, // offset handled in post-processing below
         };
 
+        let index_catalog = self
+            .catalog
+            .index_manager()
+            .catalog_snapshot_at(self.statement_read_seq())
+            .map_err(|error| format!("index catalog read failed: {error}"))?;
         let stats = crate::optimizer::gather_stats_at_checked(
             &self.catalog,
-            None,
+            Some(&index_catalog),
             &self.db,
             self.statement_read_seq(),
         )?;
@@ -2134,7 +2192,11 @@ impl SqlExecutor {
             WriteBatch::new()
         };
         let count = rows.len();
+        self.seed_pending_indexes(&mut batch)?;
+        let index_manager = self.catalog.index_manager();
         for (row, old_key) in rows.iter_mut().zip(old_keys) {
+            let old_document = serde_json::to_value(&*row)
+                .map_err(|e| format!("Serialize old index document: {e}"))?;
             for (resolved, val) in &assignments {
                 let stored = match val {
                     SqlValue::Null => None,
@@ -2171,6 +2233,18 @@ impl SqlExecutor {
             }
             let value = serde_json::to_string(&row).map_err(|e| format!("{}", e))?;
             batch.set(&key, value).map_err(|e| format!("{:?}", e))?;
+            let new_document = serde_json::to_value(&*row)
+                .map_err(|e| format!("Serialize new index document: {e}"))?;
+            index_manager
+                .replace_document_indexes(
+                    &table.name,
+                    &old_key[table.row_prefix().len()..],
+                    &old_document,
+                    &crate::volcano::canonicalize_pk_key(&table, &pk),
+                    &new_document,
+                    &mut batch,
+                )
+                .map_err(|e| format!("Index maintenance failed: {e}"))?;
         }
 
         if !batch.is_empty() {
@@ -2215,6 +2289,8 @@ impl SqlExecutor {
             WriteBatch::new()
         };
         let count = rows.len();
+        self.seed_pending_indexes(&mut batch)?;
+        let index_manager = self.catalog.index_manager();
         for row in &rows {
             let pk = row
                 .get(&table.primary_key)
@@ -2226,6 +2302,16 @@ impl SqlExecutor {
                 table.row_prefix(),
                 crate::volcano::canonicalize_pk_key(&table, &pk)
             );
+            let document = serde_json::to_value(row)
+                .map_err(|e| format!("Serialize old index document: {e}"))?;
+            index_manager
+                .remove_document_indexes(
+                    &table.name,
+                    &crate::volcano::canonicalize_pk_key(&table, &pk),
+                    &document,
+                    &mut batch,
+                )
+                .map_err(|e| format!("Index maintenance failed: {e}"))?;
             batch.delete(&key).map_err(|e| format!("{:?}", e))?;
         }
 

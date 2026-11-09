@@ -565,9 +565,8 @@ async fn ready_handler(State(state): State<AppState>) -> impl IntoResponse {
     }
 }
 
-/// Cluster topology snapshot — no user data, same posture as /health
-/// (public) so monitoring and the compose smoke script can watch leader
-/// failover without minting tokens.
+/// Cluster topology snapshot — no user data, but protected because it reveals
+/// member addresses and leadership state to operational callers.
 #[derive(Serialize)]
 struct ClusterStatus {
     mode: &'static str,
@@ -578,7 +577,17 @@ struct ClusterStatus {
     members: Vec<(u64, String)>,
 }
 
-async fn cluster_status_handler(State(state): State<AppState>) -> impl IntoResponse {
+async fn cluster_status_handler(
+    State(state): State<AppState>,
+    Extension(claims): Extension<crate::auth::Claims>,
+) -> impl IntoResponse {
+    audit_claims_event(
+        "cluster.status",
+        AuditOutcome::Success,
+        &claims,
+        "/cluster/status",
+        "topology_read",
+    );
     let Some(gateway) = &state.cluster_gateway else {
         return (
             StatusCode::OK,

@@ -982,7 +982,7 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
             // installs without BatchTooLarge.
             if batch.op_count() >= crate::WriteBatch::MAX_OPS {
                 tmp_db
-                    .commit_batch(&batch)
+                    .commit_batch_local(&batch)
                     .map_err(|e| io_err(&format!("commit snapshot batch: {}", e)))?;
                 batch = crate::WriteBatch::new();
             }
@@ -998,7 +998,7 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
         // apply path): data before pointer.
         if batch.op_count() >= crate::WriteBatch::MAX_OPS {
             tmp_db
-                .commit_batch(&batch)
+                .commit_batch_local(&batch)
                 .map_err(|e| io_err(&format!("commit snapshot batch: {}", e)))?;
             batch = crate::WriteBatch::new();
         }
@@ -1018,7 +1018,7 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
 
         if !batch.is_empty() {
             tmp_db
-                .commit_batch(&batch)
+                .commit_batch_local(&batch)
                 .map_err(|e| io_err(&format!("commit snapshot batch: {}", e)))?;
             tmp_db
                 .compact_sstables()

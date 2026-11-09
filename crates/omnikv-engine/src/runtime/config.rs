@@ -107,9 +107,8 @@ impl StorageConfig {
 pub struct RaftConfig {
     /// This node's cluster ID (openraft NodeId). 1-based.
     pub node_id: Option<u64>,
-    /// The plaintext listener for consensus traffic (etcd's peer-port
-    /// model: client TLS never terminates here). This is the BIND
-    /// address — `0.0.0.0:port` is valid here.
+    /// The listener address for consensus traffic. This is the BIND address
+    /// — `0.0.0.0:port` is valid here.
     pub raft_addr: Option<String>,
     /// What PEERS dial to reach this node — the address that goes into
     /// cluster membership. Must be routable FROM other nodes; a
@@ -123,9 +122,19 @@ pub struct RaftConfig {
     /// single-node cluster when raft_addr is set.
     pub peers: Vec<String>,
     /// Shared bearer token required on every peer RPC. This authenticates
-    /// consensus callers before deserializing or executing an RPC.
+    /// consensus callers before deserializing or executing an RPC, including
+    /// development clusters where peer TLS is disabled.
     #[serde(default = "default_raft_auth_token")]
     pub auth_token: String,
+    /// Encrypts and server-authenticates peer RPCs with the server TLS
+    /// identity. Production clusters must enable this.
+    #[serde(default)]
+    pub tls: bool,
+    /// PEM CA bundle used by Raft clients to verify peer certificates.
+    /// Required with `tls` in production; development may use the explicit
+    /// `tls_insecure_skip` opt-in for ephemeral self-signed certificates.
+    #[serde(default)]
+    pub tls_ca_path: Option<String>,
     /// Override election/heartbeat tuning (defaults suit tests and LANs).
     pub heartbeat_interval_ms: Option<u64>,
     pub election_timeout_min_ms: Option<u64>,
@@ -144,6 +153,8 @@ impl Default for RaftConfig {
             advertise_addr: None,
             peers: Vec::new(),
             auth_token: default_raft_auth_token(),
+            tls: false,
+            tls_ca_path: None,
             heartbeat_interval_ms: None,
             election_timeout_min_ms: None,
             election_timeout_max_ms: None,
@@ -480,6 +491,12 @@ impl ServerConfig {
         if let Ok(v) = std::env::var("OMNIKV_RAFT_AUTH_TOKEN") {
             self.raft.auth_token = v;
         }
+        if let Ok(v) = std::env::var("OMNIKV_RAFT_TLS") {
+            self.raft.tls = parse_env_value("OMNIKV_RAFT_TLS", &v)?;
+        }
+        if let Ok(v) = std::env::var("OMNIKV_RAFT_TLS_CA_PATH") {
+            self.raft.tls_ca_path = if v.is_empty() { None } else { Some(v) };
+        }
         if let Ok(v) = std::env::var("OMNIKV_RAFT_HEARTBEAT_MS") {
             self.raft.heartbeat_interval_ms = Some(
                 v.parse()
@@ -517,6 +534,11 @@ impl ServerConfig {
                 ));
             }
             if self.mode == ServerMode::Production {
+                if self.tls_insecure_skip {
+                    return Err(ConfigError(
+                        "production cluster mode forbids OMNIKV_TLS_INSECURE_SKIP; Raft peer certificates must be verified".into(),
+                    ));
+                }
                 if self.raft.auth_token == DEV_RAFT_AUTH_TOKEN {
                     return Err(ConfigError(
                         "production cluster mode requires a non-default Raft peer auth token"
@@ -528,6 +550,37 @@ impl ServerConfig {
                         "Raft peer auth token must be at least 32 characters in production".into(),
                     ));
                 }
+                if !self.raft.tls {
+                    return Err(ConfigError(
+                        "production cluster mode requires OMNIKV_RAFT_TLS=true for encrypted peer RPCs"
+                            .into(),
+                    ));
+                }
+                if self.raft.tls_ca_path.is_none() {
+                    return Err(ConfigError(
+                        "production cluster mode requires OMNIKV_RAFT_TLS_CA_PATH to verify peer certificates"
+                            .into(),
+                    ));
+                }
+                if self.tls_cert_path.is_none() || self.tls_key_path.is_none() {
+                    return Err(ConfigError(
+                        "production cluster mode requires operator TLS certificate and key paths for mutual Raft TLS"
+                            .into(),
+                    ));
+                }
+            } else if self.raft.tls && self.raft.tls_ca_path.is_none() && !self.tls_insecure_skip {
+                return Err(ConfigError(
+                    "Raft TLS requires OMNIKV_RAFT_TLS_CA_PATH, or the explicit development-only TLS_INSECURE_SKIP opt-in"
+                        .into(),
+                ));
+            } else if self.raft.tls
+                && self.raft.tls_ca_path.is_some()
+                && (self.tls_cert_path.is_none() || self.tls_key_path.is_none())
+            {
+                return Err(ConfigError(
+                    "Raft mTLS requires tls_cert_path and tls_key_path when a peer CA bundle is configured"
+                        .into(),
+                ));
             }
         }
         if self.raft.election_timeout_min_ms.unwrap_or(0)

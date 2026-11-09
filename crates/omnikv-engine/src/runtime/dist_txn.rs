@@ -64,7 +64,7 @@ pub enum DistTxnState {
 }
 
 /// A write operation targeted at a specific node.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct DistWrite {
     /// Target node ID.
     pub node_id: u64,
@@ -364,7 +364,7 @@ impl TwoPhaseCoordinator {
 
         for (id, txn) in active.iter() {
             if txn.state == DistTxnState::WaitingForVotes {
-                let elapsed_ms = now.saturating_sub(txn.created_at) * 1000;
+                let elapsed_ms = now.saturating_sub(txn.created_at);
                 if elapsed_ms > txn.timeout_ms {
                     timed_out.push(*id);
                 }
@@ -471,7 +471,7 @@ impl TwoPhaseCoordinator {
 
         let mut batch = WriteBatch::new();
         batch.set(&log_key, log_value)?;
-        self.db.commit_batch(&batch)?;
+        self.db.commit_2pc_batch(&batch)?;
         Ok(())
     }
 }
@@ -542,17 +542,22 @@ fn build_write_batch(writes: &[DistWrite]) -> Result<WriteBatch, String> {
                 .map_err(|error| error.to_string())?,
         }
     }
+    crate::raft_command::RaftCommand::from_batch(&batch).protects_system_keys()?;
     Ok(batch)
 }
 
 impl TwoPhaseParticipant {
     pub fn new(node_id: u64, db: Arc<OmniKV>) -> Self {
-        Self {
+        let participant = Self {
             node_id,
             db,
             prepared: Mutex::new(HashMap::new()),
             key_locks: Mutex::new(HashMap::new()),
+        };
+        if let Err(error) = participant.recover() {
+            tracing::error!(node_id, ?error, "2PC participant recovery failed");
         }
+        participant
     }
 
     /// PREPARE — validate writes and vote.
@@ -576,29 +581,58 @@ impl TwoPhaseParticipant {
         writes: &[DistWrite],
         read_seq: u64,
     ) -> PrepareResult {
-        if let Some(existing) = self.load_participant_log(txn_id).ok().flatten() {
-            return match existing.state.as_str() {
-                "PREPARED" | "COMMITTED" => PrepareResult {
-                    node_id: self.node_id,
-                    txn_id,
-                    vote: Vote::Commit,
-                    prepare_seq: existing.prepare_seq,
-                },
-                "ABORTED" => PrepareResult {
-                    node_id: self.node_id,
-                    txn_id,
-                    vote: Vote::Abort("transaction was already aborted".into()),
-                    prepare_seq: existing.prepare_seq,
-                },
-                _ => PrepareResult {
-                    node_id: self.node_id,
-                    txn_id,
-                    vote: Vote::Abort("unknown participant recovery state".into()),
-                    prepare_seq: 0,
-                },
-            };
-        }
+        let result = (|| -> Result<PrepareResult, OmniError> {
+            let lock = self
+                .db
+                .sql_table_lock(&format!("\x002PC\x00{}", self.node_id))?;
+            let _guard = lock
+                .lock()
+                .map_err(|_| OmniError::LockPoisoned("2PC participant".into()))?;
+            self.recover_locked()?;
+            if let Some(existing) = self.load_participant_log(txn_id)? {
+                if existing.writes != writes && existing.state != "ABORTED" {
+                    return Err(OmniError::IoError(
+                        "transaction ID was reused with different writes".into(),
+                    ));
+                }
+                return Ok(match existing.state.as_str() {
+                    "PREPARED" | "COMMITTED" => PrepareResult {
+                        node_id: self.node_id,
+                        txn_id,
+                        vote: Vote::Commit,
+                        prepare_seq: existing.prepare_seq,
+                    },
+                    "ABORTED" => PrepareResult {
+                        node_id: self.node_id,
+                        txn_id,
+                        vote: Vote::Abort("transaction was already aborted".into()),
+                        prepare_seq: existing.prepare_seq,
+                    },
+                    _ => PrepareResult {
+                        node_id: self.node_id,
+                        txn_id,
+                        vote: Vote::Abort("unknown participant recovery state".into()),
+                        prepare_seq: 0,
+                    },
+                });
+            }
+            build_write_batch(writes).map_err(OmniError::IoError)?;
+            Ok(self.prepare_locked(txn_id, writes, read_seq))
+        })();
+        result.unwrap_or_else(|error| PrepareResult {
+            node_id: self.node_id,
+            txn_id,
+            vote: Vote::Abort(error.to_string()),
+            prepare_seq: 0,
+        })
+    }
 
+    fn prepare_locked(
+        &self,
+        txn_id: GlobalTxnId,
+        writes: &[DistWrite],
+        read_seq: u64,
+    ) -> PrepareResult {
         let write_keys: Vec<String> = writes.iter().map(|write| write.key.clone()).collect();
         if let Some(reason) = self
             .db
@@ -724,7 +758,7 @@ impl TwoPhaseParticipant {
             &legacy_participant_prepare_key(txn_id),
             format!("PREPARED:{}", self.node_id),
         );
-        match self.db.commit_batch(&prepare_batch) {
+        match self.db.commit_2pc_batch(&prepare_batch) {
             Ok(prepare_seq) => {
                 let persisted = ParticipantLogEntry {
                     txn_id,
@@ -738,7 +772,7 @@ impl TwoPhaseParticipant {
                 if let Ok(encoded) = serde_json::to_string(&persisted)
                     && update.set(&prepare_key, encoded).is_ok()
                 {
-                    let _ = self.db.commit_batch(&update);
+                    let _ = self.db.commit_2pc_batch(&update);
                 }
                 // Store the prepared batch for later commit
                 let mut prepared = self.prepared.lock().expect("participant lock");
@@ -799,10 +833,23 @@ impl TwoPhaseParticipant {
     /// durable records remain authoritative; this method is safe to call more
     /// than once and leaves committed/aborted records out of the prepared set.
     pub fn recover(&self) -> Result<usize, OmniError> {
+        let lock = self
+            .db
+            .sql_table_lock(&format!("\x002PC\x00{}", self.node_id))?;
+        let _guard = lock
+            .lock()
+            .map_err(|_| OmniError::LockPoisoned("2PC participant".into()))?;
+        self.recover_locked()
+    }
+
+    fn recover_locked(&self) -> Result<usize, OmniError> {
+        let prefix = format!("__2PC_PREPARE__/{}/", self.node_id);
         let entries = self
             .db
-            .scan("__2PC_PREPARE__/", "__2PC_PREPARE__/~", self.db.get_seq())?;
+            .scan(&prefix, &format!("{prefix}~"), self.db.get_seq())?;
         let mut recovered = 0;
+        let mut recovered_prepared = HashMap::new();
+        let mut recovered_locks = HashMap::new();
         let mut prepared = self
             .prepared
             .lock()
@@ -812,19 +859,24 @@ impl TwoPhaseParticipant {
             .lock()
             .map_err(|_| OmniError::LockPoisoned("participant key locks".into()))?;
         for (_, value) in entries {
-            let entry: ParticipantLogEntry = match serde_json::from_str(&value) {
-                Ok(entry) => entry,
-                Err(_) => continue,
-            };
+            let entry: ParticipantLogEntry = serde_json::from_str(&value).map_err(|error| {
+                OmniError::IoError(format!("invalid prepared transaction log: {error}"))
+            })?;
             if entry.node_id != self.node_id || entry.state != "PREPARED" {
                 continue;
             }
             let batch = build_write_batch(&entry.writes)
                 .map_err(|error| OmniError::IoError(format!("recover prepared batch: {error}")))?;
             for write in &entry.writes {
-                key_locks.insert(write.key.clone(), entry.txn_id);
+                if let Some(owner) = recovered_locks.insert(write.key.clone(), entry.txn_id)
+                    && owner != entry.txn_id
+                {
+                    return Err(OmniError::IoError(
+                        "conflicting durable prepared reservations".into(),
+                    ));
+                }
             }
-            prepared.insert(
+            recovered_prepared.insert(
                 entry.txn_id,
                 PreparedState {
                     batch,
@@ -835,37 +887,36 @@ impl TwoPhaseParticipant {
             );
             recovered += 1;
         }
+        *prepared = recovered_prepared;
+        *key_locks = recovered_locks;
         Ok(recovered)
     }
 
     /// COMMIT — apply the previously prepared writes.
     pub fn commit(&self, txn_id: GlobalTxnId) -> Result<u64, OmniError> {
-        let mut prepared = self
-            .prepared
+        let lock = self
+            .db
+            .sql_table_lock(&format!("\x002PC\x00{}", self.node_id))?;
+        let _guard = lock
             .lock()
-            .map_err(|_| OmniError::LockPoisoned("participant prepared".into()))?;
-
-        let state = match prepared.remove(&txn_id) {
-            Some(state) => state,
-            None => {
-                drop(prepared);
-                let entry = self.load_participant_log(txn_id)?.ok_or_else(|| {
-                    OmniError::IoError(format!("No prepared transaction {txn_id:?}"))
-                })?;
-                if entry.state == "COMMITTED" {
-                    return Ok(entry.commit_seq.unwrap_or_default());
-                }
-                let batch = build_write_batch(&entry.writes).map_err(|error| {
-                    OmniError::IoError(format!("recover commit batch: {error}"))
-                })?;
-                PreparedState {
-                    batch,
-                    writes: entry.writes,
-                    prepare_seq: entry.prepare_seq,
-                    prepared_at: Instant::now(),
-                }
+            .map_err(|_| OmniError::LockPoisoned("2PC participant".into()))?;
+        let state = self
+            .load_participant_log(txn_id)?
+            .ok_or_else(|| OmniError::IoError(format!("No prepared transaction {txn_id:?}")))?;
+        match state.state.as_str() {
+            "COMMITTED" => {
+                // A crash can occur after the atomic data+decision batch but
+                // before its optional marker annotation. Return a current
+                // read point in that case; never replay the committed data.
+                return Ok(state.commit_seq.unwrap_or_else(|| self.db.get_seq()));
             }
-        };
+            "PREPARED" => {}
+            _ => {
+                return Err(OmniError::IoError(
+                    "cannot commit an aborted or invalid transaction".into(),
+                ));
+            }
+        }
 
         let mut commit_batch = build_write_batch(&state.writes)
             .map_err(|error| OmniError::IoError(format!("commit prepared batch: {error}")))?;
@@ -888,7 +939,7 @@ impl TwoPhaseParticipant {
             &legacy_participant_prepare_key(txn_id),
             format!("COMMITTED:{}", self.node_id),
         )?;
-        let commit_seq = self.db.commit_batch(&commit_batch)?;
+        let commit_seq = self.db.commit_2pc_batch(&commit_batch)?;
         let mut final_log = WriteBatch::new();
         final_log.set(
             &participant_prepare_key(self.node_id, txn_id),
@@ -898,7 +949,14 @@ impl TwoPhaseParticipant {
             })
             .map_err(|error| OmniError::IoError(format!("commit log update: {error}")))?,
         )?;
-        let _ = self.db.commit_batch(&final_log)?;
+        // This annotation is advisory: the data and COMMITTED decision above
+        // are already durable. Its failure must not turn a committed write
+        // into an error or leave its keys reserved indefinitely.
+        let _ = self.db.commit_2pc_batch(&final_log);
+        self.prepared
+            .lock()
+            .map_err(|_| OmniError::LockPoisoned("participant prepared".into()))?
+            .remove(&txn_id);
         self.release_key_locks(
             txn_id,
             &state
@@ -913,22 +971,23 @@ impl TwoPhaseParticipant {
 
     /// ABORT — discard the prepared writes.
     pub fn abort(&self, txn_id: GlobalTxnId) -> Result<(), OmniError> {
-        let mut prepared = self
-            .prepared
+        let lock = self
+            .db
+            .sql_table_lock(&format!("\x002PC\x00{}", self.node_id))?;
+        let _guard = lock
             .lock()
-            .map_err(|_| OmniError::LockPoisoned("participant prepared".into()))?;
-
-        let state = prepared.remove(&txn_id);
-        drop(prepared);
-        let writes = state
-            .map(|state| state.writes)
-            .or_else(|| {
-                self.load_participant_log(txn_id)
-                    .ok()
-                    .flatten()
-                    .map(|entry| entry.writes)
-            })
-            .unwrap_or_default();
+            .map_err(|_| OmniError::LockPoisoned("2PC participant".into()))?;
+        let writes = match self.load_participant_log(txn_id)? {
+            Some(entry) if entry.state == "COMMITTED" => {
+                return Err(OmniError::IoError(
+                    "cannot abort a committed transaction".into(),
+                ));
+            }
+            Some(entry) if entry.state == "ABORTED" => return Ok(()),
+            Some(entry) if entry.state == "PREPARED" => entry.writes,
+            Some(_) => return Err(OmniError::IoError("invalid participant decision".into())),
+            None => Vec::new(),
+        };
 
         // Write ABORT record durably.
         let abort_key = participant_prepare_key(self.node_id, txn_id);
@@ -950,7 +1009,11 @@ impl TwoPhaseParticipant {
             &legacy_participant_prepare_key(txn_id),
             format!("ABORTED:{}", self.node_id),
         );
-        self.db.commit_batch(&log_batch)?;
+        self.db.commit_2pc_batch(&log_batch)?;
+        self.prepared
+            .lock()
+            .map_err(|_| OmniError::LockPoisoned("participant prepared".into()))?
+            .remove(&txn_id);
         self.release_key_locks(
             txn_id,
             &writes

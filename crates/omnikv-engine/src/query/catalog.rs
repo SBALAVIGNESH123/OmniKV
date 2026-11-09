@@ -3,6 +3,7 @@
 //! Stores table definitions (columns, types) inside OmniKV itself
 //! using the key prefix `\x00CATALOG\x00`.
 
+use crate::secondary_index::IndexManager;
 use crate::{OmniError, OmniKV, WriteBatch};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
@@ -130,13 +131,16 @@ impl TableDef {
 pub struct Catalog {
     db: Arc<OmniKV>,
     cache: std::sync::RwLock<HashMap<String, TableDef>>,
+    index_manager: Arc<IndexManager>,
 }
 
 impl Catalog {
     pub fn new(db: Arc<OmniKV>) -> Self {
+        let index_manager = Arc::new(IndexManager::new(db.clone()));
         let cat = Self {
             db,
             cache: std::sync::RwLock::new(HashMap::new()),
+            index_manager,
         };
         cat.load_all(None);
         cat
@@ -147,9 +151,11 @@ impl Catalog {
     /// connection migrated in the meantime would otherwise decode this
     /// transaction's rows under the wrong NULL encoding.
     pub fn at_snapshot(db: Arc<OmniKV>, seq: u64) -> Self {
+        let index_manager = Arc::new(IndexManager::new(db.clone()));
         let cat = Self {
             db,
             cache: std::sync::RwLock::new(HashMap::new()),
+            index_manager,
         };
         cat.load_all(Some(seq));
         cat
@@ -321,6 +327,11 @@ impl Catalog {
             .read()
             .expect("catalog cache RwLock poisoned: fatal invariant");
         cache.get(&name.to_lowercase()).cloned()
+    }
+
+    /// Shared index maintenance/catalog view for SQL planning and DML.
+    pub fn index_manager(&self) -> Arc<IndexManager> {
+        self.index_manager.clone()
     }
 
     pub fn list_tables(&self) -> Vec<String> {
