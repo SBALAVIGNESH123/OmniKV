@@ -107,15 +107,22 @@ impl RaftCommand {
     /// rejected up front with a clear error instead of an "ERR" apply
     /// result the client can't distinguish from success.
     pub fn protects_system_keys(&self) -> Result<(), String> {
-        const SYS: &str = "__sys__/raft/";
+        self.reject_prefixes(&["__sys__/raft/", "__2PC_LOG__/", "__2PC_PREPARE__/"])
+    }
+
+    pub(crate) fn protects_raft_keys(&self) -> Result<(), String> {
+        self.reject_prefixes(&["__sys__/raft/"])
+    }
+
+    fn reject_prefixes(&self, reserved: &[&str]) -> Result<(), String> {
         for op in &self.sets {
-            if op.key.starts_with(SYS) {
-                return Err(format!("key prefix '{SYS}' is reserved"));
+            if let Some(prefix) = reserved.iter().find(|prefix| op.key.starts_with(**prefix)) {
+                return Err(format!("key prefix '{prefix}' is reserved"));
             }
         }
         for key in &self.dels {
-            if key.starts_with(SYS) {
-                return Err(format!("key prefix '{SYS}' is reserved"));
+            if let Some(prefix) = reserved.iter().find(|prefix| key.starts_with(**prefix)) {
+                return Err(format!("key prefix '{prefix}' is reserved"));
             }
         }
         Ok(())
@@ -183,6 +190,22 @@ mod tests {
             ttl: 0,
         });
         assert!(cmd.protects_system_keys().is_err());
+    }
+
+    #[test]
+    fn distributed_transaction_keys_are_rejected_at_proposal_time() {
+        for key in ["__2PC_LOG__/1_1/COMMIT", "__2PC_PREPARE__/2/1_1"] {
+            let mut cmd = RaftCommand::default();
+            cmd.sets.push(SetOp {
+                key: key.into(),
+                value: "forged".into(),
+                ttl: 0,
+            });
+            assert!(
+                cmd.protects_system_keys().is_err(),
+                "{key} must be reserved"
+            );
+        }
     }
 
     #[test]

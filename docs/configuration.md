@@ -59,6 +59,9 @@ cargo run -p omnikv-server -- --config /etc/omnikv/omnikv.toml
 | `OMNIKV_TLS_CERT_PATH` | _(none)_ | Path to TLS certificate (PEM) |
 | `OMNIKV_TLS_KEY_PATH` | _(none)_ | Path to TLS private key (PEM) |
 | `OMNIKV_TLS_INSECURE_SKIP` | `false` | Skip TLS checks — prints a warning; not recommended |
+| `OMNIKV_RAFT_AUTH_TOKEN` | dev default | Shared peer RPC credential; production requires a non-default value of at least 32 characters |
+| `OMNIKV_RAFT_TLS` | `false` | TLS 1.3 for consensus; required in production cluster mode |
+| `OMNIKV_RAFT_TLS_CA_PATH` | _(none)_ | PEM CA bundle for mutual peer certificate verification |
 | `OMNIKV_LOG_LEVEL` | `info` | `trace`, `debug`, `info`, `warn`, `error` |
 | `OMNIKV_DATA_DIR` | _(none)_ | Convenience base directory; derives manifest, WAL, and backup paths unless those are overridden |
 | `OMNIKV_WAL_PATH` | `wal.bin` | WAL file path |
@@ -97,6 +100,10 @@ cargo run -p omnikv-server -- --config /etc/omnikv/omnikv.toml
   or `OMNIKV_TLS_INSECURE_SKIP=true` must be set explicitly
   (a warning is printed to stderr when this override is active).
 - **Missing TLS files** cause a hard startup failure with a clear error message.
+- **Cluster transport** requires `OMNIKV_RAFT_TLS=true`, a peer CA bundle,
+  and operator certificate/key paths. Peer certificates must support both
+  server and client authentication and include the advertised address in
+  their SAN. `OMNIKV_TLS_INSECURE_SKIP` is rejected for production clusters.
 - **Rate-limit settings** must be positive so production cannot accidentally
   start with disabled or nonsensical throttling.
 - **Compaction policy** must be internally consistent: L0/L1 compaction

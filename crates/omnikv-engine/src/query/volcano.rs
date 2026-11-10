@@ -276,6 +276,215 @@ impl RowIterator for SeqScanIter {
     }
 }
 
+/// Index-backed point/range scan. The index stores primary keys as values;
+/// this iterator resolves those keys back to table rows at the statement's
+/// MVCC point and leaves predicate evaluation to the normal FilterIter above
+/// it. Materialising the matched key set is bounded by the selectivity of the
+/// index and, unlike the old implementation, never silently falls back to a
+/// full table scan while claiming an IndexScan plan.
+pub struct IndexScanIter {
+    rows: Vec<Row>,
+    pos: usize,
+    error: Option<String>,
+}
+
+impl IndexScanIter {
+    pub fn with_scan(
+        db: &Arc<OmniKV>,
+        catalog: &Arc<Catalog>,
+        table: &TableDef,
+        index_name: &str,
+        predicate: Option<&WhereExpr>,
+        scan_seq: u64,
+        reads: Option<&Arc<std::sync::Mutex<ReadCollector>>>,
+    ) -> Self {
+        let Some(reads) = reads else {
+            return Self::build(db, catalog, table, index_name, predicate, scan_seq, None);
+        };
+        if let Ok(mut collector) = reads.lock() {
+            collector.record_range(&table.row_prefix(), &format!("{}\x7F", table.row_prefix()));
+        }
+        Self::build(
+            db,
+            catalog,
+            table,
+            index_name,
+            predicate,
+            scan_seq,
+            Some(reads),
+        )
+    }
+
+    fn build(
+        db: &Arc<OmniKV>,
+        catalog: &Arc<Catalog>,
+        table: &TableDef,
+        index_name: &str,
+        predicate: Option<&WhereExpr>,
+        scan_seq: u64,
+        _reads: Option<&Arc<std::sync::Mutex<ReadCollector>>>,
+    ) -> Self {
+        let manager = catalog.index_manager();
+        let definition = match manager.definition_at(index_name, scan_seq) {
+            Ok(definition) if !definition.fields.is_empty() => definition,
+            Ok(_) => {
+                return Self {
+                    rows: Vec::new(),
+                    pos: 0,
+                    error: Some(format!("index '{}' has no fields", index_name)),
+                };
+            }
+            Err(error) => {
+                return Self {
+                    rows: Vec::new(),
+                    pos: 0,
+                    error: Some(error.to_string()),
+                };
+            }
+        };
+        let (field, field_type) = &definition.fields[0];
+        let (lower, upper) = index_bounds(predicate, field, field_type);
+        let primary_keys = match manager.range_scan_bounds_at(
+            index_name,
+            lower.as_ref(),
+            upper.as_ref(),
+            scan_seq,
+        ) {
+            Ok(keys) => keys,
+            Err(error) => {
+                return Self {
+                    rows: Vec::new(),
+                    pos: 0,
+                    error: Some(format!("index scan failed: {error}")),
+                };
+            }
+        };
+
+        let mut rows = Vec::with_capacity(primary_keys.len());
+        let mut seen = std::collections::HashSet::new();
+        for primary_key in primary_keys {
+            if !seen.insert(primary_key.clone()) {
+                continue;
+            }
+            let key = format!("{}{}", table.row_prefix(), primary_key);
+            let stored = match db.find(&key, scan_seq) {
+                Ok(stored) => stored,
+                Err(error) => {
+                    return Self {
+                        rows,
+                        pos: 0,
+                        error: Some(format!("indexed row lookup failed: {error}")),
+                    };
+                }
+            };
+            if let Some(value) = stored {
+                match crate::plan_exec::PlanExecutor::deserialize_row_checked(
+                    &value,
+                    table.row_format,
+                ) {
+                    Ok(row) => rows.push(row),
+                    Err(error) => {
+                        return Self {
+                            rows,
+                            pos: 0,
+                            error: Some(format!(
+                                "table '{}' row decode failed: {error}",
+                                table.name
+                            )),
+                        };
+                    }
+                }
+            }
+        }
+        Self {
+            rows,
+            pos: 0,
+            error: None,
+        }
+    }
+}
+
+impl RowIterator for IndexScanIter {
+    fn next_row(&mut self) -> Option<Row> {
+        if self.pos < self.rows.len() {
+            let row = self.rows[self.pos].clone();
+            self.pos += 1;
+            Some(row)
+        } else {
+            None
+        }
+    }
+
+    fn try_next_row(&mut self) -> Result<Option<Row>, String> {
+        if let Some(error) = &self.error {
+            return Err(error.clone());
+        }
+        Ok(self.next_row())
+    }
+
+    fn check_error(&self) -> Result<(), String> {
+        self.error.clone().map_or(Ok(()), Err)
+    }
+
+    fn next_chunk(&mut self, max_rows: usize, out: &mut Vec<Row>) -> usize {
+        let remaining = self.rows.len().saturating_sub(self.pos);
+        let take = remaining.min(max_rows);
+        if take == 0 {
+            return 0;
+        }
+        out.extend(self.rows[self.pos..self.pos + take].iter().cloned());
+        self.pos += take;
+        take
+    }
+}
+
+fn index_bounds(
+    predicate: Option<&WhereExpr>,
+    field: &str,
+    field_type: &crate::secondary_index::IndexFieldType,
+) -> (Option<serde_json::Value>, Option<serde_json::Value>) {
+    let mut lower = None;
+    let mut upper = None;
+    fn visit(
+        expr: &WhereExpr,
+        field: &str,
+        field_type: &crate::secondary_index::IndexFieldType,
+        lower: &mut Option<serde_json::Value>,
+        upper: &mut Option<serde_json::Value>,
+    ) {
+        match expr {
+            WhereExpr::And(left, right) => {
+                visit(left, field, field_type, lower, upper);
+                visit(right, field, field_type, lower, upper);
+            }
+            WhereExpr::Comparison { column, op, value }
+                if column
+                    .rsplit_once('.')
+                    .map_or(column.as_str(), |(_, name)| name)
+                    .eq_ignore_ascii_case(field) =>
+            {
+                let Some(value) = crate::secondary_index::sql_index_bound(value, field_type) else {
+                    return;
+                };
+                match op {
+                    CmpOp::Eq => {
+                        *lower = Some(value.clone());
+                        *upper = Some(value);
+                    }
+                    CmpOp::Gt | CmpOp::Gte => *lower = Some(value),
+                    CmpOp::Lt | CmpOp::Lte => *upper = Some(value),
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+    if let Some(predicate) = predicate {
+        visit(predicate, field, field_type, &mut lower, &mut upper);
+    }
+    (lower, upper)
+}
+
 // ─── PK Lookup Iterator ────────────────────────────────────────────────────
 
 /// Single-row lookup by primary key. O(1).
@@ -1132,7 +1341,7 @@ pub fn compile_plan_with_scan(
                         }
                     }
                 }
-                AccessMethod::SeqScan | AccessMethod::IndexScan { .. } => match scan {
+                AccessMethod::SeqScan => match scan {
                     Some(ctx) => Box::new(SeqScanIter::with_scan(
                         db,
                         &table_def,
@@ -1141,6 +1350,37 @@ pub fn compile_plan_with_scan(
                         ctx.reads.as_ref(),
                     )),
                     None => Box::new(SeqScanIter::new(db, &table_def)),
+                },
+                AccessMethod::IndexScan { index_name, .. } => match scan {
+                    // A transaction's staged rows are not yet visible to the
+                    // persisted secondary index. Use the overlay-aware table
+                    // scan for that case so read-your-own-writes wins over
+                    // the optimisation without returning stale results.
+                    Some(ctx) if !ctx.overlay.is_empty() => Box::new(SeqScanIter::with_scan(
+                        db,
+                        &table_def,
+                        ctx.scan_seq,
+                        Some(&ctx.overlay),
+                        ctx.reads.as_ref(),
+                    )),
+                    Some(ctx) => Box::new(IndexScanIter::with_scan(
+                        db,
+                        catalog,
+                        &table_def,
+                        index_name,
+                        filter.as_ref(),
+                        ctx.scan_seq,
+                        ctx.reads.as_ref(),
+                    )),
+                    None => Box::new(IndexScanIter::with_scan(
+                        db,
+                        catalog,
+                        &table_def,
+                        index_name,
+                        filter.as_ref(),
+                        db.get_seq(),
+                        None,
+                    )),
                 },
             };
             match filter {

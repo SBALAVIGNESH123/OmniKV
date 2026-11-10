@@ -24,7 +24,7 @@
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
-use crate::secondary_index::{IndexFieldType, IndexManager};
+use crate::secondary_index::{IndexFieldType, IndexManager, collection_row_ranges};
 use crate::{OmniError, OmniKV, WriteBatch};
 
 /// Prefix for schema metadata stored in OmniKV.
@@ -33,6 +33,7 @@ const SCHEMA_PREFIX: &str = "\x00SCHEMA\x00";
 const VERSION_KEY: &str = "\x00SCHEMA\x00__version__";
 /// Prefix for individual migration records.
 const MIGRATION_PREFIX: &str = "\x00SCHEMA\x00migration:";
+const MIGRATION_LOCK_NAME: &str = "\x00SCHEMA\x00__migration_lock__";
 
 /// Schema version number.
 pub type Version = u64;
@@ -135,11 +136,9 @@ impl SchemaManager {
         let end = &format!("{}~", MIGRATION_PREFIX);
         let mut records = Vec::new();
 
-        if let Ok(iter) = self.db.scan_iter(start, end, seq) {
-            for (_, value) in iter {
-                if let Ok(record) = serde_json::from_str::<MigrationRecord>(&value) {
-                    records.push(record);
-                }
+        for (_, value) in self.db.scan(start, end, seq)? {
+            if let Ok(record) = serde_json::from_str::<MigrationRecord>(&value) {
+                records.push(record);
             }
         }
 
@@ -152,17 +151,39 @@ impl SchemaManager {
     /// If the migration has already been applied, it's skipped (idempotent).
     /// Progress is tracked and persisted for crash recovery.
     pub fn migrate_up(&self, migration: &Migration) -> Result<(), OmniError> {
+        let lock = self.db.sql_table_lock(MIGRATION_LOCK_NAME)?;
+        let _guard = lock
+            .lock()
+            .map_err(|_| OmniError::LockPoisoned("schema migration".into()))?;
+        self.migrate_up_locked(migration)
+    }
+
+    fn migrate_up_locked(&self, migration: &Migration) -> Result<(), OmniError> {
         let current = self.current_version()?;
 
         // Check idempotency
         if migration.version <= current {
-            let log = self.migration_log()?;
-            if log
-                .iter()
-                .any(|r| r.version == migration.version && r.state == MigrationState::Applied)
-            {
-                return Ok(()); // Already applied
-            }
+            return match self.migration_status(migration.version)? {
+                Some(MigrationRecord {
+                    state: MigrationState::Applied,
+                    ..
+                }) => Ok(()),
+                Some(record) => Err(OmniError::IoError(format!(
+                    "schema version {} is already at or below current version {} but has state {:?}",
+                    migration.version, current, record.state
+                ))),
+                None => Err(OmniError::IoError(format!(
+                    "schema migration v{} is missing its durable record",
+                    migration.version
+                ))),
+            };
+        }
+        if migration.version != current.saturating_add(1) {
+            return Err(OmniError::IoError(format!(
+                "schema migration versions must be applied consecutively: expected {}, got {}",
+                current.saturating_add(1),
+                migration.version
+            )));
         }
 
         // Mark as in-progress
@@ -178,7 +199,7 @@ impl SchemaManager {
         for (i, op) in migration.up.iter().enumerate() {
             match self.execute_op(op) {
                 Ok(()) => {
-                    let pct = ((i + 1) * 100 / total_ops) as u8;
+                    let pct = ((i + 1) * 100).checked_div(total_ops).unwrap_or(100) as u8;
                     self.save_migration_record(&MigrationRecord {
                         version: migration.version,
                         description: migration.description.clone(),
@@ -199,25 +220,38 @@ impl SchemaManager {
             }
         }
 
-        // Mark as applied and update version
-        self.save_migration_record(&MigrationRecord {
-            version: migration.version,
-            description: migration.description.clone(),
-            state: MigrationState::Applied,
-            applied_at: timestamp_ms(),
-        })?;
-        self.set_version(migration.version)?;
+        // Publish the applied record and version in one durable batch. A crash
+        // between two separate commits would leave a migration looking
+        // applied while the version still points at its predecessor, causing
+        // a replay to run non-idempotent DDL a second time.
+        self.save_applied_version(
+            &MigrationRecord {
+                version: migration.version,
+                description: migration.description.clone(),
+                state: MigrationState::Applied,
+                applied_at: timestamp_ms(),
+            },
+            migration.version,
+        )?;
 
         Ok(())
     }
 
     /// MIGRATE DOWN — rolls back a migration.
     pub fn migrate_down(&self, migration: &Migration) -> Result<(), OmniError> {
+        let lock = self.db.sql_table_lock(MIGRATION_LOCK_NAME)?;
+        let _guard = lock
+            .lock()
+            .map_err(|_| OmniError::LockPoisoned("schema migration".into()))?;
+        self.migrate_down_locked(migration)
+    }
+
+    fn migrate_down_locked(&self, migration: &Migration) -> Result<(), OmniError> {
         let current = self.current_version()?;
-        if migration.version > current {
+        if migration.version != current {
             return Err(OmniError::IoError(format!(
-                "Cannot rollback v{}: current version is v{}",
-                migration.version, current
+                "schema rollback must remove the current version: current is v{}, requested v{}",
+                current, migration.version
             )));
         }
 
@@ -226,49 +260,55 @@ impl SchemaManager {
             self.execute_op(op)?;
         }
 
-        // Update state
-        self.save_migration_record(&MigrationRecord {
-            version: migration.version,
-            description: migration.description.clone(),
-            state: MigrationState::RolledBack,
-            applied_at: timestamp_ms(),
-        })?;
-
-        // Set version to one below
-        let new_version = migration.version.saturating_sub(1);
-        self.set_version(new_version)?;
+        // Publish the rollback record and predecessor version atomically.
+        self.save_applied_version(
+            &MigrationRecord {
+                version: migration.version,
+                description: migration.description.clone(),
+                state: MigrationState::RolledBack,
+                applied_at: timestamp_ms(),
+            },
+            migration.version.saturating_sub(1),
+        )?;
 
         Ok(())
     }
 
     /// MIGRATE TO — applies or rolls back migrations to reach a target version.
     pub fn migrate_to(&self, migrations: &[Migration], target: Version) -> Result<(), OmniError> {
+        let lock = self.db.sql_table_lock(MIGRATION_LOCK_NAME)?;
+        let _guard = lock
+            .lock()
+            .map_err(|_| OmniError::LockPoisoned("schema migration".into()))?;
         let current = self.current_version()?;
 
         if target > current {
-            // Apply forward
             let mut sorted: Vec<&Migration> = migrations
                 .iter()
                 .filter(|m| m.version > current && m.version <= target)
                 .collect();
             sorted.sort_by_key(|m| m.version);
-
             for m in sorted {
-                self.migrate_up(m)?;
+                self.migrate_up_locked(m)?;
             }
         } else if target < current {
-            // Rollback
             let mut sorted: Vec<&Migration> = migrations
                 .iter()
                 .filter(|m| m.version <= current && m.version > target)
                 .collect();
             sorted.sort_by_key(|m| std::cmp::Reverse(m.version));
-
             for m in sorted {
-                self.migrate_down(m)?;
+                self.migrate_down_locked(m)?;
             }
         }
 
+        let reached = self.current_version()?;
+        if reached != target {
+            return Err(OmniError::IoError(format!(
+                "could not reach schema version {}; ended at {}",
+                target, reached
+            )));
+        }
         Ok(())
     }
 
@@ -290,6 +330,21 @@ impl SchemaManager {
     // Internal
     // ═══════════════════════════════════════════════════════════════
 
+    /// Serializes schema work with SQL DML for the affected collection.
+    /// DML holds the same process-local lock from its visibility read through
+    /// commit, so a backfill's fixed snapshot cannot miss a row that races it.
+    fn with_collection_lock<T>(
+        &self,
+        collection: &str,
+        operation: impl FnOnce() -> Result<T, OmniError>,
+    ) -> Result<T, OmniError> {
+        let lock = self.db.sql_table_lock(collection)?;
+        let _guard = lock
+            .lock()
+            .map_err(|_| OmniError::LockPoisoned("schema collection".into()))?;
+        operation()
+    }
+
     /// Executes a single schema operation.
     fn execute_op(&self, op: &SchemaOp) -> Result<(), OmniError> {
         match op {
@@ -298,28 +353,39 @@ impl SchemaManager {
                 collection,
                 fields,
                 unique,
-            } => {
-                self.index_manager
-                    .create_index(name, collection, fields.clone(), *unique)?;
-                // Online rebuild: index existing documents in batches
-                self.index_manager.rebuild_index(name)?;
+            } => self.with_collection_lock(collection, || {
+                self.index_manager.create_index_locked(
+                    name,
+                    collection,
+                    fields.clone(),
+                    *unique,
+                )?;
+                // Rebuild while the collection lock is held, so no SQL DML
+                // can create rows that escape the initial index population.
+                self.index_manager.rebuild_index_locked(name)?;
                 Ok(())
-            }
+            }),
             SchemaOp::DropIndex { name } => self.index_manager.drop_index(name),
             SchemaOp::AddField {
                 collection,
                 field_name,
                 default_value,
-            } => self.backfill_field(collection, field_name, Some(default_value)),
+            } => self.with_collection_lock(collection, || {
+                self.backfill_field(collection, field_name, Some(default_value))
+            }),
             SchemaOp::RemoveField {
                 collection,
                 field_name,
-            } => self.backfill_field(collection, field_name, None),
+            } => self.with_collection_lock(collection, || {
+                self.backfill_field(collection, field_name, None)
+            }),
             SchemaOp::RenameField {
                 collection,
                 old_name,
                 new_name,
-            } => self.rename_field_online(collection, old_name, new_name),
+            } => self.with_collection_lock(collection, || {
+                self.rename_field_online(collection, old_name, new_name)
+            }),
         }
     }
 
@@ -331,37 +397,46 @@ impl SchemaManager {
         field_name: &str,
         default_value: Option<&serde_json::Value>,
     ) -> Result<(), OmniError> {
-        let prefix = format!("{}:", collection);
-        let end = format!("{}:~", collection);
+        self.index_manager.refresh_catalog()?;
         let seq = self.db.get_seq();
 
         let mut batch = WriteBatch::new();
         let mut count = 0;
 
-        if let Ok(iter) = self.db.scan_iter(&prefix, &end, seq) {
-            for (key, value) in iter {
-                if let Ok(mut doc) = serde_json::from_str::<serde_json::Value>(&value)
-                    && let Some(obj) = doc.as_object_mut()
-                {
-                    match default_value {
-                        Some(val) => {
-                            // AddField: only add if not already present
-                            if !obj.contains_key(field_name) {
-                                obj.insert(field_name.to_string(), val.clone());
-                            }
-                        }
-                        None => {
-                            // RemoveField
-                            obj.remove(field_name);
-                        }
+        for (prefix, end) in collection_row_ranges(collection) {
+            for (key, value) in self.db.scan(&prefix, &end, seq)? {
+                let Ok(mut doc) = serde_json::from_str::<serde_json::Value>(&value) else {
+                    continue;
+                };
+                let old_doc = doc.clone();
+                let Some(obj) = doc.as_object_mut() else {
+                    continue;
+                };
+                let changed = match default_value {
+                    Some(val) if !obj.contains_key(field_name) => {
+                        obj.insert(field_name.to_string(), val.clone());
+                        true
                     }
+                    Some(_) => false,
+                    None => obj.remove(field_name).is_some(),
+                };
+                if changed {
                     let updated = serde_json::to_string(&doc)
                         .map_err(|e| OmniError::IoError(e.to_string()))?;
+                    let primary_key = key.strip_prefix(&prefix).unwrap_or(&key);
+                    self.index_manager.replace_document_indexes(
+                        collection,
+                        primary_key,
+                        &old_doc,
+                        primary_key,
+                        &doc,
+                        &mut batch,
+                    )?;
                     batch.set(&key, updated)?;
                     count += 1;
 
-                    // Commit in batches of 500
-                    if count % 500 == 0 {
+                    // Commit in batches of 500.
+                    if count % 500 == 0 && !batch.is_empty() {
                         self.db.commit_batch(&batch)?;
                         batch = WriteBatch::new();
                     }
@@ -369,7 +444,7 @@ impl SchemaManager {
             }
         }
 
-        if !batch.buffered_writes.is_empty() {
+        if !batch.is_empty() {
             self.db.commit_batch(&batch)?;
         }
 
@@ -383,26 +458,44 @@ impl SchemaManager {
         old_name: &str,
         new_name: &str,
     ) -> Result<(), OmniError> {
-        let prefix = format!("{}:", collection);
-        let end = format!("{}:~", collection);
+        self.index_manager.refresh_catalog()?;
         let seq = self.db.get_seq();
 
         let mut batch = WriteBatch::new();
         let mut count = 0;
 
-        if let Ok(iter) = self.db.scan_iter(&prefix, &end, seq) {
-            for (key, value) in iter {
-                if let Ok(mut doc) = serde_json::from_str::<serde_json::Value>(&value)
-                    && let Some(obj) = doc.as_object_mut()
-                    && let Some(val) = obj.remove(old_name)
-                {
+        for (prefix, end) in collection_row_ranges(collection) {
+            for (key, value) in self.db.scan(&prefix, &end, seq)? {
+                let Ok(mut doc) = serde_json::from_str::<serde_json::Value>(&value) else {
+                    continue;
+                };
+                let old_doc = doc.clone();
+                let Some(obj) = doc.as_object_mut() else {
+                    continue;
+                };
+                if let Some(val) = obj.remove(old_name) {
+                    if obj.contains_key(new_name) {
+                        return Err(OmniError::IoError(format!(
+                            "cannot rename field '{}' to '{}' because the destination exists",
+                            old_name, new_name
+                        )));
+                    }
                     obj.insert(new_name.to_string(), val);
                     let updated = serde_json::to_string(&doc)
                         .map_err(|e| OmniError::IoError(e.to_string()))?;
+                    let primary_key = key.strip_prefix(&prefix).unwrap_or(&key);
+                    self.index_manager.replace_document_indexes(
+                        collection,
+                        primary_key,
+                        &old_doc,
+                        primary_key,
+                        &doc,
+                        &mut batch,
+                    )?;
                     batch.set(&key, updated)?;
                     count += 1;
 
-                    if count % 500 == 0 {
+                    if count % 500 == 0 && !batch.is_empty() {
                         self.db.commit_batch(&batch)?;
                         batch = WriteBatch::new();
                     }
@@ -410,7 +503,7 @@ impl SchemaManager {
             }
         }
 
-        if !batch.buffered_writes.is_empty() {
+        if !batch.is_empty() {
             self.db.commit_batch(&batch)?;
         }
 
@@ -427,9 +520,16 @@ impl SchemaManager {
         Ok(())
     }
 
-    /// Updates the current schema version.
-    fn set_version(&self, version: Version) -> Result<(), OmniError> {
+    /// Publishes a migration state and schema version atomically.
+    fn save_applied_version(
+        &self,
+        record: &MigrationRecord,
+        version: Version,
+    ) -> Result<(), OmniError> {
+        let key = format!("{}{:06}", MIGRATION_PREFIX, record.version);
+        let value = serde_json::to_string(record).map_err(|e| OmniError::IoError(e.to_string()))?;
         let mut batch = WriteBatch::new();
+        batch.set(&key, value)?;
         batch.set(VERSION_KEY, version.to_string())?;
         self.db.commit_batch(&batch)?;
         Ok(())

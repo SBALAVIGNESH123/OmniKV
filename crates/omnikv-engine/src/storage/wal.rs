@@ -192,6 +192,8 @@ impl WriteAheadLog {
         // sync_data() pushes kernel page cache → stable storage (disk/SSD)
         // Without this, a power loss after flush() can lose committed data.
         // fdatasync is sufficient here — we don't need metadata (sync_all).
+        crate::failpoints::maybe_fail("wal::sync")
+            .map_err(|e| OmniError::IoError(format!("WAL failure point: {e}")))?;
         self.writer
             .get_ref()
             .sync_data()
@@ -245,6 +247,8 @@ impl WriteAheadLog {
     /// Called by group commit leader after all writers in the group have
     /// appended their batches.
     pub fn sync(&mut self) -> Result<(), OmniError> {
+        crate::failpoints::maybe_fail("wal::sync")
+            .map_err(|e| OmniError::IoError(format!("WAL failure point: {e}")))?;
         match self.writer.get_ref().sync_data() {
             Ok(()) => {
                 self.mark_pending_durable();

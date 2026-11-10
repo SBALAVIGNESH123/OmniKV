@@ -26,6 +26,9 @@ OMNIKV_RAFT_ADDR=0.0.0.0:9090  # the BIND address for the peer listener
 # When the bind address is a wildcard, peers also need the routable
 # address to DIAL — see "Bind vs advertised address" below.
 OMNIKV_RAFT_ADVERTISE_ADDR=node-1.example:9090
+OMNIKV_RAFT_AUTH_TOKEN="a-random-32-byte-or-longer-shared-secret"
+OMNIKV_RAFT_TLS=true
+OMNIKV_RAFT_TLS_CA_PATH=/etc/omnikv/raft-ca.pem
 ```
 
 Optional tuning (defaults suit tests and LANs):
@@ -38,6 +41,18 @@ OMNIKV_RAFT_ELECTION_MAX_MS=3000
 
 A server started **without** these variables is a fully independent
 single-node engine — no consensus machinery runs at all.
+
+Every cluster member must use the same `OMNIKV_RAFT_AUTH_TOKEN`. Peer RPCs
+without this credential are rejected before request deserialization or Raft
+execution. Production mode also requires `OMNIKV_RAFT_TLS=true` and a CA
+bundle in `OMNIKV_RAFT_TLS_CA_PATH`; the server certificate presented by each
+node must contain the advertised hostname/IP in its SAN and permit both
+server and client authentication. Nodes present their configured TLS identity
+as a client certificate, and the peer listener requires a certificate issued
+by the configured CA. Development mode may
+use the explicit `OMNIKV_TLS_INSECURE_SKIP=true` opt-in with generated
+self-signed certificates. Never use the development token or insecure TLS
+verification in production.
 
 ## Bootstrap
 
@@ -61,8 +76,8 @@ same internal raft port (9090) on the private compose network, node 1
 lists the other two, and each node advertises its compose hostname
 (`omni-node-N:9090`) so peers can dial it. The consensus ports are NOT
 published to the host — nothing off the compose network needs them
-(Prometheus scrapes the client HTTPS port); keeping them private limits
-exposure to the plaintext peer traffic (see "Known limitations").
+(Prometheus scrapes the client HTTPS port); keeping them private adds a
+network boundary around consensus traffic (see "Known limitations").
 
 ## Bind vs advertised address
 
@@ -141,10 +156,11 @@ applied state:
   node you wrote to (and after a failover, until you reconnect to the
   new leader).
 
-For topology (not data), `GET /cluster/status` is a public endpoint
-(same posture as `/health`) reporting `mode`, `node_id`, `leader_id`,
-`term`, `last_applied_index`, and the member list — the shape the
-failover smoke and monitoring dashboards watch.
+For topology (not data), `GET /cluster/status` requires a `cluster` or `admin`
+JWT and reports `mode`, `node_id`, `leader_id`, `term`, `last_applied_index`,
+and the member list. `/health` and `/ready` remain public liveness endpoints;
+topology is protected because member addresses and leadership state are
+operationally sensitive.
 
 ## Failover
 
@@ -159,13 +175,10 @@ Writes sent to a follower during a leaderless window fail with
 
 ## Known limitations
 
-- **Peer traffic is plaintext HTTP.** The raft listener is a dedicated
-  port following etcd's peer-port model: client TLS never terminates
-  there, and consensus nodes authenticate by cluster membership. Keep
-  it on a trusted network — the compose demos publish only the client
-  ports to the host and leave the consensus port on the private compose
-  network, so nothing off-network can reach it. Mutual TLS for peer
-  traffic is not implemented yet.
+- **Peer identity is CA-scoped.** Production uses mutual TLS 1.3 and the
+  shared bearer token. Certificates are checked against the peer CA, rather
+  than mapped individually to Raft node IDs. Use a dedicated cluster CA and
+  keep the consensus port private.
 - **One write in flight cluster-wide.** The flight lock trades write
   throughput for a gap-free serialization point. Pipelined proposals
   are not implemented yet.

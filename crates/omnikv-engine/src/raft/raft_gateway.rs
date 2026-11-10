@@ -160,6 +160,10 @@ impl ClusterGateway {
     /// lock; this is what makes the leader's committed view gap-free.
     async fn propose_locked(&self, cmd: RaftCommand) -> Result<WriteAck, RaftWriteError> {
         cmd.protects_system_keys().map_err(RaftWriteError::other)?;
+        self.apply_proposal_locked(cmd).await
+    }
+
+    async fn apply_proposal_locked(&self, cmd: RaftCommand) -> Result<WriteAck, RaftWriteError> {
         if cmd.is_empty() {
             // Nothing to replicate — nothing to ack either. Callers that
             // need read-only round-trip semantics use `probe()`.
@@ -270,6 +274,24 @@ impl ClusterGateway {
             .block_on_ctx(async { self.propose_locked(cmd).await })
             .map_err(RaftWriteError::into_omni_error)?;
         Ok(ack.index)
+    }
+
+    /// Trusted engine-only 2PC records still pass through consensus. Public
+    /// proposal APIs reject these namespaces; Raft bookkeeping remains
+    /// forbidden even for this internal entry point.
+    pub(crate) fn commit_2pc_batch(
+        &self,
+        batch: &crate::WriteBatch,
+    ) -> Result<u64, crate::OmniError> {
+        let _flight = self.flight_blocking();
+        let command = RaftCommand::from_batch(batch);
+        command
+            .protects_raft_keys()
+            .map_err(crate::OmniError::IoError)?;
+        let ack = self
+            .block_on_ctx(self.apply_proposal_locked(command))
+            .map_err(RaftWriteError::into_omni_error)?;
+        Ok(ack.commit_seq)
     }
 
     /// The clustered SSI COMMIT: runs the transaction's validation

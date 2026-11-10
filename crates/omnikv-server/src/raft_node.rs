@@ -2,9 +2,10 @@
 //! this server is a cluster member.
 //!
 //! `OMNIKV_RAFT_ADDR` + `OMNIKV_NODE_ID` present → the server boots an
-//! openraft node, serves consensus RPCs on a dedicated plaintext
-//! listener, and routes every client write through consensus before
-//! acknowledging it. Absent → the server stays an independent
+//! openraft node, serves consensus RPCs on a dedicated listener, and routes
+//! every client write through consensus before acknowledging it. Production
+//! peer traffic uses HTTPS with a configured CA bundle; development can keep
+//! the compatibility HTTP mode. Absent → the server stays an independent
 //! single-node engine and none of this runs.
 //!
 //! Bind vs advertised address: `OMNIKV_RAFT_ADDR` is
@@ -24,8 +25,10 @@ use omni_engine::raft_network::OmniNetwork;
 use omni_engine::raft_storage::OmniRaftStorage;
 use omni_engine::{OmniKV, config::ServerConfig};
 use openraft::BasicNode;
+use rustls::pki_types::pem::PemObject;
 
 use crate::raft_routes::{RaftState, build_raft_router};
+use crate::tls::ServerTls;
 
 /// A booted cluster node: the openraft handle, the write gateway (whose
 /// consensus runtime hosts every openraft task and the RPC listener
@@ -35,6 +38,7 @@ pub struct ClusterNode {
     pub gateway: Arc<ClusterGateway>,
     pub raft_listener: tokio::net::TcpListener,
     pub raft_addr: SocketAddr,
+    pub auth_token: String,
 }
 
 /// Builds the openraft config with the engine defaults plus the
@@ -108,16 +112,10 @@ fn boot_rt(
 
     let storage = OmniRaftStorage::new(db.clone());
     let (log_store, state_machine) = openraft::storage::Adaptor::new(storage);
+    let network = raft_network_from(cfg)?;
 
     let raft = rt.block_on(async {
-        OmniRaft::new(
-            node_id,
-            config,
-            OmniNetwork::new(),
-            log_store,
-            state_machine,
-        )
-        .await
+        OmniRaft::new(node_id, config, network, log_store, state_machine).await
     })?;
     let raft = Arc::new(raft);
 
@@ -181,7 +179,36 @@ fn boot_rt(
         gateway,
         raft_listener,
         raft_addr,
+        auth_token: cfg.raft.auth_token.clone(),
     }))
+}
+
+fn raft_network_from(cfg: &ServerConfig) -> Result<OmniNetwork, Box<dyn std::error::Error>> {
+    if !cfg.raft.tls {
+        return Ok(OmniNetwork::new(cfg.raft.auth_token.clone()));
+    }
+
+    let ca_pem = cfg
+        .raft
+        .tls_ca_path
+        .as_deref()
+        .map(std::fs::read)
+        .transpose()?;
+    let identity_pem = match (&cfg.tls_cert_path, &cfg.tls_key_path) {
+        (Some(cert_path), Some(key_path)) => {
+            let mut identity = std::fs::read(cert_path)?;
+            identity.extend_from_slice(&std::fs::read(key_path)?);
+            Some(identity)
+        }
+        (None, None) => None,
+        _ => return Err("TLS certificate and key must be configured together".into()),
+    };
+    Ok(OmniNetwork::new_tls(
+        cfg.raft.auth_token.clone(),
+        ca_pem.as_deref(),
+        identity_pem.as_deref(),
+        cfg.tls_insecure_skip,
+    )?)
 }
 
 /// Builds the consensus runtime, then constructs the node ON it (see
@@ -212,13 +239,71 @@ pub fn boot_cluster_node(
     })
 }
 
-/// Serves the consensus RPC routes on the node's dedicated plaintext
-/// listener. Call from a task spawned on the gateway's consensus
-/// runtime — never returns under normal operation.
-pub async fn serve_raft_rpc(node: ClusterNode) -> std::io::Result<()> {
+/// Serves the consensus RPC routes on the node's dedicated listener. Call
+/// from a task spawned on the gateway's consensus runtime — never returns
+/// under normal operation.
+pub async fn serve_raft_rpc(
+    node: ClusterNode,
+    tls: Option<ServerTls>,
+    ca_pem: Option<Vec<u8>>,
+) -> std::io::Result<()> {
     let app = build_raft_router(RaftState {
         raft: node.raft.clone(),
+        auth_token: node.auth_token.clone(),
     });
-    tracing::info!("Raft consensus listener on {}", node.raft_addr);
-    axum::serve(node.raft_listener, app).await
+    if let Some(tls) = tls {
+        let listener = node.raft_listener.into_std()?;
+        let config = raft_server_tls_config(tls, ca_pem.as_deref())?;
+        tracing::info!("Raft HTTPS consensus listener on {}", node.raft_addr);
+        axum_server::from_tcp_rustls(listener, config)
+            .map_err(|error| std::io::Error::other(format!("Raft TLS listener: {error}")))?
+            .serve(app.into_make_service())
+            .await
+            .map_err(|error| std::io::Error::other(format!("Raft HTTPS server: {error}")))
+    } else {
+        tracing::warn!("Raft plaintext consensus listener on {}", node.raft_addr);
+        axum::serve(node.raft_listener, app).await
+    }
 }
+
+fn raft_server_tls_config(
+    tls: ServerTls,
+    ca_pem: Option<&[u8]>,
+) -> std::io::Result<axum_server::tls_rustls::RustlsConfig> {
+    let server_config = if let Some(ca_pem) = ca_pem {
+        let mut roots = rustls::RootCertStore::empty();
+        let mut found = false;
+        for cert in rustls::pki_types::CertificateDer::pem_slice_iter(ca_pem) {
+            let cert = cert.map_err(|error| {
+                std::io::Error::other(format!("Raft client CA certificate: {error}"))
+            })?;
+            roots.add(cert).map_err(|error| {
+                std::io::Error::other(format!("Raft client CA certificate: {error}"))
+            })?;
+            found = true;
+        }
+        if !found {
+            return Err(std::io::Error::other(
+                "Raft TLS CA bundle contains no certificates",
+            ));
+        }
+        let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots))
+            .build()
+            .map_err(|error| std::io::Error::other(format!("Raft mTLS verifier: {error}")))?;
+        rustls::ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+            .with_client_cert_verifier(verifier)
+            .with_single_cert(tls.certs, tls.key)
+            .map_err(|error| std::io::Error::other(format!("Raft TLS certificate: {error}")))?
+    } else {
+        rustls::ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+            .with_no_client_auth()
+            .with_single_cert(tls.certs, tls.key)
+            .map_err(|error| std::io::Error::other(format!("Raft TLS certificate: {error}")))?
+    };
+    Ok(axum_server::tls_rustls::RustlsConfig::from_config(
+        Arc::new(server_config),
+    ))
+}
+
+#[cfg(test)]
+mod tests;

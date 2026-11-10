@@ -1885,6 +1885,8 @@ impl OmniKV {
                 pos += n as u64;
             }
         }
+        crate::failpoints::maybe_fail("heap::sync_data")
+            .map_err(|e| OmniError::IoError(format!("heap failure point: {e}")))?;
         heap.sync_data()?;
         self.heap_offset
             .store(offset + data.len() as u64, Ordering::SeqCst);
@@ -1915,6 +1917,8 @@ impl OmniKV {
             .heap_file
             .lock()
             .map_err(|_| OmniError::LockPoisoned("heap_file".into()))?;
+        crate::failpoints::maybe_fail("heap::sync_all")
+            .map_err(|e| OmniError::IoError(format!("heap failure point: {e}")))?;
         heap.sync_all()?;
         Ok(())
     }
@@ -1929,6 +1933,21 @@ impl OmniKV {
     /// This allows multiple concurrent batches to overlap their CPU-intensive
     /// compression work and only serialize briefly for sequence numbering.
     pub fn commit_batch(&self, tx: &WriteBatch) -> Result<u64, OmniError> {
+        for key in tx
+            .buffered_writes
+            .iter()
+            .map(|(key, _, _)| key.as_slice())
+            .chain(tx.buffered_deletes.iter().map(Vec::as_slice))
+        {
+            if key.starts_with(b"__sys__/raft/")
+                || key.starts_with(b"__2PC_LOG__/")
+                || key.starts_with(b"__2PC_PREPARE__/")
+            {
+                return Err(OmniError::IoError(
+                    "reserved consensus/transaction system key".into(),
+                ));
+            }
+        }
         // Clustered: client writes must be consensus-replicated before
         // they are acknowledged. The gateway proposes this batch as one
         // raft entry; raft's state machine (not this call) applies it
@@ -1937,6 +1956,15 @@ impl OmniKV {
         // too, since only the leader accepts client writes.
         if let Some(gateway) = self.cluster_gateway.get() {
             return gateway.commit_batch(tx);
+        }
+        self.commit_batch_local(tx)
+    }
+
+    /// Engine-owned distributed transaction metadata is reserved from client
+    /// writes, but must replicate with its data when consensus is configured.
+    pub(crate) fn commit_2pc_batch(&self, tx: &WriteBatch) -> Result<u64, OmniError> {
+        if let Some(gateway) = self.cluster_gateway.get() {
+            return gateway.commit_2pc_batch(tx);
         }
         self.commit_batch_local(tx)
     }
@@ -2191,9 +2219,12 @@ impl OmniKV {
             .lock()
             .map_err(|_| OmniError::LockPoisoned("wal lock".into()))?;
 
-        let result = heap
-            .sync_data()
-            .map_err(|e| OmniError::IoError(format!("group commit heap fsync failed: {e}")))
+        let result = crate::failpoints::maybe_fail("heap::sync_data")
+            .map_err(|e| OmniError::IoError(format!("heap failure point: {e}")))
+            .and_then(|()| {
+                heap.sync_data()
+                    .map_err(|e| OmniError::IoError(format!("group commit heap fsync failed: {e}")))
+            })
             .and_then(|()| {
                 wal.sync()
                     .map_err(|e| OmniError::IoError(format!("group commit wal fsync failed: {e}")))
@@ -2308,7 +2339,12 @@ impl OmniKV {
         let shard = shard_idx(&target_key);
 
         let memtable = self.roots.load().memtable.clone();
-        for entry in memtable[shard].range((target_key.clone(), Reverse(read_seq))..) {
+        // SkipMap's second key is `Reverse(seq)`, so an exclusive lower bound
+        // at `Reverse(read_seq + 1)` includes the version whose sequence is
+        // exactly `read_seq`. This matches the inclusive `seq <= read_seq`
+        // rule used by SSTables.
+        let memtable_start = Reverse(read_seq.saturating_add(1));
+        for entry in memtable[shard].range((target_key.clone(), memtable_start)..) {
             if entry.key().0 != target_key {
                 break;
             }
@@ -2330,7 +2366,8 @@ impl OmniKV {
 
         let frozen_memtables = self.roots.load().frozen_memtables.clone();
         for frozen in frozen_memtables.iter().rev() {
-            for entry in frozen[shard].range((target_key.clone(), Reverse(read_seq))..) {
+            let frozen_start = Reverse(read_seq.saturating_add(1));
+            for entry in frozen[shard].range((target_key.clone(), frozen_start)..) {
                 if entry.key().0 != target_key {
                     break;
                 }
@@ -2449,7 +2486,8 @@ impl OmniKV {
         // Memtable (highest priority â€” newest data)
         let active_mem = self.roots.load().memtable.clone();
         for shard in active_mem.iter() {
-            for entry in shard.range((start_key.clone(), Reverse(read_seq))..) {
+            let memtable_start = Reverse(read_seq.saturating_add(1));
+            for entry in shard.range((start_key.clone(), memtable_start)..) {
                 let key = entry.key().0.clone();
                 if key > end_key {
                     break;
@@ -2472,7 +2510,8 @@ impl OmniKV {
         let frozen = self.roots.load().frozen_memtables.clone();
         for f_mem in frozen.iter().rev() {
             for shard in f_mem.iter() {
-                for entry in shard.range((start_key.clone(), Reverse(read_seq))..) {
+                let frozen_start = Reverse(read_seq.saturating_add(1));
+                for entry in shard.range((start_key.clone(), frozen_start)..) {
                     let key = entry.key().0.clone();
                     if key > end_key {
                         break;
@@ -2579,7 +2618,8 @@ impl OmniKV {
 
         // 1. Active memtable
         let memtable = self.roots.load().memtable.clone();
-        for entry in memtable[shard].range((target_key.clone(), Reverse(read_seq))..) {
+        let memtable_start = Reverse(read_seq.saturating_add(1));
+        for entry in memtable[shard].range((target_key.clone(), memtable_start)..) {
             if entry.key().0 != target_key {
                 break;
             }
@@ -2591,7 +2631,8 @@ impl OmniKV {
         // 2. Frozen memtables
         let frozen_memtables = self.roots.load().frozen_memtables.clone();
         for frozen in frozen_memtables.iter().rev() {
-            for entry in frozen[shard].range((target_key.clone(), Reverse(read_seq))..) {
+            let frozen_start = Reverse(read_seq.saturating_add(1));
+            for entry in frozen[shard].range((target_key.clone(), frozen_start)..) {
                 if entry.key().0 != target_key {
                     break;
                 }

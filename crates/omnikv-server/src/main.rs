@@ -193,24 +193,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         bootstrap_admin_key: cfg.bootstrap_admin_key.clone(),
         manifest_path,
         wal_path,
+        backup_dir: cfg.storage.backup_dir.clone(),
         rate_limiter: rate_limiter.clone(),
         cluster_gateway: cluster.as_ref().map(|c| c.gateway.clone()),
         cluster_node_id: cfg.raft.node_id,
     };
 
+    let raft_tls = cluster
+        .as_ref()
+        .filter(|_| cfg.raft.tls)
+        .map(|_| server_tls.for_next_listener());
+    let raft_ca_pem = if cfg.raft.tls {
+        cfg.raft
+            .tls_ca_path
+            .as_deref()
+            .map(std::fs::read)
+            .transpose()?
+    } else {
+        None
+    };
     let (http_handle, quic_handle, tcp_handle) =
         spawn_protocol_servers(db, &cfg, rate_limiter, app_state, server_tls).await?;
 
     // ─── 5. Raft consensus listener (cluster mode only) ───────
     // Serves /raft/{append,vote,snapshot} for this node's peers on the
-    // dedicated plaintext port — ON the consensus runtime (never the
-    // client-facing server runtime), so parked client workers can't
-    // starve peer RPCs either. A dead listener means a deaf cluster
+    // dedicated listener — HTTPS in production — ON the consensus runtime
+    // (never the client-facing server runtime), so parked client workers
+    // cannot starve peer RPCs either. A dead listener means a deaf cluster
     // member, so its exit is handled like any other server exit below.
     let raft_handle = cluster.map(|node| {
         let handle = node.gateway.consensus_handle.clone();
         handle.spawn(async move {
-            if let Err(e) = raft_node::serve_raft_rpc(node).await {
+            if let Err(e) = raft_node::serve_raft_rpc(node, raft_tls, raft_ca_pem).await {
                 tracing::error!("Raft consensus listener exited: {e}");
             }
         })
