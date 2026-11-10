@@ -276,12 +276,10 @@ impl RowIterator for SeqScanIter {
     }
 }
 
-/// Index-backed point/range scan. The index stores primary keys as values;
-/// this iterator resolves those keys back to table rows at the statement's
-/// MVCC point and leaves predicate evaluation to the normal FilterIter above
-/// it. Materialising the matched key set is bounded by the selectivity of the
-/// index and, unlike the old implementation, never silently falls back to a
-/// full table scan while claiming an IndexScan plan.
+/// Index-backed point/range scan. Resolves primary keys stored in the index
+/// back to table rows at the statement's MVCC point. Predicate evaluation
+/// stays in the FilterIter above. The matched key set is bounded by index
+/// selectivity — never a silent full-table fallback.
 pub struct IndexScanIter {
     rows: Vec<Row>,
     pos: usize,

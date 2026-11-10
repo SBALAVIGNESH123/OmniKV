@@ -649,6 +649,13 @@ impl ServerConfig {
         if self.mode == ServerMode::Production {
             self.validate_production()?;
         }
+        if self.tls_insecure_skip {
+            eprintln!(
+                "WARNING: OMNIKV_TLS_INSECURE_SKIP is enabled — \
+                 peer certificate verification is disabled. \
+                 Do NOT use this in production."
+            );
+        }
         Ok(())
     }
 

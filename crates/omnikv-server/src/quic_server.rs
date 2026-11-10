@@ -217,11 +217,9 @@ pub async fn run_quic_server(endpoint: Endpoint, db: Arc<OmniKV>, rate_limiter: 
 
 /// Read exactly one length-prefixed request frame from a QUIC stream.
 ///
-/// QUIC stream reads are allowed to split an application frame at any byte
-/// boundary. The old one-read implementation treated a partial read as a
-/// complete request and silently capped every request at 64 KiB. This helper
-/// reads the fixed length first, validates the explicit cap before allocating,
-/// and then loops until the whole frame arrives.
+/// QUIC streams can split a frame at any byte boundary. This reads the
+/// length prefix first, validates the cap, then loops until the full
+/// payload arrives.
 async fn read_quic_frame(recv: &mut RecvStream) -> Result<Vec<u8>, String> {
     let mut length_bytes = [0u8; QUIC_FRAME_LENGTH_BYTES];
     read_quic_exact(recv, &mut length_bytes).await?;

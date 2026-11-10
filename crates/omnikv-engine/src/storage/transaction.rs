@@ -270,6 +270,8 @@ const COMMIT_STRIPE_COUNT: usize = 64;
 pub struct SsiHistory {
     /// Recently committed transactions, kept for conflict detection.
     committed_txns: Mutex<Vec<CommittedTxn>>,
+    /// Hard ceiling to prevent unbounded growth between prunes.
+    max_entries: usize,
 }
 
 impl SsiHistory {
@@ -282,6 +284,11 @@ impl SsiHistory {
             .committed_txns
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        if committed.len() >= self.max_entries {
+            // Evict the oldest quarter to amortize the drain cost.
+            let drain_count = self.max_entries / 4;
+            committed.drain(..drain_count);
+        }
         committed.push(CommittedTxn {
             txn_id,
             commit_seq,
@@ -513,6 +520,7 @@ impl Default for SsiHistory {
     fn default() -> Self {
         Self {
             committed_txns: Mutex::new(Vec::new()),
+            max_entries: 100_000,
         }
     }
 }

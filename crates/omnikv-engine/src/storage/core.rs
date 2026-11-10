@@ -1247,6 +1247,9 @@ pub struct OmniKV {
     scan_buffer_pool: Arc<ScanBufferPool>,
     compaction_policy: RwLock<CompactionPolicy>,
 
+    // Wakes writers stalled on L0 compaction backlog.
+    compaction_cv: (std::sync::Mutex<()>, std::sync::Condvar),
+
     // ── Group commit engine ──
     // Batches concurrent fsyncs: N writers → 1 fsync instead of N fsyncs.
     group_commit: crate::hardening::GroupCommitEngine,
@@ -1373,6 +1376,7 @@ impl OmniKV {
             block_cache: moka::sync::Cache::builder().max_capacity(100_000).build(),
             scan_buffer_pool: Arc::new(ScanBufferPool::default()),
             compaction_policy: RwLock::new(CompactionPolicy::default()),
+            compaction_cv: (std::sync::Mutex::new(()), std::sync::Condvar::new()),
             // Group commit: wait up to 200µs for more writers to join each batch.
             // On SSDs, this batches 5-50 concurrent writes into a single fsync.
             group_commit: crate::hardening::GroupCommitEngine::new(200),
@@ -2000,15 +2004,22 @@ impl OmniKV {
         metrics_prometheus::record_compaction_backlog(self.compaction_backlog_sstables());
         if l0_sstables >= compaction_policy.l0_write_stall_threshold {
             let mut stalled = true;
+            let (ref stall_lock, ref cv) = self.compaction_cv;
+            let mut guard = stall_lock.lock().unwrap_or_else(|e| e.into_inner());
             for _ in 0..compaction_policy.write_stall_wait_attempts {
-                std::thread::sleep(std::time::Duration::from_millis(
-                    compaction_policy.write_stall_wait_ms,
-                ));
+                let (returned, _timeout) = cv
+                    .wait_timeout(
+                        guard,
+                        std::time::Duration::from_millis(compaction_policy.write_stall_wait_ms),
+                    )
+                    .unwrap_or_else(|e| e.into_inner());
+                guard = returned;
                 if self.sstable_count() < compaction_policy.l0_write_stall_threshold {
                     stalled = false;
                     break;
                 }
             }
+            drop(guard);
             if stalled {
                 metrics_prometheus::record_write_stall();
                 return Err(OmniError::WriteStall);
@@ -2720,7 +2731,9 @@ impl OmniKV {
             .transition_guard
             .read()
             .map_err(|_| OmniError::LockPoisoned("transition_guard".into()))?;
-        self.compact_sstables_locked()
+        let result = self.compact_sstables_locked();
+        self.compaction_cv.1.notify_all();
+        result
     }
 
     /// Compacts the active memtable while the caller already holds the

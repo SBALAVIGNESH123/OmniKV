@@ -184,7 +184,7 @@ impl TwoPhaseCoordinator {
             timeout_ms: self.default_timeout_ms,
         };
 
-        let mut active = self.active_txns.lock().expect("coordinator lock");
+        let mut active = self.active_txns.lock().unwrap_or_else(|e| e.into_inner());
         active.insert(txn_id, txn);
         txn_id
     }
@@ -359,7 +359,7 @@ impl TwoPhaseCoordinator {
             .unwrap_or_default()
             .as_millis() as u64;
 
-        let active = self.active_txns.lock().expect("coordinator lock");
+        let active = self.active_txns.lock().unwrap_or_else(|e| e.into_inner());
         let mut timed_out = Vec::new();
 
         for (id, txn) in active.iter() {
@@ -473,6 +473,38 @@ impl TwoPhaseCoordinator {
         batch.set(&log_key, log_value)?;
         self.db.commit_2pc_batch(&batch)?;
         Ok(())
+    }
+
+    /// Removes completed (COMMITTED/ABORTED) coordinator log entries older
+    /// than `max_age_secs`. Returns the number of entries purged.
+    pub fn gc_completed_logs(&self, max_age_secs: u64) -> Result<usize, OmniError> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let entries = self
+            .db
+            .scan("__2PC_LOG__/", "__2PC_LOG__/~", self.db.get_seq())?;
+        let mut purged = 0;
+        let mut batch = WriteBatch::new();
+        for (key, value) in &entries {
+            let entry: Result<TwoPhaseLogEntry, _> = serde_json::from_str(value);
+            let dominated = match &entry {
+                Ok(e) => {
+                    let terminal = e.state == "COMMIT" || e.state == "ABORT";
+                    terminal && now.saturating_sub(e.timestamp) > max_age_secs
+                }
+                Err(_) => now > max_age_secs, // corrupt entry — safe to remove
+            };
+            if dominated {
+                batch.delete(key)?;
+                purged += 1;
+            }
+        }
+        if purged > 0 {
+            self.db.commit_2pc_batch(&batch)?;
+        }
+        Ok(purged)
     }
 }
 
@@ -775,7 +807,7 @@ impl TwoPhaseParticipant {
                     let _ = self.db.commit_2pc_batch(&update);
                 }
                 // Store the prepared batch for later commit
-                let mut prepared = self.prepared.lock().expect("participant lock");
+                let mut prepared = self.prepared.lock().unwrap_or_else(|e| e.into_inner());
                 prepared.insert(
                     txn_id,
                     PreparedState {
@@ -1032,7 +1064,7 @@ impl TwoPhaseParticipant {
 
     /// Check for stale prepared transactions (for recovery).
     pub fn stale_prepared(&self, max_age: Duration) -> Vec<GlobalTxnId> {
-        let prepared = self.prepared.lock().expect("participant lock");
+        let prepared = self.prepared.lock().unwrap_or_else(|e| e.into_inner());
         prepared
             .iter()
             .filter(|(_, state)| state.prepared_at.elapsed() > max_age)

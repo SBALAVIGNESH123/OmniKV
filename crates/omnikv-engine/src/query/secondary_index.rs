@@ -621,10 +621,10 @@ impl IndexManager {
         self.write_new_index_entries(&entries, primary_key, batch)
     }
 
-    /// Replaces all index entries for one row in the same batch. In
-    /// particular, an UPDATE that leaves an indexed value unchanged must not
-    /// append both a SET and DELETE for the same key: storage applies deletes
-    /// after writes, so that naïve sequence would silently remove the index.
+    /// Replaces all index entries for one row in the same batch. An UPDATE
+    /// that leaves an indexed value unchanged must not emit both SET and
+    /// DELETE for the same key — deletes apply after writes, so the entry
+    /// would vanish.
     pub fn replace_document_indexes(
         &self,
         collection: &str,
