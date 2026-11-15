@@ -615,7 +615,7 @@ async fn cluster_status_handler(
             node_id: state.cluster_node_id,
             leader_id: metrics.current_leader,
             term: metrics.current_term,
-            last_applied_index: metrics.last_applied.map(|l| l.index).unwrap_or_default(),
+            last_applied_index: metrics.last_applied.map_or_default(|l| l.index),
             members,
         }),
     )
