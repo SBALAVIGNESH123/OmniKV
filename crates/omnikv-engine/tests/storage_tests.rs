@@ -2139,3 +2139,71 @@ fn test_2pc_terminal_decisions_cannot_be_reversed_after_recovery() {
         Some("value".into())
     );
 }
+
+#[test]
+fn test_2pc_prepared_reservation_blocks_local_ssi_and_commit_records_history() {
+    let (db, _dir) = create_test_db();
+    let mgr = omni_engine::transaction::TransactionManager::new(db.clone());
+    let participant = TwoPhaseParticipant::new(1, db.clone());
+    let txn_2pc = (9, 1);
+    let writes = vec![DistWrite {
+        node_id: 1,
+        key: "shared_key".into(),
+        value: Some("from_2pc".into()),
+        ttl: 0,
+    }];
+
+    let mut blocked_while_prepared = mgr.begin();
+    mgr.set(
+        &mut blocked_while_prepared,
+        "shared_key",
+        "local_while_prepared".into(),
+    )
+    .unwrap();
+
+    let mut blocked_after_commit = mgr.begin();
+    mgr.set(
+        &mut blocked_after_commit,
+        "shared_key",
+        "local_after_commit".into(),
+    )
+    .unwrap();
+
+    let prep = participant.prepare(txn_2pc, &writes);
+    assert!(matches!(prep.vote, Vote::Commit));
+
+    let mut direct_batch = WriteBatch::new();
+    direct_batch
+        .set("shared_key", "direct_overwrite".into())
+        .unwrap();
+    assert!(
+        db.commit_batch(&direct_batch).is_err(),
+        "direct commit_batch must reject keys held by a prepared 2PC txn"
+    );
+    assert!(
+        mgr.commit(&mut blocked_while_prepared).is_err(),
+        "local SSI commit must abort while key is prepared by 2PC"
+    );
+    assert_eq!(
+        blocked_while_prepared.state,
+        omni_engine::transaction::TxnState::Aborted
+    );
+
+    participant.commit(txn_2pc).unwrap();
+    assert_eq!(
+        db.find("shared_key", db.get_seq()).unwrap().as_deref(),
+        Some("from_2pc")
+    );
+    assert!(
+        mgr.commit(&mut blocked_after_commit).is_err(),
+        "local SSI txn started before 2PC commit must conflict with recorded SsiHistory"
+    );
+    assert!(
+        db.commit_batch(&direct_batch).is_ok(),
+        "direct commit_batch succeeds once 2PC releases its reservation"
+    );
+    assert_eq!(
+        db.find("shared_key", db.get_seq()).unwrap().as_deref(),
+        Some("direct_overwrite")
+    );
+}

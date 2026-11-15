@@ -950,6 +950,7 @@ fn resolve_safe_child(root: &FsPath, requested: &str, label: &str) -> Result<Pat
     }
 }
 
+#[allow(clippy::too_many_lines)]
 async fn restore_handler(
     State(state): State<AppState>,
     Extension(claims): Extension<crate::auth::Claims>,
@@ -958,6 +959,7 @@ async fn restore_handler(
     let backup_root = FsPath::new(&state.backup_dir);
     let data_root = FsPath::new(&state.manifest_path)
         .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| FsPath::new("."));
     if !backup_root.is_dir() {
         audit_claims_event(
@@ -1013,24 +1015,54 @@ async fn restore_handler(
             ApiResponse::<String>::err("backup not found"),
         );
     }
-    if restore_dir.exists() {
-        audit_claims_event(
-            "restore.started",
-            AuditOutcome::Denied,
-            &claims,
-            "/admin/restore",
-            "restore_target_exists",
-        );
+    if let Some(parent) = restore_dir.parent()
+        && !parent.as_os_str().is_empty()
+        && let Err(e) = std::fs::create_dir_all(parent)
+    {
         return (
-            StatusCode::CONFLICT,
-            ApiResponse::<String>::err("restore directory already exists"),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            ApiResponse::<String>::err(&sanitize_err(&e)),
         );
+    }
+    match std::fs::create_dir(&restore_dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            audit_claims_event(
+                "restore.started",
+                AuditOutcome::Denied,
+                &claims,
+                "/admin/restore",
+                "restore_target_exists",
+            );
+            return (
+                StatusCode::CONFLICT,
+                ApiResponse::<String>::err("restore directory already exists"),
+            );
+        }
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ApiResponse::<String>::err(&sanitize_err(&e)),
+            );
+        }
     }
 
     let backup_path = backup_path.to_string_lossy().into_owned();
     let restore_dir = restore_dir.to_string_lossy().into_owned();
-    match omni_engine::backup::restore_backup(&backup_path, &restore_dir) {
-        Ok(()) => {
+    let restore_dir_cleanup = restore_dir.clone();
+    audit_claims_event(
+        "restore.started",
+        AuditOutcome::Success,
+        &claims,
+        "/admin/restore",
+        "restore_accepted",
+    );
+    let result = tokio::task::spawn_blocking(move || {
+        omni_engine::backup::restore_backup(&backup_path, &restore_dir)
+    })
+    .await;
+    match result {
+        Ok(Ok(())) => {
             audit_claims_event(
                 "restore.completed",
                 AuditOutcome::Success,
@@ -1040,7 +1072,8 @@ async fn restore_handler(
             );
             (StatusCode::OK, ApiResponse::ok(restore_dir_name))
         }
-        Err(error) => {
+        Ok(Err(error)) => {
+            let _ = std::fs::remove_dir_all(&restore_dir_cleanup);
             audit_claims_event(
                 "restore.completed",
                 AuditOutcome::Failure,
@@ -1051,6 +1084,20 @@ async fn restore_handler(
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 ApiResponse::<String>::err(&sanitize_err(&error)),
+            )
+        }
+        Err(join_error) => {
+            let _ = std::fs::remove_dir_all(&restore_dir_cleanup);
+            audit_claims_event(
+                "restore.completed",
+                AuditOutcome::Failure,
+                &claims,
+                "/admin/restore",
+                "restore_task_panicked",
+            );
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ApiResponse::<String>::err(&format!("restore task failed: {join_error}")),
             )
         }
     }

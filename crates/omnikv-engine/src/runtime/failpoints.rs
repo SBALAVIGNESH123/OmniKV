@@ -72,9 +72,13 @@ pub fn maybe_fail(name: &str) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn arm_and_disarm() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let reg = FailRegistry::new();
         reg.reset();
         assert!(!reg.is_armed("wal_sync"));
@@ -86,6 +90,7 @@ mod tests {
 
     #[test]
     fn reset_clears_all() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let reg = FailRegistry::new();
         reg.reset();
         reg.arm("a");
@@ -97,6 +102,7 @@ mod tests {
 
     #[test]
     fn clone_shares_state() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let reg = FailRegistry::new();
         reg.reset();
         let reg2 = reg.clone();
@@ -107,6 +113,7 @@ mod tests {
 
     #[test]
     fn disarmed_failure_point_is_a_noop() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let reg = FailRegistry::new();
         reg.reset();
         assert!(maybe_fail("not-armed").is_ok());

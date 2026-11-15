@@ -9,6 +9,7 @@ x-omnikv-common-env: &omnikv-common-env
   # inside the container, reachable via `docker exec` for debugging.
   OMNIKV_TCP_ADDR: "127.0.0.1:7072"
   OMNIKV_BACKUP_DIR: "/data/backups"
+  OMNIKV_MODE: "${OMNIKV_MODE:-production}"
   # Set true only for local demos with generated self-signed certificates.
   # Production deployments should provide trusted client/server TLS material
   # and OMNIKV_RAFT_TLS_CA_PATH in their deployment environment.

@@ -7,7 +7,7 @@
 use omni_engine::hardening::RateLimiter;
 use omni_engine::metrics_prometheus;
 use omni_engine::{OmniKV, WriteBatch};
-use quinn::{ClientConfig, Endpoint, RecvStream, ServerConfig};
+use quinn::{ClientConfig, Endpoint, RecvStream, ServerConfig, TransportConfig};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use std::sync::Arc;
 
@@ -114,10 +114,15 @@ pub fn create_server_endpoint(
 
     server_crypto.alpn_protocols = vec![b"omnikv/1".to_vec()];
 
-    let server_config = ServerConfig::with_crypto(Arc::new(
+    let mut transport_config = TransportConfig::default();
+    transport_config.max_concurrent_bidi_streams(64u32.into());
+    transport_config.max_concurrent_uni_streams(0u32.into());
+
+    let mut server_config = ServerConfig::with_crypto(Arc::new(
         quinn::crypto::rustls::QuicServerConfig::try_from(server_crypto)
             .map_err(|e| format!("QUIC server config: {}", e))?,
     ));
+    server_config.transport_config(Arc::new(transport_config));
 
     let addr = bind_addr
         .parse()
@@ -193,7 +198,13 @@ pub async fn run_quic_server(endpoint: Endpoint, db: Arc<OmniKV>, rate_limiter: 
                         let secret = jwt_secret.clone();
                         let rate_limiter = rate_limiter.clone();
                         tokio::spawn(async move {
-                            let response = match read_quic_frame(&mut recv).await {
+                            let read = tokio::time::timeout(
+                                std::time::Duration::from_secs(10),
+                                read_quic_frame(&mut recv),
+                            )
+                            .await
+                            .unwrap_or_else(|_| Err("READ_TIMEOUT".to_string()));
+                            let response = match read {
                                 Ok(frame) => handle_authenticated_request(
                                     &db,
                                     &frame,
@@ -227,8 +238,26 @@ async fn read_quic_frame(recv: &mut RecvStream) -> Result<Vec<u8>, String> {
 
     validate_quic_frame_length(frame_len)?;
 
-    let mut frame = vec![0u8; frame_len];
-    read_quic_exact(recv, &mut frame).await?;
+    let mut auth_len_bytes = [0u8; QUIC_AUTH_LENGTH_BYTES];
+    read_quic_exact(recv, &mut auth_len_bytes).await?;
+    let auth_len = u16::from_le_bytes(auth_len_bytes) as usize;
+    if auth_len == 0 || auth_len > MAX_QUIC_AUTH_BYTES {
+        return Err("INVALID_AUTH_HEADER".to_string());
+    }
+    if QUIC_AUTH_LENGTH_BYTES + auth_len >= frame_len {
+        return Err("INVALID_FRAME".to_string());
+    }
+
+    let mut frame = Vec::with_capacity(frame_len.min(64 * 1024));
+    frame.extend_from_slice(&auth_len_bytes);
+    let mut remaining = frame_len - QUIC_AUTH_LENGTH_BYTES;
+    let mut chunk = [0u8; 8192];
+    while remaining > 0 {
+        let to_read = remaining.min(chunk.len());
+        read_quic_exact(recv, &mut chunk[..to_read]).await?;
+        frame.extend_from_slice(&chunk[..to_read]);
+        remaining -= to_read;
+    }
     Ok(frame)
 }
 

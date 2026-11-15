@@ -399,6 +399,7 @@ impl SchemaManager {
     ) -> Result<(), OmniError> {
         self.index_manager.refresh_catalog()?;
         let seq = self.db.get_seq();
+        let catalog = self.index_manager.catalog_snapshot_at(seq)?;
 
         let mut batch = WriteBatch::new();
         let mut count = 0;
@@ -424,7 +425,8 @@ impl SchemaManager {
                     let updated = serde_json::to_string(&doc)
                         .map_err(|e| OmniError::IoError(e.to_string()))?;
                     let primary_key = key.strip_prefix(&prefix).unwrap_or(&key);
-                    self.index_manager.replace_document_indexes(
+                    self.index_manager.replace_document_indexes_with_catalog(
+                        &catalog,
                         collection,
                         primary_key,
                         &old_doc,
@@ -460,6 +462,21 @@ impl SchemaManager {
     ) -> Result<(), OmniError> {
         self.index_manager.refresh_catalog()?;
         let seq = self.db.get_seq();
+        let catalog = self.index_manager.catalog_snapshot_at(seq)?;
+
+        for (prefix, end) in collection_row_ranges(collection) {
+            for (_, value) in self.db.scan(&prefix, &end, seq)? {
+                if let Ok(serde_json::Value::Object(obj)) = serde_json::from_str(&value)
+                    && obj.contains_key(old_name)
+                    && obj.contains_key(new_name)
+                {
+                    return Err(OmniError::IoError(format!(
+                        "cannot rename field '{}' to '{}' because the destination exists",
+                        old_name, new_name
+                    )));
+                }
+            }
+        }
 
         let mut batch = WriteBatch::new();
         let mut count = 0;
@@ -484,7 +501,8 @@ impl SchemaManager {
                     let updated = serde_json::to_string(&doc)
                         .map_err(|e| OmniError::IoError(e.to_string()))?;
                     let primary_key = key.strip_prefix(&prefix).unwrap_or(&key);
-                    self.index_manager.replace_document_indexes(
+                    self.index_manager.replace_document_indexes_with_catalog(
+                        &catalog,
                         collection,
                         primary_key,
                         &old_doc,

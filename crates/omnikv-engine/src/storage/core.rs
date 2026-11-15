@@ -1927,6 +1927,18 @@ impl OmniKV {
         Ok(())
     }
 
+    pub(crate) fn validate_client_key_bytes(key: &[u8]) -> Result<(), OmniError> {
+        if key.starts_with(b"__sys__/raft/")
+            || key.starts_with(b"__2PC_LOG__/")
+            || key.starts_with(b"__2PC_PREPARE__/")
+        {
+            return Err(OmniError::IoError(
+                "reserved consensus/transaction system key".into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Commits a batch of write operations atomically.
     ///
     /// Uses a 3-phase pipelined write (inspired by RocksDB):
@@ -1943,13 +1955,11 @@ impl OmniKV {
             .map(|(key, _, _)| key.as_slice())
             .chain(tx.buffered_deletes.iter().map(Vec::as_slice))
         {
-            if key.starts_with(b"__sys__/raft/")
-                || key.starts_with(b"__2PC_LOG__/")
-                || key.starts_with(b"__2PC_PREPARE__/")
+            Self::validate_client_key_bytes(key)?;
+            if let Ok(key_str) = std::str::from_utf8(key)
+                && let Some(conflict) = self.ssi_history.check_prepared_write_conflict(key_str)
             {
-                return Err(OmniError::IoError(
-                    "reserved consensus/transaction system key".into(),
-                ));
+                return Err(OmniError::IoError(conflict));
             }
         }
         // Clustered: client writes must be consensus-replicated before
@@ -1971,6 +1981,25 @@ impl OmniKV {
             return gateway.commit_2pc_batch(tx);
         }
         self.commit_batch_local(tx)
+    }
+
+    pub(crate) fn commit_2pc_batch_with_ssi(
+        &self,
+        tx: &WriteBatch,
+        ssi: crate::transaction::SsiCommitRecord,
+    ) -> Result<u64, OmniError> {
+        if let Some(gateway) = self.cluster_gateway.get() {
+            return gateway.commit_2pc_batch_with_ssi(tx, ssi);
+        }
+        let _topology_guard = self
+            .transition_guard
+            .read()
+            .map_err(|_| OmniError::LockPoisoned("transition_guard".into()))?;
+        let commit_seq = self.commit_batch_local_locked(tx)?;
+        self.ssi_history
+            .record_committed(ssi.txn_id, commit_seq, &ssi);
+        self.ssi_history.prune(self.min_active_snapshot());
+        Ok(commit_seq)
     }
 
     /// The single-node commit path, also used by the raft state machine

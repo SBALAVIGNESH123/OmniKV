@@ -267,9 +267,12 @@ const COMMIT_STRIPE_COUNT: usize = 64;
 /// The `commit_seq` each entry is recorded at is per-node (every node's
 /// sequence counter is its own), so it is stamped by the apply from the
 /// LOCAL batch marker, never carried across the wire.
+type PreparedKeyOwner = (u64, (u64, u64));
+
 pub struct SsiHistory {
     /// Recently committed transactions, kept for conflict detection.
     committed_txns: Mutex<Vec<CommittedTxn>>,
+    prepared_keys: Mutex<HashMap<String, PreparedKeyOwner>>,
     /// Hard ceiling to prevent unbounded growth between prunes.
     max_entries: usize,
 }
@@ -302,6 +305,88 @@ impl SsiHistory {
     /// conflict detection.
     pub fn committed_record_count(&self) -> usize {
         self.committed_txns.lock().map(|c| c.len()).unwrap_or(0)
+    }
+
+    pub(crate) fn reserve_prepared_keys(
+        &self,
+        node_id: u64,
+        txn_id: (u64, u64),
+        keys: &[String],
+    ) -> Result<(), String> {
+        let mut prepared = self.prepared_keys.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((conflict_key, (_, conflict_txn))) = keys.iter().find_map(|key| {
+            prepared
+                .get(key)
+                .copied()
+                .filter(|&owner| owner != (node_id, txn_id))
+                .map(|owner| (key, owner))
+        }) {
+            return Err(format!(
+                "prepared key '{}' is reserved by transaction {:?}",
+                conflict_key, conflict_txn
+            ));
+        }
+        for key in keys {
+            prepared.insert(key.clone(), (node_id, txn_id));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn release_prepared_keys(&self, node_id: u64, txn_id: (u64, u64), keys: &[String]) {
+        let mut prepared = self.prepared_keys.lock().unwrap_or_else(|e| e.into_inner());
+        for key in keys {
+            if prepared
+                .get(key)
+                .is_some_and(|&owner| owner == (node_id, txn_id))
+            {
+                prepared.remove(key);
+            }
+        }
+    }
+
+    pub(crate) fn replace_prepared_keys_for_node(
+        &self,
+        node_id: u64,
+        keys: &HashMap<String, (u64, u64)>,
+    ) -> Result<(), String> {
+        let mut prepared = self.prepared_keys.lock().unwrap_or_else(|e| e.into_inner());
+        for key in keys.keys() {
+            if let Some(&(owner_node, owner_txn)) = prepared.get(key)
+                && owner_node != node_id
+            {
+                return Err(format!(
+                    "prepared key '{}' is reserved by transaction {:?}",
+                    key, owner_txn
+                ));
+            }
+        }
+        prepared.retain(|_, (owner_node, _)| *owner_node != node_id);
+        for (key, txn_id) in keys {
+            prepared.insert(key.clone(), (node_id, *txn_id));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn check_prepared_write_conflict(&self, key: &str) -> Option<String> {
+        let prepared = self.prepared_keys.lock().unwrap_or_else(|e| e.into_inner());
+        prepared.get(key).map(|(node_id, txn_id)| {
+            format!(
+                "SSI CONFLICT (2PC): prepared key '{}' is reserved by node {} txn {:?}",
+                key, node_id, txn_id
+            )
+        })
+    }
+
+    fn check_prepared_txn_write_conflicts(&self, txn: &Transaction) -> Option<String> {
+        let prepared = self.prepared_keys.lock().unwrap_or_else(|e| e.into_inner());
+        txn.write_set.keys().find_map(|key| {
+            prepared.get(key).map(|(node_id, txn_id)| {
+                format!(
+                    "SSI CONFLICT (2PC): prepared key '{}' is reserved by node {} txn {:?}",
+                    key, node_id, txn_id
+                )
+            })
+        })
     }
 
     /// Checks whether a distributed prepare would conflict with a committed
@@ -397,15 +482,13 @@ impl SsiHistory {
         &self,
         txn: &Transaction,
     ) -> (Option<String>, std::sync::MutexGuard<'_, Vec<CommittedTxn>>) {
-        // The only lock SsiHistory takes, so there is no second lock to
-        // order against. Poison-tolerant like the stripes: a panicked
-        // holder never leaves the Vec torn.
+        let prepared_conflict = self.check_prepared_txn_write_conflicts(txn);
         let committed = self
             .committed_txns
             .lock()
             .unwrap_or_else(|e| e.into_inner());
 
-        let found = Self::scan_conflicts(txn, &committed);
+        let found = prepared_conflict.or_else(|| Self::scan_conflicts(txn, &committed));
         (found, committed)
     }
 
@@ -493,6 +576,9 @@ impl SsiHistory {
     /// stall every concurrent commit on the node for each consensus
     /// round trip.
     fn detect_conflicts(&self, txn: &Transaction) -> Option<String> {
+        if let Some(conflict) = self.check_prepared_txn_write_conflicts(txn) {
+            return Some(conflict);
+        }
         let committed = self
             .committed_txns
             .lock()
@@ -520,6 +606,7 @@ impl Default for SsiHistory {
     fn default() -> Self {
         Self {
             committed_txns: Mutex::new(Vec::new()),
+            prepared_keys: Mutex::new(HashMap::new()),
             max_entries: 100_000,
         }
     }
@@ -899,7 +986,16 @@ impl TransactionManager {
         }
 
         // No conflicts! Build the batch the SSI engine would apply.
-        let batch = Self::build_write_batch(txn)?;
+        let batch = match Self::build_write_batch(txn) {
+            Ok(batch) => batch,
+            Err(error) => {
+                drop(committed_guard);
+                txn.state = TxnState::Aborted;
+                self.cleanup_txn(txn.id, txn.read_seq);
+                self.metrics.txns_aborted.fetch_add(1, Ordering::Relaxed);
+                return Err(error);
+            }
+        };
         let commit_seq = self.db.commit_batch_local_locked(&batch)?;
 
         // Record this transaction by pushing into the guard we still hold
@@ -1007,6 +1103,7 @@ impl TransactionManager {
     fn build_write_batch(txn: &Transaction) -> Result<WriteBatch, OmniError> {
         let mut batch = WriteBatch::new();
         for (key, (value, ttl)) in &txn.write_set {
+            OmniKV::validate_client_key_bytes(key.as_bytes())?;
             match value {
                 Some(val) => {
                     if *ttl > 0 {

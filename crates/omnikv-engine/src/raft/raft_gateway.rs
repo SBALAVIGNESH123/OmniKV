@@ -294,6 +294,22 @@ impl ClusterGateway {
         Ok(ack.commit_seq)
     }
 
+    pub(crate) fn commit_2pc_batch_with_ssi(
+        &self,
+        batch: &crate::WriteBatch,
+        ssi: crate::transaction::SsiCommitRecord,
+    ) -> Result<u64, crate::OmniError> {
+        let _flight = self.flight_blocking();
+        let command = RaftCommand::from_batch_with_ssi(batch, ssi);
+        command
+            .protects_raft_keys()
+            .map_err(crate::OmniError::IoError)?;
+        let ack = self
+            .block_on_ctx(self.apply_proposal_locked(command))
+            .map_err(RaftWriteError::into_omni_error)?;
+        Ok(ack.commit_seq)
+    }
+
     /// The clustered SSI COMMIT: runs the transaction's validation
     /// under the flight lock (so no other proposal can land between
     /// its conflict checks and its consensus commit), then proposes the

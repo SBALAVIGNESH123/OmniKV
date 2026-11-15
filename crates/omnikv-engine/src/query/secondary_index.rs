@@ -577,6 +577,60 @@ impl IndexManager {
             .and_then(|catalog| catalog.get_by_name(name).map(|idx| idx.collection.clone()))
     }
 
+    pub fn append_drop_indexes_for_collection(
+        &self,
+        collection: &str,
+        batch: &mut WriteBatch,
+    ) -> Result<(), OmniError> {
+        self.append_drop_indexes_for_collection_at(collection, self.db.get_seq(), batch)
+    }
+
+    pub fn append_drop_indexes_for_collection_at(
+        &self,
+        collection: &str,
+        seq: u64,
+        batch: &mut WriteBatch,
+    ) -> Result<(), OmniError> {
+        let catalog = IndexCatalog::load_checked_at(&self.db, seq)?;
+        for def in catalog.indexes_for_collection(collection) {
+            let cat_key = format!("{}{}", CATALOG_PREFIX, def.id);
+            let ready_key = format!("{READY_PREFIX}{}", def.id);
+            let prefix = build_index_scan_prefix(def.id);
+            let end = format!("{}\x7f", prefix);
+            let staged_keys: Vec<String> = batch
+                .buffered_writes
+                .iter()
+                .filter_map(|(key, _, _)| {
+                    if key.starts_with(prefix.as_bytes()) {
+                        std::str::from_utf8(key).ok().map(str::to_string)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            batch.buffered_writes.retain(|(key, _, _)| {
+                key.as_slice() != cat_key.as_bytes()
+                    && key.as_slice() != ready_key.as_bytes()
+                    && !key.starts_with(prefix.as_bytes())
+            });
+            batch.delete(&cat_key)?;
+            batch.delete(&ready_key)?;
+            for key in staged_keys {
+                batch.delete(&key)?;
+            }
+            for (key, _) in self.db.scan(&prefix, &end, seq)? {
+                if !batch
+                    .buffered_deletes
+                    .iter()
+                    .any(|deleted| deleted.as_slice() == key.as_bytes())
+                {
+                    batch.delete(&key)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Returns a stable copy of an index definition for a query plan.
     pub fn definition(&self, name: &str) -> Result<IndexDefinition, OmniError> {
         self.definition_at(name, self.db.get_seq())
@@ -617,8 +671,38 @@ impl IndexManager {
         batch: &mut WriteBatch,
     ) -> Result<(), OmniError> {
         let catalog = self.catalog_snapshot()?;
-        let entries = index_entries(&catalog, collection, primary_key, document)?;
-        self.write_new_index_entries(&entries, primary_key, batch)
+        self.index_document_with_catalog(&catalog, collection, primary_key, document, batch)
+    }
+
+    pub fn index_document_with_catalog(
+        &self,
+        catalog: &IndexCatalog,
+        collection: &str,
+        primary_key: &str,
+        document: &serde_json::Value,
+        batch: &mut WriteBatch,
+    ) -> Result<(), OmniError> {
+        self.index_document_with_catalog_and_reads(
+            catalog,
+            collection,
+            primary_key,
+            document,
+            batch,
+            None,
+        )
+    }
+
+    pub fn index_document_with_catalog_and_reads(
+        &self,
+        catalog: &IndexCatalog,
+        collection: &str,
+        primary_key: &str,
+        document: &serde_json::Value,
+        batch: &mut WriteBatch,
+        read_collector: Option<&mut crate::volcano::ReadCollector>,
+    ) -> Result<(), OmniError> {
+        let entries = index_entries(catalog, collection, primary_key, document)?;
+        self.write_new_index_entries(&entries, primary_key, batch, read_collector)
     }
 
     /// Replaces all index entries for one row in the same batch. An UPDATE
@@ -635,8 +719,54 @@ impl IndexManager {
         batch: &mut WriteBatch,
     ) -> Result<(), OmniError> {
         let catalog = self.catalog_snapshot()?;
-        let old_entries = index_entries(&catalog, collection, old_primary_key, old_document)?;
-        let new_entries = index_entries(&catalog, collection, new_primary_key, new_document)?;
+        self.replace_document_indexes_with_catalog(
+            &catalog,
+            collection,
+            old_primary_key,
+            old_document,
+            new_primary_key,
+            new_document,
+            batch,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn replace_document_indexes_with_catalog(
+        &self,
+        catalog: &IndexCatalog,
+        collection: &str,
+        old_primary_key: &str,
+        old_document: &serde_json::Value,
+        new_primary_key: &str,
+        new_document: &serde_json::Value,
+        batch: &mut WriteBatch,
+    ) -> Result<(), OmniError> {
+        self.replace_document_indexes_with_catalog_and_reads(
+            catalog,
+            collection,
+            old_primary_key,
+            old_document,
+            new_primary_key,
+            new_document,
+            batch,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn replace_document_indexes_with_catalog_and_reads(
+        &self,
+        catalog: &IndexCatalog,
+        collection: &str,
+        old_primary_key: &str,
+        old_document: &serde_json::Value,
+        new_primary_key: &str,
+        new_document: &serde_json::Value,
+        batch: &mut WriteBatch,
+        read_collector: Option<&mut crate::volcano::ReadCollector>,
+    ) -> Result<(), OmniError> {
+        let old_entries = index_entries(catalog, collection, old_primary_key, old_document)?;
+        let new_entries = index_entries(catalog, collection, new_primary_key, new_document)?;
         let new_keys: std::collections::HashSet<&str> =
             new_entries.iter().map(|(_, key)| key.as_str()).collect();
 
@@ -645,7 +775,7 @@ impl IndexManager {
                 append_index_delete(batch, old_key)?;
             }
         }
-        self.write_new_index_entries(&new_entries, new_primary_key, batch)
+        self.write_new_index_entries(&new_entries, new_primary_key, batch, read_collector)
     }
 
     /// Removes index entries for a DELETE or pre-UPDATE cleanup.
@@ -657,7 +787,24 @@ impl IndexManager {
         batch: &mut WriteBatch,
     ) -> Result<(), OmniError> {
         let catalog = self.catalog_snapshot()?;
-        let entries = index_entries(&catalog, collection, primary_key, old_document)?;
+        self.remove_document_indexes_with_catalog(
+            &catalog,
+            collection,
+            primary_key,
+            old_document,
+            batch,
+        )
+    }
+
+    pub fn remove_document_indexes_with_catalog(
+        &self,
+        catalog: &IndexCatalog,
+        collection: &str,
+        primary_key: &str,
+        old_document: &serde_json::Value,
+        batch: &mut WriteBatch,
+    ) -> Result<(), OmniError> {
+        let entries = index_entries(catalog, collection, primary_key, old_document)?;
         for (_, key) in entries {
             append_index_delete(batch, &key)?;
         }
@@ -669,10 +816,17 @@ impl IndexManager {
         entries: &[(IndexDefinition, String)],
         primary_key: &str,
         batch: &mut WriteBatch,
+        mut read_collector: Option<&mut crate::volcano::ReadCollector>,
     ) -> Result<(), OmniError> {
         for (idx_def, idx_key) in entries {
             if idx_def.unique {
-                self.check_unique(idx_def, idx_key, primary_key, batch)?;
+                self.check_unique(
+                    idx_def,
+                    idx_key,
+                    primary_key,
+                    batch,
+                    read_collector.as_deref_mut(),
+                )?;
             }
             append_index_set(batch, idx_key, primary_key)?;
         }
@@ -685,9 +839,13 @@ impl IndexManager {
         idx_key: &str,
         primary_key: &str,
         batch: &WriteBatch,
+        read_collector: Option<&mut crate::volcano::ReadCollector>,
     ) -> Result<(), OmniError> {
         let prefix = &idx_key[..idx_key.len() - primary_key.len()];
         let end = format!("{}\x01", &prefix[..prefix.len() - 1]);
+        if let Some(collector) = read_collector {
+            collector.ranges.push((prefix.to_string(), end.clone()));
+        }
         let seq = self.db.get_seq();
         for (existing_key, existing_pk) in self.db.scan(prefix, &end, seq)? {
             if batch
@@ -879,6 +1037,7 @@ impl IndexManager {
         self.db.commit_batch(&invalidate)?;
 
         let seq = self.db.get_seq();
+        let catalog = self.catalog_snapshot_at(seq)?;
 
         let mut count = 0;
         let mut batch = WriteBatch::new();
@@ -891,7 +1050,13 @@ impl IndexManager {
                             OmniError::IoError(format!("invalid row during index rebuild: {error}"))
                         })?;
                     let pk = key.strip_prefix(&collection_prefix).unwrap_or(&key);
-                    self.index_document(&idx_def.collection, pk, &doc, &mut batch)?;
+                    self.index_document_with_catalog(
+                        &catalog,
+                        &idx_def.collection,
+                        pk,
+                        &doc,
+                        &mut batch,
+                    )?;
                     count += 1;
 
                     // Commit in batches of 1000 to avoid huge memory usage.

@@ -14,7 +14,7 @@ services:
     volumes:
       - omni-cluster-smoke-data-1:/data
     environment: &omni-cluster-smoke-env
-      OMNIKV_MODE: "production"
+      OMNIKV_MODE: "development"
       OMNIKV_HTTP_ADDR: "0.0.0.0:8443"
       OMNIKV_PGWIRE_ADDR: "0.0.0.0:5433"
       OMNIKV_TCP_ADDR: "0.0.0.0:8080"

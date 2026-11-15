@@ -16,6 +16,8 @@ use omni_engine::failpoints::FailRegistry;
 use omni_engine::{OmniKV, WriteBatch};
 use tempfile::TempDir;
 
+static TEST_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -40,6 +42,9 @@ fn write_and_close(manifest: &str, wal: &str, key: &str, value: &str) {
 #[cfg(feature = "failpoints")]
 #[test]
 fn armed_wal_sync_fails_the_commit_instead_of_acknowledging_durability() {
+    let _lock = TEST_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let dir = TempDir::new().unwrap();
     let (manifest, wal) = fresh_db_paths(&dir);
     let db = OmniKV::open(&manifest, &wal).expect("open must succeed");
@@ -65,6 +70,9 @@ fn armed_wal_sync_fails_the_commit_instead_of_acknowledging_durability() {
 // ---------------------------------------------------------------------------
 #[test]
 fn test_clean_shutdown_no_data_loss() {
+    let _lock = TEST_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let dir = TempDir::new().unwrap();
     let (manifest, wal) = fresh_db_paths(&dir);
 
@@ -86,6 +94,9 @@ fn test_clean_shutdown_no_data_loss() {
 // ---------------------------------------------------------------------------
 #[test]
 fn test_wal_tail_corruption_committed_data_survives() {
+    let _lock = TEST_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let dir = TempDir::new().unwrap();
     let (manifest, wal) = fresh_db_paths(&dir);
 
@@ -117,6 +128,9 @@ fn test_wal_tail_corruption_committed_data_survives() {
 // ---------------------------------------------------------------------------
 #[test]
 fn test_wal_fully_corrupted_opens_empty() {
+    let _lock = TEST_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let dir = TempDir::new().unwrap();
     let (manifest, wal) = fresh_db_paths(&dir);
 
@@ -140,6 +154,9 @@ fn test_wal_fully_corrupted_opens_empty() {
 // ---------------------------------------------------------------------------
 #[test]
 fn test_manifest_truncation_returns_error() {
+    let _lock = TEST_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let dir = TempDir::new().unwrap();
     let (manifest, wal) = fresh_db_paths(&dir);
 
@@ -159,6 +176,9 @@ fn test_manifest_truncation_returns_error() {
 // ---------------------------------------------------------------------------
 #[test]
 fn test_uncommitted_write_not_visible_after_crash() {
+    let _lock = TEST_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let dir = TempDir::new().unwrap();
     let (manifest, wal) = fresh_db_paths(&dir);
 
@@ -195,6 +215,9 @@ fn test_uncommitted_write_not_visible_after_crash() {
 // ---------------------------------------------------------------------------
 #[test]
 fn test_multiple_keys_survive_clean_shutdown() {
+    let _lock = TEST_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let dir = TempDir::new().unwrap();
     let (manifest, wal) = fresh_db_paths(&dir);
 
@@ -228,6 +251,9 @@ fn test_multiple_keys_survive_clean_shutdown() {
 // ---------------------------------------------------------------------------
 #[test]
 fn test_delete_is_durable_across_restart() {
+    let _lock = TEST_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let dir = TempDir::new().unwrap();
     let (manifest, wal) = fresh_db_paths(&dir);
 
@@ -254,6 +280,9 @@ fn test_delete_is_durable_across_restart() {
 // ---------------------------------------------------------------------------
 #[test]
 fn test_100_crash_recovery_cycles() {
+    let _lock = TEST_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let dir = TempDir::new().unwrap();
     let (manifest, wal) = fresh_db_paths(&dir);
 
@@ -284,6 +313,9 @@ fn test_100_crash_recovery_cycles() {
 // ---------------------------------------------------------------------------
 #[test]
 fn test_wal_replay_multi_batch() {
+    let _lock = TEST_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let dir = TempDir::new().unwrap();
     let (manifest, wal) = fresh_db_paths(&dir);
 
@@ -321,6 +353,9 @@ fn test_wal_replay_multi_batch() {
 // ---------------------------------------------------------------------------
 #[test]
 fn test_overwrite_survives_restart() {
+    let _lock = TEST_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let dir = TempDir::new().unwrap();
     let (manifest, wal) = fresh_db_paths(&dir);
 

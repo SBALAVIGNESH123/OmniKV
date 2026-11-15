@@ -237,6 +237,9 @@ impl Catalog {
         for (key, _) in &rows {
             batch.delete(key).map_err(|e| format!("{:?}", e))?;
         }
+        self.index_manager
+            .append_drop_indexes_for_collection(&table.name, &mut batch)
+            .map_err(|e| format!("{e:?}"))?;
         let cat_key = format!("{}{}", CATALOG_PREFIX, name_lower);
         batch.delete(&cat_key).map_err(|e| format!("{:?}", e))?;
         self.db

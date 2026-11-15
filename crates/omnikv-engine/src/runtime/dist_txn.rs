@@ -620,7 +620,6 @@ impl TwoPhaseParticipant {
             let _guard = lock
                 .lock()
                 .map_err(|_| OmniError::LockPoisoned("2PC participant".into()))?;
-            self.recover_locked()?;
             if let Some(existing) = self.load_participant_log(txn_id)? {
                 if existing.writes != writes && existing.state != "ABORTED" {
                     return Err(OmniError::IoError(
@@ -666,19 +665,6 @@ impl TwoPhaseParticipant {
         read_seq: u64,
     ) -> PrepareResult {
         let write_keys: Vec<String> = writes.iter().map(|write| write.key.clone()).collect();
-        if let Some(reason) = self
-            .db
-            .ssi_history
-            .check_write_conflicts(read_seq, &write_keys)
-        {
-            return PrepareResult {
-                node_id: self.node_id,
-                txn_id,
-                vote: Vote::Abort(reason),
-                prepare_seq: 0,
-            };
-        }
-
         {
             let mut key_locks = match self.key_locks.lock() {
                 Ok(locks) => locks,
@@ -711,6 +697,32 @@ impl TwoPhaseParticipant {
             for key in &write_keys {
                 key_locks.insert(key.clone(), txn_id);
             }
+        }
+        if let Err(reason) =
+            self.db
+                .ssi_history
+                .reserve_prepared_keys(self.node_id, txn_id, &write_keys)
+        {
+            self.release_key_locks(txn_id, &write_keys);
+            return PrepareResult {
+                node_id: self.node_id,
+                txn_id,
+                vote: Vote::Abort(reason),
+                prepare_seq: 0,
+            };
+        }
+        if let Some(reason) = self
+            .db
+            .ssi_history
+            .check_write_conflicts(read_seq, &write_keys)
+        {
+            self.release_key_locks(txn_id, &write_keys);
+            return PrepareResult {
+                node_id: self.node_id,
+                txn_id,
+                vote: Vote::Abort(reason),
+                prepare_seq: 0,
+            };
         }
 
         // Build the write batch
@@ -859,6 +871,9 @@ impl TwoPhaseParticipant {
                 }
             }
         }
+        self.db
+            .ssi_history
+            .release_prepared_keys(self.node_id, txn_id, keys);
     }
 
     /// Rebuilds in-memory prepared batches after a participant restart. The
@@ -919,6 +934,10 @@ impl TwoPhaseParticipant {
             );
             recovered += 1;
         }
+        self.db
+            .ssi_history
+            .replace_prepared_keys_for_node(self.node_id, &recovered_locks)
+            .map_err(OmniError::IoError)?;
         *prepared = recovered_prepared;
         *key_locks = recovered_locks;
         Ok(recovered)
@@ -971,7 +990,18 @@ impl TwoPhaseParticipant {
             &legacy_participant_prepare_key(txn_id),
             format!("COMMITTED:{}", self.node_id),
         )?;
-        let commit_seq = self.db.commit_2pc_batch(&commit_batch)?;
+        let write_keys: Vec<String> = state.writes.iter().map(|w| w.key.clone()).collect();
+        let ssi_txn_id = txn_id.0.wrapping_mul(1_000_000).wrapping_add(txn_id.1);
+        let commit_seq = self.db.commit_2pc_batch_with_ssi(
+            &commit_batch,
+            crate::transaction::SsiCommitRecord {
+                txn_id: ssi_txn_id,
+                write_keys,
+                read_keys: Vec::new(),
+                read_ranges: Vec::new(),
+            },
+        )?;
+
         let mut final_log = WriteBatch::new();
         final_log.set(
             &participant_prepare_key(self.node_id, txn_id),

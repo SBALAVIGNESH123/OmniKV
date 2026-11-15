@@ -550,10 +550,14 @@ impl SqlExecutor {
             }
             SqlStatement::Explain(inner) => {
                 self.refresh_statement_catalog_for(inner, self.statement_read_seq())?;
-                // Use the cost-based optimizer for real EXPLAIN output
+                let index_catalog = self
+                    .catalog
+                    .index_manager()
+                    .catalog_snapshot_at(self.statement_read_seq())
+                    .map_err(|error| format!("index catalog read failed: {error}"))?;
                 let stats = crate::optimizer::gather_stats_at_checked(
                     &self.catalog,
-                    None,
+                    Some(&index_catalog),
                     &self.db,
                     self.statement_read_seq(),
                 )?;
@@ -578,10 +582,14 @@ impl SqlExecutor {
             }
             SqlStatement::ExplainAnalyze(inner) => {
                 self.refresh_statement_catalog_for(inner, self.statement_read_seq())?;
-                // Run the query through the plan executor and collect stats
+                let index_catalog = self
+                    .catalog
+                    .index_manager()
+                    .catalog_snapshot_at(self.statement_read_seq())
+                    .map_err(|error| format!("index catalog read failed: {error}"))?;
                 let stats = crate::optimizer::gather_stats_at_checked(
                     &self.catalog,
-                    None,
+                    Some(&index_catalog),
                     &self.db,
                     self.statement_read_seq(),
                 )?;
@@ -782,6 +790,7 @@ impl SqlExecutor {
         // statements. Outside one, the catalog's autocommit path handles.
         if self.is_transactional() {
             self.record_catalog_read(name);
+            let read_seq = self.statement_read_seq();
             // The table's own rows go through the normal DML staging: the
             // row reads use this statement's snapshot+overlay, so only
             // rows that exist for this transaction are deleted.
@@ -796,6 +805,11 @@ impl SqlExecutor {
                 let key = format!("{}{}", table.row_prefix(), pk);
                 batch.delete(&key).map_err(|e| format!("{:?}", e))?;
             }
+            self.seed_pending_indexes(&mut batch)?;
+            self.catalog
+                .index_manager()
+                .append_drop_indexes_for_collection_at(&table.name, read_seq, &mut batch)
+                .map_err(|e| format!("{:?}", e))?;
             let cat_key = Catalog::staged_drop_key(name);
             batch.delete(&cat_key).map_err(|e| format!("{:?}", e))?;
             self.stage_or_commit(batch)?;
@@ -871,6 +885,11 @@ impl SqlExecutor {
         }
 
         let mut batch = WriteBatch::new();
+        self.seed_pending_indexes(&mut batch)?;
+        let index_manager = self.catalog.index_manager();
+        let index_catalog = index_manager
+            .catalog_snapshot_at(seq)
+            .map_err(|e| format!("Index catalog snapshot failed: {e}"))?;
         // The typed path keys and compares a numeric primary key canonically,
         // so a legacy row stored at ...007 is re-keyed to ...7.
         let mut canonical_keys: HashMap<String, &str> = HashMap::new();
@@ -883,6 +902,8 @@ impl SqlExecutor {
                             table.name
                         )
                     })?;
+            let old_document = serde_json::to_value(&row)
+                .map_err(|e| format!("Serialize old index document: {e}"))?;
 
             let stored_suffix = key.strip_prefix(prefix.as_str()).unwrap_or_default();
             let canonical_suffix = crate::volcano::canonicalize_pk_key(table, stored_suffix);
@@ -908,6 +929,21 @@ impl SqlExecutor {
             } else if &typed != serialized {
                 batch.set(key, typed).map_err(|e| format!("{:?}", e))?;
             }
+            let new_document = serde_json::to_value(&row)
+                .map_err(|e| format!("Serialize new index document: {e}"))?;
+            let mut reads = self.pending_reads.borrow_mut();
+            index_manager
+                .replace_document_indexes_with_catalog_and_reads(
+                    &index_catalog,
+                    &table.name,
+                    stored_suffix,
+                    &old_document,
+                    &canonical_suffix,
+                    &new_document,
+                    &mut batch,
+                    reads.as_mut(),
+                )
+                .map_err(|e| format!("Index maintenance failed: {e}"))?;
         }
 
         let mut updated = table.clone();
@@ -985,6 +1021,9 @@ impl SqlExecutor {
         let mut count = 0;
         self.seed_pending_indexes(&mut batch)?;
         let index_manager = self.catalog.index_manager();
+        let index_catalog = index_manager
+            .catalog_snapshot_at(read_seq)
+            .map_err(|e| format!("Index catalog snapshot failed: {e}"))?;
 
         for row_vals in values {
             let mut row_map = Row::new();
@@ -1026,8 +1065,16 @@ impl SqlExecutor {
             batch.set(&key, value).map_err(|e| format!("{:?}", e))?;
             let document = serde_json::to_value(&row_map)
                 .map_err(|e| format!("Serialize index document: {e}"))?;
+            let mut reads = self.pending_reads.borrow_mut();
             index_manager
-                .index_document(&table.name, &canonical_pk, &document, &mut batch)
+                .index_document_with_catalog_and_reads(
+                    &index_catalog,
+                    &table.name,
+                    &canonical_pk,
+                    &document,
+                    &mut batch,
+                    reads.as_mut(),
+                )
                 .map_err(|e| format!("Index maintenance failed: {e}"))?;
             count += 1;
         }
@@ -2194,8 +2241,11 @@ impl SqlExecutor {
         let count = rows.len();
         self.seed_pending_indexes(&mut batch)?;
         let index_manager = self.catalog.index_manager();
+        let index_catalog = index_manager
+            .catalog_snapshot_at(read_seq)
+            .map_err(|e| format!("Index catalog snapshot failed: {e}"))?;
         for (row, old_key) in rows.iter_mut().zip(old_keys) {
-            let old_document = serde_json::to_value(&*row)
+            let mut old_document = serde_json::to_value(&*row)
                 .map_err(|e| format!("Serialize old index document: {e}"))?;
             for (resolved, val) in &assignments {
                 let stored = match val {
@@ -2217,32 +2267,53 @@ impl SqlExecutor {
                 .ok_or_else(|| format!("primary key cannot be NULL in table '{}'", table.name))?;
             // A legacy row may be stored under a non-canonical key ("007");
             // the typed path addresses it as "7".
-            let key = format!(
-                "{}{}",
-                table.row_prefix(),
-                crate::volcano::canonicalize_pk_key(&table, &pk)
-            );
+            let canonical_pk = crate::volcano::canonicalize_pk_key(&table, &pk);
+            let key = format!("{}{}", table.row_prefix(), canonical_pk);
             if !available_keys.insert(key.clone()) {
                 return Err(format!(
                     "duplicate key value violates primary key of table '{}'",
                     table.name
                 ));
             }
+            let raw_old_pk = &old_key[table.row_prefix().len()..];
+            let effective_old_pk = if table.row_format == crate::catalog::RowFormat::Legacy {
+                let migrated_pk = crate::volcano::canonicalize_pk_key(&table, raw_old_pk);
+                if let Some(obj) = old_document.as_object_mut()
+                    && let Some(slot) = obj.get_mut(&table.primary_key)
+                    && let Some(old_val) = slot.as_str().map(str::to_string)
+                {
+                    *slot = serde_json::Value::String(crate::volcano::canonicalize_pk_key(
+                        &table, &old_val,
+                    ));
+                }
+                migrated_pk
+            } else {
+                raw_old_pk.to_string()
+            };
+            let migrated_old_key = format!("{}{}", table.row_prefix(), effective_old_pk);
             if old_key != key {
                 batch.delete(&old_key).map_err(|e| format!("{:?}", e))?;
+            }
+            if migrated_old_key != old_key && migrated_old_key != key {
+                batch
+                    .delete(&migrated_old_key)
+                    .map_err(|e| format!("{:?}", e))?;
             }
             let value = serde_json::to_string(&row).map_err(|e| format!("{}", e))?;
             batch.set(&key, value).map_err(|e| format!("{:?}", e))?;
             let new_document = serde_json::to_value(&*row)
                 .map_err(|e| format!("Serialize new index document: {e}"))?;
+            let mut reads = self.pending_reads.borrow_mut();
             index_manager
-                .replace_document_indexes(
+                .replace_document_indexes_with_catalog_and_reads(
+                    &index_catalog,
                     &table.name,
-                    &old_key[table.row_prefix().len()..],
+                    &effective_old_pk,
                     &old_document,
-                    &crate::volcano::canonicalize_pk_key(&table, &pk),
+                    &canonical_pk,
                     &new_document,
                     &mut batch,
+                    reads.as_mut(),
                 )
                 .map_err(|e| format!("Index maintenance failed: {e}"))?;
         }
@@ -2291,6 +2362,9 @@ impl SqlExecutor {
         let count = rows.len();
         self.seed_pending_indexes(&mut batch)?;
         let index_manager = self.catalog.index_manager();
+        let index_catalog = index_manager
+            .catalog_snapshot_at(read_seq)
+            .map_err(|e| format!("Index catalog snapshot failed: {e}"))?;
         for row in &rows {
             let pk = row
                 .get(&table.primary_key)
@@ -2305,7 +2379,8 @@ impl SqlExecutor {
             let document = serde_json::to_value(row)
                 .map_err(|e| format!("Serialize old index document: {e}"))?;
             index_manager
-                .remove_document_indexes(
+                .remove_document_indexes_with_catalog(
+                    &index_catalog,
                     &table.name,
                     &crate::volcano::canonicalize_pk_key(&table, &pk),
                     &document,
