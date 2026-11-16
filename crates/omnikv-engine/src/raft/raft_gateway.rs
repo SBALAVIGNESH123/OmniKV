@@ -276,9 +276,7 @@ impl ClusterGateway {
         Ok(ack.index)
     }
 
-    /// Trusted engine-only 2PC records still pass through consensus. Public
-    /// proposal APIs reject these namespaces; Raft bookkeeping remains
-    /// forbidden even for this internal entry point.
+    /// Internal 2PC commit through consensus. Public APIs reject these namespaces.
     pub(crate) fn commit_2pc_batch(
         &self,
         batch: &crate::WriteBatch,

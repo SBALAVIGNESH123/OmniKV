@@ -228,9 +228,7 @@ pub async fn run_quic_server(endpoint: Endpoint, db: Arc<OmniKV>, rate_limiter: 
 
 /// Read exactly one length-prefixed request frame from a QUIC stream.
 ///
-/// QUIC streams can split a frame at any byte boundary. This reads the
-/// length prefix first, validates the cap, then loops until the full
-/// payload arrives.
+/// Reads a length-prefixed QUIC frame, validating the size cap.
 async fn read_quic_frame(recv: &mut RecvStream) -> Result<Vec<u8>, String> {
     let mut length_bytes = [0u8; QUIC_FRAME_LENGTH_BYTES];
     read_quic_exact(recv, &mut length_bytes).await?;

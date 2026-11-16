@@ -105,7 +105,11 @@ impl IndexCatalog {
     pub fn load_checked_at(db: &Arc<OmniKV>, seq: u64) -> Result<Self, OmniError> {
         let mut catalog = Self::empty();
         let mut names = HashSet::new();
-        for (key, value) in db.scan(CATALOG_PREFIX, &format!("{}\x7f", CATALOG_PREFIX), seq)? {
+        for (key, value) in db.scan(
+            CATALOG_PREFIX,
+            &format!("{}\u{10ffff}", CATALOG_PREFIX),
+            seq,
+        )? {
             let def: IndexDefinition = serde_json::from_str(&value)
                 .map_err(|error| OmniError::IoError(format!("invalid index catalog: {error}")))?;
             if def.fields.is_empty()
@@ -175,7 +179,7 @@ impl IndexCatalog {
     }
 
     pub(crate) fn catalog_scan_range() -> (&'static str, &'static str) {
-        (CATALOG_PREFIX, "\x00IDX_CATALOG\x00\x7f")
+        (CATALOG_PREFIX, "\x00IDX_CATALOG\x00\u{10ffff}")
     }
 
     pub(crate) fn apply_overlay(&mut self, overlay: &HashMap<String, Option<String>>) {
@@ -356,9 +360,7 @@ fn index_entries(
     Ok(entries)
 }
 
-/// Converts a SQL comparison to the same representation as stored index
-/// values. Unrepresentable literals remain residual predicates on a table
-/// scan; they must never be silently encoded as zero or an empty string.
+/// Converts a SQL comparison to the stored index representation.
 pub(crate) fn sql_index_bound(
     value: &crate::sql::SqlValue,
     field_type: &IndexFieldType,
@@ -387,10 +389,7 @@ fn unique_violation(idx_def: &IndexDefinition) -> OmniError {
     ))
 }
 
-/// WriteBatch stores writes and deletes in separate vectors and commits all
-/// writes before all deletes. These helpers make an index mutation behave as
-/// a last-write-wins operation even when a caller replaces an indexed value
-/// more than once in one batch.
+/// Batch helpers: last-write-wins even when an indexed value is replaced more than once.
 fn append_index_set(batch: &mut WriteBatch, key: &str, value: &str) -> Result<(), OmniError> {
     let key_bytes = key.as_bytes();
     batch
@@ -413,10 +412,7 @@ fn append_index_delete(batch: &mut WriteBatch, key: &str) -> Result<(), OmniErro
     batch.delete(key)
 }
 
-/// The index API supports both the original collection/document key space
-/// (`collection:primary-key`) and SQL tables (`\x00T\x00table\x00primary-key`).
-/// Keeping both ranges here makes rebuilds and schema backfills cover the same
-/// rows that SQL DML maintains incrementally.
+/// Row ranges for both collection/doc keys and SQL table keys.
 pub(crate) fn collection_row_ranges(collection: &str) -> [(String, String); 2] {
     [
         (
@@ -630,8 +626,7 @@ impl IndexManager {
         Ok(())
     }
 
-    /// Returns the collection owned by an index, if the index exists.
-    /// Schema migration uses this to serialize index DDL with table writes.
+    /// Returns the collection owning an index, used by schema migration for DDL serialization.
     pub fn collection_for_index(&self, name: &str) -> Option<String> {
         IndexCatalog::load_checked_at(&self.db, self.db.get_seq())
             .ok()
@@ -706,9 +701,7 @@ impl IndexManager {
             .ok_or_else(|| OmniError::IoError(format!("Index '{}' not found", name)))
     }
 
-    /// Returns a read-only snapshot for the optimizer. Index definitions are
-    /// immutable after creation; DDL replaces the manager/catalog atomically
-    /// at the storage layer, so planning never holds the catalog mutex.
+    /// Read-only catalog snapshot for the optimizer.
     pub fn catalog_snapshot(&self) -> Result<IndexCatalog, OmniError> {
         self.catalog_snapshot_at(self.db.get_seq())
     }
@@ -766,10 +759,7 @@ impl IndexManager {
         self.write_new_index_entries(&entries, primary_key, batch, read_collector)
     }
 
-    /// Replaces all index entries for one row in the same batch. An UPDATE
-    /// that leaves an indexed value unchanged must not emit both SET and
-    /// DELETE for the same key — deletes apply after writes, so the entry
-    /// would vanish.
+    /// Replaces index entries for one row. Skips unchanged values to avoid delete-after-write.
     pub fn replace_document_indexes(
         &self,
         collection: &str,
@@ -920,9 +910,7 @@ impl IndexManager {
                 return Err(unique_violation(idx_def));
             }
         }
-        // A multi-row INSERT or an UPDATE can stage a conflicting index
-        // entry in this same atomic batch. Deletes already staged for that
-        // exact key make the pending write inactive.
+        // Dedup against conflicting staged deletes in the same batch.
         for (pending_key, pending_pk, _) in &batch.buffered_writes {
             let Ok(pending_key) = std::str::from_utf8(pending_key) else {
                 continue;
@@ -1010,10 +998,7 @@ impl IndexManager {
         )
     }
 
-    /// Scans an index using inclusive bounds on its leading field at a
-    /// caller-supplied MVCC sequence. Composite indexes are supported for
-    /// predicates on their first field; later fields remain residual filters
-    /// evaluated by the SQL executor.
+    /// Range scan on the index's leading field at a given MVCC sequence.
     pub fn range_scan_bounds_at(
         &self,
         index_name: &str,

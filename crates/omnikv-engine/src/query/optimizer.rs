@@ -95,7 +95,7 @@ pub fn gather_stats_at_checked(
         if let Some(table) = catalog.get_table(&table_name) {
             let prefix = table.row_prefix();
             let sample = db
-                .scan(&prefix, &format!("{}\x7F", prefix), seq)
+                .scan(&prefix, &format!("{}\u{10ffff}", prefix), seq)
                 .map_err(|error| {
                     format!(
                         "storage statistics scan failed for table '{}': {error}",
@@ -824,10 +824,7 @@ impl Optimizer {
     /// Find the best index for a WHERE predicate.
     fn find_best_index(&self, table_name: &str, expr: &WhereExpr) -> Option<IndexDefinition> {
         let stats = self.stats.get(table_name)?;
-        // Sparse indexes omit NULL/missing fields. They are safe only when a
-        // conjunct requires a representable comparison on the indexed field.
-        // OR/NOT/IS NULL and composite-prefix scans can otherwise omit rows
-        // that satisfy the residual predicate.
+        // Sparse indexes omit NULLs; only use when the predicate requires a representable value.
         stats
             .indexes
             .iter()

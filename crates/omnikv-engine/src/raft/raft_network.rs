@@ -7,11 +7,7 @@ use openraft::raft::{
 
 use crate::raft_impl::{OmniNode, OmniTypeConfig};
 
-/// Consensus transport for openraft RPCs. Production clusters use HTTPS with
-/// a configured CA bundle so peer traffic is confidential and the target
-/// server is authenticated; the bearer token remains the application-level
-/// authorization check. Plain HTTP remains available for development and
-/// compatibility tests only.
+/// Consensus transport for openraft RPCs. HTTPS in production, HTTP for dev.
 pub struct OmniNetwork {
     client: reqwest::Client,
     auth_token: String,
@@ -30,9 +26,7 @@ impl OmniNetwork {
             .expect("Failed to build Raft HTTP client")
     }
 
-    /// Builds a TLS-protected peer client. `ca_pem` is the operator's trust
-    /// bundle; omitting it is only valid with the explicit development
-    /// `insecure_skip` opt-in.
+    /// Builds a TLS-protected peer client.
     pub fn new_tls(
         auth_token: impl Into<String>,
         ca_pem: Option<&[u8]>,

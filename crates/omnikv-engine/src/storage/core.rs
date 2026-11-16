@@ -1931,6 +1931,7 @@ impl OmniKV {
         if key.starts_with(b"__sys__/raft/")
             || key.starts_with(b"__2PC_LOG__/")
             || key.starts_with(b"__2PC_PREPARE__/")
+            || key.starts_with(b"__2PC_")
         {
             return Err(OmniError::IoError(
                 "reserved consensus/transaction system key".into(),
@@ -1974,8 +1975,7 @@ impl OmniKV {
         self.commit_batch_local(tx)
     }
 
-    /// Engine-owned distributed transaction metadata is reserved from client
-    /// writes, but must replicate with its data when consensus is configured.
+    /// Commits engine-internal 2PC metadata, bypassing client key validation.
     pub(crate) fn commit_2pc_batch(&self, tx: &WriteBatch) -> Result<u64, OmniError> {
         if let Some(gateway) = self.cluster_gateway.get() {
             return gateway.commit_2pc_batch(tx);
@@ -1995,7 +1995,7 @@ impl OmniKV {
             .transition_guard
             .read()
             .map_err(|_| OmniError::LockPoisoned("transition_guard".into()))?;
-        let commit_seq = self.commit_batch_local_locked(tx)?;
+        let commit_seq = self.commit_batch_local_locked_skip_prepared(tx)?;
         self.ssi_history
             .record_committed(ssi.txn_id, commit_seq, &ssi);
         self.ssi_history.prune(self.min_active_snapshot());
@@ -2017,6 +2017,10 @@ impl OmniKV {
         crate::dist_txn::sync_all_prepared_reservations(self)
     }
 
+    pub(crate) fn sync_prepared_2pc_from_batch(&self, batch: &WriteBatch) -> Result<(), OmniError> {
+        crate::dist_txn::sync_prepared_reservations_from_batch(self, batch)
+    }
+
     pub(crate) fn commit_batch_local(&self, tx: &WriteBatch) -> Result<u64, OmniError> {
         // Acquire shared topology lock — blocks only during an exclusive
         // snapshot install or a build_snapshot's capture window. Thousands
@@ -2035,6 +2039,21 @@ impl OmniKV {
     /// record missing (or the reverse), and pairing them under the shared lock
     /// is what matches build_snapshot's exclusive capture window.
     pub(crate) fn commit_batch_local_locked(&self, tx: &WriteBatch) -> Result<u64, OmniError> {
+        self.commit_batch_local_locked_inner(tx, false)
+    }
+
+    pub(crate) fn commit_batch_local_locked_skip_prepared(
+        &self,
+        tx: &WriteBatch,
+    ) -> Result<u64, OmniError> {
+        self.commit_batch_local_locked_inner(tx, true)
+    }
+
+    fn commit_batch_local_locked_inner(
+        &self,
+        tx: &WriteBatch,
+        skip_prepared_check: bool,
+    ) -> Result<u64, OmniError> {
         let start_time = std::time::Instant::now();
 
         // Write Backpressure: If L0 SSTables exceed threshold, wait for compaction
@@ -2047,17 +2066,21 @@ impl OmniKV {
             let mut stalled = true;
             let (ref stall_lock, ref cv) = self.compaction_cv;
             let mut guard = stall_lock.lock().unwrap_or_else(|e| e.into_inner());
-            for _ in 0..compaction_policy.write_stall_wait_attempts {
-                let (returned, _timeout) = cv
-                    .wait_timeout(
-                        guard,
-                        std::time::Duration::from_millis(compaction_policy.write_stall_wait_ms),
-                    )
-                    .unwrap_or_else(|e| e.into_inner());
-                guard = returned;
-                if self.sstable_count() < compaction_policy.l0_write_stall_threshold {
-                    stalled = false;
-                    break;
+            if self.sstable_count() < compaction_policy.l0_write_stall_threshold {
+                stalled = false;
+            } else {
+                for _ in 0..compaction_policy.write_stall_wait_attempts {
+                    let (returned, _timeout) = cv
+                        .wait_timeout(
+                            guard,
+                            std::time::Duration::from_millis(compaction_policy.write_stall_wait_ms),
+                        )
+                        .unwrap_or_else(|e| e.into_inner());
+                    guard = returned;
+                    if self.sstable_count() < compaction_policy.l0_write_stall_threshold {
+                        stalled = false;
+                        break;
+                    }
                 }
             }
             drop(guard);
@@ -2106,20 +2129,12 @@ impl OmniKV {
         // numbers and reserve a contiguous region in the heap file.
         // No I/O happens here â€” just atomic integer operations.
         // â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
-        let is_2pc_internal = tx
-            .buffered_writes
-            .iter()
-            .any(|(key, _, _)| key.starts_with(b"__2PC_"))
-            || tx
-                .buffered_deletes
-                .iter()
-                .any(|key| key.starts_with(b"__2PC_"));
         let (base_seq, reserved_offset) = {
             let _guard = self
                 .write_mutex
                 .lock()
                 .map_err(|_| OmniError::LockPoisoned("commit_seq".into()))?;
-            if !is_2pc_internal
+            if !skip_prepared_check
                 && let Some(conflict) = self.ssi_history.check_batch_prepared_conflicts(tx)
             {
                 return Err(OmniError::IoError(conflict));
@@ -2404,10 +2419,7 @@ impl OmniKV {
         let shard = shard_idx(&target_key);
 
         let memtable = self.roots.load().memtable.clone();
-        // SkipMap's second key is `Reverse(seq)`, so an exclusive lower bound
-        // at `Reverse(read_seq + 1)` includes the version whose sequence is
-        // exactly `read_seq`. This matches the inclusive `seq <= read_seq`
-        // rule used by SSTables.
+        // Reverse(seq) ordering: exclusive lower bound at Reverse(read_seq+1) includes read_seq.
         let memtable_start = Reverse(read_seq.saturating_add(1));
         for entry in memtable[shard].range((target_key.clone(), memtable_start)..) {
             if entry.key().0 != target_key {
@@ -2985,6 +2997,7 @@ impl OmniKV {
             });
 
             stats.record("l0_to_l1", started_at, self.compaction_backlog_sstables());
+            self.compaction_cv.1.notify_all();
             return Ok(());
         }
 
@@ -3049,6 +3062,7 @@ impl OmniKV {
         });
 
         stats.record("l0_to_l1", started_at, self.compaction_backlog_sstables());
+        self.compaction_cv.1.notify_all();
         Ok(())
     }
 

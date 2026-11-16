@@ -369,9 +369,7 @@ impl SqlExecutor {
         }
     }
 
-    /// Include earlier statements' index mutations in uniqueness checks and
-    /// replacements. A new statement's data batch alone cannot see a unique
-    /// value inserted or removed earlier in this same transaction.
+    /// Merges earlier statements' index mutations for cross-statement uniqueness.
     fn seed_pending_indexes(&self, batch: &mut WriteBatch) -> Result<(), String> {
         let pending = self.pending_batch.borrow();
         let Some(pending) = pending.as_ref() else {
@@ -444,10 +442,7 @@ impl SqlExecutor {
             None
         };
 
-        // Index definitions are durable MVCC metadata just like table
-        // definitions. Refresh the shared manager at this statement's read
-        // point so long-lived executors see newly-created indexes while an
-        // explicit transaction cannot use an index created after its snapshot.
+        // Refresh index catalog at this statement's read point.
         self.catalog
             .index_manager()
             .refresh_catalog_at(self.statement_read_seq())
@@ -806,6 +801,8 @@ impl SqlExecutor {
                 batch.delete(&key).map_err(|e| format!("{:?}", e))?;
             }
             self.seed_pending_indexes(&mut batch)?;
+            let (idx_start, idx_end) = crate::secondary_index::IndexCatalog::catalog_scan_range();
+            self.record_range_read(idx_start, idx_end);
             self.catalog
                 .index_manager()
                 .append_drop_indexes_for_collection_at(&table.name, read_seq, &mut batch)
@@ -847,7 +844,7 @@ impl SqlExecutor {
                 .and_then(|v| serde_json::from_str::<TableDef>(v).ok()));
         }
         self.record_point_read(&key);
-        let end = format!("{key}\x7F");
+        let end = format!("{key}\u{10ffff}");
         Ok(self
             .db
             .scan(&key, &end, seq)
@@ -878,7 +875,7 @@ impl SqlExecutor {
         }
 
         let prefix = table.row_prefix();
-        let end = format!("{}\u{7F}", prefix);
+        let end = format!("{}\u{10ffff}", prefix);
         self.record_range_read(&prefix, &end);
         let mut stored = self
             .db
@@ -1112,10 +1109,10 @@ impl SqlExecutor {
         // aborts this transaction's COMMIT (phantom/write-skew
         // protection). Autocommit executors collect nothing (their
         // collector is None — nothing to abort).
-        self.record_range_read(&prefix, &format!("{}\x7F", prefix));
+        self.record_range_read(&prefix, &format!("{}\u{10ffff}", prefix));
         let mut results = self
             .db
-            .scan(&prefix, &format!("{}\x7F", prefix), seq)
+            .scan(&prefix, &format!("{}\u{10ffff}", prefix), seq)
             .map_err(|error| format!("storage scan failed for table '{}': {error}", table.name))?;
 
         // Read-your-own-writes: staged rows replace their stored copies,

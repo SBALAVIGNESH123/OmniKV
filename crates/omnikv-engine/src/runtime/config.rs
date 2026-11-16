@@ -107,32 +107,21 @@ impl StorageConfig {
 pub struct RaftConfig {
     /// This node's cluster ID (openraft NodeId). 1-based.
     pub node_id: Option<u64>,
-    /// The listener address for consensus traffic. This is the BIND address
-    /// — `0.0.0.0:port` is valid here.
+    /// Bind address for consensus traffic (`0.0.0.0:port` is valid).
     pub raft_addr: Option<String>,
-    /// What PEERS dial to reach this node — the address that goes into
-    /// cluster membership. Must be routable FROM other nodes; a
-    /// wildcard (0.0.0.0/::) is refused by validation because it would
-    /// resolve to the dialer itself. When unset, the bind address is
-    /// advertised (fine for specific-IP/loopback binds; a wildcard bind
-    /// REQUIRES this override).
+    /// Routable address peers use to reach this node. Defaults to raft_addr.
     #[serde(default)]
     pub advertise_addr: Option<String>,
     /// The other initial members, "host:port" per entry. Empty means
     /// single-node cluster when raft_addr is set.
     pub peers: Vec<String>,
-    /// Shared bearer token required on every peer RPC. This authenticates
-    /// consensus callers before deserializing or executing an RPC, including
-    /// development clusters where peer TLS is disabled.
+    /// Shared bearer token for peer RPC authentication.
     #[serde(default = "default_raft_auth_token")]
     pub auth_token: String,
-    /// Encrypts and server-authenticates peer RPCs with the server TLS
-    /// identity. Production clusters must enable this.
+    /// Enable TLS for peer RPCs.
     #[serde(default)]
     pub tls: bool,
-    /// PEM CA bundle used by Raft clients to verify peer certificates.
-    /// Required with `tls` in production; development may use the explicit
-    /// `tls_insecure_skip` opt-in for ephemeral self-signed certificates.
+    /// PEM CA bundle for peer certificate verification.
     #[serde(default)]
     pub tls_ca_path: Option<String>,
     /// Override election/heartbeat tuning (defaults suit tests and LANs).

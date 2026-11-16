@@ -170,9 +170,9 @@ impl SeqScanIter {
         if let Some(reads) = reads
             && let Ok(mut collector) = reads.lock()
         {
-            collector.record_range(&prefix, &format!("{}\x7F", prefix));
+            collector.record_range(&prefix, &format!("{}\u{10ffff}", prefix));
         }
-        let stored = match db.scan(&prefix, &format!("{}\x7F", prefix), scan_seq) {
+        let stored = match db.scan(&prefix, &format!("{}\u{10ffff}", prefix), scan_seq) {
             Ok(stored) => stored,
             Err(error) => {
                 return Self {
@@ -276,10 +276,7 @@ impl RowIterator for SeqScanIter {
     }
 }
 
-/// Index-backed point/range scan. Resolves primary keys stored in the index
-/// back to table rows at the statement's MVCC point. Predicate evaluation
-/// stays in the FilterIter above. The matched key set is bounded by index
-/// selectivity — never a silent full-table fallback.
+/// Index-backed point/range scan resolving index keys to table rows.
 pub struct IndexScanIter {
     rows: Vec<Row>,
     pos: usize,
@@ -300,7 +297,10 @@ impl IndexScanIter {
             return Self::build(db, catalog, table, index_name, predicate, scan_seq, None);
         };
         if let Ok(mut collector) = reads.lock() {
-            collector.record_range(&table.row_prefix(), &format!("{}\x7F", table.row_prefix()));
+            collector.record_range(
+                &table.row_prefix(),
+                &format!("{}\u{10ffff}", table.row_prefix()),
+            );
         }
         Self::build(
             db,
@@ -509,7 +509,7 @@ impl PkLookupIter {
         reads: Option<&std::sync::Arc<std::sync::Mutex<ReadCollector>>>,
     ) -> Self {
         let key = format!("{}{}", table.row_prefix(), key_value);
-        let end = format!("{}{}\x7F", table.row_prefix(), key_value);
+        let end = format!("{}{}\u{10ffff}", table.row_prefix(), key_value);
         if let Some(ov) = overlay {
             match ov.get(key.as_str()) {
                 // Buffered write: read our own uncommitted row.
@@ -1350,10 +1350,7 @@ pub fn compile_plan_with_scan(
                     None => Box::new(SeqScanIter::new(db, &table_def)),
                 },
                 AccessMethod::IndexScan { index_name, .. } => match scan {
-                    // A transaction's staged rows are not yet visible to the
-                    // persisted secondary index. Use the overlay-aware table
-                    // scan for that case so read-your-own-writes wins over
-                    // the optimisation without returning stale results.
+                    // Staged rows aren't in the persisted index; fall back to overlay scan.
                     Some(ctx) if !ctx.overlay.is_empty() => Box::new(SeqScanIter::with_scan(
                         db,
                         &table_def,

@@ -163,10 +163,11 @@ impl Catalog {
 
     fn load_all(&self, seq: Option<u64>) {
         let seq = seq.unwrap_or_else(|| self.db.get_seq());
-        if let Ok(results) = self
-            .db
-            .scan(CATALOG_PREFIX, &format!("{}\x7F", CATALOG_PREFIX), seq)
-        {
+        if let Ok(results) = self.db.scan(
+            CATALOG_PREFIX,
+            &format!("{}\u{10ffff}", CATALOG_PREFIX),
+            seq,
+        ) {
             let mut cache = self
                 .cache
                 .write()
@@ -226,7 +227,7 @@ impl Catalog {
         let seq = self.db.get_seq();
         let rows = self
             .db
-            .scan(&prefix, &format!("{}\x7F", prefix), seq)
+            .scan(&prefix, &format!("{}\u{10ffff}", prefix), seq)
             .map_err(|e| format!("{:?}", e))?;
 
         // Delete the table rows and catalog entry in one atomic batch. The
@@ -364,7 +365,11 @@ impl Catalog {
     ) -> Result<Vec<String>, String> {
         let mut entries: BTreeMap<_, _> = self
             .db
-            .scan(CATALOG_PREFIX, &format!("{}\x7F", CATALOG_PREFIX), seq)
+            .scan(
+                CATALOG_PREFIX,
+                &format!("{}\u{10ffff}", CATALOG_PREFIX),
+                seq,
+            )
             .map_err(|e| format!("Catalog scan failed: {e:?}"))?
             .into_iter()
             .collect();

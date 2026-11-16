@@ -1,12 +1,7 @@
-//! Cluster boot: constructs the real openraft node when the config says
-//! this server is a cluster member.
+//! Cluster boot: constructs the openraft node when raft config is present.
 //!
-//! `OMNIKV_RAFT_ADDR` + `OMNIKV_NODE_ID` present → the server boots an
-//! openraft node, serves consensus RPCs on a dedicated listener, and routes
-//! every client write through consensus before acknowledging it. Production
-//! peer traffic uses HTTPS with a configured CA bundle; development can keep
-//! the compatibility HTTP mode. Absent → the server stays an independent
-//! single-node engine and none of this runs.
+//! RAFT_ADDR + NODE_ID → boots openraft, serves consensus RPCs, routes
+//! writes through consensus. Absent → standalone single-node engine.
 //!
 //! Bind vs advertised address: `OMNIKV_RAFT_ADDR` is
 //! what the listener BINDS to (0.0.0.0 is fine there);
@@ -239,9 +234,7 @@ pub fn boot_cluster_node(
     })
 }
 
-/// Serves the consensus RPC routes on the node's dedicated listener. Call
-/// from a task spawned on the gateway's consensus runtime — never returns
-/// under normal operation.
+/// Serves consensus RPC routes on the dedicated listener. Does not return.
 pub async fn serve_raft_rpc(
     node: ClusterNode,
     tls: Option<ServerTls>,

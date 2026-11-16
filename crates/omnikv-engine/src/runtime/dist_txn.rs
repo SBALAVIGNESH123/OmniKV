@@ -143,11 +143,20 @@ pub struct TwoPhaseCoordinator {
 impl TwoPhaseCoordinator {
     /// Creates a new 2PC coordinator.
     pub fn new(node_id: u64, db: Arc<OmniKV>, timeout_ms: u64) -> Self {
-        let next_seq = db
-            .scan("__2PC_LOG__/", "__2PC_LOG__/~", db.get_seq())
+        let hwm_key = format!("__2PC_LOG__/NEXT_SEQ/{node_id}");
+        let persisted_hwm = db
+            .find(&hwm_key, db.get_seq())
             .ok()
-            .into_iter()
             .flatten()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(0);
+        let scan_max = db
+            .scan("__2PC_LOG__/", "__2PC_LOG__/~", db.get_seq())
+            .unwrap_or_else(|error| {
+                tracing::error!(?error, "2PC coordinator log scan failed on startup");
+                Vec::new()
+            })
+            .into_iter()
             .filter_map(|(key, _)| {
                 let txn = key.strip_prefix("__2PC_LOG__/")?.split('/').next()?;
                 let (coordinator, sequence) = txn.split_once('_')?;
@@ -156,8 +165,8 @@ impl TwoPhaseCoordinator {
                 (coordinator == node_id).then_some(sequence)
             })
             .max()
-            .unwrap_or(0)
-            .saturating_add(1);
+            .unwrap_or(0);
+        let next_seq = persisted_hwm.max(scan_max).saturating_add(1);
         Self {
             node_id,
             db,
@@ -171,6 +180,12 @@ impl TwoPhaseCoordinator {
     pub fn begin(&self) -> GlobalTxnId {
         let seq = self.next_seq.fetch_add(1, Ordering::SeqCst);
         let txn_id = (self.node_id, seq);
+
+        let hwm_key = format!("__2PC_LOG__/NEXT_SEQ/{}", self.node_id);
+        let mut hwm_batch = WriteBatch::new();
+        if hwm_batch.set(&hwm_key, seq.to_string()).is_ok() {
+            let _ = self.db.commit_2pc_batch(&hwm_batch);
+        }
 
         let txn = DistTransaction {
             id: txn_id,
@@ -489,8 +504,7 @@ impl TwoPhaseCoordinator {
         Ok(())
     }
 
-    /// Removes completed (COMMITTED/ABORTED) coordinator log entries older
-    /// than `max_age_secs`. Returns the number of entries purged.
+    /// GC completed coordinator log entries older than `max_age_secs`.
     pub fn gc_completed_logs(&self, max_age_secs: u64) -> Result<usize, OmniError> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -506,10 +520,12 @@ impl TwoPhaseCoordinator {
                 Ok(entry) => {
                     by_txn.entry(entry.txn_id).or_default().push((key, entry));
                 }
-                Err(_) if now > max_age_secs => {
-                    keys_to_delete.push(key);
+                Err(_) => {
+                    tracing::warn!(
+                        key,
+                        "2PC coordinator log entry is malformed; retaining for manual review"
+                    );
                 }
-                Err(_) => {}
             }
         }
         for records in by_txn.into_values() {
@@ -623,6 +639,58 @@ pub(crate) fn sync_all_prepared_reservations(db: &OmniKV) -> Result<(), OmniErro
         }
     }
     db.ssi_history.replace_all_prepared_keys(reserved);
+    Ok(())
+}
+
+pub(crate) fn sync_prepared_reservations_from_batch(
+    db: &OmniKV,
+    batch: &WriteBatch,
+) -> Result<(), OmniError> {
+    let seq = db.get_seq();
+    for (key_bytes, value, _) in &batch.buffered_writes {
+        let Ok(key) = std::str::from_utf8(key_bytes) else {
+            continue;
+        };
+        let Some(rest) = key.strip_prefix("__2PC_PREPARE__/") else {
+            continue;
+        };
+        if !rest.contains('/') {
+            continue;
+        }
+        let Ok(entry) = serde_json::from_str::<ParticipantLogEntry>(value) else {
+            continue;
+        };
+        match entry.state.as_str() {
+            "PREPARED" => {
+                let mut reservations = HashMap::new();
+                for write in &entry.writes {
+                    reservations.insert(write.key.clone(), (entry.node_id, entry.txn_id));
+                }
+                db.ssi_history.merge_prepared_keys(reservations);
+            }
+            "COMMITTED" | "ABORTED" => {
+                let keys: Vec<String> = entry.writes.iter().map(|w| w.key.clone()).collect();
+                db.ssi_history
+                    .release_prepared_keys(entry.node_id, entry.txn_id, &keys);
+            }
+            _ => {}
+        }
+    }
+    for key_bytes in &batch.buffered_deletes {
+        let Ok(key) = std::str::from_utf8(key_bytes) else {
+            continue;
+        };
+        if !key.starts_with("__2PC_PREPARE__/") {
+            continue;
+        }
+        if let Ok(Some(old_value)) = db.find(key, seq)
+            && let Ok(entry) = serde_json::from_str::<ParticipantLogEntry>(&old_value)
+        {
+            let keys: Vec<String> = entry.writes.iter().map(|w| w.key.clone()).collect();
+            db.ssi_history
+                .release_prepared_keys(entry.node_id, entry.txn_id, &keys);
+        }
+    }
     Ok(())
 }
 
@@ -1019,9 +1087,7 @@ impl TwoPhaseParticipant {
             .ok_or_else(|| OmniError::IoError(format!("No prepared transaction {txn_id:?}")))?;
         match state.state.as_str() {
             "COMMITTED" => {
-                // A crash can occur after the atomic data+decision batch but
-                // before its optional marker annotation. Return a current
-                // read point in that case; never replay the committed data.
+                // Crash between data+decision and marker: use current read point.
                 return Ok(state.commit_seq.unwrap_or_else(|| self.db.get_seq()));
             }
             "PREPARED" => {}
@@ -1074,9 +1140,7 @@ impl TwoPhaseParticipant {
             })
             .map_err(|error| OmniError::IoError(format!("commit log update: {error}")))?,
         )?;
-        // This annotation is advisory: the data and COMMITTED decision above
-        // are already durable. Its failure must not turn a committed write
-        // into an error or leave its keys reserved indefinitely.
+        // Advisory marker — data is already durable; ignore failures.
         let _ = self.db.commit_2pc_batch(&final_log);
         self.prepared
             .lock()

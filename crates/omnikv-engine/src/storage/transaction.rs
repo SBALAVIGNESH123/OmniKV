@@ -387,6 +387,13 @@ impl SsiHistory {
         *prepared = keys;
     }
 
+    pub(crate) fn merge_prepared_keys(&self, reservations: HashMap<String, PreparedKeyOwner>) {
+        let mut prepared = self.prepared_keys.lock().unwrap_or_else(|e| e.into_inner());
+        for (key, owner) in reservations {
+            prepared.insert(key, owner);
+        }
+    }
+
     pub(crate) fn check_prepared_write_conflict(&self, key: &str) -> Option<String> {
         let prepared = self.prepared_keys.lock().unwrap_or_else(|e| e.into_inner());
         prepared.get(key).map(|(node_id, txn_id)| {
@@ -1067,7 +1074,21 @@ impl TransactionManager {
                 return Err(error);
             }
         };
-        let commit_seq = self.db.commit_batch_local_locked(&batch)?;
+        let commit_seq = match self.db.commit_batch_local_locked(&batch) {
+            Ok(seq) => seq,
+            Err(error) => {
+                drop(committed_guard);
+                txn.state = TxnState::Aborted;
+                self.cleanup_txn(txn.id, txn.read_seq);
+                if matches!(&error, OmniError::IoError(msg) if msg.starts_with("SSI CONFLICT")) {
+                    self.metrics
+                        .conflicts_detected
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                self.metrics.txns_aborted.fetch_add(1, Ordering::Relaxed);
+                return Err(error);
+            }
+        };
 
         // Record this transaction by pushing into the guard we still hold
         // — no other txn can have snuck between our validation and this

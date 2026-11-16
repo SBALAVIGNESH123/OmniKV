@@ -217,9 +217,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ─── 5. Raft consensus listener (cluster mode only) ───────
     // Serves /raft/{append,vote,snapshot} for this node's peers on the
-    // dedicated listener — HTTPS in production — ON the consensus runtime
-    // (never the client-facing server runtime), so parked client workers
-    // cannot starve peer RPCs either. A dead listener means a deaf cluster
+    // Consensus listener on its own runtime to avoid client worker starvation.
     // member, so its exit is handled like any other server exit below.
     let raft_handle = cluster.map(|node| {
         let handle = node.gateway.consensus_handle.clone();
@@ -1149,7 +1147,7 @@ fn dispatch_tcp_command(
         }
         "SCAN" => {
             let start = parts.next().unwrap_or("");
-            let end = parts.next().unwrap_or("\x7F");
+            let end = parts.next().unwrap_or("\u{10ffff}");
             let seq = db.get_seq();
             match db.scan(start, end, seq) {
                 Ok(results) => {

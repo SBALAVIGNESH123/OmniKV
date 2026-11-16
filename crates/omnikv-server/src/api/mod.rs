@@ -565,8 +565,7 @@ async fn ready_handler(State(state): State<AppState>) -> impl IntoResponse {
     }
 }
 
-/// Cluster topology snapshot — no user data, but protected because it reveals
-/// member addresses and leadership state to operational callers.
+/// Cluster topology snapshot (admin-only, no user data).
 #[derive(Serialize)]
 struct ClusterStatus {
     mode: &'static str,
@@ -786,7 +785,7 @@ async fn scan_handler(
         }
     };
     let start = q.start.as_deref().unwrap_or("");
-    let end = q.end.as_deref().unwrap_or("\x7F");
+    let end = q.end.as_deref().unwrap_or("\u{10ffff}");
     let seq = state.db.snapshot();
     let results = state.db.scan(start, end, seq);
     state.db.unregister_snapshot(seq);

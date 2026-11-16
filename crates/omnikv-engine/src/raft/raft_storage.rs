@@ -726,9 +726,9 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
                     .buffered_deletes
                     .iter()
                     .any(|key| key.starts_with(b"__2PC_PREPARE__/"));
-            let marker = self.db.commit_batch_local_locked(batch)?;
+            let marker = self.db.commit_batch_local_locked_skip_prepared(batch)?;
             if touches_2pc {
-                self.db.sync_prepared_2pc_reservations()?;
+                self.db.sync_prepared_2pc_from_batch(batch)?;
             }
             let history = self.db.ssi_history();
             // Entries sharing a batch committed atomically at one marker —

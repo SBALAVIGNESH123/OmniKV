@@ -250,7 +250,7 @@ impl PlanExecutor {
             AccessMethod::PkLookup { key_value } => {
                 let key_value = crate::volcano::canonicalize_pk_key(&table, key_value);
                 let key = format!("{}{}", table.row_prefix(), key_value);
-                let end = format!("{}{}\x7F", table.row_prefix(), key_value);
+                let end = format!("{}{}\u{10ffff}", table.row_prefix(), key_value);
                 let seq = self.read_seq();
                 self.db
                     .scan(&key, &end, seq)
@@ -320,7 +320,7 @@ impl PlanExecutor {
         let seq = self.read_seq();
         let stored = self
             .db
-            .scan(&prefix, &format!("{}\x7F", prefix), seq)
+            .scan(&prefix, &format!("{}\u{10ffff}", prefix), seq)
             .map_err(|error| format!("storage scan failed for table '{}': {error}", table.name))?;
         stored
             .into_iter()
@@ -352,7 +352,7 @@ impl PlanExecutor {
         let seq = self.read_seq();
         let stored = self
             .db
-            .scan(&prefix, &format!("{}\x7F", prefix), seq)
+            .scan(&prefix, &format!("{}\u{10ffff}", prefix), seq)
             .map_err(|error| format!("storage scan failed for table '{}': {error}", table.name))?;
         stored
             .into_iter()

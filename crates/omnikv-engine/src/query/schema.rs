@@ -331,8 +331,6 @@ impl SchemaManager {
     // ═══════════════════════════════════════════════════════════════
 
     /// Serializes schema work with SQL DML for the affected collection.
-    /// DML holds the same process-local lock from its visibility read through
-    /// commit, so a backfill's fixed snapshot cannot miss a row that races it.
     fn with_collection_lock<T>(
         &self,
         collection: &str,
@@ -375,6 +373,22 @@ impl SchemaManager {
                 collection,
                 field_name,
             } => self.with_collection_lock(collection, || {
+                let seq = self.db.get_seq();
+                if let Some(raw) = self
+                    .db
+                    .find(
+                        &format!("\x00CATALOG\x00{}", collection.to_lowercase()),
+                        seq,
+                    )?
+                    .as_deref()
+                    .and_then(|v| serde_json::from_str::<crate::catalog::TableDef>(v).ok())
+                    && raw.primary_key.eq_ignore_ascii_case(field_name)
+                {
+                    return Err(crate::OmniError::IoError(format!(
+                        "cannot remove primary key field '{}' from SQL table '{}'",
+                        field_name, collection
+                    )));
+                }
                 self.backfill_field(collection, field_name, None)
             }),
             SchemaOp::RenameField {
@@ -382,6 +396,53 @@ impl SchemaManager {
                 old_name,
                 new_name,
             } => self.with_collection_lock(collection, || {
+                let seq = self.db.get_seq();
+                let catalog_key = format!("\x00CATALOG\x00{}", collection.to_lowercase());
+                if let Some(mut table) = self
+                    .db
+                    .find(&catalog_key, seq)?
+                    .as_deref()
+                    .and_then(|v| serde_json::from_str::<crate::catalog::TableDef>(v).ok())
+                {
+                    if table.primary_key.eq_ignore_ascii_case(old_name) {
+                        return Err(crate::OmniError::IoError(format!(
+                            "cannot rename primary key field '{}' in SQL table '{}' \
+                             without also updating the row-key contract",
+                            old_name, collection
+                        )));
+                    }
+                    let mut column_updated = false;
+                    for col in &mut table.columns {
+                        if col.name.eq_ignore_ascii_case(old_name) {
+                            col.name = new_name.clone();
+                            column_updated = true;
+                        }
+                    }
+                    if column_updated {
+                        let cat_value = serde_json::to_string(&table)
+                            .map_err(|e| crate::OmniError::IoError(e.to_string()))?;
+                        let mut cat_batch = WriteBatch::new();
+                        cat_batch.set(&catalog_key, cat_value)?;
+                        self.db.commit_batch(&cat_batch)?;
+                    }
+                    for idx_def in self
+                        .index_manager
+                        .catalog_snapshot_at(seq)?
+                        .indexes_for_collection(collection)
+                    {
+                        if idx_def
+                            .fields
+                            .iter()
+                            .any(|(f, _)| f.eq_ignore_ascii_case(old_name))
+                        {
+                            return Err(crate::OmniError::IoError(format!(
+                                "cannot rename field '{}' in SQL table '{}' \
+                                 because index '{}' references it; drop the index first",
+                                old_name, collection, idx_def.name
+                            )));
+                        }
+                    }
+                }
                 self.rename_field_online(collection, old_name, new_name)
             }),
         }
