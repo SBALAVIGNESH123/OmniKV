@@ -218,8 +218,8 @@ fn concurrent_ssi_unique_index_inserts_with_non_ascii_pk_abort_conflicting_txn()
         &HashMap::new(),
     );
 
-    execute(&exec1, "INSERT INTO items VALUES ('clé-α', 'first', 999)");
-    execute(&exec2, "INSERT INTO items VALUES ('clé-β', 'second', 999)");
+    execute(&exec1, "INSERT INTO items VALUES ('α-clé', 'first', 999)");
+    execute(&exec2, "INSERT INTO items VALUES ('β-clé', 'second', 999)");
 
     if let Some(reads) = exec1.drain_reads() {
         t1.read_set.extend(reads.keys);
@@ -260,6 +260,6 @@ fn concurrent_ssi_unique_index_inserts_with_non_ascii_pk_abort_conflicting_txn()
     );
     assert_eq!(
         rows(&executor, "SELECT id FROM items WHERE n = 999"),
-        vec![vec![Some("clé-α".to_string())]]
+        vec![vec![Some("α-clé".to_string())]]
     );
 }

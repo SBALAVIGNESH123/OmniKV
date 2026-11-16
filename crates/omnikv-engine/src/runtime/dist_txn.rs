@@ -313,16 +313,32 @@ impl TwoPhaseCoordinator {
 
     /// COMMIT PHASE — marks the transaction as committed after all ACKs.
     pub fn finalize_commit(&self, txn_id: GlobalTxnId) -> Result<(), OmniError> {
-        let mut active = self
-            .active_txns
-            .lock()
-            .map_err(|_| OmniError::LockPoisoned("coordinator".into()))?;
-
-        if let Some(txn) = active.get_mut(&txn_id) {
-            txn.state = DistTxnState::Committed;
-            // Remove from active set
-            active.remove(&txn_id);
-        }
+        let participants = {
+            let mut active = self
+                .active_txns
+                .lock()
+                .map_err(|_| OmniError::LockPoisoned("coordinator".into()))?;
+            if let Some(txn) = active.get_mut(&txn_id) {
+                txn.state = DistTxnState::Committed;
+                let participants: Vec<u64> = txn.writes_by_node.keys().copied().collect();
+                active.remove(&txn_id);
+                Some(participants)
+            } else {
+                None
+            }
+        };
+        let participants = match participants {
+            Some(list) => list,
+            None => {
+                let commit_key = format!("__2PC_LOG__/{}_{}/COMMIT", txn_id.0, txn_id.1);
+                self.db
+                    .find(&commit_key, self.db.get_seq())?
+                    .and_then(|raw| serde_json::from_str::<TwoPhaseLogEntry>(&raw).ok())
+                    .map(|entry| entry.participants)
+                    .unwrap_or_default()
+            }
+        };
+        self.log_state(txn_id, "COMPLETE", &participants)?;
         Ok(())
     }
 
@@ -431,18 +447,16 @@ impl TwoPhaseCoordinator {
         let mut in_doubt = Vec::new();
 
         for (txn_id, states) in &txn_states {
-            if states.contains_key("COMMIT") {
-                // COMMIT was decided — need to re-deliver to participants
-                if let Some(entry) = states.get("COMMIT") {
-                    in_doubt.push((*txn_id, "COMMIT".to_string(), entry.participants.clone()));
-                }
-            } else if states.contains_key("PREPARE") && !states.contains_key("ABORT") {
-                // PREPARE but no decision — in-doubt, default to ABORT
-                if let Some(entry) = states.get("PREPARE") {
-                    in_doubt.push((*txn_id, "PREPARE".to_string(), entry.participants.clone()));
-                }
+            if states.contains_key("COMPLETE") {
+                continue;
             }
-            // ABORT records are already resolved — skip
+            if let Some(entry) = states.get("COMMIT") {
+                in_doubt.push((*txn_id, "COMMIT".to_string(), entry.participants.clone()));
+            } else if !states.contains_key("ABORT")
+                && let Some(entry) = states.get("PREPARE")
+            {
+                in_doubt.push((*txn_id, "PREPARE".to_string(), entry.participants.clone()));
+            }
         }
 
         Ok(in_doubt)
@@ -485,47 +499,54 @@ impl TwoPhaseCoordinator {
         let entries = self
             .db
             .scan("__2PC_LOG__/", "__2PC_LOG__/~", self.db.get_seq())?;
-        let mut purged = 0;
-        let mut batch = WriteBatch::new();
-        for (key, value) in &entries {
-            let entry: Result<TwoPhaseLogEntry, _> = serde_json::from_str(value);
-            let dominated = match &entry {
-                Ok(e) => {
-                    let terminal = e.state == "COMMIT" || e.state == "ABORT";
-                    terminal && now.saturating_sub(e.timestamp) > max_age_secs
+        let mut by_txn: HashMap<GlobalTxnId, Vec<(String, TwoPhaseLogEntry)>> = HashMap::new();
+        let mut keys_to_delete = Vec::new();
+        for (key, value) in entries {
+            match serde_json::from_str::<TwoPhaseLogEntry>(&value) {
+                Ok(entry) => {
+                    by_txn.entry(entry.txn_id).or_default().push((key, entry));
                 }
-                Err(_) => now > max_age_secs, // corrupt entry — safe to remove
-            };
-            if dominated {
-                batch.delete(key)?;
-                purged += 1;
+                Err(_) if now > max_age_secs => {
+                    keys_to_delete.push(key);
+                }
+                Err(_) => {}
             }
         }
-        if purged > 0 {
+        for records in by_txn.into_values() {
+            let terminal_entry = records
+                .iter()
+                .find(|(_, e)| e.state == "COMPLETE" || e.state == "ABORT")
+                .map(|(_, e)| e);
+            if let Some(terminal) = terminal_entry
+                && now.saturating_sub(terminal.timestamp) > max_age_secs
+            {
+                for (key, _) in records {
+                    keys_to_delete.push(key);
+                }
+            }
+        }
+        let purged = keys_to_delete.len();
+        let mut batch = WriteBatch::new();
+        for key in keys_to_delete {
+            batch.delete(&key)?;
+            if batch.op_count() >= 1000 {
+                self.db.commit_2pc_batch(&batch)?;
+                batch.clear();
+            }
+        }
+        if !batch.is_empty() {
             self.db.commit_2pc_batch(&batch)?;
         }
         Ok(purged)
     }
 }
 
-/// ═══════════════════════════════════════════════════════════════════════
-/// 2PC PARTICIPANT
-/// ═══════════════════════════════════════════════════════════════════════
-///
-/// The participant runs on each node that holds data involved in the
-/// distributed transaction. It validates writes using local SSI and
-/// votes COMMIT or ABORT.
 pub struct TwoPhaseParticipant {
-    /// This node's ID.
     node_id: u64,
-    /// Local OmniKV instance.
     db: Arc<OmniKV>,
-    /// Prepared transactions awaiting COMMIT/ABORT decision.
     prepared: Mutex<HashMap<GlobalTxnId, PreparedState>>,
-    /// In-process key reservations prevent two concurrent prepares from
-    /// voting COMMIT for the same key. Durable prepared records are rebuilt
-    /// into this map when recovery is requested.
     key_locks: Mutex<HashMap<String, GlobalTxnId>>,
+    needs_recovery: std::sync::atomic::AtomicBool,
 }
 
 /// State of a prepared transaction on a participant.
@@ -560,6 +581,9 @@ fn legacy_participant_prepare_key(txn_id: GlobalTxnId) -> String {
 }
 
 fn build_write_batch(writes: &[DistWrite]) -> Result<WriteBatch, String> {
+    if writes.len().saturating_add(2) > WriteBatch::MAX_OPS {
+        return Err("2PC batch exceeds maximum size after decision records".into());
+    }
     let mut batch = WriteBatch::new();
     for write in writes {
         match &write.value {
@@ -578,6 +602,30 @@ fn build_write_batch(writes: &[DistWrite]) -> Result<WriteBatch, String> {
     Ok(batch)
 }
 
+pub(crate) fn sync_all_prepared_reservations(db: &OmniKV) -> Result<(), OmniError> {
+    let entries = db.scan("__2PC_PREPARE__/", "__2PC_PREPARE__/~", db.get_seq())?;
+    let mut reserved = HashMap::new();
+    for (key, value) in entries {
+        let Some(rest) = key.strip_prefix("__2PC_PREPARE__/") else {
+            continue;
+        };
+        if !rest.contains('/') {
+            continue;
+        }
+        let Ok(entry) = serde_json::from_str::<ParticipantLogEntry>(&value) else {
+            continue;
+        };
+        if entry.state != "PREPARED" {
+            continue;
+        }
+        for write in entry.writes {
+            reserved.insert(write.key, (entry.node_id, entry.txn_id));
+        }
+    }
+    db.ssi_history.replace_all_prepared_keys(reserved);
+    Ok(())
+}
+
 impl TwoPhaseParticipant {
     pub fn new(node_id: u64, db: Arc<OmniKV>) -> Self {
         let participant = Self {
@@ -585,6 +633,7 @@ impl TwoPhaseParticipant {
             db,
             prepared: Mutex::new(HashMap::new()),
             key_locks: Mutex::new(HashMap::new()),
+            needs_recovery: std::sync::atomic::AtomicBool::new(true),
         };
         if let Err(error) = participant.recover() {
             tracing::error!(node_id, ?error, "2PC participant recovery failed");
@@ -620,6 +669,7 @@ impl TwoPhaseParticipant {
             let _guard = lock
                 .lock()
                 .map_err(|_| OmniError::LockPoisoned("2PC participant".into()))?;
+            self.recover_locked()?;
             if let Some(existing) = self.load_participant_log(txn_id)? {
                 if existing.writes != writes && existing.state != "ABORTED" {
                     return Err(OmniError::IoError(
@@ -708,6 +758,15 @@ impl TwoPhaseParticipant {
                 node_id: self.node_id,
                 txn_id,
                 vote: Vote::Abort(reason),
+                prepare_seq: 0,
+            };
+        }
+        if let Err(error) = self.db.fence_write_reservation() {
+            self.release_key_locks(txn_id, &write_keys);
+            return PrepareResult {
+                node_id: self.node_id,
+                txn_id,
+                vote: Vote::Abort(error.to_string()),
                 prepare_seq: 0,
             };
         }
@@ -940,6 +999,7 @@ impl TwoPhaseParticipant {
             .map_err(OmniError::IoError)?;
         *prepared = recovered_prepared;
         *key_locks = recovered_locks;
+        self.needs_recovery.store(false, Ordering::SeqCst);
         Ok(recovered)
     }
 
@@ -951,6 +1011,9 @@ impl TwoPhaseParticipant {
         let _guard = lock
             .lock()
             .map_err(|_| OmniError::LockPoisoned("2PC participant".into()))?;
+        if self.needs_recovery.load(Ordering::SeqCst) {
+            self.recover_locked()?;
+        }
         let state = self
             .load_participant_log(txn_id)?
             .ok_or_else(|| OmniError::IoError(format!("No prepared transaction {txn_id:?}")))?;
@@ -1039,6 +1102,9 @@ impl TwoPhaseParticipant {
         let _guard = lock
             .lock()
             .map_err(|_| OmniError::LockPoisoned("2PC participant".into()))?;
+        if self.needs_recovery.load(Ordering::SeqCst) {
+            self.recover_locked()?;
+        }
         let writes = match self.load_participant_log(txn_id)? {
             Some(entry) if entry.state == "COMMITTED" => {
                 return Err(OmniError::IoError(

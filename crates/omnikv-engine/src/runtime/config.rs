@@ -403,10 +403,10 @@ impl ServerConfig {
             self.rate_limit_max_users = parse_env_value("OMNIKV_RATE_LIMIT_MAX_USERS", &v)?;
         }
         if let Ok(v) = std::env::var("OMNIKV_TLS_CERT_PATH") {
-            self.tls_cert_path = Some(v);
+            self.tls_cert_path = if v.is_empty() { None } else { Some(v) };
         }
         if let Ok(v) = std::env::var("OMNIKV_TLS_KEY_PATH") {
-            self.tls_key_path = Some(v);
+            self.tls_key_path = if v.is_empty() { None } else { Some(v) };
         }
         if let Ok(v) = std::env::var("OMNIKV_TLS_INSECURE_SKIP") {
             self.tls_insecure_skip = parse_env_value("OMNIKV_TLS_INSECURE_SKIP", &v)?;
@@ -519,9 +519,73 @@ impl ServerConfig {
     }
 
     pub fn validate_runtime(&self) -> Result<(), ConfigError> {
-        // A node id without a raft listener, or a listener without a
-        // node id, is a half-configured cluster: refuse to boot rather
-        // than silently degrade to single-node.
+        self.validate_cluster(self.mode == ServerMode::Production)?;
+        self.validate_common()?;
+        if self.mode == ServerMode::Production {
+            self.validate_production()?;
+        }
+        if self.tls_insecure_skip {
+            eprintln!(
+                "WARNING: OMNIKV_TLS_INSECURE_SKIP is enabled — \
+                 peer certificate verification is disabled. \
+                 Do NOT use this in production."
+            );
+        }
+        Ok(())
+    }
+
+    pub fn validate_production(&self) -> Result<(), ConfigError> {
+        self.validate_cluster(true)?;
+        self.validate_common()?;
+        if self.jwt_secret == DEV_JWT_SECRET {
+            return Err(ConfigError(
+                "production mode requires a non-default JWT secret".into(),
+            ));
+        }
+        if self.jwt_secret.len() < 32 {
+            return Err(ConfigError(
+                "JWT secret must be at least 32 characters in production".into(),
+            ));
+        }
+        if self.bootstrap_admin_key == DEV_BOOTSTRAP_ADMIN_KEY {
+            return Err(ConfigError(
+                "production mode requires a non-default bootstrap admin key".into(),
+            ));
+        }
+        if self.bootstrap_admin_key.len() < 32 {
+            return Err(ConfigError(
+                "bootstrap admin key must be at least 32 characters in production".into(),
+            ));
+        }
+        if self.bootstrap_admin_key == self.jwt_secret {
+            return Err(ConfigError(
+                "bootstrap admin key must be different from the JWT secret".into(),
+            ));
+        }
+        if !self.tls_insecure_skip {
+            match (&self.tls_cert_path, &self.tls_key_path) {
+                (Some(cert), Some(key)) => {
+                    if !Path::new(cert).exists() {
+                        return Err(ConfigError(format!("TLS cert not found: {cert}")));
+                    }
+                    if !Path::new(key).exists() {
+                        return Err(ConfigError(format!("TLS key not found: {key}")));
+                    }
+                }
+                _ => {
+                    return Err(ConfigError(
+                        "production mode requires TLS cert+key or OMNIKV_TLS_INSECURE_SKIP=true"
+                            .into(),
+                    ));
+                }
+            }
+        } else {
+            eprintln!("WARNING: TLS verification is disabled (OMNIKV_TLS_INSECURE_SKIP=true)");
+        }
+        Ok(())
+    }
+
+    fn validate_cluster(&self, production_mode: bool) -> Result<(), ConfigError> {
         if self.raft.node_id.is_some() != self.raft.raft_addr.is_some() {
             return Err(ConfigError(
                 "raft.node_id and raft.raft_addr must be set together (OMNIKV_NODE_ID / OMNIKV_RAFT_ADDR)".into(),
@@ -533,7 +597,7 @@ impl ServerConfig {
                     "cluster mode requires OMNIKV_RAFT_AUTH_TOKEN to authenticate peer RPCs".into(),
                 ));
             }
-            if self.mode == ServerMode::Production {
+            if production_mode {
                 if self.tls_insecure_skip {
                     return Err(ConfigError(
                         "production cluster mode forbids OMNIKV_TLS_INSECURE_SKIP; Raft peer certificates must be verified".into(),
@@ -590,13 +654,6 @@ impl ServerConfig {
                 "raft.election_timeout_min_ms must be <= election_timeout_max_ms".into(),
             ));
         }
-        // The ADVERTISED address is what peers dial — it must never be
-        // a wildcard. When the explicit override is set, validate it;
-        // when it is not, the bind address is the advertised one, so a
-        // wildcard bind requires the override (a cluster member bound
-        // to 0.0.0.0 without a routable advertise address would poison
-        // every peer's routing table with an address that resolves to
-        // the dialer itself).
         let advertised = self
             .raft
             .advertise_addr
@@ -611,24 +668,9 @@ impl ServerConfig {
                     .into(),
             ));
         }
-        // Shape check on the explicit override only: "host:port" with a
-        // non-empty host and a valid port. Hostnames (the container
-        // pattern: omni-node-1:9090) are valid here — peers resolve them
-        // through the compose network.
         if let Some(advertise) = &self.raft.advertise_addr {
             validate_raft_endpoint(advertise, "raft.advertise_addr")?;
         }
-        // Each network address must map to exactly one peer identity:
-        // duplicate peer endpoints (or a peer that duplicates this node's
-        // advertised address) let openraft route several member ids to one
-        // listener, which breaks quorum arithmetic in subtle ways.
-        //
-        // Every peer is also dialed exactly as written (boot_cluster_node
-        // copies it into openraft::BasicNode.addr and OmniNetwork builds
-        // the RPC URL from it), so a malformed, wildcard, or port-zero
-        // peer is not a typo an operator can recover from later — it is a
-        // member that can never be reached. Validate each one up front,
-        // with the same rules as the advertised address.
         if let Some(me) = advertised {
             let mut seen = std::collections::HashSet::new();
             for peer in &self.raft.peers {
@@ -644,67 +686,6 @@ impl ServerConfig {
                     )));
                 }
             }
-        }
-        self.validate_common()?;
-        if self.mode == ServerMode::Production {
-            self.validate_production()?;
-        }
-        if self.tls_insecure_skip {
-            eprintln!(
-                "WARNING: OMNIKV_TLS_INSECURE_SKIP is enabled — \
-                 peer certificate verification is disabled. \
-                 Do NOT use this in production."
-            );
-        }
-        Ok(())
-    }
-
-    pub fn validate_production(&self) -> Result<(), ConfigError> {
-        self.validate_common()?;
-        if self.jwt_secret == DEV_JWT_SECRET {
-            return Err(ConfigError(
-                "production mode requires a non-default JWT secret".into(),
-            ));
-        }
-        if self.jwt_secret.len() < 32 {
-            return Err(ConfigError(
-                "JWT secret must be at least 32 characters in production".into(),
-            ));
-        }
-        if self.bootstrap_admin_key == DEV_BOOTSTRAP_ADMIN_KEY {
-            return Err(ConfigError(
-                "production mode requires a non-default bootstrap admin key".into(),
-            ));
-        }
-        if self.bootstrap_admin_key.len() < 32 {
-            return Err(ConfigError(
-                "bootstrap admin key must be at least 32 characters in production".into(),
-            ));
-        }
-        if self.bootstrap_admin_key == self.jwt_secret {
-            return Err(ConfigError(
-                "bootstrap admin key must be different from the JWT secret".into(),
-            ));
-        }
-        if !self.tls_insecure_skip {
-            match (&self.tls_cert_path, &self.tls_key_path) {
-                (Some(cert), Some(key)) => {
-                    if !Path::new(cert).exists() {
-                        return Err(ConfigError(format!("TLS cert not found: {cert}")));
-                    }
-                    if !Path::new(key).exists() {
-                        return Err(ConfigError(format!("TLS key not found: {key}")));
-                    }
-                }
-                _ => {
-                    return Err(ConfigError(
-                        "production mode requires TLS cert+key or OMNIKV_TLS_INSECURE_SKIP=true"
-                            .into(),
-                    ));
-                }
-            }
-        } else {
-            eprintln!("WARNING: TLS verification is disabled (OMNIKV_TLS_INSECURE_SKIP=true)");
         }
         Ok(())
     }

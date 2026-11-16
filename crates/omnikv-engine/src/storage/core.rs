@@ -2005,6 +2005,18 @@ impl OmniKV {
     /// The single-node commit path, also used by the raft state machine
     /// itself when it applies entries: raft's own bookkeeping must
     /// never route back through the cluster gateway.
+    pub(crate) fn fence_write_reservation(&self) -> Result<(), OmniError> {
+        let _guard = self
+            .write_mutex
+            .lock()
+            .map_err(|_| OmniError::LockPoisoned("commit_seq".into()))?;
+        Ok(())
+    }
+
+    pub(crate) fn sync_prepared_2pc_reservations(&self) -> Result<(), OmniError> {
+        crate::dist_txn::sync_all_prepared_reservations(self)
+    }
+
     pub(crate) fn commit_batch_local(&self, tx: &WriteBatch) -> Result<u64, OmniError> {
         // Acquire shared topology lock — blocks only during an exclusive
         // snapshot install or a build_snapshot's capture window. Thousands
@@ -2094,11 +2106,24 @@ impl OmniKV {
         // numbers and reserve a contiguous region in the heap file.
         // No I/O happens here â€” just atomic integer operations.
         // â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+        let is_2pc_internal = tx
+            .buffered_writes
+            .iter()
+            .any(|(key, _, _)| key.starts_with(b"__2PC_"))
+            || tx
+                .buffered_deletes
+                .iter()
+                .any(|key| key.starts_with(b"__2PC_"));
         let (base_seq, reserved_offset) = {
             let _guard = self
                 .write_mutex
                 .lock()
                 .map_err(|_| OmniError::LockPoisoned("commit_seq".into()))?;
+            if !is_2pc_internal
+                && let Some(conflict) = self.ssi_history.check_batch_prepared_conflicts(tx)
+            {
+                return Err(OmniError::IoError(conflict));
+            }
             let seq = self.global_seq.fetch_add(num_records + 1, Ordering::SeqCst);
             let offset = self
                 .heap_offset

@@ -615,7 +615,7 @@ async fn cluster_status_handler(
             node_id: state.cluster_node_id,
             leader_id: metrics.current_leader,
             term: metrics.current_term,
-            last_applied_index: metrics.last_applied.map_or_default(|l| l.index),
+            last_applied_index: metrics.last_applied.map_or(0, |l| l.index),
             members,
         }),
     )
@@ -1015,6 +1015,22 @@ async fn restore_handler(
             ApiResponse::<String>::err("backup not found"),
         );
     }
+    let _active_restore = match ActiveRestoreGuard::acquire(&restore_dir) {
+        Some(guard) => guard,
+        None => {
+            audit_claims_event(
+                "restore.started",
+                AuditOutcome::Denied,
+                &claims,
+                "/admin/restore",
+                "restore_in_progress",
+            );
+            return (
+                StatusCode::CONFLICT,
+                ApiResponse::<String>::err("restore already in progress for target path"),
+            );
+        }
+    };
     if let Some(parent) = restore_dir.parent()
         && !parent.as_os_str().is_empty()
         && let Err(e) = std::fs::create_dir_all(parent)
@@ -1100,6 +1116,43 @@ async fn restore_handler(
                 ApiResponse::<String>::err(&format!("restore task failed: {join_error}")),
             )
         }
+    }
+}
+
+struct ActiveRestoreGuard {
+    path: std::path::PathBuf,
+}
+
+impl ActiveRestoreGuard {
+    fn registry() -> &'static std::sync::Mutex<Vec<std::path::PathBuf>> {
+        static ACTIVE: std::sync::OnceLock<std::sync::Mutex<Vec<std::path::PathBuf>>> =
+            std::sync::OnceLock::new();
+        ACTIVE.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+    }
+
+    fn acquire(target: &std::path::Path) -> Option<Self> {
+        let mut active = Self::registry()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if active
+            .iter()
+            .any(|existing| target.starts_with(existing) || existing.starts_with(target))
+        {
+            return None;
+        }
+        let path = target.to_path_buf();
+        active.push(path.clone());
+        drop(active);
+        Some(Self { path })
+    }
+}
+
+impl Drop for ActiveRestoreGuard {
+    fn drop(&mut self) {
+        let mut active = Self::registry()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        active.retain(|existing| existing != &self.path);
     }
 }
 

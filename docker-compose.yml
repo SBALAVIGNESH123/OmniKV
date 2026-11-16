@@ -14,6 +14,10 @@ x-omnikv-common-env: &omnikv-common-env
   # Production deployments should provide trusted client/server TLS material
   # and OMNIKV_RAFT_TLS_CA_PATH in their deployment environment.
   OMNIKV_TLS_INSECURE_SKIP: "${OMNIKV_TLS_INSECURE_SKIP:?set OMNIKV_TLS_INSECURE_SKIP=false for production, or true only for a local demo}"
+  OMNIKV_TLS_CERT_PATH: "${OMNIKV_TLS_CERT_PATH:-}"
+  OMNIKV_TLS_KEY_PATH: "${OMNIKV_TLS_KEY_PATH:-}"
+  OMNIKV_RAFT_TLS: "${OMNIKV_RAFT_TLS:-false}"
+  OMNIKV_RAFT_TLS_CA_PATH: "${OMNIKV_RAFT_TLS_CA_PATH:-}"
   # Compose validates presence only; OmniKV validates minimum length and uniqueness at startup.
   OMNIKV_JWT_SECRET: "${OMNIKV_JWT_SECRET:?set OMNIKV_JWT_SECRET to a strong 32+ character value}"
   OMNIKV_BOOTSTRAP_ADMIN_KEY: "${OMNIKV_BOOTSTRAP_ADMIN_KEY:?set OMNIKV_BOOTSTRAP_ADMIN_KEY to a different strong 32+ character value}"

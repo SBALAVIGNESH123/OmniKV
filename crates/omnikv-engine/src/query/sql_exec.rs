@@ -823,6 +823,20 @@ impl SqlExecutor {
     /// The table definition as recorded at this statement's read point. The
     /// catalog cache can lag a migration, and a stale `row_format` would
     /// re-migrate rows that are already typed.
+    fn dml_index_catalog(&self, seq: u64) -> Result<crate::secondary_index::IndexCatalog, String> {
+        let (start, end) = crate::secondary_index::IndexCatalog::catalog_scan_range();
+        self.record_range_read(start, end);
+        let mut catalog = self
+            .catalog
+            .index_manager()
+            .catalog_snapshot_at(seq)
+            .map_err(|e| format!("Index catalog snapshot failed: {e}"))?;
+        if let Some(overlay) = self.pending_overlay() {
+            catalog.apply_overlay(&overlay);
+        }
+        Ok(catalog)
+    }
+
     fn effective_table(&self, name: &str, seq: u64) -> Result<Option<TableDef>, String> {
         let key = Catalog::catalog_key(name);
         if let Some(overlay) = self.pending_overlay()
@@ -887,9 +901,7 @@ impl SqlExecutor {
         let mut batch = WriteBatch::new();
         self.seed_pending_indexes(&mut batch)?;
         let index_manager = self.catalog.index_manager();
-        let index_catalog = index_manager
-            .catalog_snapshot_at(seq)
-            .map_err(|e| format!("Index catalog snapshot failed: {e}"))?;
+        let index_catalog = self.dml_index_catalog(seq)?;
         // The typed path keys and compares a numeric primary key canonically,
         // so a legacy row stored at ...007 is re-keyed to ...7.
         let mut canonical_keys: HashMap<String, &str> = HashMap::new();
@@ -1021,9 +1033,7 @@ impl SqlExecutor {
         let mut count = 0;
         self.seed_pending_indexes(&mut batch)?;
         let index_manager = self.catalog.index_manager();
-        let index_catalog = index_manager
-            .catalog_snapshot_at(read_seq)
-            .map_err(|e| format!("Index catalog snapshot failed: {e}"))?;
+        let index_catalog = self.dml_index_catalog(read_seq)?;
 
         for row_vals in values {
             let mut row_map = Row::new();
@@ -1229,11 +1239,14 @@ impl SqlExecutor {
             offset: None, // offset handled in post-processing below
         };
 
-        let index_catalog = self
+        let mut index_catalog = self
             .catalog
             .index_manager()
             .catalog_snapshot_at(self.statement_read_seq())
             .map_err(|error| format!("index catalog read failed: {error}"))?;
+        if let Some(overlay) = self.pending_overlay() {
+            index_catalog.apply_overlay(&overlay);
+        }
         let stats = crate::optimizer::gather_stats_at_checked(
             &self.catalog,
             Some(&index_catalog),
@@ -2241,9 +2254,7 @@ impl SqlExecutor {
         let count = rows.len();
         self.seed_pending_indexes(&mut batch)?;
         let index_manager = self.catalog.index_manager();
-        let index_catalog = index_manager
-            .catalog_snapshot_at(read_seq)
-            .map_err(|e| format!("Index catalog snapshot failed: {e}"))?;
+        let index_catalog = self.dml_index_catalog(read_seq)?;
         for (row, old_key) in rows.iter_mut().zip(old_keys) {
             let mut old_document = serde_json::to_value(&*row)
                 .map_err(|e| format!("Serialize old index document: {e}"))?;
@@ -2362,9 +2373,7 @@ impl SqlExecutor {
         let count = rows.len();
         self.seed_pending_indexes(&mut batch)?;
         let index_manager = self.catalog.index_manager();
-        let index_catalog = index_manager
-            .catalog_snapshot_at(read_seq)
-            .map_err(|e| format!("Index catalog snapshot failed: {e}"))?;
+        let index_catalog = self.dml_index_catalog(read_seq)?;
         for row in &rows {
             let pk = row
                 .get(&table.primary_key)

@@ -360,9 +360,7 @@ impl SchemaManager {
                     fields.clone(),
                     *unique,
                 )?;
-                // Rebuild while the collection lock is held, so no SQL DML
-                // can create rows that escape the initial index population.
-                self.index_manager.rebuild_index_locked(name)?;
+                self.index_manager.rebuild_index_locked(name, collection)?;
                 Ok(())
             }),
             SchemaOp::DropIndex { name } => self.index_manager.drop_index(name),
@@ -400,11 +398,40 @@ impl SchemaManager {
         self.index_manager.refresh_catalog()?;
         let seq = self.db.get_seq();
         let catalog = self.index_manager.catalog_snapshot_at(seq)?;
+        let sql_table = self
+            .db
+            .find(
+                &format!("\x00CATALOG\x00{}", collection.to_lowercase()),
+                seq,
+            )?
+            .and_then(|raw| serde_json::from_str::<crate::catalog::TableDef>(&raw).ok());
+        let sql_row_format = sql_table
+            .as_ref()
+            .map(|table| table.row_format)
+            .unwrap_or_default();
+        let sql_default = match default_value {
+            Some(serde_json::Value::Null) => Some(serde_json::Value::Null),
+            Some(serde_json::Value::String(s)) => Some(serde_json::Value::String(s.clone())),
+            Some(serde_json::Value::Number(n)) => Some(serde_json::Value::String(n.to_string())),
+            Some(serde_json::Value::Bool(b)) => Some(serde_json::Value::String(b.to_string())),
+            Some(other) => {
+                let sql_prefix = format!("\x00T\x00{}\x00", collection);
+                let sql_end = format!("\x00T\x00{}\x00\u{10ffff}", collection);
+                if sql_table.is_some() || !self.db.scan(&sql_prefix, &sql_end, seq)?.is_empty() {
+                    return Err(OmniError::IoError(format!(
+                        "unsupported SQL row value for field '{field_name}': {other}"
+                    )));
+                }
+                None
+            }
+            None => None,
+        };
 
         let mut batch = WriteBatch::new();
         let mut count = 0;
 
         for (prefix, end) in collection_row_ranges(collection) {
+            let is_sql_rows = prefix.starts_with("\x00T\x00");
             for (key, value) in self.db.scan(&prefix, &end, seq)? {
                 let Ok(mut doc) = serde_json::from_str::<serde_json::Value>(&value) else {
                     continue;
@@ -415,7 +442,12 @@ impl SchemaManager {
                 };
                 let changed = match default_value {
                     Some(val) if !obj.contains_key(field_name) => {
-                        obj.insert(field_name.to_string(), val.clone());
+                        let insert_val = if is_sql_rows {
+                            sql_default.clone().unwrap_or(serde_json::Value::Null)
+                        } else {
+                            val.clone()
+                        };
+                        obj.insert(field_name.to_string(), insert_val);
                         true
                     }
                     Some(_) => false,
@@ -425,19 +457,38 @@ impl SchemaManager {
                     let updated = serde_json::to_string(&doc)
                         .map_err(|e| OmniError::IoError(e.to_string()))?;
                     let primary_key = key.strip_prefix(&prefix).unwrap_or(&key);
+                    let (old_index_doc, new_index_doc) = if is_sql_rows {
+                        let old_row = crate::plan_exec::PlanExecutor::deserialize_row_checked(
+                            &value,
+                            sql_row_format,
+                        )
+                        .map_err(OmniError::IoError)?;
+                        let new_row = crate::plan_exec::PlanExecutor::deserialize_row_checked(
+                            &updated,
+                            sql_row_format,
+                        )
+                        .map_err(OmniError::IoError)?;
+                        (
+                            serde_json::to_value(&old_row)
+                                .map_err(|e| OmniError::IoError(e.to_string()))?,
+                            serde_json::to_value(&new_row)
+                                .map_err(|e| OmniError::IoError(e.to_string()))?,
+                        )
+                    } else {
+                        (old_doc, doc)
+                    };
                     self.index_manager.replace_document_indexes_with_catalog(
                         &catalog,
                         collection,
                         primary_key,
-                        &old_doc,
+                        &old_index_doc,
                         primary_key,
-                        &doc,
+                        &new_index_doc,
                         &mut batch,
                     )?;
                     batch.set(&key, updated)?;
                     count += 1;
 
-                    // Commit in batches of 500.
                     if count % 500 == 0 && !batch.is_empty() {
                         self.db.commit_batch(&batch)?;
                         batch = WriteBatch::new();
@@ -463,6 +514,15 @@ impl SchemaManager {
         self.index_manager.refresh_catalog()?;
         let seq = self.db.get_seq();
         let catalog = self.index_manager.catalog_snapshot_at(seq)?;
+        let sql_row_format = self
+            .db
+            .find(
+                &format!("\x00CATALOG\x00{}", collection.to_lowercase()),
+                seq,
+            )?
+            .and_then(|raw| serde_json::from_str::<crate::catalog::TableDef>(&raw).ok())
+            .map(|table| table.row_format)
+            .unwrap_or_default();
 
         for (prefix, end) in collection_row_ranges(collection) {
             for (_, value) in self.db.scan(&prefix, &end, seq)? {
@@ -482,6 +542,7 @@ impl SchemaManager {
         let mut count = 0;
 
         for (prefix, end) in collection_row_ranges(collection) {
+            let is_sql_rows = prefix.starts_with("\x00T\x00");
             for (key, value) in self.db.scan(&prefix, &end, seq)? {
                 let Ok(mut doc) = serde_json::from_str::<serde_json::Value>(&value) else {
                     continue;
@@ -501,13 +562,33 @@ impl SchemaManager {
                     let updated = serde_json::to_string(&doc)
                         .map_err(|e| OmniError::IoError(e.to_string()))?;
                     let primary_key = key.strip_prefix(&prefix).unwrap_or(&key);
+                    let (old_index_doc, new_index_doc) = if is_sql_rows {
+                        let old_row = crate::plan_exec::PlanExecutor::deserialize_row_checked(
+                            &value,
+                            sql_row_format,
+                        )
+                        .map_err(OmniError::IoError)?;
+                        let new_row = crate::plan_exec::PlanExecutor::deserialize_row_checked(
+                            &updated,
+                            sql_row_format,
+                        )
+                        .map_err(OmniError::IoError)?;
+                        (
+                            serde_json::to_value(&old_row)
+                                .map_err(|e| OmniError::IoError(e.to_string()))?,
+                            serde_json::to_value(&new_row)
+                                .map_err(|e| OmniError::IoError(e.to_string()))?,
+                        )
+                    } else {
+                        (old_doc, doc)
+                    };
                     self.index_manager.replace_document_indexes_with_catalog(
                         &catalog,
                         collection,
                         primary_key,
-                        &old_doc,
+                        &old_index_doc,
                         primary_key,
-                        &doc,
+                        &new_index_doc,
                         &mut batch,
                     )?;
                     batch.set(&key, updated)?;

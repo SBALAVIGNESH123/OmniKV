@@ -718,7 +718,18 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
                 .transition_guard
                 .read()
                 .map_err(|_| crate::OmniError::LockPoisoned("transition_guard".into()))?;
+            let touches_2pc = batch
+                .buffered_writes
+                .iter()
+                .any(|(key, _, _)| key.starts_with(b"__2PC_PREPARE__/"))
+                || batch
+                    .buffered_deletes
+                    .iter()
+                    .any(|key| key.starts_with(b"__2PC_PREPARE__/"));
             let marker = self.db.commit_batch_local_locked(batch)?;
+            if touches_2pc {
+                self.db.sync_prepared_2pc_reservations()?;
+            }
             let history = self.db.ssi_history();
             // Entries sharing a batch committed atomically at one marker —
             // a transaction whose read_seq equals it sees all of them.
@@ -1194,6 +1205,9 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
                 .map(|e| (e.txn_id, e.commit_seq, e.record))
                 .collect(),
         );
+        self.db
+            .sync_prepared_2pc_reservations()
+            .map_err(|e| io_err(&format!("sync 2PC prepared reservations: {e}")))?;
 
         // ── Phase I: Release exclusive lock (writers resume on new topology) ──
         drop(_exclusive);

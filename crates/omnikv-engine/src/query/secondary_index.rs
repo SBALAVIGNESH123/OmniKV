@@ -173,6 +173,43 @@ impl IndexCatalog {
     pub fn is_ready(&self, id: IndexId) -> bool {
         self.ready.contains(&id)
     }
+
+    pub(crate) fn catalog_scan_range() -> (&'static str, &'static str) {
+        (CATALOG_PREFIX, "\x00IDX_CATALOG\x00\x7f")
+    }
+
+    pub(crate) fn apply_overlay(&mut self, overlay: &HashMap<String, Option<String>>) {
+        for (key, value) in overlay {
+            if let Some(id_str) = key.strip_prefix(CATALOG_PREFIX)
+                && let Ok(id) = id_str.parse::<IndexId>()
+            {
+                if let Some(old) = self.indexes.remove(&id) {
+                    for (field_name, _) in &old.fields {
+                        if let Some(ids) = self
+                            .field_index
+                            .get_mut(&(old.collection.clone(), field_name.clone()))
+                        {
+                            ids.retain(|&existing| existing != id);
+                        }
+                    }
+                    self.ready.remove(&id);
+                }
+                if let Some(raw) = value
+                    && let Ok(def) = serde_json::from_str::<IndexDefinition>(raw)
+                {
+                    self.register_in_memory(def);
+                }
+            } else if let Some(id_str) = key.strip_prefix(READY_PREFIX)
+                && let Ok(id) = id_str.parse::<IndexId>()
+            {
+                if value.as_deref() == Some("ready") {
+                    self.ready.insert(id);
+                } else {
+                    self.ready.remove(&id);
+                }
+            }
+        }
+    }
 }
 
 /// Encodes a field value into a byte sequence that preserves sort order.
@@ -382,10 +419,13 @@ fn append_index_delete(batch: &mut WriteBatch, key: &str) -> Result<(), OmniErro
 /// rows that SQL DML maintains incrementally.
 pub(crate) fn collection_row_ranges(collection: &str) -> [(String, String); 2] {
     [
-        (format!("{}:", collection), format!("{}:\x7f", collection)),
+        (
+            format!("{}:", collection),
+            format!("{}:\u{10ffff}", collection),
+        ),
         (
             format!("\x00T\x00{}\x00", collection),
-            format!("\x00T\x00{}\x00\x7f", collection),
+            format!("\x00T\x00{}\x00\u{10ffff}", collection),
         ),
     ]
 }
@@ -527,7 +567,17 @@ impl IndexManager {
         let mut batch = WriteBatch::new();
         batch.set(&catalog_key, catalog_value)?;
         batch.set(NEXT_ID_KEY, next_id.to_string())?;
-        self.db.commit_batch(&batch)?;
+        let commit_seq = self.db.commit_batch(&batch)?;
+        self.db.ssi_history().record_committed(
+            0,
+            commit_seq,
+            &crate::transaction::SsiCommitRecord {
+                txn_id: 0,
+                write_keys: vec![catalog_key],
+                read_keys: Vec::new(),
+                read_ranges: Vec::new(),
+            },
+        );
 
         Ok(id)
     }
@@ -547,6 +597,7 @@ impl IndexManager {
 
         let id = catalog
             .get_by_name(name)
+            .filter(|d| d.collection.eq_ignore_ascii_case(&definition.collection))
             .map(|d| d.id)
             .ok_or_else(|| OmniError::IoError(format!("Index '{}' not found", name)))?;
 
@@ -558,13 +609,23 @@ impl IndexManager {
 
         // Delete all index entries (scan and delete)
         let prefix = build_index_scan_prefix(id);
-        let end = format!("{}\x7f", prefix);
+        let end = format!("{}\u{10ffff}", prefix);
         let seq = self.db.get_seq();
         for (key, _) in self.db.scan(&prefix, &end, seq)? {
             batch.delete(&key)?;
         }
 
-        self.db.commit_batch(&batch)?;
+        let commit_seq = self.db.commit_batch(&batch)?;
+        self.db.ssi_history().record_committed(
+            0,
+            commit_seq,
+            &crate::transaction::SsiCommitRecord {
+                txn_id: 0,
+                write_keys: vec![catalog_key],
+                read_keys: Vec::new(),
+                read_ranges: Vec::new(),
+            },
+        );
 
         Ok(())
     }
@@ -596,7 +657,7 @@ impl IndexManager {
             let cat_key = format!("{}{}", CATALOG_PREFIX, def.id);
             let ready_key = format!("{READY_PREFIX}{}", def.id);
             let prefix = build_index_scan_prefix(def.id);
-            let end = format!("{}\x7f", prefix);
+            let end = format!("{}\u{10ffff}", prefix);
             let staged_keys: Vec<String> = batch
                 .buffered_writes
                 .iter()
@@ -1025,45 +1086,72 @@ impl IndexManager {
         let _guard = lock
             .lock()
             .map_err(|_| OmniError::LockPoisoned("index collection".into()))?;
-        self.rebuild_index_locked(index_name)
+        self.rebuild_index_locked(index_name, &definition.collection)
     }
 
-    pub(crate) fn rebuild_index_locked(&self, index_name: &str) -> Result<usize, OmniError> {
+    pub(crate) fn rebuild_index_locked(
+        &self,
+        index_name: &str,
+        expected_collection: &str,
+    ) -> Result<usize, OmniError> {
         let idx_def = self.definition(index_name)?;
-        // Publish readiness only after all backfill batches are durable. A
-        // failed/restarted build remains unavailable to the SQL planner.
+        if !idx_def.collection.eq_ignore_ascii_case(expected_collection) {
+            return Err(OmniError::IoError(format!(
+                "Index '{}' not found on collection '{}'",
+                index_name, expected_collection
+            )));
+        }
         let mut invalidate = WriteBatch::new();
         invalidate.delete(&format!("{READY_PREFIX}{}", idx_def.id))?;
         self.db.commit_batch(&invalidate)?;
 
         let seq = self.db.get_seq();
         let catalog = self.catalog_snapshot_at(seq)?;
+        let table_row_format = self
+            .db
+            .find(
+                &format!("\x00CATALOG\x00{}", idx_def.collection.to_lowercase()),
+                seq,
+            )?
+            .and_then(|raw| serde_json::from_str::<crate::catalog::TableDef>(&raw).ok())
+            .map(|table| table.row_format)
+            .unwrap_or_default();
 
         let mut count = 0;
         let mut batch = WriteBatch::new();
 
         for (collection_prefix, collection_end) in collection_row_ranges(&idx_def.collection) {
+            let is_sql_rows = collection_prefix.starts_with("\x00T\x00");
             for (key, value) in self.db.scan(&collection_prefix, &collection_end, seq)? {
-                {
-                    let doc =
-                        serde_json::from_str::<serde_json::Value>(&value).map_err(|error| {
-                            OmniError::IoError(format!("invalid row during index rebuild: {error}"))
-                        })?;
-                    let pk = key.strip_prefix(&collection_prefix).unwrap_or(&key);
-                    self.index_document_with_catalog(
-                        &catalog,
-                        &idx_def.collection,
-                        pk,
-                        &doc,
-                        &mut batch,
-                    )?;
-                    count += 1;
+                let doc = if is_sql_rows {
+                    let row = crate::plan_exec::PlanExecutor::deserialize_row_checked(
+                        &value,
+                        table_row_format,
+                    )
+                    .map_err(|error| {
+                        OmniError::IoError(format!("invalid row during index rebuild: {error}"))
+                    })?;
+                    serde_json::to_value(&row).map_err(|error| {
+                        OmniError::IoError(format!("invalid row during index rebuild: {error}"))
+                    })?
+                } else {
+                    serde_json::from_str::<serde_json::Value>(&value).map_err(|error| {
+                        OmniError::IoError(format!("invalid row during index rebuild: {error}"))
+                    })?
+                };
+                let pk = key.strip_prefix(&collection_prefix).unwrap_or(&key);
+                self.index_document_with_catalog(
+                    &catalog,
+                    &idx_def.collection,
+                    pk,
+                    &doc,
+                    &mut batch,
+                )?;
+                count += 1;
 
-                    // Commit in batches of 1000 to avoid huge memory usage.
-                    if count % 1000 == 0 && !batch.is_empty() {
-                        self.db.commit_batch(&batch)?;
-                        batch = WriteBatch::new();
-                    }
+                if count % 1000 == 0 && !batch.is_empty() {
+                    self.db.commit_batch(&batch)?;
+                    batch = WriteBatch::new();
                 }
             }
         }
