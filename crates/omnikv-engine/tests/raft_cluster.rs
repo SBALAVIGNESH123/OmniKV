@@ -4784,7 +4784,7 @@ async fn test_v2_snapshot_missing_history_field_is_rejected() {
     let snapshot = builder.build_snapshot().await.unwrap();
     let mut json: serde_json::Value =
         serde_json::from_slice(&snapshot.snapshot.into_inner()).unwrap();
-    assert_eq!(json["version"], 2, "a current snapshot is version 2");
+    assert_eq!(json["version"], 3, "a current snapshot is version 3");
     json.as_object_mut()
         .expect("snapshot envelope is a JSON object")
         .remove("ssi_history");

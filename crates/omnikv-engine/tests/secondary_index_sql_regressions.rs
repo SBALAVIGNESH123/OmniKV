@@ -263,3 +263,87 @@ fn concurrent_ssi_unique_index_inserts_with_non_ascii_pk_abort_conflicting_txn()
         vec![vec![Some("α-clé".to_string())]]
     );
 }
+
+#[test]
+fn transactional_update_primary_key_shift_retains_moved_rows() {
+    let (db, _dir, _executor) = setup();
+    let mgr = TransactionManager::new(db.clone());
+    let mut txn = mgr.begin();
+    let mut tx_exec = SqlExecutor::with_transaction(
+        db.clone(),
+        Arc::new(Catalog::at_snapshot(db, txn.read_seq)),
+        txn.read_seq,
+        &HashMap::new(),
+    );
+    execute(
+        &tx_exec,
+        "CREATE TABLE shift_pk (id INTEGER PRIMARY KEY, label TEXT)",
+    );
+    execute(
+        &tx_exec,
+        "INSERT INTO shift_pk VALUES (1, 'one'), (2, 'two')",
+    );
+    execute(&tx_exec, "UPDATE shift_pk SET id = 3 WHERE id = 2");
+    execute(&tx_exec, "UPDATE shift_pk SET id = 2 WHERE id = 1");
+    assert_eq!(
+        rows(&tx_exec, "SELECT id, label FROM shift_pk ORDER BY id"),
+        vec![
+            vec![Some("2".to_string()), Some("one".to_string())],
+            vec![Some("3".to_string()), Some("two".to_string())],
+        ]
+    );
+    let _ = (&mut txn, &mut tx_exec);
+}
+
+#[test]
+fn remove_field_resolves_case_insensitive_sql_column_and_2pc_tracks_plain_writes() {
+    use omni_engine::dist_txn::{DistWrite, TwoPhaseParticipant, Vote};
+    use omni_engine::schema::{Migration, SchemaManager, SchemaOp};
+
+    let (db, _dir, executor) = setup();
+    let schema = SchemaManager::new(db.clone(), Arc::new(IndexManager::new(db.clone())));
+    schema
+        .migrate_up(&Migration {
+            version: 1,
+            description: "remove label with different case".into(),
+            up: vec![SchemaOp::RemoveField {
+                collection: "items".into(),
+                field_name: "LABEL".into(),
+            }],
+            down: vec![],
+        })
+        .expect("case-insensitive RemoveField should succeed");
+
+    let catalog = Catalog::new(db.clone());
+    let table = catalog.get_table("items").expect("items table");
+    assert!(
+        !table
+            .columns
+            .iter()
+            .any(|c| c.name.eq_ignore_ascii_case("label"))
+    );
+    let _ = executor;
+
+    let participant = TwoPhaseParticipant::new(1, db.clone());
+    let snap = db.get_seq().saturating_sub(1);
+    let mut plain_batch = WriteBatch::new();
+    plain_batch
+        .set("plain_conflict_k", "plain_v".into())
+        .unwrap();
+    db.commit_batch(&plain_batch).unwrap();
+
+    let res = participant.prepare_with_snapshot(
+        (1, 100),
+        &[DistWrite {
+            node_id: 1,
+            key: "plain_conflict_k".into(),
+            value: Some("2pc_v".into()),
+            ttl: 0,
+        }],
+        snap,
+    );
+    assert!(
+        matches!(res.vote, Vote::Abort(_)),
+        "prepare_with_snapshot must abort when a plain write modified the key after read_seq"
+    );
+}

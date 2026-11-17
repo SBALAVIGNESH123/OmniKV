@@ -842,6 +842,17 @@ impl TwoPhaseParticipant {
             .db
             .ssi_history
             .check_write_conflicts(read_seq, &write_keys)
+            .or_else(|| {
+                write_keys.iter().find_map(|key| {
+                    let latest_seq = self.db.get_seq_for_key(key, u64::MAX);
+                    (latest_seq > read_seq).then(|| {
+                        format!(
+                            "SSI CONFLICT (WW): key '{}' written at seq {}",
+                            key, latest_seq
+                        )
+                    })
+                })
+            })
         {
             self.release_key_locks(txn_id, &write_keys);
             return PrepareResult {
@@ -1061,13 +1072,16 @@ impl TwoPhaseParticipant {
                     ));
                 }
             }
+            let prepared_at = prepared
+                .get(&entry.txn_id)
+                .map_or_else(Instant::now, |existing| existing.prepared_at);
             recovered_prepared.insert(
                 entry.txn_id,
                 PreparedState {
                     batch,
                     writes: entry.writes,
                     prepare_seq: entry.prepare_seq,
-                    prepared_at: Instant::now(),
+                    prepared_at,
                 },
             );
             recovered += 1;

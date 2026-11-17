@@ -370,14 +370,24 @@ impl SchemaManager {
                 field_name,
                 default_value,
             } => self.with_collection_lock(collection, || {
-                self.backfill_field(collection, field_name, Some(default_value))?;
                 let seq = self.db.get_seq();
                 let catalog_key = format!("\x00CATALOG\x00{}", collection.to_lowercase());
-                if let Some(mut table) = self
+                let sql_table = self
                     .db
                     .find(&catalog_key, seq)?
                     .as_deref()
-                    .and_then(|v| serde_json::from_str::<crate::catalog::TableDef>(v).ok())
+                    .and_then(|v| serde_json::from_str::<crate::catalog::TableDef>(v).ok());
+                let effective_field = sql_table
+                    .as_ref()
+                    .and_then(|t| {
+                        t.columns
+                            .iter()
+                            .find(|c| c.name.eq_ignore_ascii_case(field_name))
+                            .map(|c| c.name.clone())
+                    })
+                    .unwrap_or_else(|| field_name.clone());
+                self.backfill_field(collection, &effective_field, Some(default_value))?;
+                if let Some(mut table) = sql_table
                     && !table
                         .columns
                         .iter()
@@ -424,18 +434,26 @@ impl SchemaManager {
                             field_name, collection
                         )));
                     }
-                    self.backfill_field(collection, field_name, None)?;
-                    let before = table.columns.len();
+                    let Some(canonical_name) = table
+                        .columns
+                        .iter()
+                        .find(|c| c.name.eq_ignore_ascii_case(field_name))
+                        .map(|c| c.name.clone())
+                    else {
+                        return Err(crate::OmniError::IoError(format!(
+                            "column '{}' does not exist in SQL table '{}'",
+                            field_name, collection
+                        )));
+                    };
+                    self.backfill_field(collection, &canonical_name, None)?;
                     table
                         .columns
-                        .retain(|c| !c.name.eq_ignore_ascii_case(field_name));
-                    if table.columns.len() != before {
-                        let cat_value = serde_json::to_string(&table)
-                            .map_err(|e| crate::OmniError::IoError(e.to_string()))?;
-                        let mut cat_batch = WriteBatch::new();
-                        cat_batch.set(&catalog_key, cat_value)?;
-                        self.db.commit_batch(&cat_batch)?;
-                    }
+                        .retain(|c| !c.name.eq_ignore_ascii_case(&canonical_name));
+                    let cat_value = serde_json::to_string(&table)
+                        .map_err(|e| crate::OmniError::IoError(e.to_string()))?;
+                    let mut cat_batch = WriteBatch::new();
+                    cat_batch.set(&catalog_key, cat_value)?;
+                    self.db.commit_batch(&cat_batch)?;
                     return Ok(());
                 }
                 self.backfill_field(collection, field_name, None)
@@ -470,6 +488,12 @@ impl SchemaManager {
                             new_name, collection
                         )));
                     }
+                    let canonical_old = table
+                        .columns
+                        .iter()
+                        .find(|c| c.name.eq_ignore_ascii_case(old_name))
+                        .map(|c| c.name.clone())
+                        .unwrap_or_else(|| old_name.clone());
                     for idx_def in self
                         .index_manager
                         .catalog_snapshot_at(seq)?
@@ -478,7 +502,7 @@ impl SchemaManager {
                         if idx_def
                             .fields
                             .iter()
-                            .any(|(f, _)| f.eq_ignore_ascii_case(old_name))
+                            .any(|(f, _)| f.eq_ignore_ascii_case(&canonical_old))
                         {
                             return Err(crate::OmniError::IoError(format!(
                                 "cannot rename field '{}' in SQL table '{}' \
@@ -487,9 +511,9 @@ impl SchemaManager {
                             )));
                         }
                     }
-                    self.rename_field_online(collection, old_name, new_name)?;
+                    self.rename_field_online(collection, &canonical_old, new_name)?;
                     for col in &mut table.columns {
-                        if col.name.eq_ignore_ascii_case(old_name) {
+                        if col.name.eq_ignore_ascii_case(&canonical_old) {
                             col.name = new_name.clone();
                         }
                     }
@@ -546,7 +570,7 @@ impl SchemaManager {
         };
 
         let mut batch = WriteBatch::new();
-        let mut count = 0;
+        let max_doc_ops = 1 + 2 * catalog.indexes_for_collection(collection).len();
 
         for (prefix, end) in collection_row_ranges(collection) {
             let is_sql_rows = prefix.starts_with("\x00T\x00");
@@ -572,6 +596,13 @@ impl SchemaManager {
                     None => obj.remove(field_name).is_some(),
                 };
                 if changed {
+                    if !batch.is_empty()
+                        && (batch.op_count() >= WriteBatch::MAX_OPS / 2
+                            || batch.op_count().saturating_add(max_doc_ops) > WriteBatch::MAX_OPS)
+                    {
+                        self.db.commit_batch(&batch)?;
+                        batch = WriteBatch::new();
+                    }
                     let updated = serde_json::to_string(&doc)
                         .map_err(|e| OmniError::IoError(e.to_string()))?;
                     let primary_key = key.strip_prefix(&prefix).unwrap_or(&key);
@@ -605,9 +636,8 @@ impl SchemaManager {
                         &mut batch,
                     )?;
                     batch.set(&key, updated)?;
-                    count += 1;
 
-                    if count % 500 == 0 && !batch.is_empty() {
+                    if batch.op_count() >= WriteBatch::MAX_OPS / 2 && !batch.is_empty() {
                         self.db.commit_batch(&batch)?;
                         batch = WriteBatch::new();
                     }
@@ -657,7 +687,7 @@ impl SchemaManager {
         }
 
         let mut batch = WriteBatch::new();
-        let mut count = 0;
+        let max_doc_ops = 1 + 2 * catalog.indexes_for_collection(collection).len();
 
         for (prefix, end) in collection_row_ranges(collection) {
             let is_sql_rows = prefix.starts_with("\x00T\x00");
@@ -675,6 +705,13 @@ impl SchemaManager {
                             "cannot rename field '{}' to '{}' because the destination exists",
                             old_name, new_name
                         )));
+                    }
+                    if !batch.is_empty()
+                        && (batch.op_count() >= WriteBatch::MAX_OPS / 2
+                            || batch.op_count().saturating_add(max_doc_ops) > WriteBatch::MAX_OPS)
+                    {
+                        self.db.commit_batch(&batch)?;
+                        batch = WriteBatch::new();
                     }
                     obj.insert(new_name.to_string(), val);
                     let updated = serde_json::to_string(&doc)
@@ -710,9 +747,8 @@ impl SchemaManager {
                         &mut batch,
                     )?;
                     batch.set(&key, updated)?;
-                    count += 1;
 
-                    if count % 500 == 0 && !batch.is_empty() {
+                    if batch.op_count() >= WriteBatch::MAX_OPS / 2 && !batch.is_empty() {
                         self.db.commit_batch(&batch)?;
                         batch = WriteBatch::new();
                     }

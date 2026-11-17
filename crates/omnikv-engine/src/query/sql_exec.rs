@@ -340,21 +340,50 @@ impl SqlExecutor {
         let mut pending_slot = self.pending_batch.borrow_mut();
         match pending_slot.as_mut() {
             Some(pending) => {
+                let delete_keys: std::collections::HashSet<Vec<u8>> =
+                    batch.buffered_deletes.iter().cloned().collect();
+                let mut incoming_keys = delete_keys.clone();
+                let mut seen_writes =
+                    std::collections::HashSet::with_capacity(batch.buffered_writes.len());
+                let mut deduped_writes = Vec::with_capacity(batch.buffered_writes.len());
+                for (key, value, ttl) in batch.buffered_writes.into_iter().rev() {
+                    incoming_keys.insert(key.clone());
+                    if !delete_keys.contains(&key) && seen_writes.insert(key.clone()) {
+                        deduped_writes.push((key, value, ttl));
+                    }
+                }
+                deduped_writes.reverse();
+
+                let mut seen_deletes =
+                    std::collections::HashSet::with_capacity(batch.buffered_deletes.len());
+                let mut deduped_deletes = Vec::with_capacity(batch.buffered_deletes.len());
+                for key in batch.buffered_deletes {
+                    if seen_deletes.insert(key.clone()) {
+                        deduped_deletes.push(key);
+                    }
+                }
+
                 let mut merged = WriteBatch {
-                    buffered_writes: pending.buffered_writes.clone(),
-                    buffered_deletes: pending.buffered_deletes.clone(),
+                    buffered_writes: pending
+                        .buffered_writes
+                        .iter()
+                        .filter(|(k, _, _)| !incoming_keys.contains(k))
+                        .cloned()
+                        .collect(),
+                    buffered_deletes: pending
+                        .buffered_deletes
+                        .iter()
+                        .filter(|k| !incoming_keys.contains(*k))
+                        .cloned()
+                        .collect(),
                 };
-                for (key, value, ttl) in batch.buffered_writes {
-                    merged.buffered_writes.retain(|(k, _, _)| *k != key);
-                    merged.buffered_deletes.retain(|k| *k != key);
+                for (key, value, ttl) in deduped_writes {
                     let key_str = String::from_utf8_lossy(&key).into_owned();
                     merged
                         .set_with_expiry(&key_str, value, ttl)
                         .map_err(|e| format!("{:?}", e))?;
                 }
-                for key in batch.buffered_deletes {
-                    merged.buffered_writes.retain(|(k, _, _)| *k != key);
-                    merged.buffered_deletes.retain(|existing| *existing != key);
+                for key in deduped_deletes {
                     let key_str = String::from_utf8_lossy(&key).into_owned();
                     merged.delete(&key_str).map_err(|e| format!("{:?}", e))?;
                 }
@@ -375,14 +404,14 @@ impl SqlExecutor {
         let Some(pending) = pending.as_ref() else {
             return Ok(());
         };
+        let existing_keys: std::collections::HashSet<Vec<u8>> = batch
+            .buffered_writes
+            .iter()
+            .map(|(k, _, _)| k.clone())
+            .chain(batch.buffered_deletes.iter().cloned())
+            .collect();
         for (key, value, expiry) in &pending.buffered_writes {
-            if key.starts_with(b"\x00IDX\x00")
-                && !batch
-                    .buffered_writes
-                    .iter()
-                    .any(|(local, _, _)| local == key)
-                && !batch.buffered_deletes.contains(key)
-            {
+            if key.starts_with(b"\x00IDX\x00") && !existing_keys.contains(key) {
                 let key = std::str::from_utf8(key).map_err(|error| error.to_string())?;
                 batch
                     .set_with_expiry(key, value.clone(), *expiry)
@@ -390,13 +419,7 @@ impl SqlExecutor {
             }
         }
         for key in &pending.buffered_deletes {
-            if key.starts_with(b"\x00IDX\x00")
-                && !batch
-                    .buffered_writes
-                    .iter()
-                    .any(|(local, _, _)| local == key)
-                && !batch.buffered_deletes.contains(key)
-            {
+            if key.starts_with(b"\x00IDX\x00") && !existing_keys.contains(key) {
                 let key = std::str::from_utf8(key).map_err(|error| error.to_string())?;
                 batch.delete(key).map_err(|error| error.to_string())?;
             }
@@ -2249,6 +2272,8 @@ impl SqlExecutor {
         self.seed_pending_indexes(&mut batch)?;
         let index_manager = self.catalog.index_manager();
         let index_catalog = self.dml_index_catalog(read_seq)?;
+        let mut new_keys = std::collections::HashSet::with_capacity(rows.len());
+        let mut stale_keys = Vec::new();
         for (row, old_key) in rows.iter_mut().zip(old_keys) {
             let mut old_document = serde_json::to_value(&*row)
                 .map_err(|e| format!("Serialize old index document: {e}"))?;
@@ -2296,15 +2321,20 @@ impl SqlExecutor {
                 raw_old_pk.to_string()
             };
             let migrated_old_key = format!("{}{}", table.row_prefix(), effective_old_pk);
+            new_keys.insert(key.clone());
             if old_key != key {
-                batch.delete(&old_key).map_err(|e| format!("{:?}", e))?;
+                stale_keys.push(old_key.clone());
             }
             if migrated_old_key != old_key && migrated_old_key != key {
-                batch
-                    .delete(&migrated_old_key)
-                    .map_err(|e| format!("{:?}", e))?;
+                stale_keys.push(migrated_old_key.clone());
             }
             let value = serde_json::to_string(&row).map_err(|e| format!("{}", e))?;
+            batch
+                .buffered_writes
+                .retain(|(k, _, _)| k.as_slice() != key.as_bytes());
+            batch
+                .buffered_deletes
+                .retain(|k| k.as_slice() != key.as_bytes());
             batch.set(&key, value).map_err(|e| format!("{:?}", e))?;
             let new_document = serde_json::to_value(&*row)
                 .map_err(|e| format!("Serialize new index document: {e}"))?;
@@ -2321,6 +2351,17 @@ impl SqlExecutor {
                     reads.as_mut(),
                 )
                 .map_err(|e| format!("Index maintenance failed: {e}"))?;
+        }
+        for stale in stale_keys {
+            if !new_keys.contains(&stale) {
+                batch
+                    .buffered_writes
+                    .retain(|(k, _, _)| k.as_slice() != stale.as_bytes());
+                batch
+                    .buffered_deletes
+                    .retain(|k| k.as_slice() != stale.as_bytes());
+                batch.delete(&stale).map_err(|e| format!("{:?}", e))?;
+            }
         }
 
         if !batch.is_empty() {

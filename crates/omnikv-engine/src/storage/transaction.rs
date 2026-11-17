@@ -273,6 +273,7 @@ pub struct SsiHistory {
     /// Recently committed transactions, kept for conflict detection.
     committed_txns: Mutex<Vec<CommittedTxn>>,
     prepared_keys: Mutex<HashMap<String, PreparedKeyOwner>>,
+    plain_write_seqs: Mutex<HashMap<String, u64>>,
     evicted_max_seq: AtomicU64,
     /// Hard ceiling to prevent unbounded growth between prunes.
     max_entries: usize,
@@ -437,6 +438,40 @@ impl SsiHistory {
         })
     }
 
+    pub(crate) fn record_plain_batch(&self, tx: &crate::WriteBatch, commit_seq: u64) {
+        let mut plain = self
+            .plain_write_seqs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        for key in tx
+            .buffered_writes
+            .iter()
+            .map(|(k, _, _)| k.as_slice())
+            .chain(tx.buffered_deletes.iter().map(Vec::as_slice))
+        {
+            if key.starts_with(b"__sys__/raft/") || key.starts_with(b"__2PC_") {
+                continue;
+            }
+            if let Ok(key_str) = std::str::from_utf8(key) {
+                plain
+                    .entry(key_str.to_string())
+                    .and_modify(|seq| *seq = (*seq).max(commit_seq))
+                    .or_insert(commit_seq);
+            }
+        }
+        if plain.len() > self.max_entries {
+            let mut seqs: Vec<u64> = plain.values().copied().collect();
+            seqs.sort_unstable();
+            let cutoff = seqs[seqs.len() / 4];
+            plain.retain(|_, seq| *seq > cutoff);
+            self.evicted_max_seq.fetch_max(cutoff, Ordering::SeqCst);
+        }
+    }
+
+    pub(crate) fn advance_eviction_floor(&self, seq: u64) {
+        self.evicted_max_seq.fetch_max(seq, Ordering::SeqCst);
+    }
+
     /// Checks whether a distributed prepare would conflict with a committed
     /// write that became visible after its snapshot. Distributed transactions
     /// currently carry writes only (no predicate/read-set payload), so this
@@ -450,6 +485,10 @@ impl SsiHistory {
             .committed_txns
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        let plain = self
+            .plain_write_seqs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let evicted_max = self.evicted_max_seq.load(Ordering::SeqCst);
         if read_seq < evicted_max {
             return Some(format!(
@@ -457,7 +496,7 @@ impl SsiHistory {
                 read_seq, evicted_max
             ));
         }
-        committed
+        if let Some(conflict) = committed
             .iter()
             .filter(|entry| entry.commit_seq > read_seq)
             .flat_map(|entry| {
@@ -472,6 +511,16 @@ impl SsiHistory {
                     })
             })
             .next()
+        {
+            return Some(conflict);
+        }
+        write_keys.iter().find_map(|key| {
+            plain
+                .get(key)
+                .copied()
+                .filter(|&seq| seq > read_seq)
+                .map(|seq| format!("SSI CONFLICT (WW): key '{}' written at seq {}", key, seq))
+        })
     }
 
     /// A serializable snapshot of the committed history, for a raft
@@ -513,8 +562,13 @@ impl SsiHistory {
             .committed_txns
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        let mut plain = self
+            .plain_write_seqs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         self.evicted_max_seq.store(eviction_floor, Ordering::SeqCst);
         committed.clear();
+        plain.clear();
         for (txn_id, commit_seq, record) in entries {
             committed.push(CommittedTxn {
                 txn_id,
@@ -689,6 +743,7 @@ impl Default for SsiHistory {
         Self {
             committed_txns: Mutex::new(Vec::new()),
             prepared_keys: Mutex::new(HashMap::new()),
+            plain_write_seqs: Mutex::new(HashMap::new()),
             evicted_max_seq: AtomicU64::new(0),
             max_entries: 100_000,
         }

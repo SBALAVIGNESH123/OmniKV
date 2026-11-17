@@ -1017,7 +1017,7 @@ async fn restore_handler(
             ApiResponse::<String>::err("backup not found"),
         );
     }
-    let _active_restore = match ActiveRestoreGuard::acquire(&restore_dir) {
+    let active_restore = match ActiveRestoreGuard::acquire(&restore_dir) {
         Some(guard) => guard,
         None => {
             audit_claims_event(
@@ -1075,26 +1075,19 @@ async fn restore_handler(
         "/admin/restore",
         "restore_accepted",
     );
-    // Spawn independently so a client disconnect doesn't abandon cleanup.
-    let claims_owned = claims.clone();
     let handle = tokio::spawn(async move {
+        let _active_restore = active_restore;
         let result = tokio::task::spawn_blocking(move || {
             omni_engine::backup::restore_backup(&backup_path, &restore_dir)
         })
         .await;
-        (result, claims_owned, restore_dir_cleanup)
-    });
-    let (result, claims, restore_dir_cleanup) = match handle.await {
-        Ok(tuple) => tuple,
-        Err(join_error) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                ApiResponse::<String>::err(&format!("restore task failed: {join_error}")),
-            );
+        if !matches!(result, Ok(Ok(()))) {
+            let _ = std::fs::remove_dir_all(&restore_dir_cleanup);
         }
-    };
-    match result {
-        Ok(Ok(())) => {
+        result
+    });
+    match handle.await {
+        Ok(Ok(Ok(()))) => {
             audit_claims_event(
                 "restore.completed",
                 AuditOutcome::Success,
@@ -1104,8 +1097,7 @@ async fn restore_handler(
             );
             (StatusCode::OK, ApiResponse::ok(restore_dir_name))
         }
-        Ok(Err(error)) => {
-            let _ = std::fs::remove_dir_all(&restore_dir_cleanup);
+        Ok(Ok(Err(error))) => {
             audit_claims_event(
                 "restore.completed",
                 AuditOutcome::Failure,
@@ -1118,8 +1110,7 @@ async fn restore_handler(
                 ApiResponse::<String>::err(&sanitize_err(&error)),
             )
         }
-        Err(join_error) => {
-            let _ = std::fs::remove_dir_all(&restore_dir_cleanup);
+        Ok(Err(join_error)) | Err(join_error) => {
             audit_claims_event(
                 "restore.completed",
                 AuditOutcome::Failure,

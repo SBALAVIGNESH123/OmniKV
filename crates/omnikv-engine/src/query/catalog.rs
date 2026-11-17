@@ -211,29 +211,33 @@ impl Catalog {
 
     pub fn drop_table(&self, name: &str) -> Result<(), String> {
         let name_lower = name.to_lowercase();
-        let table = {
-            let cache = self
-                .cache
-                .read()
-                .expect("catalog cache RwLock poisoned: fatal invariant");
-            cache
-                .get(&name_lower)
-                .cloned()
-                .ok_or_else(|| format!("Table '{}' does not exist", name))?
-        };
+        let mut cache = self
+            .cache
+            .write()
+            .expect("catalog cache RwLock poisoned: fatal invariant");
+        let table = cache
+            .get(&name_lower)
+            .cloned()
+            .ok_or_else(|| format!("Table '{}' does not exist", name))?;
 
-        // Delete all rows
         let prefix = table.row_prefix();
         let seq = self.db.get_seq();
         let rows = self
             .db
             .scan(&prefix, &format!("{}\u{10ffff}", prefix), seq)
             .map_err(|e| format!("{:?}", e))?;
+        let (index_entry_keys, index_meta_keys) = self
+            .index_manager
+            .collect_drop_index_keys_for_collection_at(&table.name, seq)
+            .map_err(|e| format!("{e:?}"))?;
 
-        // Chunk deletes so large tables don't exceed the batch op limit.
         let chunk_cap = WriteBatch::MAX_OPS.saturating_sub(4);
         let mut batch = WriteBatch::new();
-        for (key, _) in &rows {
+        for key in rows
+            .iter()
+            .map(|(k, _)| k.as_str())
+            .chain(index_entry_keys.iter().map(String::as_str))
+        {
             batch.delete(key).map_err(|e| format!("{:?}", e))?;
             if batch.op_count() >= chunk_cap {
                 self.db
@@ -242,14 +246,26 @@ impl Catalog {
                 batch = WriteBatch::new();
             }
         }
-        self.index_manager
-            .append_drop_indexes_for_collection(&table.name, &mut batch)
-            .map_err(|e| format!("{e:?}"))?;
-        if batch.op_count() >= chunk_cap {
+        if !batch.is_empty()
+            && batch
+                .op_count()
+                .saturating_add(index_meta_keys.len())
+                .saturating_add(1)
+                > WriteBatch::MAX_OPS
+        {
             self.db
                 .commit_batch(&batch)
                 .map_err(|e| format!("{:?}", e))?;
             batch = WriteBatch::new();
+        }
+        for meta_key in &index_meta_keys {
+            if batch.op_count().saturating_add(1) >= WriteBatch::MAX_OPS {
+                self.db
+                    .commit_batch(&batch)
+                    .map_err(|e| format!("{:?}", e))?;
+                batch = WriteBatch::new();
+            }
+            batch.delete(meta_key).map_err(|e| format!("{:?}", e))?;
         }
         let cat_key = format!("{}{}", CATALOG_PREFIX, name_lower);
         batch.delete(&cat_key).map_err(|e| format!("{:?}", e))?;
@@ -257,10 +273,6 @@ impl Catalog {
             .commit_batch(&batch)
             .map_err(|e| format!("{:?}", e))?;
 
-        let mut cache = self
-            .cache
-            .write()
-            .expect("catalog cache RwLock poisoned: fatal invariant");
         cache.remove(&name_lower);
         Ok(())
     }

@@ -24,7 +24,7 @@ const RAFT_META_KEY: &str = "__sys__/raft/meta";
 /// history — losing every conflict record for commits the snapshot's data
 /// actually carries. Keeping the version in lockstep with the format means
 /// a legacy snapshot is rejected instead of silently corrupting history.
-const SNAPSHOT_VERSION: u32 = 2;
+const SNAPSHOT_VERSION: u32 = 3;
 
 /// Versioned snapshot envelope — adding version field now prevents future migration pain.
 #[derive(Serialize, Deserialize, Debug)]
@@ -47,7 +47,6 @@ struct SnapshotEnvelope {
     /// loudly rather than silently install an empty history.
     ssi_history: Vec<SsiHistoryEntry>,
     /// SSI eviction floor carried with the snapshot history.
-    #[serde(default)]
     ssi_eviction_floor: u64,
 }
 

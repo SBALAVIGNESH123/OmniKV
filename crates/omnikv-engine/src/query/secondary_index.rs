@@ -633,6 +633,26 @@ impl IndexManager {
             .and_then(|catalog| catalog.get_by_name(name).map(|idx| idx.collection.clone()))
     }
 
+    pub fn collect_drop_index_keys_for_collection_at(
+        &self,
+        collection: &str,
+        seq: u64,
+    ) -> Result<(Vec<String>, Vec<String>), OmniError> {
+        let catalog = IndexCatalog::load_checked_at(&self.db, seq)?;
+        let mut entry_keys = Vec::new();
+        let mut meta_keys = Vec::new();
+        for def in catalog.indexes_for_collection(collection) {
+            meta_keys.push(format!("{}{}", CATALOG_PREFIX, def.id));
+            meta_keys.push(format!("{READY_PREFIX}{}", def.id));
+            let prefix = build_index_scan_prefix(def.id);
+            let end = format!("{}\u{10ffff}", prefix);
+            for (key, _) in self.db.scan(&prefix, &end, seq)? {
+                entry_keys.push(key);
+            }
+        }
+        Ok((entry_keys, meta_keys))
+    }
+
     pub fn append_drop_indexes_for_collection(
         &self,
         collection: &str,

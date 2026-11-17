@@ -2143,6 +2143,7 @@ impl OmniKV {
             let offset = self
                 .heap_offset
                 .fetch_add(total_heap_bytes, Ordering::SeqCst);
+            self.ssi_history.record_plain_batch(tx, seq + num_records);
             (seq, offset)
         };
         // write_mutex is RELEASED here â€” other batches can now reserve their sequences
