@@ -104,6 +104,8 @@ fn boot_rt(
         .unwrap_or_else(|| raft_addr_str.clone());
 
     let config = raft_config_from(cfg)?;
+    let raft_listener = rt.block_on(tokio::net::TcpListener::bind(raft_addr))?;
+    tracing::info!(%raft_addr, "Raft consensus listener bound");
 
     let storage = OmniRaftStorage::new(db.clone());
     let (log_store, state_machine) = openraft::storage::Adaptor::new(storage);
@@ -160,14 +162,6 @@ fn boot_rt(
     // ── Write gateway + engine hooks ──
     let gateway = Arc::new(ClusterGateway::with_runtime(rt, (*raft).clone()));
     db.set_cluster_gateway(gateway.clone());
-
-    // Bind the consensus listener up front: a taken port must fail the
-    // boot (the node would look alive but never hear a vote otherwise).
-    // Uses the gateway's runtime handle — `rt` has been adopted above.
-    let raft_listener = gateway
-        .consensus_handle
-        .block_on(tokio::net::TcpListener::bind(raft_addr))?;
-    tracing::info!(%raft_addr, "Raft consensus listener bound");
 
     Ok(Some(ClusterNode {
         raft,

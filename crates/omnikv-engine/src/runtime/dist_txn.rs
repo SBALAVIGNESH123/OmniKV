@@ -367,6 +367,14 @@ impl TwoPhaseCoordinator {
         let txn = active
             .get_mut(&txn_id)
             .ok_or_else(|| OmniError::IoError("Transaction not found".into()))?;
+        if matches!(
+            txn.state,
+            DistTxnState::Committing | DistTxnState::Committed
+        ) {
+            return Err(OmniError::IoError(
+                "cannot abort a transaction after its commit decision".into(),
+            ));
+        }
 
         let participants: Vec<u64> = txn.writes_by_node.keys().copied().collect();
         txn.state = DistTxnState::Aborted;
@@ -529,25 +537,26 @@ impl TwoPhaseCoordinator {
             }
         }
         for records in by_txn.into_values() {
+            let has_commit = records.iter().any(|(_, e)| e.state == "COMMIT");
             let terminal_entry = records
                 .iter()
-                .find(|(_, e)| e.state == "COMPLETE" || e.state == "ABORT")
+                .find(|(_, e)| e.state == "COMPLETE" || (e.state == "ABORT" && !has_commit))
                 .map(|(_, e)| e);
             if let Some(terminal) = terminal_entry
                 && now.saturating_sub(terminal.timestamp) > max_age_secs
             {
-                for (key, _) in records {
-                    keys_to_delete.push(key);
-                }
+                keys_to_delete.push(records.into_iter().map(|(key, _)| key).collect::<Vec<_>>());
             }
         }
-        let purged = keys_to_delete.len();
+        let purged = keys_to_delete.iter().map(Vec::len).sum();
         let mut batch = WriteBatch::new();
-        for key in keys_to_delete {
-            batch.delete(&key)?;
-            if batch.op_count() >= 1000 {
+        for txn_keys in keys_to_delete {
+            if batch.op_count() + txn_keys.len() > 1000 && !batch.is_empty() {
                 self.db.commit_2pc_batch(&batch)?;
                 batch.clear();
+            }
+            for key in txn_keys {
+                batch.delete(&key)?;
             }
         }
         if !batch.is_empty() {

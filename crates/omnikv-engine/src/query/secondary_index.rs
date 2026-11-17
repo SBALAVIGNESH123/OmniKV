@@ -585,6 +585,14 @@ impl IndexManager {
         let _guard = lock
             .lock()
             .map_err(|_| OmniError::LockPoisoned("index collection".into()))?;
+        self.drop_index_locked(name, &definition.collection)
+    }
+
+    pub(crate) fn drop_index_locked(
+        &self,
+        name: &str,
+        expected_collection: &str,
+    ) -> Result<(), OmniError> {
         let ddl_lock = self.db.sql_table_lock(DDL_LOCK_NAME)?;
         let _ddl_guard = ddl_lock
             .lock()
@@ -593,7 +601,7 @@ impl IndexManager {
 
         let id = catalog
             .get_by_name(name)
-            .filter(|d| d.collection.eq_ignore_ascii_case(&definition.collection))
+            .filter(|d| d.collection.eq_ignore_ascii_case(expected_collection))
             .map(|d| d.id)
             .ok_or_else(|| OmniError::IoError(format!("Index '{}' not found", name)))?;
 

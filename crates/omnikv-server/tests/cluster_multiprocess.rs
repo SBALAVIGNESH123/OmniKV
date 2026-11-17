@@ -161,14 +161,35 @@ fn tcp_cmd_raw_lines(port: u16, request: &str, expect_lines: usize) -> Result<St
     Ok(lines.pop().expect("checked len above"))
 }
 
-/// A free port for a listener the test will bind later. Racy in theory,
-/// fine in practice: the window between drop and re-bind is test-local.
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .expect("bind ephemeral")
-        .local_addr()
-        .expect("local addr")
-        .port()
+fn allocate_port_set(count: usize) -> Vec<(u16, u16, u16, u16, u16)> {
+    let mut tcp_guards = Vec::with_capacity(count * 5);
+    let mut udp_guards = Vec::with_capacity(count);
+    let mut ports = Vec::with_capacity(count);
+    for _ in 0..count {
+        let mut tuple = [0u16; 5];
+        for (slot_idx, slot) in tuple.iter_mut().enumerate() {
+            loop {
+                let tcp = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral tcp");
+                let port = tcp.local_addr().expect("local addr").port();
+                if slot_idx == 2 {
+                    if let Ok(udp) = std::net::UdpSocket::bind(("127.0.0.1", port)) {
+                        udp_guards.push(udp);
+                        tcp_guards.push(tcp);
+                        *slot = port;
+                        break;
+                    }
+                } else {
+                    tcp_guards.push(tcp);
+                    *slot = port;
+                    break;
+                }
+            }
+        }
+        ports.push(tuple.into());
+    }
+    drop(udp_guards);
+    drop(tcp_guards);
+    ports
 }
 
 /// Hands out a fresh data dir for every node, in every test. The naive
@@ -260,46 +281,43 @@ fn spawn_node(id: u64, ports: &[(u16, u16, u16, u16, u16)], tcp_tls: bool) -> No
 
 /// Spawns the three-node cluster and waits for every TCP listener.
 fn boot_cluster() -> Vec<Node> {
-    let ports: Vec<(u16, u16, u16, u16, u16)> = (0..3)
-        .map(|_| {
-            (
-                free_port(),
-                free_port(),
-                free_port(),
-                free_port(),
-                free_port(),
-            )
-        })
-        .collect();
-    let nodes: Vec<Node> = (1..=3).map(|id| spawn_node(id, &ports, false)).collect();
+    for attempt in 1..=3 {
+        let ports = allocate_port_set(3);
+        let n2 = spawn_node(2, &ports, false);
+        let n3 = spawn_node(3, &ports, false);
+        let n1 = spawn_node(1, &ports, false);
+        let mut nodes = vec![n1, n2, n3];
 
-    // Each node gets its own budget: a single deadline shared across the
-    // loop lets a slow first node consume the window the rest need, and
-    // a loaded CI machine times the last node out before it binds.
-    //
-    // Readiness is a full round trip, not an accepted connection: a node
-    // whose listener is bound but whose command handler is still coming up
-    // accepts the socket and closes it without a reply. Probing only for a
-    // connect lets that node through, and the first real command then races
-    // the handler and fails. An unauthenticated GET must come back with the
-    // AUTH_REQUIRED refusal before the cluster is considered booted.
-    for node in &nodes {
-        let deadline = Instant::now() + Duration::from_secs(30);
-        loop {
-            assert!(
-                Instant::now() <= deadline,
-                "node {} command interface never became ready",
-                node.id
-            );
-            match tcp_cmd_unauthenticated(node.tcp_port(), "GET failover:key") {
-                Ok(resp) if resp.contains("AUTH_REQUIRED") => break,
-                // Not up yet: either the bind is still pending, or the
-                // handler accepted and closed mid-init. Both are transient.
-                _ => std::thread::sleep(Duration::from_millis(100)),
+        let mut all_ready = true;
+        for node in &mut nodes {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            loop {
+                if let Ok(Some(_)) = node.child.try_wait() {
+                    all_ready = false;
+                    break;
+                }
+                if Instant::now() > deadline {
+                    all_ready = false;
+                    break;
+                }
+                match tcp_cmd_unauthenticated(node.tcp_port(), "GET failover:key") {
+                    Ok(resp) if resp.contains("AUTH_REQUIRED") => break,
+                    _ => std::thread::sleep(Duration::from_millis(100)),
+                }
+            }
+            if !all_ready {
+                break;
             }
         }
+        if all_ready {
+            return nodes;
+        }
+        assert!(
+            attempt < 3,
+            "cluster nodes failed to become ready after 3 attempts"
+        );
     }
-    nodes
+    unreachable!()
 }
 
 /// The leadership oracle: a SET through the write gateway succeeds only
@@ -587,17 +605,7 @@ fn find_leader_among(nodes: &[(u16, u64)]) -> Option<(u16, u64)> {
 
 /// One node with TLS on the command interface, listening and ready.
 fn boot_tls_node() -> Node {
-    let ports: Vec<(u16, u16, u16, u16, u16)> = (0..5)
-        .map(|_| {
-            (
-                free_port(),
-                free_port(),
-                free_port(),
-                free_port(),
-                free_port(),
-            )
-        })
-        .collect();
+    let ports = allocate_port_set(5);
     let node = spawn_node(1, &ports, true);
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {

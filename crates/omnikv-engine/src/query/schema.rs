@@ -359,7 +359,7 @@ impl SchemaManager {
                     *unique,
                 )?;
                 if let Err(error) = self.index_manager.rebuild_index_locked(name, collection) {
-                    let _ = self.index_manager.drop_index(name);
+                    let _ = self.index_manager.drop_index_locked(name, collection);
                     return Err(error);
                 }
                 Ok(())
@@ -386,7 +386,10 @@ impl SchemaManager {
                             .map(|c| c.name.clone())
                     })
                     .unwrap_or_else(|| field_name.clone());
-                self.backfill_field(collection, &effective_field, Some(default_value))?;
+                let target_collection = sql_table
+                    .as_ref()
+                    .map_or(collection.as_str(), |t| t.name.as_str());
+                self.backfill_field(target_collection, &effective_field, Some(default_value))?;
                 if let Some(mut table) = sql_table
                     && !table
                         .columns
@@ -445,7 +448,7 @@ impl SchemaManager {
                             field_name, collection
                         )));
                     };
-                    self.backfill_field(collection, &canonical_name, None)?;
+                    self.backfill_field(&table.name, &canonical_name, None)?;
                     table
                         .columns
                         .retain(|c| !c.name.eq_ignore_ascii_case(&canonical_name));
@@ -497,7 +500,7 @@ impl SchemaManager {
                     for idx_def in self
                         .index_manager
                         .catalog_snapshot_at(seq)?
-                        .indexes_for_collection(collection)
+                        .indexes_for_collection(&table.name)
                     {
                         if idx_def
                             .fields
@@ -511,7 +514,7 @@ impl SchemaManager {
                             )));
                         }
                     }
-                    self.rename_field_online(collection, &canonical_old, new_name)?;
+                    self.rename_field_online(&table.name, &canonical_old, new_name)?;
                     for col in &mut table.columns {
                         if col.name.eq_ignore_ascii_case(&canonical_old) {
                             col.name = new_name.clone();
