@@ -46,6 +46,9 @@ struct SnapshotEnvelope {
     /// field and a missing one is a malformed snapshot that must fail
     /// loudly rather than silently install an empty history.
     ssi_history: Vec<SsiHistoryEntry>,
+    /// SSI eviction floor carried with the snapshot history.
+    #[serde(default)]
+    ssi_eviction_floor: u64,
 }
 
 /// One committed transaction in a snapshot envelope: the SSI record plus
@@ -293,6 +296,7 @@ impl RaftSnapshotBuilder<TypeConfig> for OmniRaftStorage {
                 record,
             })
             .collect();
+        let ssi_eviction_floor = self.db.ssi_history().eviction_floor();
 
         let mut entries = Vec::new();
         let (snap_meta, max_seq) = {
@@ -340,6 +344,7 @@ impl RaftSnapshotBuilder<TypeConfig> for OmniRaftStorage {
             max_seq,
             entries,
             ssi_history,
+            ssi_eviction_floor,
         };
         let serialized = serde_json::to_vec(&envelope).map_err(|e| StorageError::IO {
             source: StorageIOError::new(
@@ -1204,6 +1209,7 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
                 .into_iter()
                 .map(|e| (e.txn_id, e.commit_seq, e.record))
                 .collect(),
+            envelope.ssi_eviction_floor,
         );
         self.db
             .sync_prepared_2pc_reservations()

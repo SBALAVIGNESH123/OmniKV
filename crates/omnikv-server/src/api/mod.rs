@@ -945,7 +945,10 @@ fn resolve_safe_child(root: &FsPath, requested: &str, label: &str) -> Result<Pat
         }
         Ok(canonical)
     } else {
-        Ok(candidate)
+        let suffix = candidate
+            .strip_prefix(existing_parent)
+            .map_err(|_| format!("cannot resolve {label} inside its configured root"))?;
+        Ok(canonical_parent.join(suffix))
     }
 }
 
@@ -1072,10 +1075,24 @@ async fn restore_handler(
         "/admin/restore",
         "restore_accepted",
     );
-    let result = tokio::task::spawn_blocking(move || {
-        omni_engine::backup::restore_backup(&backup_path, &restore_dir)
-    })
-    .await;
+    // Spawn independently so a client disconnect doesn't abandon cleanup.
+    let claims_owned = claims.clone();
+    let handle = tokio::spawn(async move {
+        let result = tokio::task::spawn_blocking(move || {
+            omni_engine::backup::restore_backup(&backup_path, &restore_dir)
+        })
+        .await;
+        (result, claims_owned, restore_dir_cleanup)
+    });
+    let (result, claims, restore_dir_cleanup) = match handle.await {
+        Ok(tuple) => tuple,
+        Err(join_error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ApiResponse::<String>::err(&format!("restore task failed: {join_error}")),
+            );
+        }
+    };
     match result {
         Ok(Ok(())) => {
             audit_claims_event(

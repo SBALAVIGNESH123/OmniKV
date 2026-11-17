@@ -824,13 +824,13 @@ impl Optimizer {
     /// Find the best index for a WHERE predicate.
     fn find_best_index(&self, table_name: &str, expr: &WhereExpr) -> Option<IndexDefinition> {
         let stats = self.stats.get(table_name)?;
-        // Sparse indexes omit NULLs; only use when the predicate requires a representable value.
-        stats
+        let conjuncts = split_conjuncts(expr);
+        let mut candidates: Vec<&IndexDefinition> = stats
             .indexes
             .iter()
-            .find(|index| {
+            .filter(|index| {
                 index.fields.len() == 1
-                    && split_conjuncts(expr).iter().any(|conjunct| {
+                    && conjuncts.iter().any(|conjunct| {
                         let WhereExpr::Comparison { column, op, value } = conjunct else {
                             return false;
                         };
@@ -847,7 +847,9 @@ impl Optimizer {
                             && crate::secondary_index::sql_index_bound(value, field_type).is_some()
                     })
             })
-            .cloned()
+            .collect();
+        candidates.sort_by_key(|idx| &idx.name);
+        candidates.first().copied().cloned()
     }
 
     /// Check if filter was already pushed into scan node.

@@ -844,14 +844,11 @@ impl SqlExecutor {
                 .and_then(|v| serde_json::from_str::<TableDef>(v).ok()));
         }
         self.record_point_read(&key);
-        let end = format!("{key}\u{10ffff}");
         Ok(self
             .db
-            .scan(&key, &end, seq)
+            .find(&key, seq)
             .map_err(|e| format!("{:?}", e))?
-            .into_iter()
-            .next()
-            .and_then(|(_, value)| serde_json::from_str::<TableDef>(&value).ok()))
+            .and_then(|value| serde_json::from_str::<TableDef>(&value).ok()))
     }
 
     /// Builds the batch that rewrites a legacy table's rows to the typed

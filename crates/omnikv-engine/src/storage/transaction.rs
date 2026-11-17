@@ -500,15 +500,20 @@ impl SsiHistory {
             .collect()
     }
 
+    /// Returns the current eviction floor for snapshot serialization.
+    pub fn eviction_floor(&self) -> u64 {
+        self.evicted_max_seq.load(Ordering::SeqCst)
+    }
+
     /// Replaces the whole history, used by snapshot install: the data was
     /// replaced wholesale, so the in-memory history must be too, then
     /// refilled from what the snapshot carried.
-    pub fn install_from(&self, entries: Vec<(TxnId, u64, SsiCommitRecord)>) {
+    pub fn install_from(&self, entries: Vec<(TxnId, u64, SsiCommitRecord)>, eviction_floor: u64) {
         let mut committed = self
             .committed_txns
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        self.evicted_max_seq.store(0, Ordering::SeqCst);
+        self.evicted_max_seq.store(eviction_floor, Ordering::SeqCst);
         committed.clear();
         for (txn_id, commit_seq, record) in entries {
             committed.push(CommittedTxn {

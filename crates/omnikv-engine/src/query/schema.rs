@@ -358,7 +358,10 @@ impl SchemaManager {
                     fields.clone(),
                     *unique,
                 )?;
-                self.index_manager.rebuild_index_locked(name, collection)?;
+                if let Err(error) = self.index_manager.rebuild_index_locked(name, collection) {
+                    let _ = self.index_manager.drop_index(name);
+                    return Err(error);
+                }
                 Ok(())
             }),
             SchemaOp::DropIndex { name } => self.index_manager.drop_index(name),
@@ -367,27 +370,73 @@ impl SchemaManager {
                 field_name,
                 default_value,
             } => self.with_collection_lock(collection, || {
-                self.backfill_field(collection, field_name, Some(default_value))
+                self.backfill_field(collection, field_name, Some(default_value))?;
+                let seq = self.db.get_seq();
+                let catalog_key = format!("\x00CATALOG\x00{}", collection.to_lowercase());
+                if let Some(mut table) = self
+                    .db
+                    .find(&catalog_key, seq)?
+                    .as_deref()
+                    .and_then(|v| serde_json::from_str::<crate::catalog::TableDef>(v).ok())
+                    && !table
+                        .columns
+                        .iter()
+                        .any(|c| c.name.eq_ignore_ascii_case(field_name))
+                {
+                    let col_type = match default_value {
+                        serde_json::Value::Number(n) if n.is_i64() || n.is_u64() => {
+                            crate::catalog::ColumnType::Integer
+                        }
+                        serde_json::Value::Number(_) => crate::catalog::ColumnType::Float,
+                        serde_json::Value::Bool(_) => crate::catalog::ColumnType::Boolean,
+                        _ => crate::catalog::ColumnType::Text,
+                    };
+                    table.columns.push(crate::catalog::Column {
+                        name: field_name.clone(),
+                        col_type,
+                        nullable: true,
+                        primary_key: false,
+                        default: Some(default_value.to_string()),
+                    });
+                    let cat_value = serde_json::to_string(&table)
+                        .map_err(|e| crate::OmniError::IoError(e.to_string()))?;
+                    let mut cat_batch = WriteBatch::new();
+                    cat_batch.set(&catalog_key, cat_value)?;
+                    self.db.commit_batch(&cat_batch)?;
+                }
+                Ok(())
             }),
             SchemaOp::RemoveField {
                 collection,
                 field_name,
             } => self.with_collection_lock(collection, || {
                 let seq = self.db.get_seq();
-                if let Some(raw) = self
+                let catalog_key = format!("\x00CATALOG\x00{}", collection.to_lowercase());
+                if let Some(mut table) = self
                     .db
-                    .find(
-                        &format!("\x00CATALOG\x00{}", collection.to_lowercase()),
-                        seq,
-                    )?
+                    .find(&catalog_key, seq)?
                     .as_deref()
                     .and_then(|v| serde_json::from_str::<crate::catalog::TableDef>(v).ok())
-                    && raw.primary_key.eq_ignore_ascii_case(field_name)
                 {
-                    return Err(crate::OmniError::IoError(format!(
-                        "cannot remove primary key field '{}' from SQL table '{}'",
-                        field_name, collection
-                    )));
+                    if table.primary_key.eq_ignore_ascii_case(field_name) {
+                        return Err(crate::OmniError::IoError(format!(
+                            "cannot remove primary key field '{}' from SQL table '{}'",
+                            field_name, collection
+                        )));
+                    }
+                    self.backfill_field(collection, field_name, None)?;
+                    let before = table.columns.len();
+                    table
+                        .columns
+                        .retain(|c| !c.name.eq_ignore_ascii_case(field_name));
+                    if table.columns.len() != before {
+                        let cat_value = serde_json::to_string(&table)
+                            .map_err(|e| crate::OmniError::IoError(e.to_string()))?;
+                        let mut cat_batch = WriteBatch::new();
+                        cat_batch.set(&catalog_key, cat_value)?;
+                        self.db.commit_batch(&cat_batch)?;
+                    }
+                    return Ok(());
                 }
                 self.backfill_field(collection, field_name, None)
             }),
@@ -411,19 +460,15 @@ impl SchemaManager {
                             old_name, collection
                         )));
                     }
-                    let mut column_updated = false;
-                    for col in &mut table.columns {
-                        if col.name.eq_ignore_ascii_case(old_name) {
-                            col.name = new_name.clone();
-                            column_updated = true;
-                        }
-                    }
-                    if column_updated {
-                        let cat_value = serde_json::to_string(&table)
-                            .map_err(|e| crate::OmniError::IoError(e.to_string()))?;
-                        let mut cat_batch = WriteBatch::new();
-                        cat_batch.set(&catalog_key, cat_value)?;
-                        self.db.commit_batch(&cat_batch)?;
+                    if table
+                        .columns
+                        .iter()
+                        .any(|c| c.name.eq_ignore_ascii_case(new_name))
+                    {
+                        return Err(crate::OmniError::IoError(format!(
+                            "column '{}' already exists in SQL table '{}'",
+                            new_name, collection
+                        )));
                     }
                     for idx_def in self
                         .index_manager
@@ -442,6 +487,18 @@ impl SchemaManager {
                             )));
                         }
                     }
+                    self.rename_field_online(collection, old_name, new_name)?;
+                    for col in &mut table.columns {
+                        if col.name.eq_ignore_ascii_case(old_name) {
+                            col.name = new_name.clone();
+                        }
+                    }
+                    let cat_value = serde_json::to_string(&table)
+                        .map_err(|e| crate::OmniError::IoError(e.to_string()))?;
+                    let mut cat_batch = WriteBatch::new();
+                    cat_batch.set(&catalog_key, cat_value)?;
+                    self.db.commit_batch(&cat_batch)?;
+                    return Ok(());
                 }
                 self.rename_field_online(collection, old_name, new_name)
             }),

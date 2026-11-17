@@ -178,6 +178,7 @@ impl TwoPhaseCoordinator {
 
     /// BEGIN DISTRIBUTED — creates a new distributed transaction.
     pub fn begin(&self) -> GlobalTxnId {
+        let mut active = self.active_txns.lock().unwrap_or_else(|e| e.into_inner());
         let seq = self.next_seq.fetch_add(1, Ordering::SeqCst);
         let txn_id = (self.node_id, seq);
 
@@ -199,7 +200,6 @@ impl TwoPhaseCoordinator {
             timeout_ms: self.default_timeout_ms,
         };
 
-        let mut active = self.active_txns.lock().unwrap_or_else(|e| e.into_inner());
         active.insert(txn_id, txn);
         txn_id
     }
@@ -916,6 +916,17 @@ impl TwoPhaseParticipant {
                 };
             }
         };
+        // Reject if the COMMITTED version would exceed MAX_VALUE_SIZE.
+        let max_value = 10 * 1024 * 1024;
+        if encoded.len() + 32 > max_value {
+            self.release_key_locks(txn_id, &write_keys);
+            return PrepareResult {
+                node_id: self.node_id,
+                txn_id,
+                vote: Vote::Abort("decision record would exceed value size limit".into()),
+                prepare_seq: 0,
+            };
+        }
         if let Err(error) = prepare_batch.set(&prepare_key, encoded) {
             self.release_key_locks(txn_id, &write_keys);
             return PrepareResult {

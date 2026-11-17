@@ -230,17 +230,27 @@ impl Catalog {
             .scan(&prefix, &format!("{}\u{10ffff}", prefix), seq)
             .map_err(|e| format!("{:?}", e))?;
 
-        // Delete the table rows and catalog entry in one atomic batch. The
-        // scan above must succeed before we build the batch, so corruption
-        // cannot turn DROP into a schema-only delete; one commit also avoids
-        // leaving orphaned rows if the second of two commits would fail.
+        // Chunk deletes so large tables don't exceed the batch op limit.
+        let chunk_cap = WriteBatch::MAX_OPS.saturating_sub(4);
         let mut batch = WriteBatch::new();
         for (key, _) in &rows {
             batch.delete(key).map_err(|e| format!("{:?}", e))?;
+            if batch.op_count() >= chunk_cap {
+                self.db
+                    .commit_batch(&batch)
+                    .map_err(|e| format!("{:?}", e))?;
+                batch = WriteBatch::new();
+            }
         }
         self.index_manager
             .append_drop_indexes_for_collection(&table.name, &mut batch)
             .map_err(|e| format!("{e:?}"))?;
+        if batch.op_count() >= chunk_cap {
+            self.db
+                .commit_batch(&batch)
+                .map_err(|e| format!("{:?}", e))?;
+            batch = WriteBatch::new();
+        }
         let cat_key = format!("{}{}", CATALOG_PREFIX, name_lower);
         batch.delete(&cat_key).map_err(|e| format!("{:?}", e))?;
         self.db
