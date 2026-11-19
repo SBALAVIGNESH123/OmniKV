@@ -36,9 +36,6 @@ use std::sync::Arc;
 use omni_engine::{OmniKV, config::ServerConfig, hardening::RateLimiter};
 
 fn print_banner(cfg: &ServerConfig, cluster_mode: Option<u64>) {
-    // The honesty rules this banner follows (issue #113): "Distributed"
-    // only when consensus is actually wired (a raft node booted), and
-    // the build credit names openraft instead of claiming every byte.
     let dist_line = match cluster_mode {
         Some(node_id) => format!("Raft cluster (node {node_id})"),
         None => "Single-node".to_string(),

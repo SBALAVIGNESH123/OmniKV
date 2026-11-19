@@ -34,11 +34,10 @@ use std::sync::Arc;
 
 use crate::{OmniError, OmniKV, WriteBatch};
 
-/// Prefix for all index entries in the key space.
 const INDEX_PREFIX: &[u8] = b"\x00IDX\x00";
-/// Prefix for index catalog metadata.
 const CATALOG_PREFIX: &str = "\x00IDX_CATALOG\x00";
 const READY_PREFIX: &str = "\x00IDX_READY\x00";
+const RETIRED_PREFIX: &str = "\x00IDX_RETIRED\x00";
 const NEXT_ID_KEY: &str = "\x00IDX_NEXT_ID\x00";
 const DDL_LOCK_NAME: &str = "\x00IDX_CATALOG\x00ddl";
 
@@ -133,6 +132,22 @@ impl IndexCatalog {
                 catalog.ready.insert(def.id);
             }
             catalog.register_in_memory(def);
+        }
+        for (key, _) in db.scan(
+            RETIRED_PREFIX,
+            &format!("{}\u{10ffff}", RETIRED_PREFIX),
+            seq,
+        )? {
+            if let Some(id_str) = key.strip_prefix(RETIRED_PREFIX)
+                && let Ok(id) = id_str.parse::<IndexId>()
+            {
+                catalog.next_id =
+                    catalog
+                        .next_id
+                        .max(id.checked_add(1).ok_or_else(|| {
+                            OmniError::IoError("index ID space exhausted".into())
+                        })?);
+            }
         }
         if let Some(next_id) = db.find(NEXT_ID_KEY, seq)? {
             let next_id = next_id.parse::<IndexId>().map_err(|error| {
@@ -270,14 +285,10 @@ fn try_encode_index_value(
     }
 }
 
-/// Builds the full index key for an entry.
-///
-/// Format: `\x00IDX\x00{index_id:08}\x00{value_1}\x00{value_2}\x00...\x00{primary_key}`
 fn build_index_key(index_id: IndexId, encoded_values: &[Vec<u8>], primary_key: &str) -> String {
     let mut key = String::new();
     key.push_str(&format!("\x00IDX\x00{:08}\x00", index_id));
     for (i, val) in encoded_values.iter().enumerate() {
-        // Use base64 to safely embed binary values in string keys
         let hex = hex_encode(val);
         key.push_str(&hex);
         if i < encoded_values.len() - 1 {
@@ -532,9 +543,9 @@ impl IndexManager {
         let collection = table
             .as_ref()
             .map_or(collection, |table| table.name.as_str());
+        self.cleanup_retired_indexes_for_collection(collection)?;
         let catalog = IndexCatalog::load_checked_at(&self.db, self.db.get_seq())?;
 
-        // Check for duplicate name
         if catalog.get_by_name(name).is_some() {
             return Err(OmniError::IoError(format!(
                 "Index '{}' already exists",
@@ -555,7 +566,6 @@ impl IndexManager {
             unique,
         };
 
-        // Persist to OmniKV
         let catalog_key = format!("{}{}", CATALOG_PREFIX, id);
         let catalog_value =
             serde_json::to_string(&def).map_err(|e| OmniError::IoError(e.to_string()))?;
@@ -580,7 +590,10 @@ impl IndexManager {
 
     /// DROP INDEX — removes an index definition and all its entries.
     pub fn drop_index(&self, name: &str) -> Result<(), OmniError> {
-        let definition = self.definition(name)?;
+        let definition = match self.definition(name) {
+            Ok(definition) => definition,
+            Err(err) => self.find_retired_index(name, None)?.ok_or(err)?,
+        };
         let lock = self.db.sql_table_lock(&definition.collection)?;
         let _guard = lock
             .lock()
@@ -599,39 +612,107 @@ impl IndexManager {
             .map_err(|_| OmniError::LockPoisoned("index DDL".into()))?;
         let catalog = IndexCatalog::load_checked_at(&self.db, self.db.get_seq())?;
 
-        let id = catalog
+        let id = if let Some(def) = catalog
             .get_by_name(name)
             .filter(|d| d.collection.eq_ignore_ascii_case(expected_collection))
-            .map(|d| d.id)
-            .ok_or_else(|| OmniError::IoError(format!("Index '{}' not found", name)))?;
+        {
+            let id = def.id;
+            let catalog_key = format!("{CATALOG_PREFIX}{id}");
+            let ready_key = format!("{READY_PREFIX}{id}");
+            let retired_key = format!("{RETIRED_PREFIX}{id}");
+            let retired_value =
+                serde_json::to_string(def).map_err(|e| OmniError::IoError(e.to_string()))?;
+            let mut meta_batch = WriteBatch::new();
+            meta_batch.delete(&catalog_key)?;
+            meta_batch.delete(&ready_key)?;
+            meta_batch.set(&retired_key, retired_value)?;
+            let commit_seq = self.db.commit_batch(&meta_batch)?;
+            self.db.ssi_history().record_committed(
+                0,
+                commit_seq,
+                &crate::transaction::SsiCommitRecord {
+                    txn_id: 0,
+                    write_keys: vec![catalog_key],
+                    read_keys: Vec::new(),
+                    read_ranges: Vec::new(),
+                },
+            );
+            id
+        } else if let Some(retired) = self.find_retired_index(name, Some(expected_collection))? {
+            retired.id
+        } else {
+            return Err(OmniError::IoError(format!("Index '{}' not found", name)));
+        };
 
-        // Delete catalog entry
-        let catalog_key = format!("{}{}", CATALOG_PREFIX, id);
-        let mut batch = WriteBatch::new();
-        batch.delete(&catalog_key)?;
-        batch.delete(&format!("{READY_PREFIX}{id}"))?;
+        self.purge_retired_index_entries(id)
+    }
 
-        // Delete all index entries (scan and delete)
+    fn find_retired_index(
+        &self,
+        name: &str,
+        expected_collection: Option<&str>,
+    ) -> Result<Option<IndexDefinition>, OmniError> {
+        let seq = self.db.get_seq();
+        for (_, value) in self.db.scan(
+            RETIRED_PREFIX,
+            &format!("{}\u{10ffff}", RETIRED_PREFIX),
+            seq,
+        )? {
+            let Ok(def) = serde_json::from_str::<IndexDefinition>(&value) else {
+                continue;
+            };
+            if def.name.eq_ignore_ascii_case(name)
+                && expected_collection
+                    .is_none_or(|expected| def.collection.eq_ignore_ascii_case(expected))
+            {
+                return Ok(Some(def));
+            }
+        }
+        Ok(None)
+    }
+
+    fn cleanup_retired_indexes_for_collection(&self, collection: &str) -> Result<(), OmniError> {
+        let seq = self.db.get_seq();
+        for (_, value) in self.db.scan(
+            RETIRED_PREFIX,
+            &format!("{}\u{10ffff}", RETIRED_PREFIX),
+            seq,
+        )? {
+            if let Ok(def) = serde_json::from_str::<IndexDefinition>(&value)
+                && def.collection.eq_ignore_ascii_case(collection)
+            {
+                self.purge_retired_index_entries(def.id)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn purge_retired_index_entries(&self, id: IndexId) -> Result<(), OmniError> {
+        const DELETE_BATCH_LIMIT: usize = WriteBatch::MAX_OPS / 2;
         let prefix = build_index_scan_prefix(id);
         let end = format!("{}\u{10ffff}", prefix);
-        let seq = self.db.get_seq();
-        for (key, _) in self.db.scan(&prefix, &end, seq)? {
-            batch.delete(&key)?;
+        let retired_key = format!("{RETIRED_PREFIX}{id}");
+        loop {
+            let seq = self.db.get_seq();
+            let entries = self.db.scan(&prefix, &end, seq)?;
+            if entries.is_empty() {
+                let mut clear_batch = WriteBatch::new();
+                clear_batch.delete(&retired_key)?;
+                self.db.commit_batch(&clear_batch)?;
+                return Ok(());
+            }
+            let total = entries.len();
+            let mut batch = WriteBatch::new();
+            for (key, _) in entries.into_iter().take(DELETE_BATCH_LIMIT) {
+                batch.delete(&key)?;
+            }
+            if total <= DELETE_BATCH_LIMIT {
+                batch.delete(&retired_key)?;
+                self.db.commit_batch(&batch)?;
+                return Ok(());
+            }
+            self.db.commit_batch(&batch)?;
         }
-
-        let commit_seq = self.db.commit_batch(&batch)?;
-        self.db.ssi_history().record_committed(
-            0,
-            commit_seq,
-            &crate::transaction::SsiCommitRecord {
-                txn_id: 0,
-                write_keys: vec![catalog_key],
-                read_keys: Vec::new(),
-                read_ranges: Vec::new(),
-            },
-        );
-
-        Ok(())
     }
 
     /// Returns the collection owning an index, used by schema migration for DDL serialization.
@@ -656,6 +737,22 @@ impl IndexManager {
             let end = format!("{}\u{10ffff}", prefix);
             for (key, _) in self.db.scan(&prefix, &end, seq)? {
                 entry_keys.push(key);
+            }
+        }
+        for (ret_key, value) in self.db.scan(
+            RETIRED_PREFIX,
+            &format!("{}\u{10ffff}", RETIRED_PREFIX),
+            seq,
+        )? {
+            if let Ok(def) = serde_json::from_str::<IndexDefinition>(&value)
+                && def.collection.eq_ignore_ascii_case(collection)
+            {
+                meta_keys.push(ret_key);
+                let prefix = build_index_scan_prefix(def.id);
+                let end = format!("{}\u{10ffff}", prefix);
+                for (key, _) in self.db.scan(&prefix, &end, seq)? {
+                    entry_keys.push(key);
+                }
             }
         }
         Ok((entry_keys, meta_keys))

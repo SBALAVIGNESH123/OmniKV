@@ -1,33 +1,17 @@
-//! Multi-process cluster failover test: three REAL server processes form
-//! a Raft cluster, a write replicates to every node, and killing the
-//! leader (hard-kill, no graceful shutdown) elects a new leader with
-//! zero data loss.
-//!
-//! Runs anywhere the test suite runs (Linux CI, Windows dev): it spawns
-//! the `omnikv-server` binary three times with distinct ports, data
-//! dirs, and raft node ids, drives writes through the TCP command
-//! interface (AUTH pipelined ahead of each command), and observes
-//! leadership by write-probing (a write succeeds only where the leader
-//! is).
+//! Multi-process Raft cluster failover and TCP command interface tests.
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-/// JWT secret the nodes boot with (see `spawn_node`) and the tests sign
-/// tokens with. A node with a mismatched secret refuses every command.
 const TEST_JWT_SECRET: &str = "test-jwt-secret-0123456789abcdef";
 
-/// One spawned cluster node. `kill()`ed tests read `ports` after the
-/// child is gone, so the connection endpoints live here, not on Child.
 struct Node {
     child: Child,
     /// (tcp, http, quic, pgwire, raft)
     ports: (u16, u16, u16, u16, u16),
     id: u64,
-    /// Where the node keeps WAL/manifest/raft state. Held so `drop` can
-    /// clean it up — a hard-killed node leaves a lock and a log behind.
     dir: std::path::PathBuf,
 }
 
@@ -39,21 +23,12 @@ impl Node {
 
 impl Drop for Node {
     fn drop(&mut self) {
-        // Test hygiene: never leak server processes, even on failure.
         let _ = self.child.kill();
         let _ = self.child.wait();
-        // ...and never leak their state. A stale raft log left behind is
-        // not just clutter: the next test to land on this directory
-        // inherits it, and openraft then refuses to initialize ("not
-        // allowed to initialize due to current raft state"), which shows
-        // up from the test as a listener that never comes up.
         let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
 
-/// Sign a JWT the TCP interface will accept: it refuses all data commands
-/// until a valid token arrives, and the token's role has to cover the
-/// command.
 fn test_token_role(role: &str) -> String {
     use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
     use serde::Serialize;
@@ -84,40 +59,22 @@ fn test_token_role(role: &str) -> String {
     .expect("sign test token")
 }
 
-/// The admin token the failover check drives writes with.
 fn test_token() -> String {
     test_token_role("admin")
 }
 
-/// Sends one command to the TCP command interface, returns the
-/// response. `AUTH <token>` is pipelined ahead of the command on the
-/// same connection; the interface authenticates the session and then
-/// runs the command, replying with one line per request.
 fn tcp_cmd(port: u16, cmd: &str) -> Result<String, String> {
     tcp_cmd_raw_lines(port, &format!("AUTH {}\n{cmd}\n", test_token()), 2)
 }
 
-/// Same wire, a token scoped to `role`: for checking that the interface
-/// authorizes per command, not just per session.
 fn tcp_cmd_role(port: u16, role: &str, cmd: &str) -> Result<String, String> {
     tcp_cmd_raw_lines(port, &format!("AUTH {}\n{cmd}\n", test_token_role(role)), 2)
 }
 
-/// Sends a command with NO auth header — the interface must refuse it.
-/// Drives the interface without a token: every data command must be
-/// refused.
 fn tcp_cmd_unauthenticated(port: u16, cmd: &str) -> Result<String, String> {
     tcp_cmd_raw_lines(port, &format!("{cmd}\n"), 1)
 }
 
-/// Write `request`, read back until `expect_lines` complete lines have
-/// arrived, return the last non-empty one. Reading a fixed number of
-/// lines matters: a single `read()` can return a prefix of the response
-/// when it arrives in multiple TCP segments, and the exact-match
-/// assertions would flake without a product defect. For a pipelined
-/// AUTH+command the last line is the command's own reply. Every expected
-/// line has to arrive: a peer that closes mid-sequence leaves the caller
-/// asserting a reply that was never fully delivered.
 fn tcp_cmd_raw_lines(port: u16, request: &str, expect_lines: usize) -> Result<String, String> {
     let mut stream =
         TcpStream::connect(("127.0.0.1", port)).map_err(|e| format!("connect: {e}"))?;
@@ -128,8 +85,6 @@ fn tcp_cmd_raw_lines(port: u16, request: &str, expect_lines: usize) -> Result<St
         .write_all(request.as_bytes())
         .map_err(|e| format!("write: {e}"))?;
 
-    // Peel whole lines out of the buffer as they arrive; a partial line
-    // stays in `out` until the next read completes it.
     let mut out = Vec::new();
     let mut lines = Vec::new();
     let mut buf = [0u8; 4096];
@@ -147,10 +102,6 @@ fn tcp_cmd_raw_lines(port: u16, request: &str, expect_lines: usize) -> Result<St
             }
         }
     }
-    // A peer that closed without delivering every expected line has
-    // incomplete state regardless of what the last line says — returning
-    // it anyway would let a dropped middle reply pass the caller's
-    // assertion on the surviving final one.
     if lines.len() != expect_lines {
         return Err(format!(
             "peer closed after {}/{} replies (got: {lines:?})",
@@ -162,21 +113,33 @@ fn tcp_cmd_raw_lines(port: u16, request: &str, expect_lines: usize) -> Result<St
 }
 
 fn allocate_port_set(count: usize) -> Vec<(u16, u16, u16, u16, u16)> {
+    const MAX_UDP_BIND_RETRIES: usize = 64;
     let mut tcp_guards = Vec::with_capacity(count * 5);
     let mut udp_guards = Vec::with_capacity(count);
     let mut ports = Vec::with_capacity(count);
     for _ in 0..count {
         let mut tuple = [0u16; 5];
         for (slot_idx, slot) in tuple.iter_mut().enumerate() {
-            loop {
+            for attempt in 0..MAX_UDP_BIND_RETRIES {
                 let tcp = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral tcp");
                 let port = tcp.local_addr().expect("local addr").port();
                 if slot_idx == 2 {
-                    if let Ok(udp) = std::net::UdpSocket::bind(("127.0.0.1", port)) {
-                        udp_guards.push(udp);
-                        tcp_guards.push(tcp);
-                        *slot = port;
-                        break;
+                    match std::net::UdpSocket::bind(("127.0.0.1", port)) {
+                        Ok(udp) => {
+                            udp_guards.push(udp);
+                            tcp_guards.push(tcp);
+                            *slot = port;
+                            break;
+                        }
+                        Err(err) if err.kind() == std::io::ErrorKind::AddrInUse => {
+                            assert!(
+                                attempt + 1 < MAX_UDP_BIND_RETRIES,
+                                "exhausted UDP port allocation retries due to AddrInUse on port {port}: {err}"
+                            );
+                        }
+                        Err(err) => {
+                            panic!("bind ephemeral udp on 127.0.0.1:{port} failed: {err}");
+                        }
                     }
                 } else {
                     tcp_guards.push(tcp);
@@ -192,28 +155,17 @@ fn allocate_port_set(count: usize) -> Vec<(u16, u16, u16, u16, u16)> {
     ports
 }
 
-/// Hands out a fresh data dir for every node, in every test. The naive
-/// `omnikv-cluster-{id}-{pid}` collides: two tests in one test binary
-/// share a pid, so the second cluster boots on the first one's raft log.
-/// openraft then refuses to initialize a node that already has one ("not
-/// allowed to initialize due to current raft state"), and the failure
-/// surfaces only as a listener that never comes up inside a 30s timeout.
 fn fresh_node_dir(id: u64) -> std::path::PathBuf {
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let seq = SEQ.fetch_add(1, Ordering::Relaxed);
     let dir =
         std::env::temp_dir().join(format!("omnikv-cluster-{id}-{}-{seq}", std::process::id()));
-    // A previous run may have died without dropping its nodes; booting on
-    // that state is the exact failure this function exists to prevent.
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("create node dir");
     dir
 }
 
-/// The command for one cluster node: distinct TCP/HTTP/QUIC/pgwire/
-/// raft ports, a private data dir, fast election timers (the test must
-/// converge in seconds, not minutes).
 fn spawn_node(id: u64, ports: &[(u16, u16, u16, u16, u16)], tcp_tls: bool) -> Node {
     let idx = usize::try_from(id - 1).expect("node id fits usize");
     let (tcp, http, quic, pgwire, raft) = ports[idx];
@@ -221,16 +173,12 @@ fn spawn_node(id: u64, ports: &[(u16, u16, u16, u16, u16)], tcp_tls: bool) -> No
     let child = Command::new(env!("CARGO_BIN_EXE_omnikv-server"))
         .env("OMNIKV_MODE", "development")
         .env("OMNIKV_TCP_ADDR", format!("127.0.0.1:{tcp}"))
-        // These tests speak the command protocol in the clear over
-        // loopback; they exercise the AUTH gate, not the transport.
         .env("OMNIKV_TCP_TLS", if tcp_tls { "true" } else { "false" })
         .env("OMNIKV_HTTP_ADDR", format!("127.0.0.1:{http}"))
         .env("OMNIKV_QUIC_ADDR", format!("127.0.0.1:{quic}"))
         .env("OMNIKV_PGWIRE_ADDR", format!("127.0.0.1:{pgwire}"))
         .env("OMNIKV_RAFT_ADDR", format!("127.0.0.1:{raft}"))
         .env("OMNIKV_NODE_ID", id.to_string())
-        // Only node 1's peer list is consumed (initial membership);
-        // peer ids are 2.. in declaration order — see raft_node.rs.
         .env(
             "OMNIKV_RAFT_PEERS",
             if id == 1 {
@@ -263,9 +211,6 @@ fn spawn_node(id: u64, ports: &[(u16, u16, u16, u16, u16)], tcp_tls: bool) -> No
         .env("OMNIKV_RAFT_ELECTION_MAX_MS", "300")
         .env("RUST_LOG", "warn")
         .stdout(Stdio::null())
-        // Server stderr goes to the node dir, not /dev/null: a node that
-        // never binds its listener is otherwise invisible from the test,
-        // and the failure shows up only as a 30s timeout.
         .stderr(std::process::Stdio::from(
             std::fs::File::create(dir.join("stderr.log")).expect("create stderr log"),
         ))
@@ -279,8 +224,32 @@ fn spawn_node(id: u64, ports: &[(u16, u16, u16, u16, u16)], tcp_tls: bool) -> No
     }
 }
 
-/// Spawns the three-node cluster and waits for every TCP listener.
+fn stderr_excerpt(dir: &std::path::Path) -> String {
+    const MAX_CHARS: usize = 1024;
+    let Ok(raw) = std::fs::read_to_string(dir.join("stderr.log")) else {
+        return "<stderr.log unavailable>".into();
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return "<stderr empty>".into();
+    }
+    if trimmed.chars().count() <= MAX_CHARS {
+        trimmed.to_string()
+    } else {
+        let tail: String = trimmed
+            .chars()
+            .rev()
+            .take(MAX_CHARS)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        format!("...{tail}")
+    }
+}
+
 fn boot_cluster() -> Vec<Node> {
+    let mut attempt_failures = Vec::new();
     for attempt in 1..=3 {
         let ports = allocate_port_set(3);
         let n2 = spawn_node(2, &ports, false);
@@ -288,16 +257,36 @@ fn boot_cluster() -> Vec<Node> {
         let n1 = spawn_node(1, &ports, false);
         let mut nodes = vec![n1, n2, n3];
 
-        let mut all_ready = true;
+        let mut failed_reason = None;
         for node in &mut nodes {
-            let deadline = Instant::now() + Duration::from_secs(20);
+            let deadline = Instant::now() + Duration::from_secs(30);
             loop {
-                if let Ok(Some(_)) = node.child.try_wait() {
-                    all_ready = false;
-                    break;
+                match node.child.try_wait() {
+                    Ok(Some(status)) => {
+                        let log = stderr_excerpt(&node.dir);
+                        failed_reason = Some(format!(
+                            "attempt {attempt}: node {} exited during startup with {status} (stderr: {log})",
+                            node.id
+                        ));
+                        break;
+                    }
+                    Err(err) => {
+                        let log = stderr_excerpt(&node.dir);
+                        failed_reason = Some(format!(
+                            "attempt {attempt}: node {} try_wait failed: {err} (stderr: {log})",
+                            node.id
+                        ));
+                        break;
+                    }
+                    Ok(None) => {}
                 }
                 if Instant::now() > deadline {
-                    all_ready = false;
+                    let log = stderr_excerpt(&node.dir);
+                    failed_reason = Some(format!(
+                        "attempt {attempt}: node {} timed out after 30s waiting for TCP listener on port {} (stderr: {log})",
+                        node.id,
+                        node.tcp_port()
+                    ));
                     break;
                 }
                 match tcp_cmd_unauthenticated(node.tcp_port(), "GET failover:key") {
@@ -305,23 +294,24 @@ fn boot_cluster() -> Vec<Node> {
                     _ => std::thread::sleep(Duration::from_millis(100)),
                 }
             }
-            if !all_ready {
+            if failed_reason.is_some() {
                 break;
             }
         }
-        if all_ready {
+        let Some(failure) = failed_reason else {
             return nodes;
-        }
+        };
+        attempt_failures.push(failure);
+        drop(nodes);
         assert!(
             attempt < 3,
-            "cluster nodes failed to become ready after 3 attempts"
+            "cluster nodes failed to become ready after 3 attempts:\n{}",
+            attempt_failures.join("\n")
         );
     }
     unreachable!()
 }
 
-/// The leadership oracle: a SET through the write gateway succeeds only
-/// on the leader (followers answer "not the leader; ...").
 fn find_leader(nodes: &[&Node]) -> Option<usize> {
     for (i, node) in nodes.iter().enumerate() {
         if let Ok(resp) = tcp_cmd(node.tcp_port(), "SET __probe__ x")
@@ -343,22 +333,9 @@ fn retry_until<T>(deadline: Instant, f: impl Fn() -> Option<T>) -> Option<T> {
     None
 }
 
-/// 16 simultaneous writers against the leader. Async REST/QUIC handlers
-/// park their own runtime's workers waiting for consensus; without the
-/// dedicated consensus runtime, enough concurrent writes can park every
-/// worker and starve the very openraft tasks that have to finish their
-/// proposals to release
-/// them. 16 writers at once (more than typical CI worker counts) must
-/// all get answers — serialized by the flight lock, but NEVER stuck —
-/// and every write must replicate to every node. Extracted to a helper
-/// to keep the failover test under clippy's function-length limit.
 fn concurrent_writers_do_not_deadlock(leader_tcp: u16, nodes: &[Node]) {
     let acknowledged = std::sync::atomic::AtomicUsize::new(0);
-    // A shared ref is Copy, so each `move` writer copies the ref
-    // instead of fighting over ownership of the atomic itself.
     let ack = &acknowledged;
-    // thread::scope joins every writer before it returns, so the count
-    // is complete by the time we read it back below.
     std::thread::scope(|scope| {
         for w in 0..16u32 {
             scope.spawn(move || {
@@ -371,7 +348,6 @@ fn concurrent_writers_do_not_deadlock(leader_tcp: u16, nodes: &[Node]) {
     });
     let ok = acknowledged.into_inner();
     assert_eq!(ok, 16, "concurrent writes: {ok}/16 acknowledged");
-    // Every concurrent write must replicate to every node.
     for node in nodes {
         let seen = retry_until(Instant::now() + Duration::from_secs(10), || {
             (0..16u32)
@@ -386,37 +362,24 @@ fn concurrent_writers_do_not_deadlock(leader_tcp: u16, nodes: &[Node]) {
     println!("16 concurrent writers all acknowledged and replicated");
 }
 
-/// Several commands in ONE write segment must each get a reply. This is
-/// the framing contract the interface's line buffer has to keep: an early
-/// version of the bounded reader consumed the whole segment, answered the
-/// first line, and discarded the rest — the client hung waiting for
-/// replies that were never coming, with no error anywhere.
 #[test]
 fn tcp_pipelined_commands_all_get_replies() {
     let nodes = boot_cluster();
     let refs: Vec<&Node> = nodes.iter().collect();
 
-    // The SET has to land on the leader: boot_cluster waits for the
-    // listeners, not for an election, and a pre-election batch comes back
-    // NOT_LEADER with nothing to DELETE. Whichever node won does not
-    // matter, only that one has by the time the batch goes out.
     let deadline = Instant::now() + Duration::from_secs(30);
     let leader =
         retry_until(deadline, || find_leader(&refs)).expect("no leader elected within 30s");
     let port = refs[leader].tcp_port();
 
-    // AUTH plus three data commands, written as one segment.
     let request = format!(
         "AUTH {}\nSET pipe:k one\nGET pipe:k\nDELETE pipe:k\n",
         test_token()
     );
     let got = tcp_cmd_raw_lines(port, &request, 4).expect("pipelined round trip");
 
-    // The LAST reply is the one the assertions care about, but every line
-    // must have arrived — a dropped command is the failure mode.
     assert!(got.starts_with("DELETED"), "DELETE reply missing: {got}");
 
-    // And the write/read really happened, not just replies returned:
     assert_eq!(
         tcp_cmd(port, "GET pipe:k").unwrap_or_default(),
         "NOT_FOUND",
@@ -424,13 +387,6 @@ fn tcp_pipelined_commands_all_get_replies() {
     );
 }
 
-/// A valid token is not a blanket grant: a read-scoped token may look
-/// around but must not mutate, and a write token may. Authentication
-/// without per-command authorization is a bypass (CWE-862). Extracted to
-/// a helper to keep the failover test under clippy's function-length
-/// limit. The refusals would hold on any node — the role gate fires
-/// before dispatch — but the write token's `SET` has to reach the leader
-/// to come back `OK`, so the caller passes a leader's port.
 fn roles_are_enforced_on_the_command_interface(port: u16) {
     let read_get = tcp_cmd_role(port, "read", "GET failover:key");
     assert!(
@@ -456,16 +412,11 @@ fn roles_are_enforced_on_the_command_interface(port: u16) {
     println!("roles enforced: read cannot write, write can");
 }
 
-/// THE test: three real processes, one replicated write, kill the
-/// leader, a new leader is elected, and no data is lost.
 #[test]
 fn cluster_failover_kill_leader_no_data_loss() {
     let nodes = boot_cluster();
     let refs: Vec<&Node> = nodes.iter().collect();
 
-    // ── 0. The command interface refuses work before AUTH ──────────
-    // Every data command is gated behind a verified JWT; without one,
-    // anyone who could reach the port would have unrestricted read/write.
     for node in &refs {
         let refused = tcp_cmd_unauthenticated(node.tcp_port(), "GET failover:key");
         assert!(
@@ -476,7 +427,6 @@ fn cluster_failover_kill_leader_no_data_loss() {
     }
     println!("all nodes refuse unauthenticated commands");
 
-    // ── 1. A leader is elected and accepts writes ──
     let deadline = Instant::now() + Duration::from_secs(30);
     let leader_idx =
         retry_until(deadline, || find_leader(&refs)).expect("no leader elected within 30s");
@@ -484,14 +434,8 @@ fn cluster_failover_kill_leader_no_data_loss() {
     let leader_tcp = refs[leader_idx].tcp_port();
     println!("leader elected: node {leader_id}");
 
-    // ── 1b. A token's role gates each command. Runs here, after the
-    // leader is known: the refusals hold on any node (the role gate fires
-    // before dispatch), but the write token's SET only comes back OK from
-    // the leader — a follower answers NOT_LEADER, which would make this
-    // assertion flake on which node won the election.
     roles_are_enforced_on_the_command_interface(leader_tcp);
 
-    // ── 2. A write on the leader replicates to every node ──
     let write = tcp_cmd(leader_tcp, "SET failover:key hello-cluster");
     assert!(
         write.unwrap_or_default().starts_with("OK"),
@@ -511,7 +455,6 @@ fn cluster_failover_kill_leader_no_data_loss() {
     }
     println!("write replicated to all 3 nodes");
 
-    // ── 3. Followers reject writes with the leader's identity ──
     let follower = refs
         .iter()
         .enumerate()
@@ -525,21 +468,15 @@ fn cluster_failover_kill_leader_no_data_loss() {
     );
     println!("follower correctly rejected a write: {resp}");
 
-    // ── 3b. CONCURRENT writers do not deadlock the cluster ──
-    // Async handlers on the server runtime park their workers waiting for
-    // consensus; the dedicated consensus runtime keeps enough workers free
-    // for openraft to complete its proposals.
     concurrent_writers_do_not_deadlock(leader_tcp, &nodes);
 
-    // ── 4. Kill the leader — hard kill, no graceful shutdown ──
-    // Capture the survivors' endpoints BEFORE consuming `nodes`.
     let survivors: Vec<(u16, u64)> = nodes
         .iter()
         .filter(|n| n.id != leader_id)
         .map(|n| (n.tcp_port(), n.id))
         .collect();
     assert_eq!(survivors.len(), 2, "quorum must survive");
-    drop(refs); // release the borrows before consuming `nodes`
+    drop(refs);
 
     let mut nodes = nodes;
     let leader_pos = nodes
@@ -552,16 +489,12 @@ fn cluster_failover_kill_leader_no_data_loss() {
     drop(killed);
     println!("leader node {leader_id} killed");
 
-    // ── 5. Survivors elect a new leader; the data survived ──
     let new_leader = retry_until(Instant::now() + Duration::from_secs(30), || {
         find_leader_among(&survivors)
     })
     .expect("no new leader elected within 30s after killing the leader");
     println!("new leader elected: node {}", new_leader.1);
 
-    // No data loss: the replicated key is still there, and a NEW write
-    // on the new leader (the strongest form of "cluster is alive")
-    // replicates to the other survivor.
     let read = tcp_cmd(new_leader.0, "GET failover:key").unwrap_or_default();
     assert!(
         read.starts_with("OK: hello-cluster"),
@@ -586,12 +519,8 @@ fn cluster_failover_kill_leader_no_data_loss() {
         "post-failover write never reached the other survivor"
     );
     println!("post-failover write replicated — no data loss, cluster fully alive");
-
-    // Nodes are dropped here: Drop kills the survivors (the leader is
-    // already dead) and removes their data dirs.
 }
 
-/// Leadership among a subset of (`tcp_port`, `node_id`) pairs.
 fn find_leader_among(nodes: &[(u16, u64)]) -> Option<(u16, u64)> {
     for (port, id) in nodes {
         if let Ok(resp) = tcp_cmd(*port, "SET __probe_after__ x")
@@ -603,9 +532,8 @@ fn find_leader_among(nodes: &[(u16, u64)]) -> Option<(u16, u64)> {
     None
 }
 
-/// One node with TLS on the command interface, listening and ready.
 fn boot_tls_node() -> Node {
-    let ports = allocate_port_set(5);
+    let ports = allocate_port_set(1);
     let node = spawn_node(1, &ports, true);
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
@@ -621,11 +549,6 @@ fn boot_tls_node() -> Node {
     node
 }
 
-/// The interface refuses to speak the command protocol in the clear: a
-/// client that sends a plaintext command to a TLS-enabled port gets no
-/// protocol reply at all, because the handshake it never performed is
-/// what would have unlocked one. Without this, the JWT would cross the
-/// wire unencrypted on any bind an operator left TLS off for.
 #[test]
 fn tls_enabled_port_refuses_plaintext_commands() {
     let node = boot_tls_node();
@@ -638,15 +561,9 @@ fn tls_enabled_port_refuses_plaintext_commands() {
 
     let mut buf = [0u8; 128];
     match stream.read(&mut buf) {
-        // The server held the connection until the deadline — nothing was
-        // said in the clear either way.
         Ok(0) | Err(_) => {}
         Ok(n) => {
             let got = &buf[..n];
-            // The right reaction is a TLS alert refusing bytes that are
-            // not a ClientHello — a protocol reply would mean the JWT was
-            // readable off the wire without a handshake. Replies are
-            // newline-terminated; an alert is not.
             assert!(
                 !got.contains(&b'\n'),
                 "TLS port answered a plaintext command: {:?}",

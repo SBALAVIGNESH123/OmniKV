@@ -343,7 +343,35 @@ impl SchemaManager {
         operation()
     }
 
-    /// Executes a single schema operation.
+    fn ensure_no_dependent_indexes(
+        &self,
+        seq: u64,
+        table_name: &str,
+        collection: &str,
+        field_name: &str,
+        canonical_field: &str,
+        action: &str,
+    ) -> Result<(), OmniError> {
+        for idx_def in self
+            .index_manager
+            .catalog_snapshot_at(seq)?
+            .indexes_for_collection(table_name)
+        {
+            if idx_def
+                .fields
+                .iter()
+                .any(|(f, _)| f.eq_ignore_ascii_case(canonical_field))
+            {
+                return Err(OmniError::IoError(format!(
+                    "cannot {action} field '{field_name}' in SQL table '{collection}' \
+                     because index '{}' references it; drop the index first",
+                    idx_def.name
+                )));
+            }
+        }
+        Ok(())
+    }
+
     fn execute_op(&self, op: &SchemaOp) -> Result<(), OmniError> {
         match op {
             SchemaOp::CreateIndex {
@@ -359,7 +387,13 @@ impl SchemaManager {
                     *unique,
                 )?;
                 if let Err(error) = self.index_manager.rebuild_index_locked(name, collection) {
-                    let _ = self.index_manager.drop_index_locked(name, collection);
+                    if let Err(cleanup_error) =
+                        self.index_manager.drop_index_locked(name, collection)
+                    {
+                        return Err(OmniError::IoError(format!(
+                            "{error}; failed index cleanup also failed: {cleanup_error}"
+                        )));
+                    }
                     return Err(error);
                 }
                 Ok(())
@@ -448,6 +482,14 @@ impl SchemaManager {
                             field_name, collection
                         )));
                     };
+                    self.ensure_no_dependent_indexes(
+                        seq,
+                        &table.name,
+                        collection,
+                        field_name,
+                        &canonical_name,
+                        "remove",
+                    )?;
                     self.backfill_field(&table.name, &canonical_name, None)?;
                     table
                         .columns
@@ -481,6 +523,19 @@ impl SchemaManager {
                             old_name, collection
                         )));
                     }
+                    let stage_key = Self::rename_stage_key(&table.name, old_name, new_name);
+                    if let Some(staged_old) = self.db.find(&stage_key, seq)?
+                        && table
+                            .columns
+                            .iter()
+                            .any(|c| c.name.eq_ignore_ascii_case(new_name))
+                        && !table
+                            .columns
+                            .iter()
+                            .any(|c| c.name.eq_ignore_ascii_case(old_name))
+                    {
+                        return self.cleanup_staged_rename(&table.name, &staged_old, &stage_key);
+                    }
                     if table
                         .columns
                         .iter()
@@ -497,24 +552,15 @@ impl SchemaManager {
                         .find(|c| c.name.eq_ignore_ascii_case(old_name))
                         .map(|c| c.name.clone())
                         .unwrap_or_else(|| old_name.clone());
-                    for idx_def in self
-                        .index_manager
-                        .catalog_snapshot_at(seq)?
-                        .indexes_for_collection(&table.name)
-                    {
-                        if idx_def
-                            .fields
-                            .iter()
-                            .any(|(f, _)| f.eq_ignore_ascii_case(&canonical_old))
-                        {
-                            return Err(crate::OmniError::IoError(format!(
-                                "cannot rename field '{}' in SQL table '{}' \
-                                 because index '{}' references it; drop the index first",
-                                old_name, collection, idx_def.name
-                            )));
-                        }
-                    }
-                    self.rename_field_online(&table.name, &canonical_old, new_name)?;
+                    self.ensure_no_dependent_indexes(
+                        seq,
+                        &table.name,
+                        collection,
+                        old_name,
+                        &canonical_old,
+                        "rename",
+                    )?;
+                    let table_name = table.name.clone();
                     for col in &mut table.columns {
                         if col.name.eq_ignore_ascii_case(&canonical_old) {
                             col.name = new_name.clone();
@@ -522,18 +568,73 @@ impl SchemaManager {
                     }
                     let cat_value = serde_json::to_string(&table)
                         .map_err(|e| crate::OmniError::IoError(e.to_string()))?;
-                    let mut cat_batch = WriteBatch::new();
-                    cat_batch.set(&catalog_key, cat_value)?;
-                    self.db.commit_batch(&cat_batch)?;
-                    return Ok(());
+                    return self.rename_field_online(
+                        &table_name,
+                        &canonical_old,
+                        new_name,
+                        Some((&catalog_key, &cat_value)),
+                    );
                 }
-                self.rename_field_online(collection, old_name, new_name)
+                self.rename_field_online(collection, old_name, new_name, None)
             }),
         }
     }
 
-    /// Online field backfill — adds or removes a field from all documents
-    /// in a collection, processing in batches to avoid blocking.
+    fn rename_stage_key(collection: &str, old_name: &str, new_name: &str) -> String {
+        format!(
+            "\x00SCHEMA\x00rename_stage:{}:{}:{}",
+            collection.to_lowercase(),
+            old_name.to_lowercase(),
+            new_name.to_lowercase()
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn stage_doc_update(
+        &self,
+        catalog: &crate::secondary_index::IndexCatalog,
+        collection: &str,
+        prefix: &str,
+        is_sql_rows: bool,
+        sql_row_format: crate::catalog::RowFormat,
+        key: &str,
+        previous_json: &str,
+        old_doc: serde_json::Value,
+        new_doc: serde_json::Value,
+        batch: &mut WriteBatch,
+    ) -> Result<(), OmniError> {
+        let updated =
+            serde_json::to_string(&new_doc).map_err(|e| OmniError::IoError(e.to_string()))?;
+        let primary_key = key.strip_prefix(prefix).unwrap_or(key);
+        let (old_index_doc, new_index_doc) = if is_sql_rows {
+            let old_row = crate::plan_exec::PlanExecutor::deserialize_row_checked(
+                previous_json,
+                sql_row_format,
+            )
+            .map_err(OmniError::IoError)?;
+            let new_row =
+                crate::plan_exec::PlanExecutor::deserialize_row_checked(&updated, sql_row_format)
+                    .map_err(OmniError::IoError)?;
+            (
+                serde_json::to_value(&old_row).map_err(|e| OmniError::IoError(e.to_string()))?,
+                serde_json::to_value(&new_row).map_err(|e| OmniError::IoError(e.to_string()))?,
+            )
+        } else {
+            (old_doc, new_doc)
+        };
+        self.index_manager.replace_document_indexes_with_catalog(
+            catalog,
+            collection,
+            primary_key,
+            &old_index_doc,
+            primary_key,
+            &new_index_doc,
+            batch,
+        )?;
+        batch.set(key, updated)?;
+        Ok(())
+    }
+
     fn backfill_field(
         &self,
         collection: &str,
@@ -556,7 +657,19 @@ impl SchemaManager {
             .unwrap_or_default();
         let sql_default = match default_value {
             Some(serde_json::Value::Null) => Some(serde_json::Value::Null),
-            Some(serde_json::Value::String(s)) => Some(serde_json::Value::String(s.clone())),
+            Some(serde_json::Value::String(s)) => {
+                if s == "NULL" && sql_row_format == crate::catalog::RowFormat::Legacy {
+                    let sql_prefix = format!("\x00T\x00{}\x00", collection);
+                    let sql_end = format!("\x00T\x00{}\x00\u{10ffff}", collection);
+                    if sql_table.is_some() || !self.db.scan(&sql_prefix, &sql_end, seq)?.is_empty()
+                    {
+                        return Err(OmniError::IoError(format!(
+                            "literal \"NULL\" default for field '{field_name}' is not supported on legacy SQL table '{collection}'"
+                        )));
+                    }
+                }
+                Some(serde_json::Value::String(s.clone()))
+            }
             Some(serde_json::Value::Number(n)) => Some(serde_json::Value::String(n.to_string())),
             Some(serde_json::Value::Bool(b)) => Some(serde_json::Value::String(b.to_string())),
             Some(other) => {
@@ -606,40 +719,18 @@ impl SchemaManager {
                         self.db.commit_batch(&batch)?;
                         batch = WriteBatch::new();
                     }
-                    let updated = serde_json::to_string(&doc)
-                        .map_err(|e| OmniError::IoError(e.to_string()))?;
-                    let primary_key = key.strip_prefix(&prefix).unwrap_or(&key);
-                    let (old_index_doc, new_index_doc) = if is_sql_rows {
-                        let old_row = crate::plan_exec::PlanExecutor::deserialize_row_checked(
-                            &value,
-                            sql_row_format,
-                        )
-                        .map_err(OmniError::IoError)?;
-                        let new_row = crate::plan_exec::PlanExecutor::deserialize_row_checked(
-                            &updated,
-                            sql_row_format,
-                        )
-                        .map_err(OmniError::IoError)?;
-                        (
-                            serde_json::to_value(&old_row)
-                                .map_err(|e| OmniError::IoError(e.to_string()))?,
-                            serde_json::to_value(&new_row)
-                                .map_err(|e| OmniError::IoError(e.to_string()))?,
-                        )
-                    } else {
-                        (old_doc, doc)
-                    };
-                    self.index_manager.replace_document_indexes_with_catalog(
+                    self.stage_doc_update(
                         &catalog,
                         collection,
-                        primary_key,
-                        &old_index_doc,
-                        primary_key,
-                        &new_index_doc,
+                        &prefix,
+                        is_sql_rows,
+                        sql_row_format,
+                        &key,
+                        &value,
+                        old_doc,
+                        doc,
                         &mut batch,
                     )?;
-                    batch.set(&key, updated)?;
-
                     if batch.op_count() >= WriteBatch::MAX_OPS / 2 && !batch.is_empty() {
                         self.db.commit_batch(&batch)?;
                         batch = WriteBatch::new();
@@ -655,12 +746,12 @@ impl SchemaManager {
         Ok(())
     }
 
-    /// Online field rename — renames a field in all documents.
     fn rename_field_online(
         &self,
         collection: &str,
         old_name: &str,
         new_name: &str,
+        sql_catalog_update: Option<(&str, &str)>,
     ) -> Result<(), OmniError> {
         self.index_manager.refresh_catalog()?;
         let seq = self.db.get_seq();
@@ -675,11 +766,14 @@ impl SchemaManager {
             .map(|table| table.row_format)
             .unwrap_or_default();
 
+        let stage_key = Self::rename_stage_key(collection, old_name, new_name);
+        let is_staged_retry = self.db.find(&stage_key, seq)?.is_some();
+
         for (prefix, end) in collection_row_ranges(collection) {
             for (_, value) in self.db.scan(&prefix, &end, seq)? {
                 if let Ok(serde_json::Value::Object(obj)) = serde_json::from_str(&value)
-                    && obj.contains_key(old_name)
-                    && obj.contains_key(new_name)
+                    && let (Some(old_val), Some(new_val)) = (obj.get(old_name), obj.get(new_name))
+                    && (!is_staged_retry || old_val != new_val)
                 {
                     return Err(OmniError::IoError(format!(
                         "cannot rename field '{}' to '{}' because the destination exists",
@@ -688,6 +782,140 @@ impl SchemaManager {
                 }
             }
         }
+
+        let max_doc_ops = 1 + 2 * catalog.indexes_for_collection(collection).len();
+        let catalog_ops = usize::from(sql_catalog_update.is_some());
+        let single_batch_budget = WriteBatch::MAX_OPS.saturating_sub(catalog_ops);
+
+        if !is_staged_retry {
+            let mut single_batch = WriteBatch::new();
+            let mut fits_in_one_batch = true;
+
+            'ranges: for (prefix, end) in collection_row_ranges(collection) {
+                let is_sql_rows = prefix.starts_with("\x00T\x00");
+                for (key, value) in self.db.scan(&prefix, &end, seq)? {
+                    let Ok(mut doc) = serde_json::from_str::<serde_json::Value>(&value) else {
+                        continue;
+                    };
+                    let old_doc = doc.clone();
+                    let Some(obj) = doc.as_object_mut() else {
+                        continue;
+                    };
+                    if let Some(val) = obj.remove(old_name) {
+                        if single_batch.op_count().saturating_add(max_doc_ops) > single_batch_budget
+                        {
+                            fits_in_one_batch = false;
+                            break 'ranges;
+                        }
+                        obj.insert(new_name.to_string(), val);
+                        self.stage_doc_update(
+                            &catalog,
+                            collection,
+                            &prefix,
+                            is_sql_rows,
+                            sql_row_format,
+                            &key,
+                            &value,
+                            old_doc,
+                            doc,
+                            &mut single_batch,
+                        )?;
+                    }
+                }
+            }
+
+            if fits_in_one_batch {
+                if let Some((cat_key, cat_val)) = sql_catalog_update {
+                    single_batch.set(cat_key, cat_val.to_string())?;
+                }
+                if !single_batch.is_empty() {
+                    self.db.commit_batch(&single_batch)?;
+                }
+                return Ok(());
+            }
+        }
+
+        // Large rename: stage the new field while keeping the old field readable,
+        // switch the table catalog once backfilled, then remove the old field.
+        let mut batch = WriteBatch::new();
+        if !is_staged_retry {
+            batch.set(&stage_key, old_name.to_string())?;
+        }
+
+        for (prefix, end) in collection_row_ranges(collection) {
+            let is_sql_rows = prefix.starts_with("\x00T\x00");
+            for (key, value) in self.db.scan(&prefix, &end, seq)? {
+                let Ok(mut doc) = serde_json::from_str::<serde_json::Value>(&value) else {
+                    continue;
+                };
+                let old_doc = doc.clone();
+                let Some(obj) = doc.as_object_mut() else {
+                    continue;
+                };
+                let Some(val) = obj.get(old_name).cloned() else {
+                    continue;
+                };
+                if obj.get(new_name) == Some(&val) {
+                    continue;
+                }
+                if !batch.is_empty()
+                    && (batch.op_count() >= WriteBatch::MAX_OPS / 2
+                        || batch.op_count().saturating_add(max_doc_ops) > WriteBatch::MAX_OPS)
+                {
+                    self.db.commit_batch(&batch)?;
+                    batch = WriteBatch::new();
+                }
+                obj.insert(new_name.to_string(), val);
+                self.stage_doc_update(
+                    &catalog,
+                    collection,
+                    &prefix,
+                    is_sql_rows,
+                    sql_row_format,
+                    &key,
+                    &value,
+                    old_doc,
+                    doc,
+                    &mut batch,
+                )?;
+                if batch.op_count() >= WriteBatch::MAX_OPS / 2 && !batch.is_empty() {
+                    self.db.commit_batch(&batch)?;
+                    batch = WriteBatch::new();
+                }
+            }
+        }
+
+        if !batch.is_empty() {
+            self.db.commit_batch(&batch)?;
+        }
+
+        if let Some((cat_key, cat_val)) = sql_catalog_update {
+            let mut cat_batch = WriteBatch::new();
+            cat_batch.set(cat_key, cat_val.to_string())?;
+            self.db.commit_batch(&cat_batch)?;
+        }
+
+        self.cleanup_staged_rename(collection, old_name, &stage_key)
+    }
+
+    fn cleanup_staged_rename(
+        &self,
+        collection: &str,
+        old_name: &str,
+        stage_key: &str,
+    ) -> Result<(), OmniError> {
+        self.index_manager.refresh_catalog()?;
+        let seq = self.db.get_seq();
+        let catalog = self.index_manager.catalog_snapshot_at(seq)?;
+        let sql_row_format = self
+            .db
+            .find(
+                &format!("\x00CATALOG\x00{}", collection.to_lowercase()),
+                seq,
+            )?
+            .and_then(|raw| serde_json::from_str::<crate::catalog::TableDef>(&raw).ok())
+            .map(|table| table.row_format)
+            .unwrap_or_default();
 
         let mut batch = WriteBatch::new();
         let max_doc_ops = 1 + 2 * catalog.indexes_for_collection(collection).len();
@@ -702,13 +930,7 @@ impl SchemaManager {
                 let Some(obj) = doc.as_object_mut() else {
                     continue;
                 };
-                if let Some(val) = obj.remove(old_name) {
-                    if obj.contains_key(new_name) {
-                        return Err(OmniError::IoError(format!(
-                            "cannot rename field '{}' to '{}' because the destination exists",
-                            old_name, new_name
-                        )));
-                    }
+                if obj.remove(old_name).is_some() {
                     if !batch.is_empty()
                         && (batch.op_count() >= WriteBatch::MAX_OPS / 2
                             || batch.op_count().saturating_add(max_doc_ops) > WriteBatch::MAX_OPS)
@@ -716,41 +938,18 @@ impl SchemaManager {
                         self.db.commit_batch(&batch)?;
                         batch = WriteBatch::new();
                     }
-                    obj.insert(new_name.to_string(), val);
-                    let updated = serde_json::to_string(&doc)
-                        .map_err(|e| OmniError::IoError(e.to_string()))?;
-                    let primary_key = key.strip_prefix(&prefix).unwrap_or(&key);
-                    let (old_index_doc, new_index_doc) = if is_sql_rows {
-                        let old_row = crate::plan_exec::PlanExecutor::deserialize_row_checked(
-                            &value,
-                            sql_row_format,
-                        )
-                        .map_err(OmniError::IoError)?;
-                        let new_row = crate::plan_exec::PlanExecutor::deserialize_row_checked(
-                            &updated,
-                            sql_row_format,
-                        )
-                        .map_err(OmniError::IoError)?;
-                        (
-                            serde_json::to_value(&old_row)
-                                .map_err(|e| OmniError::IoError(e.to_string()))?,
-                            serde_json::to_value(&new_row)
-                                .map_err(|e| OmniError::IoError(e.to_string()))?,
-                        )
-                    } else {
-                        (old_doc, doc)
-                    };
-                    self.index_manager.replace_document_indexes_with_catalog(
+                    self.stage_doc_update(
                         &catalog,
                         collection,
-                        primary_key,
-                        &old_index_doc,
-                        primary_key,
-                        &new_index_doc,
+                        &prefix,
+                        is_sql_rows,
+                        sql_row_format,
+                        &key,
+                        &value,
+                        old_doc,
+                        doc,
                         &mut batch,
                     )?;
-                    batch.set(&key, updated)?;
-
                     if batch.op_count() >= WriteBatch::MAX_OPS / 2 && !batch.is_empty() {
                         self.db.commit_batch(&batch)?;
                         batch = WriteBatch::new();
@@ -759,10 +958,12 @@ impl SchemaManager {
             }
         }
 
-        if !batch.is_empty() {
+        if batch.op_count() >= WriteBatch::MAX_OPS {
             self.db.commit_batch(&batch)?;
+            batch = WriteBatch::new();
         }
-
+        batch.delete(stage_key)?;
+        self.db.commit_batch(&batch)?;
         Ok(())
     }
 

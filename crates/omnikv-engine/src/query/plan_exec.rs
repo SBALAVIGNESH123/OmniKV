@@ -332,11 +332,6 @@ impl PlanExecutor {
     }
 
     /// Load only specific columns (column pruning).
-    ///
-    /// This compatibility wrapper preserves the original infallible public
-    /// API. New SQL execution paths should use
-    /// [`Self::load_table_rows_pruned_checked`] so storage and decode errors
-    /// remain visible to callers.
     pub fn load_table_rows_pruned(&self, table: &TableDef, needed_cols: &[String]) -> Vec<Row> {
         self.load_table_rows_pruned_checked(table, needed_cols)
             .unwrap_or_default()

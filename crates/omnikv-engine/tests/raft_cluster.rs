@@ -2122,7 +2122,7 @@ fn test_2pc_happy_path_commit() {
     let participant3 = TwoPhaseParticipant::new(30, db_p3.clone());
 
     // BEGIN distributed transaction
-    let txn_id = coordinator.begin();
+    let txn_id = coordinator.begin().unwrap();
     assert_eq!(coordinator.get_state(txn_id), Some(DistTxnState::Preparing));
 
     // Add writes for each participant
@@ -2215,7 +2215,7 @@ fn test_2pc_abort_on_single_abort_vote() {
     let participant2 = TwoPhaseParticipant::new(20, db_p2.clone());
 
     // BEGIN
-    let txn_id = coordinator.begin();
+    let txn_id = coordinator.begin().unwrap();
 
     coordinator
         .add_write(txn_id, 10, "abort_key1".into(), Some("val1".into()), 0)
@@ -2296,7 +2296,7 @@ fn test_2pc_coordinator_wal_persistence() {
         let participant = TwoPhaseParticipant::new(10, db);
 
         // Run a full 2PC
-        txn_id = coordinator.begin();
+        txn_id = coordinator.begin().unwrap();
         coordinator
             .add_write(
                 txn_id,
@@ -2398,7 +2398,7 @@ fn test_2pc_cross_shard_with_raft_replication() {
     let p3 = TwoPhaseParticipant::new(30, db_s3_primary.clone());
 
     // Create a multi-shard transaction: transfer money across 3 accounts
-    let txn_id = coordinator.begin();
+    let txn_id = coordinator.begin().unwrap();
     coordinator
         .add_write(
             txn_id,
@@ -2537,7 +2537,7 @@ fn test_2pc_concurrent_independent_transactions() {
     let participant2 = TwoPhaseParticipant::new(20, db_p2.clone());
 
     // === Txn1: will COMMIT ===
-    let txn1 = coordinator.begin();
+    let txn1 = coordinator.begin().unwrap();
     coordinator
         .add_write(txn1, 10, "conc_committed_1".into(), Some("yes1".into()), 0)
         .unwrap();
@@ -2546,7 +2546,7 @@ fn test_2pc_concurrent_independent_transactions() {
         .unwrap();
 
     // === Txn2: will ABORT ===
-    let txn2 = coordinator.begin();
+    let txn2 = coordinator.begin().unwrap();
     coordinator
         .add_write(txn2, 10, "conc_aborted_1".into(), Some("no1".into()), 0)
         .unwrap();
@@ -2735,14 +2735,6 @@ fn test_ssi_no_false_positive() {
 }
 
 /// Gap #9d: Overlapping txns — T2 reads a key that T1 writes concurrently.
-///
-/// This is the rw-antidependency conflict (and the shape of the classic
-/// write-skew): T2 snapshotted `chain_y` before T1 committed a new value
-/// for it, so T2's commit must abort. NOTE: despite an earlier name, this
-/// never exercised the "dangerous structure" pivot check — that check was
-/// unreachable dead code and has been removed; the abort here comes from
-/// the plain RW branch, which is what catches the crossing read/write
-/// pair.
 #[test]
 fn test_ssi_rw_antidependency_chain() {
     let (db, _, _d) = create_node("ssi_chain");
@@ -2787,7 +2779,7 @@ fn test_deadlock_across_2pc_participants() {
     db.commit_batch(&batch).unwrap();
 
     // Txn1: write to conflict_key via 2PC
-    let txn1 = coordinator.begin();
+    let txn1 = coordinator.begin().unwrap();
     coordinator
         .add_write(txn1, 10, "conflict_key".into(), Some("txn1_val".into()), 0)
         .unwrap();
@@ -2802,7 +2794,7 @@ fn test_deadlock_across_2pc_participants() {
     coordinator.finalize_commit(txn1).unwrap();
 
     // Txn2: also writes conflict_key — should succeed (no in-memory SSI conflict for 2PC)
-    let txn2 = coordinator.begin();
+    let txn2 = coordinator.begin().unwrap();
     coordinator
         .add_write(txn2, 10, "conflict_key".into(), Some("txn2_val".into()), 0)
         .unwrap();

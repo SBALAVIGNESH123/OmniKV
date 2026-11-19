@@ -347,3 +347,290 @@ fn remove_field_resolves_case_insensitive_sql_column_and_2pc_tracks_plain_writes
         "prepare_with_snapshot must abort when a plain write modified the key after read_seq"
     );
 }
+
+#[test]
+fn remove_field_rejects_indexed_sql_column_until_index_is_dropped() {
+    use omni_engine::schema::{Migration, SchemaManager, SchemaOp};
+
+    let (db, _dir, _executor) = setup();
+    let idx_mgr = Arc::new(IndexManager::new(db.clone()));
+    create_index(&idx_mgr, "n", IndexFieldType::Integer, false);
+    let schema = SchemaManager::new(db.clone(), idx_mgr.clone());
+
+    let err = schema
+        .migrate_up(&Migration {
+            version: 1,
+            description: "attempt removing indexed column".into(),
+            up: vec![SchemaOp::RemoveField {
+                collection: "ITEMS".into(),
+                field_name: "N".into(),
+            }],
+            down: vec![],
+        })
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("items_n_idx"),
+        "expected dependent index rejection, got: {err}"
+    );
+
+    idx_mgr.drop_index("items_n_idx").unwrap();
+    schema
+        .migrate_up(&Migration {
+            version: 1,
+            description: "remove unindexed column and recreate as text".into(),
+            up: vec![
+                SchemaOp::RemoveField {
+                    collection: "ITEMS".into(),
+                    field_name: "N".into(),
+                },
+                SchemaOp::AddField {
+                    collection: "ITEMS".into(),
+                    field_name: "n".into(),
+                    default_value: serde_json::Value::String("new".into()),
+                },
+            ],
+            down: vec![],
+        })
+        .expect("removing and recreating column as text succeeds once index is dropped");
+
+    let executor = SqlExecutor::new(db.clone(), Arc::new(Catalog::new(db)));
+    assert_eq!(
+        rows(&executor, "SELECT n FROM items WHERE id = 'a'"),
+        vec![vec![Some("new".to_string())]]
+    );
+}
+
+#[test]
+fn add_field_rejects_literal_null_default_on_legacy_sql_table() {
+    use omni_engine::schema::{Migration, SchemaManager, SchemaOp};
+
+    let dir = TempDir::new().unwrap();
+    let db = OmniKV::open(
+        dir.path().join("manifest.json").to_str().unwrap(),
+        dir.path().join("wal.bin").to_str().unwrap(),
+    )
+    .unwrap();
+    let manifest = "{\"name\":\"legacy_null_def\",\"columns\":[{\"name\":\"id\",\"col_type\":\"Text\",\"nullable\":false,\"primary_key\":true,\"default\":null}],\"primary_key\":\"id\",\"created_at\":1000}";
+    let mut wb = WriteBatch::new();
+    wb.set("\u{0}CATALOG\u{0}legacy_null_def", manifest.to_string())
+        .unwrap();
+    wb.set(
+        "\u{0}T\u{0}legacy_null_def\u{0}r1",
+        "{\"id\":\"r1\"}".to_string(),
+    )
+    .unwrap();
+    db.commit_batch(&wb).unwrap();
+
+    let schema = SchemaManager::new(db.clone(), Arc::new(IndexManager::new(db.clone())));
+    let err = schema
+        .migrate_up(&Migration {
+            version: 1,
+            description: "literal NULL default on legacy table".into(),
+            up: vec![SchemaOp::AddField {
+                collection: "LEGACY_NULL_DEF".into(),
+                field_name: "note".into(),
+                default_value: serde_json::Value::String("NULL".into()),
+            }],
+            down: vec![],
+        })
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("NULL"),
+        "expected literal NULL default to be rejected on legacy table, got: {err}"
+    );
+    let raw = db
+        .find("\u{0}T\u{0}legacy_null_def\u{0}r1", db.get_seq())
+        .unwrap()
+        .unwrap();
+    assert_eq!(raw, "{\"id\":\"r1\"}");
+}
+
+#[test]
+fn rename_field_commits_rows_and_catalog_together_and_handles_large_online_renames() {
+    use omni_engine::schema::{Migration, SchemaManager, SchemaOp};
+
+    let (db, _dir, _executor) = setup();
+    let schema = SchemaManager::new(db.clone(), Arc::new(IndexManager::new(db.clone())));
+    schema
+        .migrate_up(&Migration {
+            version: 1,
+            description: "single-batch rename".into(),
+            up: vec![SchemaOp::RenameField {
+                collection: "ITEMS".into(),
+                old_name: "label".into(),
+                new_name: "title".into(),
+            }],
+            down: vec![],
+        })
+        .unwrap();
+
+    let cat_seq = db.get_seq_for_key("\u{0}CATALOG\u{0}items", u64::MAX);
+    let row_seq = db.get_seq_for_key("\u{0}T\u{0}items\u{0}a", u64::MAX);
+    assert_eq!(
+        cat_seq,
+        row_seq + 4,
+        "single-batch rename must publish all 4 rewritten SQL rows and TableDef in one WriteBatch without an intermediate commit marker"
+    );
+
+    let executor = SqlExecutor::new(db.clone(), Arc::new(Catalog::new(db.clone())));
+    execute(
+        &executor,
+        "CREATE TABLE big_rename (id TEXT PRIMARY KEY, old_col TEXT)",
+    );
+    let mut seed = WriteBatch::new();
+    for i in 0..1100 {
+        if seed.op_count() >= 500 {
+            db.commit_batch(&seed).unwrap();
+            seed = WriteBatch::new();
+        }
+        seed.set(
+            &format!("\u{0}T\u{0}big_rename\u{0}k{i:04}"),
+            format!("{{\"id\":\"k{i:04}\",\"old_col\":\"v{i}\"}}"),
+        )
+        .unwrap();
+    }
+    if !seed.is_empty() {
+        db.commit_batch(&seed).unwrap();
+    }
+
+    let mut partial = WriteBatch::new();
+    partial
+        .set(
+            "\u{0}SCHEMA\u{0}rename_stage:big_rename:old_col:new_col",
+            "old_col".into(),
+        )
+        .unwrap();
+    partial
+        .set(
+            "\u{0}T\u{0}big_rename\u{0}k0000",
+            "{\"id\":\"k0000\",\"old_col\":\"v0\",\"new_col\":\"v0\"}".into(),
+        )
+        .unwrap();
+    db.commit_batch(&partial).unwrap();
+
+    schema
+        .migrate_up(&Migration {
+            version: 2,
+            description: "multi-batch online rename with pre-staged row".into(),
+            up: vec![SchemaOp::RenameField {
+                collection: "BIG_RENAME".into(),
+                old_name: "old_col".into(),
+                new_name: "new_col".into(),
+            }],
+            down: vec![],
+        })
+        .expect("large staged rename must complete and tolerate already-staged rows");
+
+    let refreshed = SqlExecutor::new(db.clone(), Arc::new(Catalog::new(db.clone())));
+    assert_eq!(
+        rows(
+            &refreshed,
+            "SELECT new_col FROM big_rename WHERE id = 'k0000'"
+        ),
+        vec![vec![Some("v0".to_string())]]
+    );
+    assert_eq!(
+        rows(
+            &refreshed,
+            "SELECT new_col FROM big_rename WHERE id = 'k1099'"
+        ),
+        vec![vec![Some("v1099".to_string())]]
+    );
+    assert_eq!(
+        db.find(
+            "\u{0}SCHEMA\u{0}rename_stage:big_rename:old_col:new_col",
+            db.get_seq()
+        )
+        .unwrap(),
+        None
+    );
+}
+
+#[test]
+fn failed_unique_index_rebuild_over_batch_limit_cleans_up_and_allows_retry() {
+    use omni_engine::schema::{Migration, SchemaManager, SchemaOp};
+
+    let dir = TempDir::new().unwrap();
+    let db = OmniKV::open(
+        dir.path().join("manifest.json").to_str().unwrap(),
+        dir.path().join("wal.bin").to_str().unwrap(),
+    )
+    .unwrap();
+    let executor = SqlExecutor::new(db.clone(), Arc::new(Catalog::new(db.clone())));
+    execute(
+        &executor,
+        "CREATE TABLE big_idx (id TEXT PRIMARY KEY, code TEXT)",
+    );
+
+    let mut batch = WriteBatch::new();
+    for i in 0..1050 {
+        if batch.op_count() >= 500 {
+            db.commit_batch(&batch).unwrap();
+            batch = WriteBatch::new();
+        }
+        batch
+            .set(
+                &format!("\u{0}T\u{0}big_idx\u{0}k{i:04}"),
+                format!("{{\"id\":\"k{i:04}\",\"code\":\"c{i:04}\"}}"),
+            )
+            .unwrap();
+    }
+    batch
+        .set(
+            "\u{0}T\u{0}big_idx\u{0}k9999",
+            "{\"id\":\"k9999\",\"code\":\"c0000\"}".into(),
+        )
+        .unwrap();
+    db.commit_batch(&batch).unwrap();
+
+    let idx_mgr = Arc::new(IndexManager::new(db.clone()));
+    let schema = SchemaManager::new(db.clone(), idx_mgr.clone());
+    let migration = Migration {
+        version: 1,
+        description: "unique index on big_idx.code".into(),
+        up: vec![SchemaOp::CreateIndex {
+            name: "big_idx_code_uq".into(),
+            collection: "big_idx".into(),
+            fields: vec![("code".into(), IndexFieldType::String)],
+            unique: true,
+        }],
+        down: vec![],
+    };
+
+    let err = schema.migrate_up(&migration).unwrap_err();
+    assert!(
+        err.to_string().contains("UNIQUE CONSTRAINT VIOLATION"),
+        "expected duplicate failure, got: {err}"
+    );
+    assert!(
+        idx_mgr.definition("big_idx_code_uq").is_err(),
+        "failed unique index definition must be retired even when >1000 entries were built"
+    );
+    assert!(
+        db.scan("\u{0}IDX\u{0}", "\u{0}IDX\u{0}\u{10ffff}", db.get_seq())
+            .unwrap()
+            .is_empty(),
+        "all partial index entries beyond WriteBatch::MAX_OPS must be cleaned up"
+    );
+
+    let mut fix = WriteBatch::new();
+    fix.set(
+        "\u{0}T\u{0}big_idx\u{0}k9999",
+        "{\"id\":\"k9999\",\"code\":\"c9999\"}".into(),
+    )
+    .unwrap();
+    db.commit_batch(&fix).unwrap();
+
+    schema
+        .migrate_up(&migration)
+        .expect("retrying unique index migration after fixing duplicate must succeed");
+    assert_eq!(
+        idx_mgr
+            .lookup(
+                "big_idx_code_uq",
+                &[serde_json::Value::String("c9999".into())]
+            )
+            .unwrap(),
+        vec!["k9999".to_string()]
+    );
+}

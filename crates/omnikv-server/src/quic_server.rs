@@ -45,7 +45,6 @@ const QUIC_FRAME_LENGTH_BYTES: usize = 4;
 const QUIC_AUTH_LENGTH_BYTES: usize = 2;
 const MAX_QUIC_AUTH_BYTES: usize = 4096;
 
-/// The certificate and private key a listener presents. Operator-supplied
 /// Generate self-signed TLS certificates for QUIC.
 pub fn generate_self_signed_cert()
 -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>), String> {
@@ -226,9 +225,7 @@ pub async fn run_quic_server(endpoint: Endpoint, db: Arc<OmniKV>, rate_limiter: 
     }
 }
 
-/// Read exactly one length-prefixed request frame from a QUIC stream.
-///
-/// Reads a length-prefixed QUIC frame, validating the size cap.
+/// Read a length-prefixed request frame from a QUIC stream.
 async fn read_quic_frame(recv: &mut RecvStream) -> Result<Vec<u8>, String> {
     let mut length_bytes = [0u8; QUIC_FRAME_LENGTH_BYTES];
     read_quic_exact(recv, &mut length_bytes).await?;

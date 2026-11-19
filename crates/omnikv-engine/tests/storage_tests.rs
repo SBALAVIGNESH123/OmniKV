@@ -1830,7 +1830,7 @@ fn test_2pc_coordinator_lifecycle() {
     let (db, _dir) = create_test_db();
     let coord = TwoPhaseCoordinator::new(1, db, 5000);
 
-    let txn_id = coord.begin();
+    let txn_id = coord.begin().unwrap();
     assert_eq!(txn_id.0, 1); // node_id
     assert_eq!(coord.active_count(), 1);
 
@@ -1853,7 +1853,7 @@ fn test_2pc_coordinator_lifecycle() {
 fn test_2pc_coordinator_sequence_resumes_after_reopen() {
     let (db, _dir) = create_test_db();
     let coordinator = TwoPhaseCoordinator::new(7, db.clone(), 5000);
-    let first = coordinator.begin();
+    let first = coordinator.begin().unwrap();
     assert_eq!(first, (7, 1));
     coordinator
         .add_write(first, 8, "sequence_key".into(), Some("value".into()), 0)
@@ -1861,7 +1861,7 @@ fn test_2pc_coordinator_sequence_resumes_after_reopen() {
     coordinator.prepare(first).unwrap();
 
     let reopened_coordinator = TwoPhaseCoordinator::new(7, db, 5000);
-    assert_eq!(reopened_coordinator.begin(), (7, 2));
+    assert_eq!(reopened_coordinator.begin().unwrap(), (7, 2));
 }
 
 #[test]
@@ -1871,7 +1871,7 @@ fn test_2pc_single_node_commit() {
     let participant = TwoPhaseParticipant::new(2, db.clone());
 
     // Begin and add writes
-    let txn_id = coord.begin();
+    let txn_id = coord.begin().unwrap();
     coord
         .add_write(txn_id, 2, "dist_key1".into(), Some("dist_val1".into()), 0)
         .unwrap();
@@ -1911,7 +1911,7 @@ fn test_2pc_multi_node_commit() {
     let p1 = TwoPhaseParticipant::new(2, db.clone());
     let p2 = TwoPhaseParticipant::new(3, db.clone());
 
-    let txn_id = coord.begin();
+    let txn_id = coord.begin().unwrap();
     coord
         .add_write(txn_id, 2, "node2_key".into(), Some("node2_val".into()), 0)
         .unwrap();
@@ -1960,7 +1960,7 @@ fn test_2pc_participant_abort() {
     let p1 = TwoPhaseParticipant::new(2, db.clone());
     let _p2 = TwoPhaseParticipant::new(3, db);
 
-    let txn_id = coord.begin();
+    let txn_id = coord.begin().unwrap();
     coord
         .add_write(txn_id, 2, "abort_key1".into(), Some("v1".into()), 0)
         .unwrap();
@@ -1997,7 +1997,7 @@ fn test_2pc_coordinator_abort() {
     let (db, _dir) = create_test_db();
     let coord = TwoPhaseCoordinator::new(1, db, 5000);
 
-    let txn_id = coord.begin();
+    let txn_id = coord.begin().unwrap();
     coord
         .add_write(txn_id, 2, "will_abort".into(), Some("nope".into()), 0)
         .unwrap();
@@ -2014,7 +2014,7 @@ fn test_2pc_timeout_detection() {
     // Very short timeout (1ms)
     let coord = TwoPhaseCoordinator::new(1, db, 1);
 
-    let txn_id = coord.begin();
+    let txn_id = coord.begin().unwrap();
     coord
         .add_write(txn_id, 2, "timeout_key".into(), Some("v".into()), 0)
         .unwrap();
@@ -2069,7 +2069,7 @@ fn test_2pc_recovery_log() {
     let coord = TwoPhaseCoordinator::new(1, db.clone(), 5000);
     let participant = TwoPhaseParticipant::new(2, db.clone());
 
-    let txn_id = coord.begin();
+    let txn_id = coord.begin().unwrap();
     coord
         .add_write(
             txn_id,
@@ -2206,4 +2206,143 @@ fn test_2pc_prepared_reservation_blocks_local_ssi_and_commit_records_history() {
         db.find("shared_key", db.get_seq()).unwrap().as_deref(),
         Some("direct_overwrite")
     );
+}
+
+#[test]
+fn test_2pc_coordinator_retains_unacknowledged_aborts() {
+    let (db, _dir) = create_test_db();
+    let coord = TwoPhaseCoordinator::new(1, db, 5000);
+    let txn_id = coord.begin().unwrap();
+    coord
+        .add_write(txn_id, 10, "k_abort".into(), Some("v".into()), 0)
+        .unwrap();
+    coord.prepare(txn_id).unwrap();
+    let _ = coord.receive_vote(
+        txn_id,
+        PrepareResult {
+            node_id: 10,
+            txn_id,
+            vote: Vote::Abort("conflict".into()),
+            prepare_seq: 0,
+        },
+    );
+
+    let recovered = coord.recover().unwrap();
+    assert!(
+        recovered
+            .iter()
+            .any(|(id, state, parts)| *id == txn_id && state == "ABORT" && parts == &vec![10]),
+        "recover() must include unacknowledged ABORT decisions: {recovered:?}"
+    );
+    assert_eq!(
+        coord.gc_completed_logs(0).unwrap(),
+        0,
+        "gc_completed_logs must retain unacknowledged ABORT records"
+    );
+
+    coord.finalize_abort(txn_id).unwrap();
+    assert!(
+        !coord
+            .recover()
+            .unwrap()
+            .iter()
+            .any(|(id, _, _)| *id == txn_id),
+        "completed ABORT must no longer be reported by recover()"
+    );
+}
+
+#[test]
+fn test_2pc_failed_commit_log_write_is_recoverable_and_participant_retries_release_reservations() {
+    let (db, _dir) = create_test_db();
+    for i in 0..2 {
+        let mut seed = WriteBatch::new();
+        seed.set(&format!("seed_l0_{i}"), "v".into()).unwrap();
+        db.commit_batch(&seed).unwrap();
+        db.compact_sstables().unwrap();
+    }
+
+    let stall_policy = omni_engine::CompactionPolicy {
+        l0_compaction_trigger: 1,
+        l1_compaction_trigger: 1,
+        l0_write_stall_threshold: 2,
+        write_stall_wait_attempts: 1,
+        write_stall_wait_ms: 1,
+    };
+    let normal_policy = omni_engine::CompactionPolicy::default();
+
+    let coord = TwoPhaseCoordinator::new(1, db.clone(), 5000);
+
+    db.set_compaction_policy(stall_policy).unwrap();
+    assert!(
+        coord.begin().is_err(),
+        "begin must fail when HWM persistence fails"
+    );
+    assert_eq!(coord.active_count(), 0);
+    db.set_compaction_policy(normal_policy).unwrap();
+
+    let txn_retry = coord.begin().unwrap();
+    coord
+        .add_write(txn_retry, 10, "k1".into(), Some("v1".into()), 0)
+        .unwrap();
+    coord.prepare(txn_retry).unwrap();
+
+    db.set_compaction_policy(stall_policy).unwrap();
+    let vote = PrepareResult {
+        node_id: 10,
+        txn_id: txn_retry,
+        vote: Vote::Commit,
+        prepare_seq: 1,
+    };
+    assert!(
+        coord.receive_vote(txn_retry, vote.clone()).is_err(),
+        "COMMIT log write should fail under write stall"
+    );
+    db.set_compaction_policy(normal_policy).unwrap();
+    assert_eq!(
+        coord.receive_vote(txn_retry, vote).unwrap(),
+        DistTxnState::Committing,
+        "replaying affirmative vote must recover COMMIT persistence"
+    );
+    assert!(
+        coord.abort(txn_retry).is_err(),
+        "abort must be rejected once COMMIT is durable"
+    );
+    coord.finalize_commit(txn_retry).unwrap();
+
+    let txn_abort = coord.begin().unwrap();
+    coord
+        .add_write(txn_abort, 10, "k2".into(), Some("v2".into()), 0)
+        .unwrap();
+    coord.prepare(txn_abort).unwrap();
+    db.set_compaction_policy(stall_policy).unwrap();
+    assert!(
+        coord
+            .receive_vote(
+                txn_abort,
+                PrepareResult {
+                    node_id: 10,
+                    txn_id: txn_abort,
+                    vote: Vote::Commit,
+                    prepare_seq: 1,
+                },
+            )
+            .is_err()
+    );
+    db.set_compaction_policy(normal_policy).unwrap();
+    assert_eq!(coord.abort(txn_abort).unwrap(), vec![10]);
+
+    let participant = TwoPhaseParticipant::new(10, db.clone());
+    let p_txn = (1, 900);
+    let writes = vec![DistWrite {
+        node_id: 10,
+        key: "lingering_key".into(),
+        value: Some("v".into()),
+        ttl: 0,
+    }];
+    assert_eq!(participant.prepare(p_txn, &writes).vote, Vote::Commit);
+    participant.commit(p_txn).unwrap();
+    assert!(participant.commit(p_txn).is_ok());
+    let mut plain = WriteBatch::new();
+    plain.set("lingering_key", "plain_ok".into()).unwrap();
+    assert!(db.commit_batch(&plain).is_ok());
 }

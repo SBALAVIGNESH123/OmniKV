@@ -586,6 +586,18 @@ impl ServerConfig {
                     "cluster mode requires OMNIKV_RAFT_AUTH_TOKEN to authenticate peer RPCs".into(),
                 ));
             }
+            if self.raft.auth_token.trim_matches([' ', '\t', '\r', '\n']) != self.raft.auth_token
+                || !self
+                    .raft
+                    .auth_token
+                    .bytes()
+                    .all(|b| matches!(b, b'\t' | b' '..=b'~'))
+            {
+                return Err(ConfigError(
+                    "raft.auth_token (OMNIKV_RAFT_AUTH_TOKEN) must be a valid HTTP header value without leading/trailing whitespace or control characters"
+                        .into(),
+                ));
+            }
             if production_mode {
                 if self.tls_insecure_skip {
                     return Err(ConfigError(

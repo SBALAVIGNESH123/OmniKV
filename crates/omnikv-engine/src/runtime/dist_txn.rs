@@ -143,19 +143,33 @@ pub struct TwoPhaseCoordinator {
 impl TwoPhaseCoordinator {
     /// Creates a new 2PC coordinator.
     pub fn new(node_id: u64, db: Arc<OmniKV>, timeout_ms: u64) -> Self {
+        let next_seq = match Self::load_next_seq(node_id, &db) {
+            Ok(next_seq) => next_seq,
+            Err(error) => {
+                tracing::error!(node_id, ?error, "2PC coordinator sequence recovery failed");
+                0
+            }
+        };
+        Self {
+            node_id,
+            db,
+            next_seq: AtomicU64::new(next_seq),
+            active_txns: Mutex::new(HashMap::new()),
+            default_timeout_ms: timeout_ms,
+        }
+    }
+
+    fn load_next_seq(node_id: u64, db: &OmniKV) -> Result<u64, OmniError> {
+        let seq = db.get_seq();
         let hwm_key = format!("__2PC_LOG__/NEXT_SEQ/{node_id}");
-        let persisted_hwm = db
-            .find(&hwm_key, db.get_seq())
-            .ok()
-            .flatten()
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(0);
+        let persisted_hwm = match db.find(&hwm_key, seq)? {
+            Some(v) => v.parse::<u64>().map_err(|error| {
+                OmniError::IoError(format!("invalid 2PC NEXT_SEQ watermark: {error}"))
+            })?,
+            None => 0,
+        };
         let scan_max = db
-            .scan("__2PC_LOG__/", "__2PC_LOG__/~", db.get_seq())
-            .unwrap_or_else(|error| {
-                tracing::error!(?error, "2PC coordinator log scan failed on startup");
-                Vec::new()
-            })
+            .scan("__2PC_LOG__/", "__2PC_LOG__/~", seq)?
             .into_iter()
             .filter_map(|(key, _)| {
                 let txn = key.strip_prefix("__2PC_LOG__/")?.split('/').next()?;
@@ -166,27 +180,28 @@ impl TwoPhaseCoordinator {
             })
             .max()
             .unwrap_or(0);
-        let next_seq = persisted_hwm.max(scan_max).saturating_add(1);
-        Self {
-            node_id,
-            db,
-            next_seq: AtomicU64::new(next_seq),
-            active_txns: Mutex::new(HashMap::new()),
-            default_timeout_ms: timeout_ms,
-        }
+        Ok(persisted_hwm.max(scan_max).saturating_add(1))
     }
 
     /// BEGIN DISTRIBUTED — creates a new distributed transaction.
-    pub fn begin(&self) -> GlobalTxnId {
-        let mut active = self.active_txns.lock().unwrap_or_else(|e| e.into_inner());
-        let seq = self.next_seq.fetch_add(1, Ordering::SeqCst);
-        let txn_id = (self.node_id, seq);
+    pub fn begin(&self) -> Result<GlobalTxnId, OmniError> {
+        let mut active = self
+            .active_txns
+            .lock()
+            .map_err(|_| OmniError::LockPoisoned("coordinator".into()))?;
+        let mut seq = self.next_seq.load(Ordering::SeqCst);
+        if seq == 0 {
+            seq = Self::load_next_seq(self.node_id, &self.db)?;
+            self.next_seq.store(seq, Ordering::SeqCst);
+        }
 
         let hwm_key = format!("__2PC_LOG__/NEXT_SEQ/{}", self.node_id);
         let mut hwm_batch = WriteBatch::new();
-        if hwm_batch.set(&hwm_key, seq.to_string()).is_ok() {
-            let _ = self.db.commit_2pc_batch(&hwm_batch);
-        }
+        hwm_batch.set(&hwm_key, seq.to_string())?;
+        self.db.commit_2pc_batch(&hwm_batch)?;
+
+        self.next_seq.store(seq.saturating_add(1), Ordering::SeqCst);
+        let txn_id = (self.node_id, seq);
 
         let txn = DistTransaction {
             id: txn_id,
@@ -201,7 +216,7 @@ impl TwoPhaseCoordinator {
         };
 
         active.insert(txn_id, txn);
-        txn_id
+        Ok(txn_id)
     }
 
     /// Buffer a write for a specific participant node.
@@ -268,6 +283,11 @@ impl TwoPhaseCoordinator {
         Ok(txn.writes_by_node.keys().copied().collect())
     }
 
+    fn has_durable_state(&self, txn_id: GlobalTxnId, state: &str) -> Result<bool, OmniError> {
+        let key = format!("__2PC_LOG__/{}_{}/{}", txn_id.0, txn_id.1, state);
+        Ok(self.db.find(&key, self.db.get_seq())?.is_some())
+    }
+
     /// Record a participant's vote.
     pub fn receive_vote(
         &self,
@@ -278,49 +298,68 @@ impl TwoPhaseCoordinator {
             .active_txns
             .lock()
             .map_err(|_| OmniError::LockPoisoned("coordinator".into()))?;
+        let durable_commit = self.has_durable_state(txn_id, "COMMIT")?;
+        let durable_abort = self.has_durable_state(txn_id, "ABORT")?;
 
         let txn = active
             .get_mut(&txn_id)
             .ok_or_else(|| OmniError::IoError("Transaction not found".into()))?;
 
-        if txn.state != DistTxnState::WaitingForVotes {
+        if durable_commit {
+            txn.state = DistTxnState::Committing;
+            return Ok(DistTxnState::Committing);
+        }
+        if durable_abort {
+            txn.state = DistTxnState::Aborted;
+            return Err(OmniError::IoError(
+                "Distributed transaction was already aborted".into(),
+            ));
+        }
+
+        if !matches!(
+            txn.state,
+            DistTxnState::WaitingForVotes | DistTxnState::InDoubt | DistTxnState::Committing
+        ) {
             return Err(OmniError::IoError("Not waiting for votes".into()));
         }
 
         txn.votes.insert(result.node_id, result.vote);
 
-        // Check if all votes are in
         let all_participants: HashSet<u64> = txn.writes_by_node.keys().copied().collect();
         let voted: HashSet<u64> = txn.votes.keys().copied().collect();
 
         if voted == all_participants {
-            // All votes received — decide
             let all_commit = txn.votes.values().all(|v| *v == Vote::Commit);
 
             if all_commit {
+                txn.state = DistTxnState::InDoubt;
+                let participants: Vec<u64> = all_participants.into_iter().collect();
+                if let Err(err) = self.log_state(txn_id, "COMMIT", &participants) {
+                    if matches!(self.has_durable_state(txn_id, "COMMIT"), Ok(true)) {
+                        txn.state = DistTxnState::Committing;
+                        return Ok(DistTxnState::Committing);
+                    }
+                    return Err(err);
+                }
                 txn.state = DistTxnState::Committing;
-                let participants: Vec<u64> = all_participants.into_iter().collect();
-                drop(active); // release lock before WAL write
-                self.log_state(txn_id, "COMMIT", &participants)?;
                 return Ok(DistTxnState::Committing);
-            } else {
-                txn.state = DistTxnState::Aborted;
-                let abort_reasons: Vec<String> = txn
-                    .votes
-                    .values()
-                    .filter_map(|v| match v {
-                        Vote::Abort(reason) => Some(reason.clone()),
-                        _ => None,
-                    })
-                    .collect();
-                let participants: Vec<u64> = all_participants.into_iter().collect();
-                drop(active);
-                self.log_state(txn_id, "ABORT", &participants)?;
-                return Err(OmniError::IoError(format!(
-                    "Distributed transaction aborted: {}",
-                    abort_reasons.join("; ")
-                )));
             }
+
+            let abort_reasons: Vec<String> = txn
+                .votes
+                .values()
+                .filter_map(|v| match v {
+                    Vote::Abort(reason) => Some(reason.clone()),
+                    _ => None,
+                })
+                .collect();
+            let participants: Vec<u64> = all_participants.into_iter().collect();
+            self.log_state(txn_id, "ABORT", &participants)?;
+            txn.state = DistTxnState::Aborted;
+            return Err(OmniError::IoError(format!(
+                "Distributed transaction aborted: {}",
+                abort_reasons.join("; ")
+            )));
         }
 
         Ok(DistTxnState::WaitingForVotes)
@@ -328,64 +367,113 @@ impl TwoPhaseCoordinator {
 
     /// COMMIT PHASE — marks the transaction as committed after all ACKs.
     pub fn finalize_commit(&self, txn_id: GlobalTxnId) -> Result<(), OmniError> {
-        let participants = {
-            let mut active = self
-                .active_txns
-                .lock()
-                .map_err(|_| OmniError::LockPoisoned("coordinator".into()))?;
-            if let Some(txn) = active.get_mut(&txn_id) {
-                txn.state = DistTxnState::Committed;
-                let participants: Vec<u64> = txn.writes_by_node.keys().copied().collect();
-                active.remove(&txn_id);
-                Some(participants)
-            } else {
-                None
+        let mut active = self
+            .active_txns
+            .lock()
+            .map_err(|_| OmniError::LockPoisoned("coordinator".into()))?;
+        let participants = if let Some(txn) = active.get(&txn_id) {
+            let all_participants: HashSet<u64> = txn.writes_by_node.keys().copied().collect();
+            let voted: HashSet<u64> = txn.votes.keys().copied().collect();
+            let all_commit =
+                voted == all_participants && txn.votes.values().all(|v| *v == Vote::Commit);
+            if !all_commit
+                && !matches!(
+                    txn.state,
+                    DistTxnState::Committing | DistTxnState::Committed
+                )
+            {
+                return Err(OmniError::IoError(
+                    "cannot finalize commit before all participants vote COMMIT".into(),
+                ));
             }
-        };
-        let participants = match participants {
-            Some(list) => list,
-            None => {
-                let commit_key = format!("__2PC_LOG__/{}_{}/COMMIT", txn_id.0, txn_id.1);
-                self.db
-                    .find(&commit_key, self.db.get_seq())?
-                    .and_then(|raw| serde_json::from_str::<TwoPhaseLogEntry>(&raw).ok())
-                    .map(|entry| entry.participants)
-                    .unwrap_or_default()
+            let list: Vec<u64> = txn.writes_by_node.keys().copied().collect();
+            if !self.has_durable_state(txn_id, "COMMIT")? {
+                if self.has_durable_state(txn_id, "ABORT")? {
+                    return Err(OmniError::IoError(
+                        "cannot finalize commit for an aborted transaction".into(),
+                    ));
+                }
+                self.log_state(txn_id, "COMMIT", &list)?;
             }
+            list
+        } else {
+            let commit_key = format!("__2PC_LOG__/{}_{}/COMMIT", txn_id.0, txn_id.1);
+            self.db
+                .find(&commit_key, self.db.get_seq())?
+                .and_then(|raw| serde_json::from_str::<TwoPhaseLogEntry>(&raw).ok())
+                .map(|entry| entry.participants)
+                .unwrap_or_default()
         };
         self.log_state(txn_id, "COMPLETE", &participants)?;
+        if let Some(txn) = active.get_mut(&txn_id) {
+            txn.state = DistTxnState::Committed;
+            active.remove(&txn_id);
+        }
         Ok(())
     }
 
-    /// ABORT — aborts a transaction at any stage.
+    /// Marks an aborted transaction as completed once all participants acknowledge the abort.
+    pub fn finalize_abort(&self, txn_id: GlobalTxnId) -> Result<(), OmniError> {
+        let mut active = self
+            .active_txns
+            .lock()
+            .map_err(|_| OmniError::LockPoisoned("coordinator".into()))?;
+        if self.has_durable_state(txn_id, "COMMIT")? {
+            return Err(OmniError::IoError(
+                "cannot finalize abort after a durable commit decision".into(),
+            ));
+        }
+        let participants = if let Some(txn) = active.get(&txn_id) {
+            if txn.state == DistTxnState::Committed {
+                return Err(OmniError::IoError(
+                    "cannot finalize abort for a committed transaction".into(),
+                ));
+            }
+            let list: Vec<u64> = txn.writes_by_node.keys().copied().collect();
+            if !self.has_durable_state(txn_id, "ABORT")? {
+                self.log_state(txn_id, "ABORT", &list)?;
+            }
+            list
+        } else {
+            let abort_key = format!("__2PC_LOG__/{}_{}/ABORT", txn_id.0, txn_id.1);
+            self.db
+                .find(&abort_key, self.db.get_seq())?
+                .and_then(|raw| serde_json::from_str::<TwoPhaseLogEntry>(&raw).ok())
+                .map(|entry| entry.participants)
+                .ok_or_else(|| {
+                    OmniError::IoError(format!("No durable ABORT decision for {txn_id:?}"))
+                })?
+        };
+        self.log_state(txn_id, "COMPLETE", &participants)?;
+        active.remove(&txn_id);
+        Ok(())
+    }
+
+    /// ABORT — aborts a transaction if no commit decision has been durably recorded.
     pub fn abort(&self, txn_id: GlobalTxnId) -> Result<Vec<u64>, OmniError> {
         let mut active = self
             .active_txns
             .lock()
             .map_err(|_| OmniError::LockPoisoned("coordinator".into()))?;
+        let durable_commit = self.has_durable_state(txn_id, "COMMIT")?;
 
         let txn = active
             .get_mut(&txn_id)
             .ok_or_else(|| OmniError::IoError("Transaction not found".into()))?;
-        if matches!(
-            txn.state,
-            DistTxnState::Committing | DistTxnState::Committed
-        ) {
+        if txn.state == DistTxnState::Committed || durable_commit {
+            if txn.state != DistTxnState::Committed {
+                txn.state = DistTxnState::Committing;
+            }
             return Err(OmniError::IoError(
                 "cannot abort a transaction after its commit decision".into(),
             ));
         }
 
         let participants: Vec<u64> = txn.writes_by_node.keys().copied().collect();
+        if !self.has_durable_state(txn_id, "ABORT")? {
+            self.log_state(txn_id, "ABORT", &participants)?;
+        }
         txn.state = DistTxnState::Aborted;
-
-        drop(active);
-        self.log_state(txn_id, "ABORT", &participants)?;
-
-        let mut active = self
-            .active_txns
-            .lock()
-            .map_err(|_| OmniError::LockPoisoned("coordinator".into()))?;
         active.remove(&txn_id);
 
         Ok(participants)
@@ -402,7 +490,14 @@ impl TwoPhaseCoordinator {
         let mut timed_out = Vec::new();
 
         for (id, txn) in active.iter() {
-            if txn.state == DistTxnState::WaitingForVotes {
+            let can_timeout = match txn.state {
+                DistTxnState::WaitingForVotes => true,
+                DistTxnState::InDoubt | DistTxnState::Committing => {
+                    !self.has_durable_state(*id, "COMMIT").unwrap_or(true)
+                }
+                _ => false,
+            };
+            if can_timeout {
                 let elapsed_ms = now.saturating_sub(txn.created_at);
                 if elapsed_ms > txn.timeout_ms {
                     timed_out.push(*id);
@@ -436,29 +531,18 @@ impl TwoPhaseCoordinator {
         self.active_txns.lock().map(|a| a.len()).unwrap_or(0)
     }
 
-    /// Recover in-doubt distributed transactions after a coordinator crash.
-    ///
-    /// Scans the WAL for 2PC log entries and identifies transactions that
-    /// were PREPARED but never reached a final COMMIT or ABORT state.
-    /// Returns a list of `(GlobalTxnId, state, participants)` tuples:
-    /// - `"PREPARE"` → transaction is in-doubt, needs resolution
-    /// - `"COMMIT"` → commit was decided but may not have been delivered
-    ///
-    /// The caller should:
-    /// - For PREPARE-only records: decide ABORT (safe default) or re-query participants.
-    /// - For COMMIT records: re-send COMMIT to all participants.
+    /// Recover uncompleted distributed transactions after a coordinator crash.
     pub fn recover(&self) -> Result<Vec<(GlobalTxnId, String, Vec<u64>)>, OmniError> {
         let seq = self.db.get_seq();
         let prefix = "__2PC_LOG__/";
-        let end = "__2PC_LOG__/~"; // '~' is after all alphanumerics in ASCII
+        let end = "__2PC_LOG__/~";
 
         let entries = self.db.scan(prefix, end, seq)?;
 
-        // Group log entries by txn_id
         let mut txn_states: HashMap<GlobalTxnId, HashMap<String, TwoPhaseLogEntry>> =
             HashMap::new();
 
-        for (key, value) in &entries {
+        for (_key, value) in &entries {
             if let Ok(entry) = serde_json::from_str::<TwoPhaseLogEntry>(value) {
                 txn_states
                     .entry(entry.txn_id)
@@ -475,9 +559,9 @@ impl TwoPhaseCoordinator {
             }
             if let Some(entry) = states.get("COMMIT") {
                 in_doubt.push((*txn_id, "COMMIT".to_string(), entry.participants.clone()));
-            } else if !states.contains_key("ABORT")
-                && let Some(entry) = states.get("PREPARE")
-            {
+            } else if let Some(entry) = states.get("ABORT") {
+                in_doubt.push((*txn_id, "ABORT".to_string(), entry.participants.clone()));
+            } else if let Some(entry) = states.get("PREPARE") {
                 in_doubt.push((*txn_id, "PREPARE".to_string(), entry.participants.clone()));
             }
         }
@@ -537,10 +621,9 @@ impl TwoPhaseCoordinator {
             }
         }
         for records in by_txn.into_values() {
-            let has_commit = records.iter().any(|(_, e)| e.state == "COMMIT");
             let terminal_entry = records
                 .iter()
-                .find(|(_, e)| e.state == "COMPLETE" || (e.state == "ABORT" && !has_commit))
+                .find(|(_, e)| e.state == "COMPLETE")
                 .map(|(_, e)| e);
             if let Some(terminal) = terminal_entry
                 && now.saturating_sub(terminal.timestamp) > max_age_secs
@@ -1022,16 +1105,29 @@ impl TwoPhaseParticipant {
     }
 
     fn release_key_locks(&self, txn_id: GlobalTxnId, keys: &[String]) {
-        if let Ok(mut locks) = self.key_locks.lock() {
-            for key in keys {
-                if locks.get(key).is_some_and(|owner| *owner == txn_id) {
-                    locks.remove(key);
-                }
+        let mut locks = self.key_locks.lock().unwrap_or_else(|e| e.into_inner());
+        for key in keys {
+            if locks.get(key).is_some_and(|owner| *owner == txn_id) {
+                locks.remove(key);
             }
         }
+        drop(locks);
         self.db
             .ssi_history
             .release_prepared_keys(self.node_id, txn_id, keys);
+    }
+
+    fn cleanup_terminal_state(
+        &self,
+        txn_id: GlobalTxnId,
+        keys: &[String],
+    ) -> Result<(), OmniError> {
+        self.release_key_locks(txn_id, keys);
+        self.prepared
+            .lock()
+            .map_err(|_| OmniError::LockPoisoned("participant prepared".into()))?
+            .remove(&txn_id);
+        Ok(())
     }
 
     /// Rebuilds in-memory prepared batches after a participant restart. The
@@ -1119,9 +1215,10 @@ impl TwoPhaseParticipant {
         let state = self
             .load_participant_log(txn_id)?
             .ok_or_else(|| OmniError::IoError(format!("No prepared transaction {txn_id:?}")))?;
+        let write_keys: Vec<String> = state.writes.iter().map(|w| w.key.clone()).collect();
         match state.state.as_str() {
             "COMMITTED" => {
-                // Crash between data+decision and marker: use current read point.
+                self.cleanup_terminal_state(txn_id, &write_keys)?;
                 return Ok(state.commit_seq.unwrap_or_else(|| self.db.get_seq()));
             }
             "PREPARED" => {}
@@ -1147,19 +1244,16 @@ impl TwoPhaseParticipant {
             serde_json::to_string(&log_entry)
                 .map_err(|error| OmniError::IoError(format!("commit log: {error}")))?,
         )?;
-        // Keep the historical marker in sync for existing recovery tooling
-        // while the node-qualified record remains the authoritative format.
         commit_batch.set(
             &legacy_participant_prepare_key(txn_id),
             format!("COMMITTED:{}", self.node_id),
         )?;
-        let write_keys: Vec<String> = state.writes.iter().map(|w| w.key.clone()).collect();
         let ssi_txn_id = txn_id.0.wrapping_mul(1_000_000).wrapping_add(txn_id.1);
         let commit_seq = self.db.commit_2pc_batch_with_ssi(
             &commit_batch,
             crate::transaction::SsiCommitRecord {
                 txn_id: ssi_txn_id,
-                write_keys,
+                write_keys: write_keys.clone(),
                 read_keys: Vec::new(),
                 read_ranges: Vec::new(),
             },
@@ -1174,20 +1268,8 @@ impl TwoPhaseParticipant {
             })
             .map_err(|error| OmniError::IoError(format!("commit log update: {error}")))?,
         )?;
-        // Advisory marker — data is already durable; ignore failures.
         let _ = self.db.commit_2pc_batch(&final_log);
-        self.prepared
-            .lock()
-            .map_err(|_| OmniError::LockPoisoned("participant prepared".into()))?
-            .remove(&txn_id);
-        self.release_key_locks(
-            txn_id,
-            &state
-                .writes
-                .iter()
-                .map(|write| write.key.clone())
-                .collect::<Vec<_>>(),
-        );
+        self.cleanup_terminal_state(txn_id, &write_keys)?;
 
         Ok(commit_seq)
     }
@@ -1209,13 +1291,16 @@ impl TwoPhaseParticipant {
                     "cannot abort a committed transaction".into(),
                 ));
             }
-            Some(entry) if entry.state == "ABORTED" => return Ok(()),
+            Some(entry) if entry.state == "ABORTED" => {
+                let write_keys: Vec<String> = entry.writes.iter().map(|w| w.key.clone()).collect();
+                self.cleanup_terminal_state(txn_id, &write_keys)?;
+                return Ok(());
+            }
             Some(entry) if entry.state == "PREPARED" => entry.writes,
             Some(_) => return Err(OmniError::IoError("invalid participant decision".into())),
             None => Vec::new(),
         };
 
-        // Write ABORT record durably.
         let abort_key = participant_prepare_key(self.node_id, txn_id);
         let abort_entry = ParticipantLogEntry {
             txn_id,
@@ -1236,17 +1321,8 @@ impl TwoPhaseParticipant {
             format!("ABORTED:{}", self.node_id),
         );
         self.db.commit_2pc_batch(&log_batch)?;
-        self.prepared
-            .lock()
-            .map_err(|_| OmniError::LockPoisoned("participant prepared".into()))?
-            .remove(&txn_id);
-        self.release_key_locks(
-            txn_id,
-            &writes
-                .iter()
-                .map(|write| write.key.clone())
-                .collect::<Vec<_>>(),
-        );
+        let write_keys: Vec<String> = writes.iter().map(|w| w.key.clone()).collect();
+        self.cleanup_terminal_state(txn_id, &write_keys)?;
 
         Ok(())
     }
@@ -1264,5 +1340,155 @@ impl TwoPhaseParticipant {
             .filter(|(_, state)| state.prepared_at.elapsed() > max_age)
             .map(|(id, _)| *id)
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_db() -> (Arc<OmniKV>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = OmniKV::open(
+            dir.path().join("manifest.json").to_str().unwrap(),
+            dir.path().join("wal.bin").to_str().unwrap(),
+        )
+        .unwrap();
+        (db, dir)
+    }
+
+    #[test]
+    fn corrupt_next_seq_watermark_fails_closed_until_repaired() {
+        let (db, _dir) = test_db();
+        let mut batch = WriteBatch::new();
+        batch
+            .set("__2PC_LOG__/NEXT_SEQ/5", "not-a-u64".into())
+            .unwrap();
+        db.commit_2pc_batch(&batch).unwrap();
+
+        let coord = TwoPhaseCoordinator::new(5, db.clone(), 5000);
+        assert!(coord.begin().is_err());
+
+        let mut fix = WriteBatch::new();
+        fix.set("__2PC_LOG__/NEXT_SEQ/5", "41".into()).unwrap();
+        db.commit_2pc_batch(&fix).unwrap();
+
+        assert_eq!(coord.begin().unwrap(), (5, 42));
+    }
+
+    #[test]
+    fn unacknowledged_abort_survives_gc_until_complete() {
+        let (db, _dir) = test_db();
+        let txn_id = (1, 77);
+        let prepare = TwoPhaseLogEntry {
+            txn_id,
+            state: "PREPARE".into(),
+            participants: vec![2, 3],
+            timestamp: 10,
+        };
+        let abort = TwoPhaseLogEntry {
+            txn_id,
+            state: "ABORT".into(),
+            participants: vec![2, 3],
+            timestamp: 11,
+        };
+        let mut batch = WriteBatch::new();
+        batch
+            .set(
+                "__2PC_LOG__/1_77/PREPARE",
+                serde_json::to_string(&prepare).unwrap(),
+            )
+            .unwrap();
+        batch
+            .set(
+                "__2PC_LOG__/1_77/ABORT",
+                serde_json::to_string(&abort).unwrap(),
+            )
+            .unwrap();
+        db.commit_2pc_batch(&batch).unwrap();
+
+        let coord = TwoPhaseCoordinator::new(1, db.clone(), 5000);
+        assert_eq!(coord.gc_completed_logs(0).unwrap(), 0);
+        assert_eq!(
+            coord.recover().unwrap(),
+            vec![(txn_id, "ABORT".to_string(), vec![2, 3])]
+        );
+
+        let complete = TwoPhaseLogEntry {
+            txn_id,
+            state: "COMPLETE".into(),
+            participants: vec![2, 3],
+            timestamp: 12,
+        };
+        let mut fin = WriteBatch::new();
+        fin.set(
+            "__2PC_LOG__/1_77/COMPLETE",
+            serde_json::to_string(&complete).unwrap(),
+        )
+        .unwrap();
+        db.commit_2pc_batch(&fin).unwrap();
+
+        assert!(coord.recover().unwrap().is_empty());
+        assert_eq!(coord.gc_completed_logs(0).unwrap(), 3);
+    }
+
+    #[test]
+    fn terminal_participant_retries_release_lingering_ssi_reservations() {
+        let (db, _dir) = test_db();
+        let participant = TwoPhaseParticipant::new(2, db.clone());
+        let committed_txn = (1, 10);
+        let aborted_txn = (1, 11);
+
+        assert_eq!(
+            participant
+                .prepare(
+                    committed_txn,
+                    &[DistWrite {
+                        node_id: 2,
+                        key: "k_committed".into(),
+                        value: Some("v1".into()),
+                        ttl: 0,
+                    }]
+                )
+                .vote,
+            Vote::Commit
+        );
+        participant.commit(committed_txn).unwrap();
+
+        db.ssi_history
+            .reserve_prepared_keys(2, committed_txn, &["k_committed".to_string()])
+            .unwrap();
+        let mut plain_c = WriteBatch::new();
+        plain_c.set("k_committed", "blocked".into()).unwrap();
+        assert!(db.commit_batch(&plain_c).is_err());
+
+        participant.commit(committed_txn).unwrap();
+        assert!(db.commit_batch(&plain_c).is_ok());
+
+        assert_eq!(
+            participant
+                .prepare(
+                    aborted_txn,
+                    &[DistWrite {
+                        node_id: 2,
+                        key: "k_aborted".into(),
+                        value: Some("v2".into()),
+                        ttl: 0,
+                    }]
+                )
+                .vote,
+            Vote::Commit
+        );
+        participant.abort(aborted_txn).unwrap();
+
+        db.ssi_history
+            .reserve_prepared_keys(2, aborted_txn, &["k_aborted".to_string()])
+            .unwrap();
+        let mut plain_a = WriteBatch::new();
+        plain_a.set("k_aborted", "blocked".into()).unwrap();
+        assert!(db.commit_batch(&plain_a).is_err());
+
+        participant.abort(aborted_txn).unwrap();
+        assert!(db.commit_batch(&plain_a).is_ok());
     }
 }

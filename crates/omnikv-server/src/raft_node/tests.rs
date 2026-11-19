@@ -139,3 +139,78 @@ async fn raft_mutual_tls_verifies_the_advertised_peer_name() {
     );
     handle.abort();
 }
+
+#[test]
+fn raft_network_from_rejects_non_header_safe_tokens_without_leaking_value() {
+    for bad_token in [
+        "secret-raft-token-0123456789abcdef\n",
+        "secret-raft-token-0123456789abcdef\r\n",
+        " secret-raft-token-0123456789abcdef",
+        "secret-raft-token-0123456789abcdef ",
+        "secret-raft-token-\x07-0123456789abcdef",
+    ] {
+        let mut cfg = ServerConfig::default();
+        cfg.raft.auth_token = bad_token.to_string();
+        let err = match raft_network_from(&cfg) {
+            Ok(_) => panic!("expected invalid raft token to be rejected"),
+            Err(err) => err.to_string(),
+        };
+        assert!(
+            err.contains("raft.auth_token") || err.contains("OMNIKV_RAFT_AUTH_TOKEN"),
+            "error must name the setting: {err}"
+        );
+        assert!(
+            !err.contains("secret-raft-token"),
+            "error must not print the token value: {err}"
+        );
+    }
+
+    let mut valid_cfg = ServerConfig::default();
+    valid_cfg.raft.auth_token = "header-safe-raft-token-0123456789abcdef".into();
+    assert!(raft_network_from(&valid_cfg).is_ok());
+}
+
+#[tokio::test]
+async fn raft_network_from_separates_cert_and_key_pem_blocks_without_trailing_newline() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let dir = tempfile::tempdir().unwrap();
+    let ca = TestCa::new();
+
+    let mut params = rcgen::CertificateParams::new(vec!["127.0.0.1".to_string()]).unwrap();
+    params.extended_key_usages = vec![
+        rcgen::ExtendedKeyUsagePurpose::ServerAuth,
+        rcgen::ExtendedKeyUsagePurpose::ClientAuth,
+    ];
+    let key = rcgen::KeyPair::generate().unwrap();
+    let issuer = rcgen::Issuer::from_params(&ca.params, &ca.key);
+    let cert = params.signed_by(&key, &issuer).unwrap();
+
+    let ca_path = dir.path().join("ca.pem");
+    let cert_path = dir.path().join("cert.pem");
+    let key_path = dir.path().join("key.pem");
+    std::fs::write(&ca_path, &ca.pem).unwrap();
+    std::fs::write(&cert_path, cert.pem().trim_end()).unwrap();
+    std::fs::write(&key_path, key.serialize_pem().trim_end()).unwrap();
+
+    let server_tls = ServerTls {
+        certs: vec![cert.der().clone()],
+        key: rustls::pki_types::PrivatePkcs8KeyDer::from(key.serialize_der()).into(),
+        posture: crate::tls::TlsPosture::Operator {
+            cert_path: cert_path.to_string_lossy().into_owned(),
+            key_path: key_path.to_string_lossy().into_owned(),
+            n_certs: 1,
+        },
+    };
+    let (addr, handle) = mock_peer(server_tls, &ca.pem);
+
+    let mut cfg = ServerConfig::default();
+    cfg.raft.tls = true;
+    cfg.raft.auth_token = "peer-secret".into();
+    cfg.raft.tls_ca_path = Some(ca_path.to_string_lossy().into_owned());
+    cfg.tls_cert_path = Some(cert_path.to_string_lossy().into_owned());
+    cfg.tls_key_path = Some(key_path.to_string_lossy().into_owned());
+
+    let network = raft_network_from(&cfg).expect("PEM blocks without trailing newline must load");
+    assert!(vote_succeeds(network, addr).await);
+    handle.abort();
+}

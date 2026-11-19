@@ -36,10 +36,7 @@ pub struct ClusterNode {
     pub auth_token: String,
 }
 
-/// Builds the openraft config with the engine defaults plus the
-/// config-file/env overrides applied. Constructed directly (not via
-/// `build_raft_config`) so the overrides can never be silently dropped
-/// by an `Arc` clone.
+/// Builds the openraft config with engine defaults and config/env overrides.
 fn raft_config_from(
     cfg: &ServerConfig,
 ) -> Result<Arc<openraft::Config>, Box<dyn std::error::Error>> {
@@ -172,7 +169,24 @@ fn boot_rt(
     }))
 }
 
+fn validate_raft_auth_token(token: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let trimmed = token.trim_matches([' ', '\t', '\r', '\n']);
+    let valid_bytes = token.bytes().all(|b| matches!(b, b'\t' | b' '..=b'~'));
+    let valid_header = axum::http::HeaderValue::from_str(token)
+        .ok()
+        .and_then(|v| v.to_str().ok().map(|s| s == token))
+        .unwrap_or(false);
+    if trimmed.is_empty() || trimmed != token || !valid_bytes || !valid_header {
+        return Err(
+            "invalid raft.auth_token (OMNIKV_RAFT_AUTH_TOKEN): must be a non-empty HTTP header value without leading/trailing whitespace or control characters"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
 fn raft_network_from(cfg: &ServerConfig) -> Result<OmniNetwork, Box<dyn std::error::Error>> {
+    validate_raft_auth_token(&cfg.raft.auth_token)?;
     if !cfg.raft.tls {
         return Ok(OmniNetwork::new(cfg.raft.auth_token.clone()));
     }
@@ -186,6 +200,9 @@ fn raft_network_from(cfg: &ServerConfig) -> Result<OmniNetwork, Box<dyn std::err
     let identity_pem = match (&cfg.tls_cert_path, &cfg.tls_key_path) {
         (Some(cert_path), Some(key_path)) => {
             let mut identity = std::fs::read(cert_path)?;
+            if !identity.ends_with(b"\n") {
+                identity.push(b'\n');
+            }
             identity.extend_from_slice(&std::fs::read(key_path)?);
             Some(identity)
         }
