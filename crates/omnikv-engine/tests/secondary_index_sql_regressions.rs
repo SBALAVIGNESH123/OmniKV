@@ -460,13 +460,66 @@ fn rename_field_commits_rows_and_catalog_together() {
                 old_name: "label".into(),
                 new_name: "title".into(),
             }],
-            down: vec![],
+            down: vec![SchemaOp::RenameField {
+                collection: "ITEMS".into(),
+                old_name: "title".into(),
+                new_name: "label".into(),
+            }],
         })
         .unwrap();
 
+    let row_seqs: Vec<u64> = ["a", "ab", "b", "c"]
+        .into_iter()
+        .map(|id| db.get_seq_for_key(&format!("\u{0}T\u{0}items\u{0}{id}"), u64::MAX))
+        .collect();
+    let first_seq = row_seqs[0];
     let cat_seq = db.get_seq_for_key("\u{0}CATALOG\u{0}items", u64::MAX);
-    let row_seq = db.get_seq_for_key("\u{0}T\u{0}items\u{0}a", u64::MAX);
-    assert_eq!(cat_seq, row_seq + 4);
+    assert_eq!(
+        row_seqs,
+        vec![first_seq, first_seq + 1, first_seq + 2, first_seq + 3]
+    );
+    assert_eq!(cat_seq, first_seq + 4);
+    for id in ["a", "ab", "b", "c"] {
+        let raw = db
+            .find(&format!("\u{0}T\u{0}items\u{0}{id}"), u64::MAX)
+            .unwrap()
+            .unwrap();
+        let doc: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert!(doc.get("title").is_some(), "row {id} missing title: {raw}");
+        assert!(
+            doc.get("label").is_none(),
+            "row {id} still has label: {raw}"
+        );
+    }
+
+    let mut doc_batch = WriteBatch::new();
+    doc_batch
+        .set("cased_docs:1", "{\"A\":1,\"a\":2}".into())
+        .unwrap();
+    db.commit_batch(&doc_batch).unwrap();
+    schema
+        .migrate_up(&Migration {
+            version: 2,
+            description: "case-sensitive two-step rename".into(),
+            up: vec![
+                SchemaOp::RenameField {
+                    collection: "cased_docs".into(),
+                    old_name: "A".into(),
+                    new_name: "X".into(),
+                },
+                SchemaOp::RenameField {
+                    collection: "cased_docs".into(),
+                    old_name: "a".into(),
+                    new_name: "x".into(),
+                },
+            ],
+            down: vec![],
+        })
+        .unwrap();
+    let cased_raw = db.find("cased_docs:1", u64::MAX).unwrap().unwrap();
+    let cased_doc: serde_json::Value = serde_json::from_str(&cased_raw).unwrap();
+    assert_eq!(cased_doc.get("X"), Some(&serde_json::json!(1)));
+    assert_eq!(cased_doc.get("x"), Some(&serde_json::json!(2)));
 }
 
 #[test]
@@ -511,12 +564,16 @@ fn large_online_rename_recovers_staged_rows_and_completed_steps() {
         ),
         (
             "\u{0}T\u{0}big_rename\u{0}k0001",
-            "{\"id\":\"k0001\",\"old_col\":\"v1_updated\",\"new_col\":\"v1\"}",
+            "{\"id\":\"k0001\",\"old_col\":\"v1\",\"new_col\":\"v1\"}",
         ),
     ] {
         partial.set(k, v.into()).unwrap();
     }
     db.commit_batch(&partial).unwrap();
+    execute(
+        &executor,
+        "UPDATE big_rename SET id = 'k1100', old_col = 'v1_moved' WHERE id = 'k0001'",
+    );
 
     let rename_op = SchemaOp::RenameField {
         collection: "BIG_RENAME".into(),
@@ -551,9 +608,9 @@ fn large_online_rename_recovers_staged_rows_and_completed_steps() {
     assert_eq!(
         rows(
             &refreshed,
-            "SELECT new_col FROM big_rename WHERE id = 'k0001'"
+            "SELECT new_col FROM big_rename WHERE id = 'k1100'"
         ),
-        vec![vec![Some("v1_updated".to_string())]]
+        vec![vec![Some("v1_moved".to_string())]]
     );
     assert_eq!(
         rows(
@@ -564,7 +621,7 @@ fn large_online_rename_recovers_staged_rows_and_completed_steps() {
     );
     assert_eq!(
         db.find(
-            "\u{0}SCHEMA\u{0}rename_done:big_rename:old_col:new_col",
+            "\u{0}SCHEMA\u{0}rename_done:000001:up:000000:big_rename:old_col:new_col",
             db.get_seq()
         )
         .unwrap(),

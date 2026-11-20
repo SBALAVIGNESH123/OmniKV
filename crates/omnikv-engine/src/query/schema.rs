@@ -197,7 +197,7 @@ impl SchemaManager {
         // Execute each operation
         let total_ops = migration.up.len();
         for (i, op) in migration.up.iter().enumerate() {
-            match self.execute_op(op) {
+            match self.execute_op(op, migration.version, "up", i) {
                 Ok(()) => {
                     let pct = ((i + 1) * 100).checked_div(total_ops).unwrap_or(100) as u8;
                     self.save_migration_record(&MigrationRecord {
@@ -256,8 +256,8 @@ impl SchemaManager {
         }
 
         // Execute down operations in reverse
-        for op in migration.down.iter().rev() {
-            self.execute_op(op)?;
+        for (i, op) in migration.down.iter().rev().enumerate() {
+            self.execute_op(op, migration.version, "down", i)?;
         }
 
         // Publish the rollback record and predecessor version atomically.
@@ -372,7 +372,13 @@ impl SchemaManager {
         Ok(())
     }
 
-    fn execute_op(&self, op: &SchemaOp) -> Result<(), OmniError> {
+    fn execute_op(
+        &self,
+        op: &SchemaOp,
+        version: Version,
+        direction: &str,
+        step_index: usize,
+    ) -> Result<(), OmniError> {
         match op {
             SchemaOp::CreateIndex {
                 name,
@@ -524,7 +530,14 @@ impl SchemaManager {
                         )));
                     }
                     let stage_key = Self::rename_stage_key(&table.name, old_name, new_name);
-                    let done_key = Self::rename_done_key(&table.name, old_name, new_name);
+                    let done_key = Self::rename_done_key(
+                        version,
+                        direction,
+                        step_index,
+                        &table.name,
+                        old_name,
+                        new_name,
+                    );
                     let has_new = table
                         .columns
                         .iter()
@@ -540,8 +553,8 @@ impl SchemaManager {
                         return self.cleanup_staged_rename(
                             &table.name,
                             &staged_old,
-                            new_name,
                             &stage_key,
+                            &done_key,
                         );
                     }
                     if has_new && !has_old && self.db.find(&done_key, seq)?.is_some() {
@@ -580,9 +593,13 @@ impl SchemaManager {
                         &canonical_old,
                         new_name,
                         Some((&catalog_key, &cat_value)),
+                        &done_key,
                     );
                 }
-                self.rename_field_online(collection, old_name, new_name, None)
+                let done_key = Self::rename_done_key(
+                    version, direction, step_index, collection, old_name, new_name,
+                );
+                self.rename_field_online(collection, old_name, new_name, None, &done_key)
             }),
         }
     }
@@ -600,12 +617,22 @@ impl SchemaManager {
         format!("{stage_key}\x00{row_key}")
     }
 
-    fn rename_done_key(collection: &str, old_name: &str, new_name: &str) -> String {
+    fn rename_done_prefix(version: Version, direction: &str) -> String {
+        format!("\x00SCHEMA\x00rename_done:{version:06}:{direction}:")
+    }
+
+    fn rename_done_key(
+        version: Version,
+        direction: &str,
+        step_index: usize,
+        collection: &str,
+        old_name: &str,
+        new_name: &str,
+    ) -> String {
         format!(
-            "\x00SCHEMA\x00rename_done:{}:{}:{}",
+            "{}{step_index:06}:{}:{old_name}:{new_name}",
+            Self::rename_done_prefix(version, direction),
             collection.to_lowercase(),
-            old_name.to_lowercase(),
-            new_name.to_lowercase()
         )
     }
 
@@ -772,6 +799,7 @@ impl SchemaManager {
         old_name: &str,
         new_name: &str,
         sql_catalog_update: Option<(&str, &str)>,
+        done_key: &str,
     ) -> Result<(), OmniError> {
         self.index_manager.refresh_catalog()?;
         let seq = self.db.get_seq();
@@ -787,11 +815,10 @@ impl SchemaManager {
             .unwrap_or_default();
 
         let stage_key = Self::rename_stage_key(collection, old_name, new_name);
-        let done_key = Self::rename_done_key(collection, old_name, new_name);
         let is_staged_retry = self.db.find(&stage_key, seq)?.is_some();
         if !is_staged_retry
             && sql_catalog_update.is_none()
-            && self.db.find(&done_key, seq)?.is_some()
+            && self.db.find(done_key, seq)?.is_some()
         {
             return Ok(());
         }
@@ -863,7 +890,7 @@ impl SchemaManager {
                     single_batch.set(cat_key, cat_val.to_string())?;
                 }
                 if !single_batch.is_empty() {
-                    single_batch.set(&done_key, "done".into())?;
+                    single_batch.set(done_key, "done".into())?;
                     self.db.commit_batch(&single_batch)?;
                 }
                 return Ok(());
@@ -933,15 +960,15 @@ impl SchemaManager {
             self.db.commit_batch(&cat_batch)?;
         }
 
-        self.cleanup_staged_rename(collection, old_name, new_name, &stage_key)
+        self.cleanup_staged_rename(collection, old_name, &stage_key, done_key)
     }
 
     fn cleanup_staged_rename(
         &self,
         collection: &str,
         old_name: &str,
-        new_name: &str,
         stage_key: &str,
+        done_key: &str,
     ) -> Result<(), OmniError> {
         self.index_manager.refresh_catalog()?;
         let seq = self.db.get_seq();
@@ -1013,8 +1040,7 @@ impl SchemaManager {
             self.db.commit_batch(&batch)?;
             batch = WriteBatch::new();
         }
-        let done_key = Self::rename_done_key(collection, old_name, new_name);
-        batch.set(&done_key, "done".into())?;
+        batch.set(done_key, "done".into())?;
         batch.delete(stage_key)?;
         self.db.commit_batch(&batch)?;
         Ok(())
@@ -1038,12 +1064,14 @@ impl SchemaManager {
     ) -> Result<(), OmniError> {
         let key = format!("{}{:06}", MIGRATION_PREFIX, record.version);
         let value = serde_json::to_string(record).map_err(|e| OmniError::IoError(e.to_string()))?;
+        let direction = match record.state {
+            MigrationState::RolledBack => "down",
+            _ => "up",
+        };
+        let done_prefix = Self::rename_done_prefix(record.version, direction);
+        let done_end = format!("{done_prefix}\u{10ffff}");
         let mut batch = WriteBatch::new();
-        for (done_key, _) in self.db.scan(
-            "\x00SCHEMA\x00rename_done:",
-            "\x00SCHEMA\x00rename_done:\u{10ffff}",
-            self.db.get_seq(),
-        )? {
+        for (done_key, _) in self.db.scan(&done_prefix, &done_end, self.db.get_seq())? {
             if batch.op_count().saturating_add(3) > WriteBatch::MAX_OPS {
                 self.db.commit_batch(&batch)?;
                 batch = WriteBatch::new();

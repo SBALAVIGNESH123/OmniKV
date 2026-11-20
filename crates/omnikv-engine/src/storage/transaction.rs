@@ -301,6 +301,18 @@ impl SsiHistory {
         );
     }
 
+    pub fn committed_seq_for_txn(&self, txn_id: TxnId) -> Option<u64> {
+        let committed = self
+            .committed_txns
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        committed
+            .iter()
+            .rev()
+            .find(|c| c.txn_id == txn_id)
+            .map(|c| c.commit_seq)
+    }
+
     fn push_committed_locked(&self, committed: &mut Vec<CommittedTxn>, entry: CommittedTxn) {
         if committed.len() >= self.max_entries {
             let drain_count = self.max_entries / 4;

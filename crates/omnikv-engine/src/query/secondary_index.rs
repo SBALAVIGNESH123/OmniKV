@@ -590,8 +590,18 @@ impl IndexManager {
 
     /// DROP INDEX — removes an index definition and all its entries.
     pub fn drop_index(&self, name: &str) -> Result<(), OmniError> {
-        let active = self.definition(name).ok();
-        let retired = self.find_retired_indexes(name, None)?;
+        let target_collection = self.resolve_drop_target_at(name, self.db.get_seq())?;
+        let lock = self.db.sql_table_lock(&target_collection)?;
+        let _guard = lock
+            .lock()
+            .map_err(|_| OmniError::LockPoisoned("index collection".into()))?;
+        self.drop_index_locked_inner(name, &target_collection, true)
+    }
+
+    fn resolve_drop_target_at(&self, name: &str, seq: u64) -> Result<String, OmniError> {
+        let catalog = IndexCatalog::load_checked_at(&self.db, seq)?;
+        let active = catalog.get_by_name(name).cloned();
+        let retired = self.find_retired_indexes_at(name, None, seq)?;
         let mut collections: Vec<String> = Vec::new();
         for def in active.iter().chain(retired.iter()) {
             if !collections
@@ -601,21 +611,14 @@ impl IndexManager {
                 collections.push(def.collection.clone());
             }
         }
-        let target_collection = match collections.as_slice() {
-            [] => return Err(OmniError::IoError(format!("Index '{}' not found", name))),
-            [single] => single.clone(),
-            _ => {
-                return Err(OmniError::IoError(format!(
-                    "Index '{}' is ambiguous across active and retired definitions; specify an explicit cleanup target",
-                    name
-                )));
-            }
-        };
-        let lock = self.db.sql_table_lock(&target_collection)?;
-        let _guard = lock
-            .lock()
-            .map_err(|_| OmniError::LockPoisoned("index collection".into()))?;
-        self.drop_index_locked(name, &target_collection)
+        match collections.as_slice() {
+            [] => Err(OmniError::IoError(format!("Index '{}' not found", name))),
+            [single] => Ok(single.clone()),
+            _ => Err(OmniError::IoError(format!(
+                "Index '{}' is ambiguous across active and retired definitions; specify an explicit cleanup target",
+                name
+            ))),
+        }
     }
 
     /// Cleans up a specific retired index by its retired ID.
@@ -643,13 +646,32 @@ impl IndexManager {
         name: &str,
         expected_collection: &str,
     ) -> Result<(), OmniError> {
+        self.drop_index_locked_inner(name, expected_collection, false)
+    }
+
+    fn drop_index_locked_inner(
+        &self,
+        name: &str,
+        expected_collection: &str,
+        revalidate_unambiguous: bool,
+    ) -> Result<(), OmniError> {
         let ddl_lock = self.db.sql_table_lock(DDL_LOCK_NAME)?;
         let _ddl_guard = ddl_lock
             .lock()
             .map_err(|_| OmniError::LockPoisoned("index DDL".into()))?;
-        let catalog = IndexCatalog::load_checked_at(&self.db, self.db.get_seq())?;
+        let seq = self.db.get_seq();
+        if revalidate_unambiguous {
+            let current_target = self.resolve_drop_target_at(name, seq)?;
+            if !current_target.eq_ignore_ascii_case(expected_collection) {
+                return Err(OmniError::IoError(format!(
+                    "Index '{}' target collection changed concurrently; retry drop_index",
+                    name
+                )));
+            }
+        }
+        let catalog = IndexCatalog::load_checked_at(&self.db, seq)?;
         let mut ids_to_purge: Vec<IndexId> = self
-            .find_retired_indexes(name, Some(expected_collection))?
+            .find_retired_indexes_at(name, Some(expected_collection), seq)?
             .into_iter()
             .map(|d| d.id)
             .collect();
@@ -692,12 +714,12 @@ impl IndexManager {
         Ok(())
     }
 
-    fn find_retired_indexes(
+    fn find_retired_indexes_at(
         &self,
         name: &str,
         expected_collection: Option<&str>,
+        seq: u64,
     ) -> Result<Vec<IndexDefinition>, OmniError> {
-        let seq = self.db.get_seq();
         let mut matches = Vec::new();
         for (_, value) in self.db.scan(
             RETIRED_PREFIX,

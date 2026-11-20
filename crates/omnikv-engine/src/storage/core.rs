@@ -2167,10 +2167,45 @@ impl OmniKV {
                 return Err(OmniError::IoError(conflict));
             }
             let seq = self.global_seq.fetch_add(num_records + 1, Ordering::SeqCst);
+            let commit_marker_seq = seq + num_records;
+            let mut stamped_any = false;
+            for ((key, value, _), prepped) in
+                tx.buffered_writes.iter().zip(prepped_writes.iter_mut())
+            {
+                if let Some(stamped) =
+                    crate::dist_txn::stamp_2pc_commit_seq(key, value, commit_marker_seq)
+                {
+                    let payload_bytes = stamped.as_bytes();
+                    let (final_bytes, length) = if payload_bytes.len() < 64 {
+                        (
+                            payload_bytes.to_vec(),
+                            (payload_bytes.len() as u64) | UNCOMPRESSED_FLAG,
+                        )
+                    } else {
+                        let comp = lz4_flex::compress_prepend_size(payload_bytes);
+                        let len = comp.len() as u64;
+                        (comp, len)
+                    };
+                    let mut hasher = crc32fast::Hasher::new();
+                    hasher.update(&final_bytes);
+                    prepped.1 = final_bytes;
+                    prepped.2 = length;
+                    prepped.3 = hasher.finalize();
+                    stamped_any = true;
+                }
+            }
+            let effective_heap_bytes = if stamped_any {
+                prepped_writes
+                    .iter()
+                    .map(|(_, _, length, _, _)| length & !UNCOMPRESSED_FLAG)
+                    .sum()
+            } else {
+                total_heap_bytes
+            };
             let offset = self
                 .heap_offset
-                .fetch_add(total_heap_bytes, Ordering::SeqCst);
-            self.ssi_history.record_plain_batch(tx, seq + num_records);
+                .fetch_add(effective_heap_bytes, Ordering::SeqCst);
+            self.ssi_history.record_plain_batch(tx, commit_marker_seq);
             (seq, offset)
         };
         // write_mutex is RELEASED here â€” other batches can now reserve their sequences

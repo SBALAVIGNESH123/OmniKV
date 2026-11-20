@@ -159,15 +159,19 @@ impl TwoPhaseCoordinator {
         }
     }
 
+    fn read_persisted_hwm(node_id: u64, db: &OmniKV, seq: u64) -> Result<Option<u64>, OmniError> {
+        let hwm_key = format!("__2PC_LOG__/NEXT_SEQ/{node_id}");
+        match db.find(&hwm_key, seq)? {
+            Some(v) => v.parse::<u64>().map(Some).map_err(|error| {
+                OmniError::IoError(format!("invalid 2PC NEXT_SEQ watermark: {error}"))
+            }),
+            None => Ok(None),
+        }
+    }
+
     fn load_next_seq(node_id: u64, db: &OmniKV) -> Result<u64, OmniError> {
         let seq = db.get_seq();
-        let hwm_key = format!("__2PC_LOG__/NEXT_SEQ/{node_id}");
-        let persisted_hwm = match db.find(&hwm_key, seq)? {
-            Some(v) => v.parse::<u64>().map_err(|error| {
-                OmniError::IoError(format!("invalid 2PC NEXT_SEQ watermark: {error}"))
-            })?,
-            None => 0,
-        };
+        let persisted_hwm = Self::read_persisted_hwm(node_id, db, seq)?.unwrap_or(0);
         let scan_max = db
             .scan("__2PC_LOG__/", "__2PC_LOG__/~", seq)?
             .into_iter()
@@ -185,26 +189,37 @@ impl TwoPhaseCoordinator {
 
     /// BEGIN DISTRIBUTED — creates a new distributed transaction.
     pub fn begin(&self) -> Result<GlobalTxnId, OmniError> {
-        let coord_lock = self
-            .db
-            .sql_table_lock(&format!("\x002PC_COORD\x00{}", self.node_id))?;
-        let _coord_guard = coord_lock
-            .lock()
-            .map_err(|_| OmniError::LockPoisoned("coordinator sequence".into()))?;
+        let txn_id = {
+            let coord_lock = self
+                .db
+                .sql_table_lock(&format!("\x002PC_COORD\x00{}", self.node_id))?;
+            let _coord_guard = coord_lock
+                .lock()
+                .map_err(|_| OmniError::LockPoisoned("coordinator sequence".into()))?;
+            let current = self.next_seq.load(Ordering::SeqCst);
+            let durable_seq = if current == 0 {
+                Self::load_next_seq(self.node_id, &self.db)?
+            } else {
+                match Self::read_persisted_hwm(self.node_id, &self.db, self.db.get_seq())? {
+                    Some(hwm) => hwm.saturating_add(1),
+                    None => Self::load_next_seq(self.node_id, &self.db)?,
+                }
+            };
+            let seq = current.max(durable_seq);
+
+            let hwm_key = format!("__2PC_LOG__/NEXT_SEQ/{}", self.node_id);
+            let mut hwm_batch = WriteBatch::new();
+            hwm_batch.set(&hwm_key, seq.to_string())?;
+            self.db.commit_2pc_batch(&hwm_batch)?;
+
+            self.next_seq.store(seq.saturating_add(1), Ordering::SeqCst);
+            (self.node_id, seq)
+        };
+
         let mut active = self
             .active_txns
             .lock()
             .map_err(|_| OmniError::LockPoisoned("coordinator".into()))?;
-        let durable_seq = Self::load_next_seq(self.node_id, &self.db)?;
-        let seq = self.next_seq.load(Ordering::SeqCst).max(durable_seq);
-
-        let hwm_key = format!("__2PC_LOG__/NEXT_SEQ/{}", self.node_id);
-        let mut hwm_batch = WriteBatch::new();
-        hwm_batch.set(&hwm_key, seq.to_string())?;
-        self.db.commit_2pc_batch(&hwm_batch)?;
-
-        self.next_seq.store(seq.saturating_add(1), Ordering::SeqCst);
-        let txn_id = (self.node_id, seq);
 
         let txn = DistTransaction {
             id: txn_id,
@@ -800,7 +815,7 @@ pub(crate) fn conflicts_with_2pc_decision(
     db: &OmniKV,
     staged: &WriteBatch,
     cmd: &crate::raft_command::RaftCommand,
-) -> bool {
+) -> Result<bool, OmniError> {
     for op in &cmd.sets {
         let Some(opposite_key) = opposite_2pc_decision_key(&op.key) else {
             continue;
@@ -821,17 +836,31 @@ pub(crate) fn conflicts_with_2pc_decision(
                 .buffered_deletes
                 .iter()
                 .any(|k| k.as_slice() == opp_bytes);
-        let conflict_in_db = !deleted_in_cmd_or_staged
-            && db
-                .find_latest_internal(&opposite_key)
-                .ok()
-                .flatten()
-                .is_some();
+        let conflict_in_db =
+            !deleted_in_cmd_or_staged && db.find_latest_internal(&opposite_key)?.is_some();
         if conflict_in_cmd || conflict_in_staged || conflict_in_db {
-            return true;
+            return Ok(true);
         }
     }
-    false
+    Ok(false)
+}
+
+pub(crate) fn stamp_2pc_commit_seq(
+    key_bytes: &[u8],
+    value: &str,
+    commit_seq: u64,
+) -> Option<String> {
+    let key = std::str::from_utf8(key_bytes).ok()?;
+    let rest = key.strip_prefix("__2PC_PREPARE__/")?;
+    if !rest.contains('/') {
+        return None;
+    }
+    let mut entry: ParticipantLogEntry = serde_json::from_str(value).ok()?;
+    if entry.state != "COMMITTED" || entry.commit_seq.is_some() {
+        return None;
+    }
+    entry.commit_seq = Some(commit_seq);
+    serde_json::to_string(&entry).ok()
 }
 
 pub(crate) fn sync_all_prepared_reservations(db: &OmniKV) -> Result<(), OmniError> {
@@ -1342,15 +1371,20 @@ impl TwoPhaseParticipant {
         let write_keys: Vec<String> = state.writes.iter().map(|w| w.key.clone()).collect();
         match state.state.as_str() {
             "COMMITTED" => {
+                let ssi_txn_id = txn_id.0.wrapping_mul(1_000_000).wrapping_add(txn_id.1);
                 let commit_seq = match state.commit_seq {
                     Some(seq) => seq,
                     None => {
+                        let recovered_seq = self
+                            .db
+                            .ssi_history()
+                            .committed_seq_for_txn(ssi_txn_id)
+                            .ok_or_else(|| {
+                                OmniError::IoError(format!(
+                                    "Missing commit sequence for committed transaction {txn_id:?}"
+                                ))
+                            })?;
                         let prep_key = participant_prepare_key(self.node_id, txn_id);
-                        let prep_seq = self.db.get_seq_for_key(&prep_key, u64::MAX);
-                        let num_deletes = build_write_batch(&state.writes)
-                            .map(|b| b.buffered_deletes.len() as u64)
-                            .unwrap_or(0);
-                        let recovered_seq = prep_seq.saturating_add(2).saturating_add(num_deletes);
                         let mut final_log = WriteBatch::new();
                         final_log.set(
                             &prep_key,
@@ -1406,17 +1440,6 @@ impl TwoPhaseParticipant {
                 read_ranges: Vec::new(),
             },
         )?;
-
-        let mut final_log = WriteBatch::new();
-        final_log.set(
-            &participant_prepare_key(self.node_id, txn_id),
-            serde_json::to_string(&ParticipantLogEntry {
-                commit_seq: Some(commit_seq),
-                ..log_entry
-            })
-            .map_err(|error| OmniError::IoError(format!("commit log update: {error}")))?,
-        )?;
-        let _ = self.db.commit_2pc_batch(&final_log);
         self.cleanup_terminal_state(txn_id, &write_keys)?;
 
         Ok(commit_seq)
@@ -1665,17 +1688,48 @@ mod tests {
                 "COMMITTED:2".into(),
             )
             .unwrap();
-        let original_seq = db
-            .commit_2pc_batch_with_ssi(
-                &commit_batch,
-                crate::transaction::SsiCommitRecord {
-                    txn_id: 1_000_055,
-                    write_keys: vec!["k_keep".into(), "k_del".into()],
-                    read_keys: Vec::new(),
-                    read_ranges: Vec::new(),
-                },
-            )
+        let cmd1 = crate::raft_command::RaftCommand::from_batch_with_ssi(
+            &commit_batch,
+            crate::transaction::SsiCommitRecord {
+                txn_id: 1_000_055,
+                write_keys: vec!["k_keep".into(), "k_del".into()],
+                read_keys: Vec::new(),
+                read_ranges: Vec::new(),
+            },
+        );
+        let mut follow_up_batch = WriteBatch::new();
+        follow_up_batch
+            .set("grouped_follow_up", "after".into())
             .unwrap();
+        let cmd2 = crate::raft_command::RaftCommand::from_batch(&follow_up_batch);
+
+        let mut raft_storage = crate::raft_storage::OmniRaftStorage::new(db.clone());
+        let leader = openraft::CommittedLeaderId::new(1, 1);
+        let entries = [
+            openraft::Entry {
+                log_id: openraft::LogId::new(leader, 1),
+                payload: openraft::EntryPayload::Normal(cmd1.encode()),
+            },
+            openraft::Entry {
+                log_id: openraft::LogId::new(leader, 2),
+                payload: openraft::EntryPayload::Normal(cmd2.encode()),
+            },
+        ];
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let responses = rt
+            .block_on(openraft::RaftStorage::apply_to_state_machine(
+                &mut raft_storage,
+                &entries,
+            ))
+            .unwrap();
+        let original_seq: u64 = responses[0].parse().unwrap();
+        let prep_seq = db.get_seq_for_key(&participant_prepare_key(2, txn_id), u64::MAX);
+        assert!(
+            original_seq > prep_seq + 3,
+            "grouped Raft apply must assign a shared batch commit marker beyond the participant's own ops"
+        );
 
         for i in 0..10 {
             let mut unrelated = WriteBatch::new();
