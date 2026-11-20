@@ -850,9 +850,8 @@ pub(crate) fn stamp_2pc_commit_seq(
     value: &str,
     commit_seq: u64,
 ) -> Option<String> {
-    let key = std::str::from_utf8(key_bytes).ok()?;
-    let rest = key.strip_prefix("__2PC_PREPARE__/")?;
-    if !rest.contains('/') {
+    let rest = key_bytes.strip_prefix(b"__2PC_PREPARE__/")?;
+    if !rest.contains(&b'/') {
         return None;
     }
     let mut entry: ParticipantLogEntry = serde_json::from_str(value).ok()?;
@@ -1730,6 +1729,13 @@ mod tests {
             original_seq > prep_seq + 3,
             "grouped Raft apply must assign a shared batch commit marker beyond the participant's own ops"
         );
+        let durable: ParticipantLogEntry = serde_json::from_str(
+            &db.find(&participant_prepare_key(2, txn_id), u64::MAX)
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(durable.commit_seq, Some(original_seq));
 
         for i in 0..10 {
             let mut unrelated = WriteBatch::new();

@@ -301,7 +301,7 @@ impl SsiHistory {
         );
     }
 
-    pub fn committed_seq_for_txn(&self, txn_id: TxnId) -> Option<u64> {
+    pub(crate) fn committed_seq_for_txn(&self, txn_id: TxnId) -> Option<u64> {
         let committed = self
             .committed_txns
             .lock()
