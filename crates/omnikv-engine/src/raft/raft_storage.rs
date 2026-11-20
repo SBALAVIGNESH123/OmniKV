@@ -773,7 +773,9 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
                             .iter()
                             .any(|op| op.key.starts_with("__sys__/raft/"))
                             || cmd.dels.iter().any(|k| k.starts_with("__sys__/raft/"));
-                        if system_key || cmd.is_empty() {
+                        let conflicting_2pc =
+                            crate::dist_txn::conflicts_with_2pc_decision(&self.db, &batch, &cmd);
+                        if system_key || conflicting_2pc || cmd.is_empty() {
                             res.push("ERR".to_string());
                             // A rejected entry is still DECIDED and applied —
                             // record the index so openraft advances past it.

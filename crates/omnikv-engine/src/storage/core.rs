@@ -1845,6 +1845,25 @@ impl OmniKV {
         Ok(results)
     }
 
+    /// Collects up to `limit` visible entries in the lexical range `[start_key, end_key]`.
+    pub fn scan_limit(
+        &self,
+        start_key: &str,
+        end_key: &str,
+        read_seq: u64,
+        limit: usize,
+    ) -> Result<Vec<(String, String)>, OmniError> {
+        let mut results = Vec::with_capacity(limit);
+        let mut iter = self.scan_iter_inner(start_key, end_key, read_seq)?;
+        while results.len() < limit {
+            let Some(entry) = iter.try_next()? else {
+                break;
+            };
+            results.push(entry);
+        }
+        Ok(results)
+    }
+
     pub fn set_global_seq(&self, seq: u64) {
         self.global_seq.store(seq, Ordering::SeqCst);
     }
@@ -1977,10 +1996,18 @@ impl OmniKV {
 
     /// Commits engine-internal 2PC metadata, bypassing client key validation.
     pub(crate) fn commit_2pc_batch(&self, tx: &WriteBatch) -> Result<u64, OmniError> {
+        crate::dist_txn::validate_2pc_decision_writes(self, None, tx)?;
         if let Some(gateway) = self.cluster_gateway.get() {
             return gateway.commit_2pc_batch(tx);
         }
         self.commit_batch_local(tx)
+    }
+
+    pub(crate) fn ensure_cluster_linearizable(&self) -> Result<(), OmniError> {
+        if let Some(gateway) = self.cluster_gateway.get() {
+            gateway.probe_blocking().map_err(OmniError::IoError)?;
+        }
+        Ok(())
     }
 
     pub(crate) fn commit_2pc_batch_with_ssi(

@@ -524,23 +524,30 @@ impl SchemaManager {
                         )));
                     }
                     let stage_key = Self::rename_stage_key(&table.name, old_name, new_name);
-                    if let Some(staged_old) = self.db.find(&stage_key, seq)?
-                        && table
-                            .columns
-                            .iter()
-                            .any(|c| c.name.eq_ignore_ascii_case(new_name))
-                        && !table
-                            .columns
-                            .iter()
-                            .any(|c| c.name.eq_ignore_ascii_case(old_name))
-                    {
-                        return self.cleanup_staged_rename(&table.name, &staged_old, &stage_key);
-                    }
-                    if table
+                    let done_key = Self::rename_done_key(&table.name, old_name, new_name);
+                    let has_new = table
                         .columns
                         .iter()
-                        .any(|c| c.name.eq_ignore_ascii_case(new_name))
+                        .any(|c| c.name.eq_ignore_ascii_case(new_name));
+                    let has_old = table
+                        .columns
+                        .iter()
+                        .any(|c| c.name.eq_ignore_ascii_case(old_name));
+                    if let Some(staged_old) = self.db.find(&stage_key, seq)?
+                        && has_new
+                        && !has_old
                     {
+                        return self.cleanup_staged_rename(
+                            &table.name,
+                            &staged_old,
+                            new_name,
+                            &stage_key,
+                        );
+                    }
+                    if has_new && !has_old && self.db.find(&done_key, seq)?.is_some() {
+                        return Ok(());
+                    }
+                    if has_new {
                         return Err(crate::OmniError::IoError(format!(
                             "column '{}' already exists in SQL table '{}'",
                             new_name, collection
@@ -583,6 +590,19 @@ impl SchemaManager {
     fn rename_stage_key(collection: &str, old_name: &str, new_name: &str) -> String {
         format!(
             "\x00SCHEMA\x00rename_stage:{}:{}:{}",
+            collection.to_lowercase(),
+            old_name.to_lowercase(),
+            new_name.to_lowercase()
+        )
+    }
+
+    fn rename_row_stage_key(stage_key: &str, row_key: &str) -> String {
+        format!("{stage_key}\x00{row_key}")
+    }
+
+    fn rename_done_key(collection: &str, old_name: &str, new_name: &str) -> String {
+        format!(
+            "\x00SCHEMA\x00rename_done:{}:{}:{}",
             collection.to_lowercase(),
             old_name.to_lowercase(),
             new_name.to_lowercase()
@@ -767,24 +787,38 @@ impl SchemaManager {
             .unwrap_or_default();
 
         let stage_key = Self::rename_stage_key(collection, old_name, new_name);
+        let done_key = Self::rename_done_key(collection, old_name, new_name);
         let is_staged_retry = self.db.find(&stage_key, seq)?.is_some();
+        if !is_staged_retry
+            && sql_catalog_update.is_none()
+            && self.db.find(&done_key, seq)?.is_some()
+        {
+            return Ok(());
+        }
 
         for (prefix, end) in collection_row_ranges(collection) {
-            for (_, value) in self.db.scan(&prefix, &end, seq)? {
+            for (key, value) in self.db.scan(&prefix, &end, seq)? {
                 if let Ok(serde_json::Value::Object(obj)) = serde_json::from_str(&value)
                     && let (Some(old_val), Some(new_val)) = (obj.get(old_name), obj.get(new_name))
-                    && (!is_staged_retry || old_val != new_val)
                 {
-                    return Err(OmniError::IoError(format!(
-                        "cannot rename field '{}' to '{}' because the destination exists",
-                        old_name, new_name
-                    )));
+                    let row_staged = is_staged_retry
+                        && (old_val == new_val
+                            || self
+                                .db
+                                .find(&Self::rename_row_stage_key(&stage_key, &key), seq)?
+                                .is_some());
+                    if !row_staged {
+                        return Err(OmniError::IoError(format!(
+                            "cannot rename field '{}' to '{}' because the destination exists",
+                            old_name, new_name
+                        )));
+                    }
                 }
             }
         }
 
         let max_doc_ops = 1 + 2 * catalog.indexes_for_collection(collection).len();
-        let catalog_ops = usize::from(sql_catalog_update.is_some());
+        let catalog_ops = usize::from(sql_catalog_update.is_some()) + 1;
         let single_batch_budget = WriteBatch::MAX_OPS.saturating_sub(catalog_ops);
 
         if !is_staged_retry {
@@ -829,6 +863,7 @@ impl SchemaManager {
                     single_batch.set(cat_key, cat_val.to_string())?;
                 }
                 if !single_batch.is_empty() {
+                    single_batch.set(&done_key, "done".into())?;
                     self.db.commit_batch(&single_batch)?;
                 }
                 return Ok(());
@@ -837,6 +872,7 @@ impl SchemaManager {
 
         // Large rename: stage the new field while keeping the old field readable,
         // switch the table catalog once backfilled, then remove the old field.
+        let stage_doc_ops = max_doc_ops.saturating_add(1);
         let mut batch = WriteBatch::new();
         if !is_staged_retry {
             batch.set(&stage_key, old_name.to_string())?;
@@ -855,12 +891,13 @@ impl SchemaManager {
                 let Some(val) = obj.get(old_name).cloned() else {
                     continue;
                 };
-                if obj.get(new_name) == Some(&val) {
+                let row_stage_key = Self::rename_row_stage_key(&stage_key, &key);
+                if obj.get(new_name) == Some(&val) && self.db.find(&row_stage_key, seq)?.is_some() {
                     continue;
                 }
                 if !batch.is_empty()
                     && (batch.op_count() >= WriteBatch::MAX_OPS / 2
-                        || batch.op_count().saturating_add(max_doc_ops) > WriteBatch::MAX_OPS)
+                        || batch.op_count().saturating_add(stage_doc_ops) > WriteBatch::MAX_OPS)
                 {
                     self.db.commit_batch(&batch)?;
                     batch = WriteBatch::new();
@@ -878,6 +915,7 @@ impl SchemaManager {
                     doc,
                     &mut batch,
                 )?;
+                batch.set(&row_stage_key, "1".into())?;
                 if batch.op_count() >= WriteBatch::MAX_OPS / 2 && !batch.is_empty() {
                     self.db.commit_batch(&batch)?;
                     batch = WriteBatch::new();
@@ -895,13 +933,14 @@ impl SchemaManager {
             self.db.commit_batch(&cat_batch)?;
         }
 
-        self.cleanup_staged_rename(collection, old_name, &stage_key)
+        self.cleanup_staged_rename(collection, old_name, new_name, &stage_key)
     }
 
     fn cleanup_staged_rename(
         &self,
         collection: &str,
         old_name: &str,
+        new_name: &str,
         stage_key: &str,
     ) -> Result<(), OmniError> {
         self.index_manager.refresh_catalog()?;
@@ -918,7 +957,7 @@ impl SchemaManager {
             .unwrap_or_default();
 
         let mut batch = WriteBatch::new();
-        let max_doc_ops = 1 + 2 * catalog.indexes_for_collection(collection).len();
+        let cleanup_doc_ops = 2 + 2 * catalog.indexes_for_collection(collection).len();
 
         for (prefix, end) in collection_row_ranges(collection) {
             let is_sql_rows = prefix.starts_with("\x00T\x00");
@@ -933,7 +972,8 @@ impl SchemaManager {
                 if obj.remove(old_name).is_some() {
                     if !batch.is_empty()
                         && (batch.op_count() >= WriteBatch::MAX_OPS / 2
-                            || batch.op_count().saturating_add(max_doc_ops) > WriteBatch::MAX_OPS)
+                            || batch.op_count().saturating_add(cleanup_doc_ops)
+                                > WriteBatch::MAX_OPS)
                     {
                         self.db.commit_batch(&batch)?;
                         batch = WriteBatch::new();
@@ -950,6 +990,7 @@ impl SchemaManager {
                         doc,
                         &mut batch,
                     )?;
+                    batch.delete(&Self::rename_row_stage_key(stage_key, &key))?;
                     if batch.op_count() >= WriteBatch::MAX_OPS / 2 && !batch.is_empty() {
                         self.db.commit_batch(&batch)?;
                         batch = WriteBatch::new();
@@ -958,10 +999,22 @@ impl SchemaManager {
             }
         }
 
-        if batch.op_count() >= WriteBatch::MAX_OPS {
+        let row_marker_prefix = format!("{stage_key}\x00");
+        let row_marker_end = format!("{stage_key}\x00\u{10ffff}");
+        for (marker_key, _) in self.db.scan(&row_marker_prefix, &row_marker_end, seq)? {
+            if batch.op_count() >= WriteBatch::MAX_OPS / 2 && !batch.is_empty() {
+                self.db.commit_batch(&batch)?;
+                batch = WriteBatch::new();
+            }
+            batch.delete(&marker_key)?;
+        }
+
+        if batch.op_count().saturating_add(2) > WriteBatch::MAX_OPS {
             self.db.commit_batch(&batch)?;
             batch = WriteBatch::new();
         }
+        let done_key = Self::rename_done_key(collection, old_name, new_name);
+        batch.set(&done_key, "done".into())?;
         batch.delete(stage_key)?;
         self.db.commit_batch(&batch)?;
         Ok(())
@@ -986,6 +1039,17 @@ impl SchemaManager {
         let key = format!("{}{:06}", MIGRATION_PREFIX, record.version);
         let value = serde_json::to_string(record).map_err(|e| OmniError::IoError(e.to_string()))?;
         let mut batch = WriteBatch::new();
+        for (done_key, _) in self.db.scan(
+            "\x00SCHEMA\x00rename_done:",
+            "\x00SCHEMA\x00rename_done:\u{10ffff}",
+            self.db.get_seq(),
+        )? {
+            if batch.op_count().saturating_add(3) > WriteBatch::MAX_OPS {
+                self.db.commit_batch(&batch)?;
+                batch = WriteBatch::new();
+            }
+            batch.delete(&done_key)?;
+        }
         batch.set(&key, value)?;
         batch.set(VERSION_KEY, version.to_string())?;
         self.db.commit_batch(&batch)?;

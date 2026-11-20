@@ -446,7 +446,7 @@ fn add_field_rejects_literal_null_default_on_legacy_sql_table() {
 }
 
 #[test]
-fn rename_field_commits_rows_and_catalog_together_and_handles_large_online_renames() {
+fn rename_field_commits_rows_and_catalog_together() {
     use omni_engine::schema::{Migration, SchemaManager, SchemaOp};
 
     let (db, _dir, _executor) = setup();
@@ -466,13 +466,15 @@ fn rename_field_commits_rows_and_catalog_together_and_handles_large_online_renam
 
     let cat_seq = db.get_seq_for_key("\u{0}CATALOG\u{0}items", u64::MAX);
     let row_seq = db.get_seq_for_key("\u{0}T\u{0}items\u{0}a", u64::MAX);
-    assert_eq!(
-        cat_seq,
-        row_seq + 4,
-        "single-batch rename must publish all 4 rewritten SQL rows and TableDef in one WriteBatch without an intermediate commit marker"
-    );
+    assert_eq!(cat_seq, row_seq + 4);
+}
 
-    let executor = SqlExecutor::new(db.clone(), Arc::new(Catalog::new(db.clone())));
+#[test]
+fn large_online_rename_recovers_staged_rows_and_completed_steps() {
+    use omni_engine::schema::{Migration, SchemaManager, SchemaOp};
+
+    let (db, _dir, executor) = setup();
+    let schema = SchemaManager::new(db.clone(), Arc::new(IndexManager::new(db.clone())));
     execute(
         &executor,
         "CREATE TABLE big_rename (id TEXT PRIMARY KEY, old_col TEXT)",
@@ -494,40 +496,64 @@ fn rename_field_commits_rows_and_catalog_together_and_handles_large_online_renam
     }
 
     let mut partial = WriteBatch::new();
-    partial
-        .set(
+    for (k, v) in [
+        (
             "\u{0}SCHEMA\u{0}rename_stage:big_rename:old_col:new_col",
-            "old_col".into(),
-        )
-        .unwrap();
-    partial
-        .set(
+            "old_col",
+        ),
+        (
             "\u{0}T\u{0}big_rename\u{0}k0000",
-            "{\"id\":\"k0000\",\"old_col\":\"v0\",\"new_col\":\"v0\"}".into(),
-        )
-        .unwrap();
+            "{\"id\":\"k0000\",\"old_col\":\"v0\",\"new_col\":\"v0\"}",
+        ),
+        (
+            "\u{0}SCHEMA\u{0}rename_stage:big_rename:old_col:new_col\u{0}\u{0}T\u{0}big_rename\u{0}k0001",
+            "1",
+        ),
+        (
+            "\u{0}T\u{0}big_rename\u{0}k0001",
+            "{\"id\":\"k0001\",\"old_col\":\"v1_updated\",\"new_col\":\"v1\"}",
+        ),
+    ] {
+        partial.set(k, v.into()).unwrap();
+    }
     db.commit_batch(&partial).unwrap();
+
+    let rename_op = SchemaOp::RenameField {
+        collection: "BIG_RENAME".into(),
+        old_name: "old_col".into(),
+        new_name: "new_col".into(),
+    };
+    let err = schema
+        .migrate_up(&Migration {
+            version: 1,
+            description: "multi-op migration where second op fails".into(),
+            up: vec![
+                rename_op.clone(),
+                SchemaOp::DropIndex {
+                    name: "nonexistent_idx_after_rename".into(),
+                },
+            ],
+            down: vec![],
+        })
+        .unwrap_err();
+    assert!(err.to_string().contains("nonexistent_idx_after_rename"));
 
     schema
         .migrate_up(&Migration {
-            version: 2,
-            description: "multi-batch online rename with pre-staged row".into(),
-            up: vec![SchemaOp::RenameField {
-                collection: "BIG_RENAME".into(),
-                old_name: "old_col".into(),
-                new_name: "new_col".into(),
-            }],
+            version: 1,
+            description: "retry after rename already finished".into(),
+            up: vec![rename_op],
             down: vec![],
         })
-        .expect("large staged rename must complete and tolerate already-staged rows");
+        .unwrap();
 
     let refreshed = SqlExecutor::new(db.clone(), Arc::new(Catalog::new(db.clone())));
     assert_eq!(
         rows(
             &refreshed,
-            "SELECT new_col FROM big_rename WHERE id = 'k0000'"
+            "SELECT new_col FROM big_rename WHERE id = 'k0001'"
         ),
-        vec![vec![Some("v0".to_string())]]
+        vec![vec![Some("v1_updated".to_string())]]
     );
     assert_eq!(
         rows(
@@ -538,7 +564,7 @@ fn rename_field_commits_rows_and_catalog_together_and_handles_large_online_renam
     );
     assert_eq!(
         db.find(
-            "\u{0}SCHEMA\u{0}rename_stage:big_rename:old_col:new_col",
+            "\u{0}SCHEMA\u{0}rename_done:big_rename:old_col:new_col",
             db.get_seq()
         )
         .unwrap(),
@@ -563,7 +589,7 @@ fn failed_unique_index_rebuild_over_batch_limit_cleans_up_and_allows_retry() {
     );
 
     let mut batch = WriteBatch::new();
-    for i in 0..1050 {
+    for i in 0..6000 {
         if batch.op_count() >= 500 {
             db.commit_batch(&batch).unwrap();
             batch = WriteBatch::new();
@@ -598,19 +624,13 @@ fn failed_unique_index_rebuild_over_batch_limit_cleans_up_and_allows_retry() {
     };
 
     let err = schema.migrate_up(&migration).unwrap_err();
-    assert!(
-        err.to_string().contains("UNIQUE CONSTRAINT VIOLATION"),
-        "expected duplicate failure, got: {err}"
-    );
-    assert!(
-        idx_mgr.definition("big_idx_code_uq").is_err(),
-        "failed unique index definition must be retired even when >1000 entries were built"
-    );
-    assert!(
+    assert!(err.to_string().contains("UNIQUE CONSTRAINT VIOLATION"));
+    assert!(idx_mgr.definition("big_idx_code_uq").is_err());
+    assert_eq!(
         db.scan("\u{0}IDX\u{0}", "\u{0}IDX\u{0}\u{10ffff}", db.get_seq())
             .unwrap()
-            .is_empty(),
-        "all partial index entries beyond WriteBatch::MAX_OPS must be cleaned up"
+            .len(),
+        0
     );
 
     let mut fix = WriteBatch::new();
@@ -621,9 +641,7 @@ fn failed_unique_index_rebuild_over_batch_limit_cleans_up_and_allows_retry() {
     .unwrap();
     db.commit_batch(&fix).unwrap();
 
-    schema
-        .migrate_up(&migration)
-        .expect("retrying unique index migration after fixing duplicate must succeed");
+    schema.migrate_up(&migration).unwrap();
     assert_eq!(
         idx_mgr
             .lookup(
@@ -633,4 +651,25 @@ fn failed_unique_index_rebuild_over_batch_limit_cleans_up_and_allows_retry() {
             .unwrap(),
         vec!["k9999".to_string()]
     );
+
+    let mut retired_conflict = WriteBatch::new();
+    retired_conflict
+        .set(
+            "\u{0}IDX_RETIRED\u{0}999",
+            serde_json::to_string(&omni_engine::secondary_index::IndexDefinition {
+                id: 999,
+                name: "big_idx_code_uq".into(),
+                collection: "other_tbl".into(),
+                fields: vec![("code".into(), IndexFieldType::String)],
+                unique: false,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+    db.commit_batch(&retired_conflict).unwrap();
+
+    let ambig_err = idx_mgr.drop_index("big_idx_code_uq").unwrap_err();
+    assert!(ambig_err.to_string().contains("ambiguous"));
+    idx_mgr.purge_retired_index(999).unwrap();
+    assert!(idx_mgr.definition("big_idx_code_uq").is_ok());
 }

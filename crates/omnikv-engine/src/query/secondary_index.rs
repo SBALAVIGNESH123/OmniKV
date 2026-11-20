@@ -590,15 +590,52 @@ impl IndexManager {
 
     /// DROP INDEX — removes an index definition and all its entries.
     pub fn drop_index(&self, name: &str) -> Result<(), OmniError> {
-        let definition = match self.definition(name) {
-            Ok(definition) => definition,
-            Err(err) => self.find_retired_index(name, None)?.ok_or(err)?,
+        let active = self.definition(name).ok();
+        let retired = self.find_retired_indexes(name, None)?;
+        let mut collections: Vec<String> = Vec::new();
+        for def in active.iter().chain(retired.iter()) {
+            if !collections
+                .iter()
+                .any(|c| c.eq_ignore_ascii_case(&def.collection))
+            {
+                collections.push(def.collection.clone());
+            }
+        }
+        let target_collection = match collections.as_slice() {
+            [] => return Err(OmniError::IoError(format!("Index '{}' not found", name))),
+            [single] => single.clone(),
+            _ => {
+                return Err(OmniError::IoError(format!(
+                    "Index '{}' is ambiguous across active and retired definitions; specify an explicit cleanup target",
+                    name
+                )));
+            }
         };
-        let lock = self.db.sql_table_lock(&definition.collection)?;
+        let lock = self.db.sql_table_lock(&target_collection)?;
         let _guard = lock
             .lock()
             .map_err(|_| OmniError::LockPoisoned("index collection".into()))?;
-        self.drop_index_locked(name, &definition.collection)
+        self.drop_index_locked(name, &target_collection)
+    }
+
+    /// Cleans up a specific retired index by its retired ID.
+    pub fn purge_retired_index(&self, id: IndexId) -> Result<(), OmniError> {
+        let retired_key = format!("{RETIRED_PREFIX}{id}");
+        let raw = self
+            .db
+            .find(&retired_key, self.db.get_seq())?
+            .ok_or_else(|| OmniError::IoError(format!("Retired index {id} not found")))?;
+        let def: IndexDefinition =
+            serde_json::from_str(&raw).map_err(|e| OmniError::IoError(e.to_string()))?;
+        let lock = self.db.sql_table_lock(&def.collection)?;
+        let _guard = lock
+            .lock()
+            .map_err(|_| OmniError::LockPoisoned("index collection".into()))?;
+        let ddl_lock = self.db.sql_table_lock(DDL_LOCK_NAME)?;
+        let _ddl_guard = ddl_lock
+            .lock()
+            .map_err(|_| OmniError::LockPoisoned("index DDL".into()))?;
+        self.purge_retired_index_entries(id)
     }
 
     pub(crate) fn drop_index_locked(
@@ -611,8 +648,13 @@ impl IndexManager {
             .lock()
             .map_err(|_| OmniError::LockPoisoned("index DDL".into()))?;
         let catalog = IndexCatalog::load_checked_at(&self.db, self.db.get_seq())?;
+        let mut ids_to_purge: Vec<IndexId> = self
+            .find_retired_indexes(name, Some(expected_collection))?
+            .into_iter()
+            .map(|d| d.id)
+            .collect();
 
-        let id = if let Some(def) = catalog
+        if let Some(def) = catalog
             .get_by_name(name)
             .filter(|d| d.collection.eq_ignore_ascii_case(expected_collection))
         {
@@ -637,22 +679,26 @@ impl IndexManager {
                     read_ranges: Vec::new(),
                 },
             );
-            id
-        } else if let Some(retired) = self.find_retired_index(name, Some(expected_collection))? {
-            retired.id
-        } else {
+            if !ids_to_purge.contains(&id) {
+                ids_to_purge.push(id);
+            }
+        } else if ids_to_purge.is_empty() {
             return Err(OmniError::IoError(format!("Index '{}' not found", name)));
-        };
+        }
 
-        self.purge_retired_index_entries(id)
+        for id in ids_to_purge {
+            self.purge_retired_index_entries(id)?;
+        }
+        Ok(())
     }
 
-    fn find_retired_index(
+    fn find_retired_indexes(
         &self,
         name: &str,
         expected_collection: Option<&str>,
-    ) -> Result<Option<IndexDefinition>, OmniError> {
+    ) -> Result<Vec<IndexDefinition>, OmniError> {
         let seq = self.db.get_seq();
+        let mut matches = Vec::new();
         for (_, value) in self.db.scan(
             RETIRED_PREFIX,
             &format!("{}\u{10ffff}", RETIRED_PREFIX),
@@ -665,10 +711,10 @@ impl IndexManager {
                 && expected_collection
                     .is_none_or(|expected| def.collection.eq_ignore_ascii_case(expected))
             {
-                return Ok(Some(def));
+                matches.push(def);
             }
         }
-        Ok(None)
+        Ok(matches)
     }
 
     fn cleanup_retired_indexes_for_collection(&self, collection: &str) -> Result<(), OmniError> {
@@ -694,19 +740,21 @@ impl IndexManager {
         let retired_key = format!("{RETIRED_PREFIX}{id}");
         loop {
             let seq = self.db.get_seq();
-            let entries = self.db.scan(&prefix, &end, seq)?;
+            let entries =
+                self.db
+                    .scan_limit(&prefix, &end, seq, DELETE_BATCH_LIMIT.saturating_add(1))?;
             if entries.is_empty() {
                 let mut clear_batch = WriteBatch::new();
                 clear_batch.delete(&retired_key)?;
                 self.db.commit_batch(&clear_batch)?;
                 return Ok(());
             }
-            let total = entries.len();
+            let has_more = entries.len() > DELETE_BATCH_LIMIT;
             let mut batch = WriteBatch::new();
             for (key, _) in entries.into_iter().take(DELETE_BATCH_LIMIT) {
                 batch.delete(&key)?;
             }
-            if total <= DELETE_BATCH_LIMIT {
+            if !has_more {
                 batch.delete(&retired_key)?;
                 self.db.commit_batch(&batch)?;
                 return Ok(());

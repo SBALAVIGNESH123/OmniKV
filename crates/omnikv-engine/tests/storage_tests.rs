@@ -1851,17 +1851,32 @@ fn test_2pc_coordinator_lifecycle() {
 
 #[test]
 fn test_2pc_coordinator_sequence_resumes_after_reopen() {
-    let (db, _dir) = create_test_db();
-    let coordinator = TwoPhaseCoordinator::new(7, db.clone(), 5000);
-    let first = coordinator.begin().unwrap();
-    assert_eq!(first, (7, 1));
-    coordinator
-        .add_write(first, 8, "sequence_key".into(), Some("value".into()), 0)
-        .unwrap();
-    coordinator.prepare(first).unwrap();
+    let dir = TempDir::new().expect("tempdir");
+    let manifest = dir
+        .path()
+        .join("test_manifest")
+        .to_string_lossy()
+        .to_string();
+    let wal = dir.path().join("test_wal").to_string_lossy().to_string();
 
-    let reopened_coordinator = TwoPhaseCoordinator::new(7, db, 5000);
-    assert_eq!(reopened_coordinator.begin().unwrap(), (7, 2));
+    {
+        let db = OmniKV::open(&manifest, &wal).expect("open");
+        let coordinator = TwoPhaseCoordinator::new(7, db, 5000);
+        let first = coordinator.begin().unwrap();
+        assert_eq!(first, (7, 1));
+    }
+
+    let reopened_db = OmniKV::open(&manifest, &wal).expect("reopen");
+    let reopened_coordinator = TwoPhaseCoordinator::new(7, reopened_db.clone(), 5000);
+    let second = reopened_coordinator.begin().unwrap();
+    assert_eq!(second, (7, 2));
+    reopened_coordinator
+        .add_write(second, 8, "sequence_key".into(), Some("value".into()), 0)
+        .unwrap();
+    reopened_coordinator.prepare(second).unwrap();
+
+    let next_coordinator = TwoPhaseCoordinator::new(7, reopened_db, 5000);
+    assert_eq!(next_coordinator.begin().unwrap(), (7, 3));
 }
 
 #[test]
