@@ -2272,7 +2272,6 @@ impl SqlExecutor {
         self.seed_pending_indexes(&mut batch)?;
         let index_manager = self.catalog.index_manager();
         let index_catalog = self.dml_index_catalog(read_seq)?;
-        let stage_markers = self.load_rename_stage_markers(&table.name, read_seq)?;
         let mut new_keys = std::collections::HashSet::with_capacity(rows.len());
         let mut stale_keys = Vec::new();
         let mut moved_keys = Vec::new();
@@ -2356,11 +2355,29 @@ impl SqlExecutor {
                 )
                 .map_err(|e| format!("Index maintenance failed: {e}"))?;
         }
-        for (from_key, _) in &moved_keys {
-            Self::delete_rename_stage_marker(&stage_markers, from_key, &mut batch)?;
-        }
-        for (from_key, to_key) in &moved_keys {
-            Self::copy_rename_stage_marker(&stage_markers, from_key, to_key, &mut batch)?;
+        if !moved_keys.is_empty() {
+            let active_stages = self.active_rename_stages(&table.name, read_seq)?;
+            if !active_stages.is_empty() {
+                let mut moved_markers = Vec::new();
+                for stage_key in &active_stages {
+                    for (from_key, to_key) in &moved_keys {
+                        let old_marker =
+                            crate::schema::SchemaManager::rename_row_stage_key(stage_key, from_key);
+                        if let Some(val) = self.find_row_stage_marker(&old_marker, read_seq)? {
+                            let new_marker = crate::schema::SchemaManager::rename_row_stage_key(
+                                stage_key, to_key,
+                            );
+                            moved_markers.push((old_marker, new_marker, val));
+                        }
+                    }
+                }
+                for (old_marker, _, _) in &moved_markers {
+                    Self::stage_batch_delete(&mut batch, old_marker)?;
+                }
+                for (_, new_marker, val) in moved_markers {
+                    Self::stage_batch_set(&mut batch, &new_marker, val)?;
+                }
+            }
         }
         for stale in stale_keys {
             if !new_keys.contains(&stale) {
@@ -2419,7 +2436,11 @@ impl SqlExecutor {
         self.seed_pending_indexes(&mut batch)?;
         let index_manager = self.catalog.index_manager();
         let index_catalog = self.dml_index_catalog(read_seq)?;
-        let stage_markers = self.load_rename_stage_markers(&table.name, read_seq)?;
+        let active_stages = if rows.is_empty() {
+            Vec::new()
+        } else {
+            self.active_rename_stages(&table.name, read_seq)?
+        };
         for row in &rows {
             let pk = row
                 .get(&table.primary_key)
@@ -2443,7 +2464,12 @@ impl SqlExecutor {
                 )
                 .map_err(|e| format!("Index maintenance failed: {e}"))?;
             batch.delete(&key).map_err(|e| format!("{:?}", e))?;
-            Self::delete_rename_stage_marker(&stage_markers, &key, &mut batch)?;
+            for stage_key in &active_stages {
+                let marker = crate::schema::SchemaManager::rename_row_stage_key(stage_key, &key);
+                if self.find_row_stage_marker(&marker, read_seq)?.is_some() {
+                    Self::stage_batch_delete(&mut batch, &marker)?;
+                }
+            }
         }
 
         if !batch.is_empty() {
@@ -2460,80 +2486,60 @@ impl SqlExecutor {
         })
     }
 
-    fn load_rename_stage_markers(
-        &self,
-        table_name: &str,
-        read_seq: u64,
-    ) -> Result<Vec<(String, String)>, String> {
+    fn active_rename_stages(&self, table_name: &str, read_seq: u64) -> Result<Vec<String>, String> {
         let prefix = format!("\x00SCHEMA\x00rename_stage:{}:", table_name.to_lowercase());
         let end = format!("{prefix}\u{10ffff}");
-        let mut markers: std::collections::BTreeMap<String, String> = self
-            .db
+        self.db
             .scan(&prefix, &end, read_seq)
-            .map_err(|e| format!("{:?}", e))?
-            .into_iter()
-            .collect();
+            .map(|entries| entries.into_iter().map(|(k, _)| k).collect())
+            .map_err(|e| format!("{:?}", e))
+    }
+
+    fn find_row_stage_marker(
+        &self,
+        marker_key: &str,
+        read_seq: u64,
+    ) -> Result<Option<String>, String> {
         if let Some(pending) = self.pending_batch.borrow().as_ref() {
-            for del in &pending.buffered_deletes {
-                if let Ok(k) = std::str::from_utf8(del)
-                    && k.starts_with(&prefix)
-                {
-                    markers.remove(k);
-                }
+            if let Some((_, val, _)) = pending
+                .buffered_writes
+                .iter()
+                .rev()
+                .find(|(k, _, _)| k.as_slice() == marker_key.as_bytes())
+            {
+                return Ok(Some(val.clone()));
             }
-            for (k_bytes, val, _) in &pending.buffered_writes {
-                if let Ok(k) = std::str::from_utf8(k_bytes)
-                    && k.starts_with(&prefix)
-                {
-                    markers.insert(k.to_string(), val.clone());
-                }
+            if pending
+                .buffered_deletes
+                .iter()
+                .any(|k| k.as_slice() == marker_key.as_bytes())
+            {
+                return Ok(None);
             }
         }
-        Ok(markers.into_iter().collect())
+        self.db
+            .find(marker_key, read_seq)
+            .map_err(|e| format!("{:?}", e))
     }
 
-    fn copy_rename_stage_marker(
-        markers: &[(String, String)],
-        old_key: &str,
-        new_key: &str,
-        batch: &mut WriteBatch,
-    ) -> Result<(), String> {
-        let suffix = format!("\x00{old_key}");
-        for (marker_key, marker_val) in markers {
-            if let Some(stage_key) = marker_key.strip_suffix(&suffix) {
-                let target = format!("{stage_key}\x00{new_key}");
-                batch
-                    .buffered_writes
-                    .retain(|(k, _, _)| k.as_slice() != target.as_bytes());
-                batch
-                    .buffered_deletes
-                    .retain(|k| k.as_slice() != target.as_bytes());
-                batch
-                    .set(&target, marker_val.clone())
-                    .map_err(|e| format!("{:?}", e))?;
-            }
-        }
-        Ok(())
+    fn stage_batch_set(batch: &mut WriteBatch, key: &str, val: String) -> Result<(), String> {
+        batch
+            .buffered_writes
+            .retain(|(k, _, _)| k.as_slice() != key.as_bytes());
+        batch
+            .buffered_deletes
+            .retain(|k| k.as_slice() != key.as_bytes());
+        batch.set(key, val).map_err(|e| format!("{:?}", e))
     }
 
-    fn delete_rename_stage_marker(
-        markers: &[(String, String)],
-        old_key: &str,
-        batch: &mut WriteBatch,
-    ) -> Result<(), String> {
-        let suffix = format!("\x00{old_key}");
-        for (marker_key, _) in markers {
-            if marker_key.ends_with(&suffix) {
-                batch
-                    .buffered_writes
-                    .retain(|(k, _, _)| k.as_slice() != marker_key.as_bytes());
-                batch
-                    .buffered_deletes
-                    .retain(|k| k.as_slice() != marker_key.as_bytes());
-                batch.delete(marker_key).map_err(|e| format!("{:?}", e))?;
-            }
-        }
-        Ok(())
+    fn stage_batch_delete(batch: &mut WriteBatch, key: &str) -> Result<(), String> {
+        batch
+            .buffered_writes
+            .retain(|(k, _, _)| k.as_slice() != key.as_bytes());
+        batch
+            .buffered_deletes
+            .retain(|k| k.as_slice() != key.as_bytes());
+        batch.delete(key).map_err(|e| format!("{:?}", e))
     }
 }
 

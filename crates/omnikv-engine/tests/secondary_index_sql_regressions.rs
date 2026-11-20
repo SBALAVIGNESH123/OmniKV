@@ -559,7 +559,7 @@ fn large_online_rename_recovers_staged_rows_and_completed_steps() {
             "{\"id\":\"k0000\",\"old_col\":\"v0\",\"new_col\":\"v0\"}",
         ),
         (
-            "\u{0}SCHEMA\u{0}rename_stage:big_rename:old_col:new_col\u{0}\u{0}T\u{0}big_rename\u{0}k0001",
+            "\u{0}SCHEMA\u{0}rename_row:big_rename:old_col:new_col\u{0}\u{0}T\u{0}big_rename\u{0}k0001",
             "1",
         ),
         (

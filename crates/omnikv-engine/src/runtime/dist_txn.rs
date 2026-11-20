@@ -184,7 +184,10 @@ impl TwoPhaseCoordinator {
             })
             .max()
             .unwrap_or(0);
-        Ok(persisted_hwm.max(scan_max).saturating_add(1))
+        persisted_hwm
+            .max(scan_max)
+            .checked_add(1)
+            .ok_or_else(|| OmniError::IoError("2PC transaction sequence exhausted".into()))
     }
 
     /// BEGIN DISTRIBUTED — creates a new distributed transaction.
@@ -201,7 +204,9 @@ impl TwoPhaseCoordinator {
                 Self::load_next_seq(self.node_id, &self.db)?
             } else {
                 match Self::read_persisted_hwm(self.node_id, &self.db, self.db.get_seq())? {
-                    Some(hwm) => hwm.saturating_add(1),
+                    Some(hwm) => hwm.checked_add(1).ok_or_else(|| {
+                        OmniError::IoError("2PC transaction sequence exhausted".into())
+                    })?,
                     None => Self::load_next_seq(self.node_id, &self.db)?,
                 }
             };

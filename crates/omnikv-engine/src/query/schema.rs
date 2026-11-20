@@ -613,8 +613,15 @@ impl SchemaManager {
         )
     }
 
-    fn rename_row_stage_key(stage_key: &str, row_key: &str) -> String {
-        format!("{stage_key}\x00{row_key}")
+    pub(crate) fn rename_row_stage_prefix(stage_key: &str) -> String {
+        let suffix = stage_key
+            .strip_prefix("\x00SCHEMA\x00rename_stage:")
+            .unwrap_or(stage_key);
+        format!("\x00SCHEMA\x00rename_row:{suffix}\x00")
+    }
+
+    pub(crate) fn rename_row_stage_key(stage_key: &str, row_key: &str) -> String {
+        format!("{}{row_key}", Self::rename_row_stage_prefix(stage_key))
     }
 
     fn rename_done_prefix(version: Version, direction: &str) -> String {
@@ -1026,8 +1033,8 @@ impl SchemaManager {
             }
         }
 
-        let row_marker_prefix = format!("{stage_key}\x00");
-        let row_marker_end = format!("{stage_key}\x00\u{10ffff}");
+        let row_marker_prefix = Self::rename_row_stage_prefix(stage_key);
+        let row_marker_end = format!("{row_marker_prefix}\u{10ffff}");
         for (marker_key, _) in self.db.scan(&row_marker_prefix, &row_marker_end, seq)? {
             if batch.op_count() >= WriteBatch::MAX_OPS / 2 && !batch.is_empty() {
                 self.db.commit_batch(&batch)?;
