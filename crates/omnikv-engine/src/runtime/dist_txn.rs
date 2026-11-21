@@ -842,7 +842,10 @@ fn check_2pc_participant_writes(
                     prev.state, entry.state
                 )));
             }
-            if prev.state == "PREPARED" && prev.writes != entry.writes {
+            if prev.state == "PREPARED"
+                && prev.writes != entry.writes
+                && !(entry.state == "ABORTED" && entry.writes.is_empty())
+            {
                 return Ok(Some(format!(
                     "conflicting 2PC participant writes for key '{key}'"
                 )));
@@ -1085,9 +1088,8 @@ pub(crate) fn sync_prepared_reservations_from_batch(
                 db.ssi_history.merge_prepared_keys(reservations);
             }
             "COMMITTED" | "ABORTED" => {
-                let keys: Vec<String> = entry.writes.iter().map(|w| w.key.clone()).collect();
                 db.ssi_history
-                    .release_prepared_keys(entry.node_id, entry.txn_id, &keys);
+                    .release_prepared_keys_for_txn(entry.node_id, entry.txn_id);
             }
             _ => {}
         }
@@ -1138,6 +1140,9 @@ impl TwoPhaseParticipant {
             let _guard = lock
                 .lock()
                 .map_err(|_| OmniError::LockPoisoned("2PC participant".into()))?;
+            if self.needs_recovery.load(Ordering::SeqCst) {
+                self.db.ensure_cluster_linearizable()?;
+            }
             self.recover_locked()?;
             if let Some(existing) = self.load_participant_log(txn_id)? {
                 if existing.writes != writes && existing.state != "ABORTED" {
@@ -1470,12 +1475,14 @@ impl TwoPhaseParticipant {
             .release_prepared_keys(self.node_id, txn_id, keys);
     }
 
-    fn cleanup_terminal_state(
-        &self,
-        txn_id: GlobalTxnId,
-        keys: &[String],
-    ) -> Result<(), OmniError> {
-        self.release_key_locks(txn_id, keys);
+    fn cleanup_terminal_state(&self, txn_id: GlobalTxnId) -> Result<(), OmniError> {
+        self.key_locks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|_, owner| *owner != txn_id);
+        self.db
+            .ssi_history
+            .release_prepared_keys_for_txn(self.node_id, txn_id);
         self.prepared
             .lock()
             .map_err(|_| OmniError::LockPoisoned("participant prepared".into()))?
@@ -1563,6 +1570,7 @@ impl TwoPhaseParticipant {
             .lock()
             .map_err(|_| OmniError::LockPoisoned("2PC participant".into()))?;
         if self.needs_recovery.load(Ordering::SeqCst) {
+            self.db.ensure_cluster_linearizable()?;
             self.recover_locked()?;
         }
         let state = self
@@ -1600,7 +1608,7 @@ impl TwoPhaseParticipant {
                         recovered_seq
                     }
                 };
-                self.cleanup_terminal_state(txn_id, &write_keys)?;
+                self.cleanup_terminal_state(txn_id)?;
                 return Ok(commit_seq);
             }
             "PREPARED" => {}
@@ -1640,7 +1648,7 @@ impl TwoPhaseParticipant {
                 read_ranges: Vec::new(),
             },
         )?;
-        self.cleanup_terminal_state(txn_id, &write_keys)?;
+        self.cleanup_terminal_state(txn_id)?;
 
         Ok(commit_seq)
     }
@@ -1654,6 +1662,7 @@ impl TwoPhaseParticipant {
             .lock()
             .map_err(|_| OmniError::LockPoisoned("2PC participant".into()))?;
         if self.needs_recovery.load(Ordering::SeqCst) {
+            self.db.ensure_cluster_linearizable()?;
             self.recover_locked()?;
         }
         let writes = match self.load_participant_log(txn_id)? {
@@ -1663,8 +1672,7 @@ impl TwoPhaseParticipant {
                 ));
             }
             Some(entry) if entry.state == "ABORTED" => {
-                let write_keys: Vec<String> = entry.writes.iter().map(|w| w.key.clone()).collect();
-                self.cleanup_terminal_state(txn_id, &write_keys)?;
+                self.cleanup_terminal_state(txn_id)?;
                 return Ok(());
             }
             Some(entry) if entry.state == "PREPARED" => entry.writes,
@@ -1692,8 +1700,7 @@ impl TwoPhaseParticipant {
             format!("ABORTED:{}", self.node_id),
         );
         self.db.commit_2pc_batch(&log_batch)?;
-        let write_keys: Vec<String> = writes.iter().map(|w| w.key.clone()).collect();
-        self.cleanup_terminal_state(txn_id, &write_keys)?;
+        self.cleanup_terminal_state(txn_id)?;
 
         Ok(())
     }
@@ -2296,5 +2303,78 @@ mod tests {
         let mut nl_plain = WriteBatch::new();
         nl_plain.set("k_not_leader", "ok".into()).unwrap();
         assert!(db.commit_batch(&nl_plain).is_ok());
+
+        // 5. Presumed-abort (ABORTED with empty writes) applied through Raft after PREPARED
+        //    must succeed and release all SSI prepared reservations for that (node_id, txn_id).
+        let t_pa = (1, 201);
+        let mut pa_prep = WriteBatch::new();
+        pa_prep
+            .set(
+                &participant_prepare_key(2, t_pa),
+                make_entry(2, t_pa, "PREPARED", "k_presumed_abort"),
+            )
+            .unwrap();
+        db.commit_2pc_batch(&pa_prep).unwrap();
+        db.ssi_history
+            .reserve_prepared_keys(2, t_pa, &["k_presumed_abort".to_string()])
+            .unwrap();
+
+        let presumed_abort = ParticipantLogEntry {
+            txn_id: t_pa,
+            node_id: 2,
+            state: "ABORTED".into(),
+            writes: Vec::new(),
+            prepare_seq: 0,
+            commit_seq: None,
+        };
+        let mut pa_abort = WriteBatch::new();
+        pa_abort
+            .set(
+                &participant_prepare_key(2, t_pa),
+                serde_json::to_string(&presumed_abort).unwrap(),
+            )
+            .unwrap();
+        let pa_cmd = crate::raft_command::RaftCommand::from_batch(&pa_abort);
+        let pa_resp = rt
+            .block_on(openraft::RaftStorage::apply_to_state_machine(
+                &mut raft_storage,
+                &[openraft::Entry {
+                    log_id: openraft::LogId::new(leader, 2),
+                    payload: openraft::EntryPayload::Normal(pa_cmd.encode()),
+                }],
+            ))
+            .unwrap();
+        assert!(
+            pa_resp[0].parse::<u64>().is_ok(),
+            "presumed-abort with empty writes must be accepted against PREPARED"
+        );
+        let mut pa_plain = WriteBatch::new();
+        pa_plain.set("k_presumed_abort", "freed".into()).unwrap();
+        assert!(
+            db.commit_batch(&pa_plain).is_ok(),
+            "presumed-abort with empty writes must still release all SSI prepared keys for the txn"
+        );
+
+        // 6. abort() when no durable log exists still clears lingering in-memory locks/SSI reservations
+        let t_ghost = (1, 202);
+        participant
+            .key_locks
+            .lock()
+            .unwrap()
+            .insert("k_ghost".into(), t_ghost);
+        db.ssi_history
+            .reserve_prepared_keys(2, t_ghost, &["k_ghost".to_string()])
+            .unwrap();
+        participant.abort(t_ghost).unwrap();
+        assert!(
+            !participant
+                .key_locks
+                .lock()
+                .unwrap()
+                .contains_key("k_ghost")
+        );
+        let mut ghost_plain = WriteBatch::new();
+        ghost_plain.set("k_ghost", "freed".into()).unwrap();
+        assert!(db.commit_batch(&ghost_plain).is_ok());
     }
 }

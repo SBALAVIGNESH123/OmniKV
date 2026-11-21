@@ -373,6 +373,11 @@ impl SsiHistory {
         }
     }
 
+    pub(crate) fn release_prepared_keys_for_txn(&self, node_id: u64, txn_id: (u64, u64)) {
+        let mut prepared = self.prepared_keys.lock().unwrap_or_else(|e| e.into_inner());
+        prepared.retain(|_, &mut owner| owner != (node_id, txn_id));
+    }
+
     pub(crate) fn replace_prepared_keys_for_node(
         &self,
         node_id: u64,
