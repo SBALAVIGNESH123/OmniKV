@@ -922,6 +922,7 @@ impl SqlExecutor {
         // The typed path keys and compares a numeric primary key canonically,
         // so a legacy row stored at ...007 is re-keyed to ...7.
         let mut canonical_keys: HashMap<String, &str> = HashMap::new();
+        let mut migrated_keys = Vec::new();
         for (key, serialized) in &stored {
             let mut row =
                 crate::plan_exec::PlanExecutor::deserialize_row(serialized, table.row_format)
@@ -955,6 +956,7 @@ impl SqlExecutor {
                 batch
                     .set(&canonical_key, typed)
                     .map_err(|e| format!("{:?}", e))?;
+                migrated_keys.push((key.clone(), canonical_key.clone()));
             } else if &typed != serialized {
                 batch.set(key, typed).map_err(|e| format!("{:?}", e))?;
             }
@@ -974,6 +976,7 @@ impl SqlExecutor {
                 )
                 .map_err(|e| format!("Index maintenance failed: {e}"))?;
         }
+        self.move_rename_stage_markers(&table.name, &migrated_keys, &mut batch, seq)?;
 
         let mut updated = table.clone();
         updated.row_format = crate::catalog::RowFormat::Typed;
@@ -2355,30 +2358,7 @@ impl SqlExecutor {
                 )
                 .map_err(|e| format!("Index maintenance failed: {e}"))?;
         }
-        if !moved_keys.is_empty() {
-            let active_stages = self.active_rename_stages(&table.name, read_seq)?;
-            if !active_stages.is_empty() {
-                let mut moved_markers = Vec::new();
-                for stage_key in &active_stages {
-                    for (from_key, to_key) in &moved_keys {
-                        let old_marker =
-                            crate::schema::SchemaManager::rename_row_stage_key(stage_key, from_key);
-                        if let Some(val) = self.find_row_stage_marker(&old_marker, read_seq)? {
-                            let new_marker = crate::schema::SchemaManager::rename_row_stage_key(
-                                stage_key, to_key,
-                            );
-                            moved_markers.push((old_marker, new_marker, val));
-                        }
-                    }
-                }
-                for (old_marker, _, _) in &moved_markers {
-                    Self::stage_batch_delete(&mut batch, old_marker)?;
-                }
-                for (_, new_marker, val) in moved_markers {
-                    Self::stage_batch_set(&mut batch, &new_marker, val)?;
-                }
-            }
-        }
+        self.move_rename_stage_markers(&table.name, &moved_keys, &mut batch, read_seq)?;
         for stale in stale_keys {
             if !new_keys.contains(&stale) {
                 batch
@@ -2466,7 +2446,10 @@ impl SqlExecutor {
             batch.delete(&key).map_err(|e| format!("{:?}", e))?;
             for stage_key in &active_stages {
                 let marker = crate::schema::SchemaManager::rename_row_stage_key(stage_key, &key);
-                if self.find_row_stage_marker(&marker, read_seq)?.is_some() {
+                if self
+                    .find_row_stage_marker_with_batch(Some(&batch), &marker, read_seq)?
+                    .is_some()
+                {
                     Self::stage_batch_delete(&mut batch, &marker)?;
                 }
             }
@@ -2495,11 +2478,66 @@ impl SqlExecutor {
             .map_err(|e| format!("{:?}", e))
     }
 
-    fn find_row_stage_marker(
+    fn move_rename_stage_markers(
         &self,
+        table_name: &str,
+        moved_keys: &[(String, String)],
+        batch: &mut WriteBatch,
+        read_seq: u64,
+    ) -> Result<(), String> {
+        if moved_keys.is_empty() {
+            return Ok(());
+        }
+        let active_stages = self.active_rename_stages(table_name, read_seq)?;
+        if active_stages.is_empty() {
+            return Ok(());
+        }
+        let mut moved_markers = Vec::new();
+        for stage_key in &active_stages {
+            for (from_key, to_key) in moved_keys {
+                let old_marker =
+                    crate::schema::SchemaManager::rename_row_stage_key(stage_key, from_key);
+                if let Some(val) =
+                    self.find_row_stage_marker_with_batch(Some(batch), &old_marker, read_seq)?
+                {
+                    let new_marker =
+                        crate::schema::SchemaManager::rename_row_stage_key(stage_key, to_key);
+                    moved_markers.push((old_marker, new_marker, val));
+                }
+            }
+        }
+        for (old_marker, _, _) in &moved_markers {
+            Self::stage_batch_delete(batch, old_marker)?;
+        }
+        for (_, new_marker, val) in moved_markers {
+            Self::stage_batch_set(batch, &new_marker, val)?;
+        }
+        Ok(())
+    }
+
+    fn find_row_stage_marker_with_batch(
+        &self,
+        batch: Option<&WriteBatch>,
         marker_key: &str,
         read_seq: u64,
     ) -> Result<Option<String>, String> {
+        if let Some(batch) = batch {
+            if batch
+                .buffered_deletes
+                .iter()
+                .any(|k| k.as_slice() == marker_key.as_bytes())
+            {
+                return Ok(None);
+            }
+            if let Some((_, val, _)) = batch
+                .buffered_writes
+                .iter()
+                .rev()
+                .find(|(k, _, _)| k.as_slice() == marker_key.as_bytes())
+            {
+                return Ok(Some(val.clone()));
+            }
+        }
         if let Some(pending) = self.pending_batch.borrow().as_ref() {
             if pending
                 .buffered_deletes

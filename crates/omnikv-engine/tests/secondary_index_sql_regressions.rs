@@ -730,3 +730,103 @@ fn failed_unique_index_rebuild_over_batch_limit_cleans_up_and_allows_retry() {
     idx_mgr.purge_retired_index(999).unwrap();
     assert!(idx_mgr.definition("big_idx_code_uq").is_ok());
 }
+
+#[test]
+fn legacy_table_online_rename_propagates_stage_markers_across_lazy_migration_update_and_delete() {
+    use omni_engine::schema::{Migration, SchemaManager, SchemaOp};
+
+    let dir = TempDir::new().unwrap();
+    let db = OmniKV::open(
+        dir.path().join("manifest.json").to_str().unwrap(),
+        dir.path().join("wal.bin").to_str().unwrap(),
+    )
+    .unwrap();
+
+    let manifest = "{\"name\":\"legacy_rename\",\"columns\":[{\"name\":\"id\",\"col_type\":\"Integer\",\"nullable\":false,\"primary_key\":true,\"default\":null},{\"name\":\"old_col\",\"col_type\":\"Text\",\"nullable\":true,\"primary_key\":false,\"default\":null}],\"primary_key\":\"id\",\"created_at\":1000}";
+    let mut seed = WriteBatch::new();
+    seed.set("\u{0}CATALOG\u{0}legacy_rename", manifest.to_string())
+        .unwrap();
+    for (raw_id, val) in [("001", "v1"), ("002", "v2"), ("003", "v3")] {
+        seed.set(
+            &format!("\u{0}T\u{0}legacy_rename\u{0}{raw_id}"),
+            format!("{{\"id\":\"{raw_id}\",\"old_col\":\"{val}\",\"new_col\":\"{val}\"}}"),
+        )
+        .unwrap();
+        seed.set(
+            &format!(
+                "\u{0}SCHEMA\u{0}rename_row:legacy_rename:old_col:new_col\u{0}\u{0}T\u{0}legacy_rename\u{0}{raw_id}"
+            ),
+            "1".into(),
+        )
+        .unwrap();
+    }
+    seed.set(
+        "\u{0}SCHEMA\u{0}rename_stage:legacy_rename:old_col:new_col",
+        "old_col".into(),
+    )
+    .unwrap();
+    db.commit_batch(&seed).unwrap();
+
+    let executor = SqlExecutor::new(db.clone(), Arc::new(Catalog::new(db.clone())));
+    // Triggers lazy Legacy -> Typed migration (001->1, 002->2, 003->3) AND shifts 1 -> 100
+    execute(
+        &executor,
+        "UPDATE legacy_rename SET id = 100, old_col = 'v1_updated' WHERE id = 1",
+    );
+    execute(&executor, "DELETE FROM legacy_rename WHERE id = 2");
+
+    // Verify markers migrated cleanly: 001 -> 100, 003 -> 3, and 002/2 deleted
+    for old_raw in ["001", "002", "003", "1", "2"] {
+        assert_eq!(
+            db.find(
+                &format!(
+                    "\u{0}SCHEMA\u{0}rename_row:legacy_rename:old_col:new_col\u{0}\u{0}T\u{0}legacy_rename\u{0}{old_raw}"
+                ),
+                db.get_seq()
+            )
+            .unwrap(),
+            None,
+            "stale marker for key {old_raw} must not remain"
+        );
+    }
+    for live_id in ["100", "3"] {
+        assert_eq!(
+            db.find(
+                &format!(
+                    "\u{0}SCHEMA\u{0}rename_row:legacy_rename:old_col:new_col\u{0}\u{0}T\u{0}legacy_rename\u{0}{live_id}"
+                ),
+                db.get_seq()
+            )
+            .unwrap(),
+            Some("1".into()),
+            "canonical marker for key {live_id} must be preserved"
+        );
+    }
+
+    let idx_mgr = Arc::new(IndexManager::new(db.clone()));
+    let schema = SchemaManager::new(db.clone(), idx_mgr);
+    schema
+        .migrate_up(&Migration {
+            version: 1,
+            description: "complete interrupted rename on legacy table".into(),
+            up: vec![SchemaOp::RenameField {
+                collection: "legacy_rename".into(),
+                old_name: "old_col".into(),
+                new_name: "new_col".into(),
+            }],
+            down: vec![],
+        })
+        .unwrap();
+
+    let refreshed = SqlExecutor::new(db.clone(), Arc::new(Catalog::new(db)));
+    assert_eq!(
+        rows(
+            &refreshed,
+            "SELECT id, new_col FROM legacy_rename ORDER BY id"
+        ),
+        vec![
+            vec![Some("3".into()), Some("v3".into())],
+            vec![Some("100".into()), Some("v1_updated".into())],
+        ]
+    );
+}

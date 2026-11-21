@@ -2179,4 +2179,122 @@ mod tests {
         let restarted = TwoPhaseParticipant::new(2, db);
         assert_eq!(restarted.recover().unwrap(), 1);
     }
+
+    #[test]
+    fn participant_record_validation_rejects_mismatched_keys_mutated_writes_and_syncs_deletes() {
+        let (db, _dir) = test_db();
+        let make_entry = |node_id: u64, txn_id: GlobalTxnId, state: &str, key: &str| {
+            serde_json::to_string(&ParticipantLogEntry {
+                txn_id,
+                node_id,
+                state: state.into(),
+                writes: vec![DistWrite {
+                    node_id,
+                    key: key.into(),
+                    value: Some("v".into()),
+                    ttl: 0,
+                }],
+                prepare_seq: 1,
+                commit_seq: None,
+            })
+            .unwrap()
+        };
+
+        // 1. Mismatched key vs payload (key says node 2 txn 1_1, payload says node 2 txn 1_99)
+        let mut spoofed = WriteBatch::new();
+        spoofed
+            .set(
+                &participant_prepare_key(2, (1, 1)),
+                make_entry(2, (1, 99), "PREPARED", "k_spoof"),
+            )
+            .unwrap();
+        assert!(
+            db.commit_2pc_batch(&spoofed).is_err(),
+            "mismatched key vs ParticipantLogEntry payload must be rejected"
+        );
+
+        // 2. Valid PREPARED record, followed by an attempt to mutate its write set
+        let t1 = (1, 1);
+        let mut valid_prep = WriteBatch::new();
+        valid_prep
+            .set(
+                &participant_prepare_key(2, t1),
+                make_entry(2, t1, "PREPARED", "k_orig"),
+            )
+            .unwrap();
+        db.commit_2pc_batch(&valid_prep).unwrap();
+
+        for bad_state in ["PREPARED", "COMMITTED", "ABORTED"] {
+            let mut mutated = WriteBatch::new();
+            mutated
+                .set(
+                    &participant_prepare_key(2, t1),
+                    make_entry(2, t1, bad_state, "k_different"),
+                )
+                .unwrap();
+            assert!(
+                db.commit_2pc_batch(&mutated).is_err(),
+                "transition from PREPARED to {bad_state} must reject mutated write set"
+            );
+        }
+
+        // 3. Raft apply deleting a __2PC_PREPARE__ record must release its SSI reservation
+        db.ssi_history
+            .reserve_prepared_keys(2, t1, &["k_orig".to_string()])
+            .unwrap();
+        let mut plain = WriteBatch::new();
+        plain.set("k_orig", "plain_val".into()).unwrap();
+        assert!(db.commit_batch(&plain).is_err());
+
+        let mut del_batch = WriteBatch::new();
+        del_batch.delete(&participant_prepare_key(2, t1)).unwrap();
+        let del_cmd = crate::raft_command::RaftCommand::from_batch(&del_batch);
+        let mut raft_storage = crate::raft_storage::OmniRaftStorage::new(db.clone());
+        let leader = openraft::CommittedLeaderId::new(1, 1);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let responses = rt
+            .block_on(openraft::RaftStorage::apply_to_state_machine(
+                &mut raft_storage,
+                &[openraft::Entry {
+                    log_id: openraft::LogId::new(leader, 1),
+                    payload: openraft::EntryPayload::Normal(del_cmd.encode()),
+                }],
+            ))
+            .unwrap();
+        assert!(responses[0].parse::<u64>().is_ok());
+        assert!(
+            db.commit_batch(&plain).is_ok(),
+            "deleting a durable PREPARED record through Raft apply must release its SSI reservation"
+        );
+
+        // 4. NotLeader error in reconcile_failed_prepare releases locks without writing ABORTED
+        let participant = TwoPhaseParticipant::new(2, db.clone());
+        let t_nl = (1, 200);
+        let nl_keys = vec!["k_not_leader".to_string()];
+        participant
+            .key_locks
+            .lock()
+            .unwrap()
+            .insert("k_not_leader".into(), t_nl);
+        db.ssi_history
+            .reserve_prepared_keys(2, t_nl, &nl_keys)
+            .unwrap();
+        participant.reconcile_failed_prepare(
+            t_nl,
+            &[DistWrite {
+                node_id: 2,
+                key: "k_not_leader".into(),
+                value: Some("v".into()),
+                ttl: 0,
+            }],
+            &nl_keys,
+            &OmniError::NotLeader { leader_id: Some(1) },
+        );
+        assert!(participant.load_participant_log(t_nl).unwrap().is_none());
+        let mut nl_plain = WriteBatch::new();
+        nl_plain.set("k_not_leader", "ok".into()).unwrap();
+        assert!(db.commit_batch(&nl_plain).is_ok());
+    }
 }
