@@ -918,25 +918,17 @@ fn online_rename_cleanup_does_not_delete_markers_of_prefix_overlapping_field_ren
     assert_eq!(db.find(&marker_two, db.get_seq()).unwrap(), None);
 }
 
-#[test]
-fn legacy_table_migration_with_rename_markers_over_batch_limit_completes_insert() {
-    let dir = TempDir::new().unwrap();
-    let db = OmniKV::open(
-        dir.path().join("manifest.json").to_str().unwrap(),
-        dir.path().join("wal.bin").to_str().unwrap(),
-    )
-    .unwrap();
-
-    let stage_key = test_rename_stage_key("big_legacy", "old_col", "new_col");
-    let manifest = "{\"name\":\"big_legacy\",\"columns\":[{\"name\":\"id\",\"col_type\":\"Integer\",\"nullable\":false,\"primary_key\":true,\"default\":null},{\"name\":\"old_col\",\"col_type\":\"Text\",\"nullable\":true,\"primary_key\":false,\"default\":null}],\"primary_key\":\"id\",\"created_at\":1000}";
+fn seed_large_legacy_table(db: &OmniKV, table_name: &str, row_count: usize) -> String {
+    let stage_key = test_rename_stage_key(table_name, "old_col", "new_col");
+    let manifest = format!(
+        "{{\"name\":\"{table_name}\",\"columns\":[{{\"name\":\"id\",\"col_type\":\"Integer\",\"nullable\":false,\"primary_key\":true,\"default\":null}},{{\"name\":\"old_col\",\"col_type\":\"Text\",\"nullable\":true,\"primary_key\":false,\"default\":null}}],\"primary_key\":\"id\",\"created_at\":1000}}"
+    );
     let mut seed = WriteBatch::new();
-    seed.set("\u{0}CATALOG\u{0}big_legacy", manifest.to_string())
+    seed.set(&format!("\u{0}CATALOG\u{0}{table_name}"), manifest)
         .unwrap();
     seed.set(&stage_key, "old_col".into()).unwrap();
     db.commit_batch(&seed).unwrap();
 
-    // MAX_OPS / 3 zero-padded keys + 1 rename marker each = 4 ops/row (> MAX_OPS total).
-    let row_count = WriteBatch::MAX_OPS / 3 + 10;
     let mut batch = WriteBatch::new();
     for i in 1..=row_count {
         if batch.op_count() >= 500 {
@@ -944,7 +936,7 @@ fn legacy_table_migration_with_rename_markers_over_batch_limit_completes_insert(
             batch = WriteBatch::new();
         }
         let raw_id = format!("{i:06}");
-        let row_key = format!("\u{0}T\u{0}big_legacy\u{0}{raw_id}");
+        let row_key = format!("\u{0}T\u{0}{table_name}\u{0}{raw_id}");
         batch
             .set(
                 &row_key,
@@ -958,6 +950,20 @@ fn legacy_table_migration_with_rename_markers_over_batch_limit_completes_insert(
     if !batch.is_empty() {
         db.commit_batch(&batch).unwrap();
     }
+    stage_key
+}
+
+#[test]
+fn legacy_table_migration_with_rename_markers_over_batch_limit_completes_insert() {
+    let dir = TempDir::new().unwrap();
+    let db = OmniKV::open(
+        dir.path().join("manifest.json").to_str().unwrap(),
+        dir.path().join("wal.bin").to_str().unwrap(),
+    )
+    .unwrap();
+
+    // MAX_OPS / 3 zero-padded keys + 1 rename marker each = 4 ops/row (> MAX_OPS total).
+    let stage_key = seed_large_legacy_table(&db, "big_legacy", WriteBatch::MAX_OPS / 3 + 10);
 
     let executor = SqlExecutor::new(db.clone(), Arc::new(Catalog::new(db.clone())));
     execute(
@@ -989,5 +995,115 @@ fn legacy_table_migration_with_rename_markers_over_batch_limit_completes_insert(
         .unwrap(),
         None,
         "old non-canonical rename marker must be removed atomically with its row"
+    );
+}
+
+fn assert_legacy_row_untouched(db: &OmniKV, table_name: &str, stage_key: &str, context: &str) {
+    let seq = db.get_seq();
+    let legacy_key = format!("\u{0}T\u{0}{table_name}\u{0}000001");
+    let canonical_key = format!("\u{0}T\u{0}{table_name}\u{0}1");
+    assert!(
+        db.find(&legacy_key, seq).unwrap().is_some(),
+        "{context}: legacy row 000001 must remain untouched"
+    );
+    assert_eq!(
+        db.find(&canonical_key, seq).unwrap(),
+        None,
+        "{context}: canonical row 1 must not be written on a failed statement"
+    );
+    assert_eq!(
+        db.find(&test_rename_row_stage_key(stage_key, &legacy_key), seq)
+            .unwrap(),
+        Some("1".into()),
+        "{context}: legacy rename marker must remain untouched"
+    );
+    assert_eq!(
+        db.find(&test_rename_row_stage_key(stage_key, &canonical_key), seq)
+            .unwrap(),
+        None,
+        "{context}: canonical rename marker must not be written on a failed statement"
+    );
+}
+
+#[test]
+fn failed_insert_and_update_on_large_legacy_table_leave_storage_untouched() {
+    let dir = TempDir::new().unwrap();
+    let db = OmniKV::open(
+        dir.path().join("manifest.json").to_str().unwrap(),
+        dir.path().join("wal.bin").to_str().unwrap(),
+    )
+    .unwrap();
+
+    let stage_key = seed_large_legacy_table(&db, "big_legacy_atomic", WriteBatch::MAX_OPS / 3 + 10);
+
+    let idx_mgr = IndexManager::new(db.clone());
+    idx_mgr
+        .create_index(
+            "big_legacy_atomic_old_col_uq",
+            "big_legacy_atomic",
+            vec![("old_col".into(), IndexFieldType::String)],
+            true,
+        )
+        .unwrap();
+    idx_mgr
+        .rebuild_index("big_legacy_atomic_old_col_uq")
+        .unwrap();
+
+    let executor = SqlExecutor::new(db.clone(), Arc::new(Catalog::new(db.clone())));
+    for (label, sql) in [
+        (
+            "duplicate PK insert",
+            "INSERT INTO big_legacy_atomic (id, old_col) VALUES (1, 'fresh')",
+        ),
+        (
+            "missing PK insert",
+            "INSERT INTO big_legacy_atomic (old_col) VALUES ('fresh')",
+        ),
+        (
+            "unique index violation insert",
+            "INSERT INTO big_legacy_atomic (id, old_col) VALUES (999999, 'v1')",
+        ),
+        (
+            "duplicate PK update",
+            "UPDATE big_legacy_atomic SET id = 2 WHERE id = 1",
+        ),
+        (
+            "NULL PK update",
+            "UPDATE big_legacy_atomic SET id = NULL WHERE id = 1",
+        ),
+        (
+            "unique index violation update",
+            "UPDATE big_legacy_atomic SET old_col = 'v2' WHERE id = 1",
+        ),
+    ] {
+        let stmt = parse_sql(sql).unwrap();
+        assert!(executor.execute(&stmt).is_err(), "{label} must be rejected");
+        assert_legacy_row_untouched(&db, "big_legacy_atomic", &stage_key, label);
+    }
+
+    // A subsequent valid UPDATE migrates cleanly and applies the update.
+    execute(
+        &executor,
+        "UPDATE big_legacy_atomic SET old_col = 'v1_updated' WHERE id = 1",
+    );
+    assert_eq!(
+        rows(
+            &executor,
+            "SELECT old_col FROM big_legacy_atomic WHERE id = 1"
+        ),
+        vec![vec![Some("v1_updated".into())]]
+    );
+    assert_eq!(
+        db.find("\u{0}T\u{0}big_legacy_atomic\u{0}000001", db.get_seq())
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        db.find(
+            &test_rename_row_stage_key(&stage_key, "\u{0}T\u{0}big_legacy_atomic\u{0}1"),
+            db.get_seq()
+        )
+        .unwrap(),
+        Some("1".into())
     );
 }

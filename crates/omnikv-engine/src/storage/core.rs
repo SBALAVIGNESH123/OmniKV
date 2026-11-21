@@ -809,6 +809,12 @@ impl ScanBufferPool {
             .unwrap_or_default()
     }
 
+    fn clear(&self) {
+        if let Ok(mut buffers) = self.buffers.lock() {
+            buffers.clear();
+        }
+    }
+
     fn release(&self, mut buffer: Vec<u8>) {
         buffer.clear();
         if let Ok(mut buffers) = self.buffers.lock()
@@ -1363,7 +1369,7 @@ impl OmniKV {
         let ssi_history = std::sync::Arc::new(crate::transaction::SsiHistory::default());
         ssi_history.advance_eviction_floor(recovered.max_seq);
 
-        Ok(Arc::new(Self {
+        let db = Arc::new(Self {
             roots: ArcSwap::from_pointee(initial_roots),
             global_seq: AtomicU64::new(recovered.max_seq.saturating_add(1)),
             heap_file: Mutex::new(recovered.heap_file),
@@ -1390,7 +1396,10 @@ impl OmniKV {
             // not immediately reuse the previous instance's token sequence.
             file_seq: std::sync::atomic::AtomicU64::new(rand::random()),
             db_lock,
-        }))
+        });
+        db.sync_prepared_2pc_reservations()?;
+        db.scan_buffer_pool.clear();
+        Ok(db)
     }
 
     // ── Topology accessor helpers ─────────────────────────────────────────────
@@ -2109,7 +2118,7 @@ impl OmniKV {
                     .write_stall_wait_ms
                     .saturating_mul(compaction_policy.write_stall_wait_attempts as u64),
             );
-            let deadline = std::time::Instant::now() + total_wait;
+            let deadline = std::time::Instant::now().checked_add(total_wait);
             let mut stalled = true;
             let (ref stall_lock, ref cv) = self.compaction_cv;
             let mut guard = stall_lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -2118,7 +2127,10 @@ impl OmniKV {
                     stalled = false;
                     break;
                 }
-                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                let remaining = match deadline {
+                    Some(limit) => limit.saturating_duration_since(std::time::Instant::now()),
+                    None => total_wait,
+                };
                 if remaining.is_zero() {
                     break;
                 }
@@ -3069,9 +3081,6 @@ impl OmniKV {
             manifest.save(&self.manifest_path)?;
             self.update_roots(|r| StorageRoots {
                 manifest: Arc::new(manifest),
-                ..r.clone()
-            });
-            self.update_roots(|r| StorageRoots {
                 sstables: Arc::new(Vec::new()),
                 ..r.clone()
             });
@@ -4281,6 +4290,50 @@ mod tests {
         assert_eq!(
             db.find("after_stall", db.get_seq()).expect("read key"),
             Some("ok".into())
+        );
+    }
+
+    #[test]
+    fn open_restores_durable_2pc_prepared_key_reservations_before_participant_init() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let manifest = dir
+            .path()
+            .join("manifest.json")
+            .to_str()
+            .expect("manifest path")
+            .to_string();
+        let wal = dir
+            .path()
+            .join("wal.bin")
+            .to_str()
+            .expect("wal path")
+            .to_string();
+
+        {
+            let db = OmniKV::open(&manifest, &wal).expect("open db");
+            let participant = crate::dist_txn::TwoPhaseParticipant::new(2, db.clone());
+            let prep = participant.prepare(
+                (1, 501),
+                &[crate::dist_txn::DistWrite {
+                    node_id: 2,
+                    key: "reserved_on_reopen".into(),
+                    value: Some("prepared_v".into()),
+                    ttl: 0,
+                }],
+            );
+            assert_eq!(prep.vote, crate::dist_txn::Vote::Commit);
+        }
+
+        // Reopen without creating TwoPhaseParticipant yet: plain writes must
+        // still be blocked from clobbering the durable PREPARED key.
+        let reopened = OmniKV::open(&manifest, &wal).expect("reopen db");
+        let mut plain = WriteBatch::new();
+        plain
+            .set("reserved_on_reopen", "clobber".into())
+            .expect("stage plain write");
+        assert!(
+            reopened.commit_batch(&plain).is_err(),
+            "plain write must not overwrite a durable 2PC PREPARED key after restart"
         );
     }
 }

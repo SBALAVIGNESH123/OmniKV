@@ -805,9 +805,6 @@ fn commit_entry_exceeds_storage_limit(
     if committed_encoded.len() > crate::storage::core::MAX_VALUE_SIZE {
         return Ok(true);
     }
-    if !clustered {
-        return Ok(false);
-    }
 
     let mut commit_batch = WriteBatch::new();
     for write in writes {
@@ -846,6 +843,9 @@ fn commit_entry_exceeds_storage_limit(
         .is_err()
     {
         return Ok(true);
+    }
+    if !clustered {
+        return Ok(false);
     }
 
     let cmd = crate::raft_command::RaftCommand::from_batch_with_ssi(
@@ -2591,5 +2591,42 @@ mod tests {
             !commit_entry_exceeds_storage_limit(2, (1, 2), &fit_writes, &fit_keys, true).unwrap(),
             "clustered Raft COMMIT whose complete encoded entry fits MAX_VALUE_SIZE must still be accepted"
         );
+    }
+
+    #[test]
+    fn prepare_rejects_writes_whose_commit_batch_would_exceed_max_ops_in_local_mode() {
+        let (db, _dir) = test_db();
+        let participant = TwoPhaseParticipant::new(2, db.clone());
+
+        // MAX_OPS - 1 writes fits in the user batch, but commit() appends 2
+        // participant log records (MAX_OPS + 1 total) and would fail after
+        // voting COMMIT unless prepare rejects it up front.
+        let overflow_writes: Vec<DistWrite> = (0..(WriteBatch::MAX_OPS - 1))
+            .map(|i| DistWrite {
+                node_id: 2,
+                key: format!("k_{i}"),
+                value: Some("v".into()),
+                ttl: 0,
+            })
+            .collect();
+        let res = participant.prepare((1, 401), &overflow_writes);
+        assert!(
+            matches!(res.vote, Vote::Abort(_)),
+            "prepare must abort when commit_batch (writes + 2 participant records) exceeds MAX_OPS"
+        );
+
+        let fitting_writes: Vec<DistWrite> = (0..(WriteBatch::MAX_OPS - 2))
+            .map(|i| DistWrite {
+                node_id: 2,
+                key: format!("f_{i}"),
+                value: Some("v".into()),
+                ttl: 0,
+            })
+            .collect();
+        let ok_res = participant.prepare((1, 402), &fitting_writes);
+        assert_eq!(ok_res.vote, Vote::Commit);
+        participant
+            .commit((1, 402))
+            .expect("MAX_OPS - 2 writes + 2 participant records must commit cleanly");
     }
 }
