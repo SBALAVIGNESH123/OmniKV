@@ -36,9 +36,6 @@ use std::sync::Arc;
 use omni_engine::{OmniKV, config::ServerConfig, hardening::RateLimiter};
 
 fn print_banner(cfg: &ServerConfig, cluster_mode: Option<u64>) {
-    // The honesty rules this banner follows (issue #113): "Distributed"
-    // only when consensus is actually wired (a raft node booted), and
-    // the build credit names openraft instead of claiming every byte.
     let dist_line = match cluster_mode {
         Some(node_id) => format!("Raft cluster (node {node_id})"),
         None => "Single-node".to_string(),
@@ -193,24 +190,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         bootstrap_admin_key: cfg.bootstrap_admin_key.clone(),
         manifest_path,
         wal_path,
+        backup_dir: cfg.storage.backup_dir.clone(),
         rate_limiter: rate_limiter.clone(),
         cluster_gateway: cluster.as_ref().map(|c| c.gateway.clone()),
         cluster_node_id: cfg.raft.node_id,
     };
 
+    let raft_tls = cluster
+        .as_ref()
+        .filter(|_| cfg.raft.tls)
+        .map(|_| server_tls.for_next_listener());
+    let raft_ca_pem = if cfg.raft.tls {
+        cfg.raft
+            .tls_ca_path
+            .as_deref()
+            .map(std::fs::read)
+            .transpose()?
+    } else {
+        None
+    };
     let (http_handle, quic_handle, tcp_handle) =
         spawn_protocol_servers(db, &cfg, rate_limiter, app_state, server_tls).await?;
 
     // ─── 5. Raft consensus listener (cluster mode only) ───────
     // Serves /raft/{append,vote,snapshot} for this node's peers on the
-    // dedicated plaintext port — ON the consensus runtime (never the
-    // client-facing server runtime), so parked client workers can't
-    // starve peer RPCs either. A dead listener means a deaf cluster
+    // Consensus listener on its own runtime to avoid client worker starvation.
     // member, so its exit is handled like any other server exit below.
     let raft_handle = cluster.map(|node| {
         let handle = node.gateway.consensus_handle.clone();
         handle.spawn(async move {
-            if let Err(e) = raft_node::serve_raft_rpc(node).await {
+            if let Err(e) = raft_node::serve_raft_rpc(node, raft_tls, raft_ca_pem).await {
                 tracing::error!("Raft consensus listener exited: {e}");
             }
         })
@@ -1135,7 +1144,7 @@ fn dispatch_tcp_command(
         }
         "SCAN" => {
             let start = parts.next().unwrap_or("");
-            let end = parts.next().unwrap_or("\x7F");
+            let end = parts.next().unwrap_or("\u{10ffff}");
             let seq = db.get_seq();
             match db.scan(start, end, seq) {
                 Ok(results) => {

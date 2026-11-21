@@ -3,6 +3,7 @@
 //! Stores table definitions (columns, types) inside OmniKV itself
 //! using the key prefix `\x00CATALOG\x00`.
 
+use crate::secondary_index::IndexManager;
 use crate::{OmniError, OmniKV, WriteBatch};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
@@ -130,13 +131,16 @@ impl TableDef {
 pub struct Catalog {
     db: Arc<OmniKV>,
     cache: std::sync::RwLock<HashMap<String, TableDef>>,
+    index_manager: Arc<IndexManager>,
 }
 
 impl Catalog {
     pub fn new(db: Arc<OmniKV>) -> Self {
+        let index_manager = Arc::new(IndexManager::new(db.clone()));
         let cat = Self {
             db,
             cache: std::sync::RwLock::new(HashMap::new()),
+            index_manager,
         };
         cat.load_all(None);
         cat
@@ -147,9 +151,11 @@ impl Catalog {
     /// connection migrated in the meantime would otherwise decode this
     /// transaction's rows under the wrong NULL encoding.
     pub fn at_snapshot(db: Arc<OmniKV>, seq: u64) -> Self {
+        let index_manager = Arc::new(IndexManager::new(db.clone()));
         let cat = Self {
             db,
             cache: std::sync::RwLock::new(HashMap::new()),
+            index_manager,
         };
         cat.load_all(Some(seq));
         cat
@@ -157,10 +163,11 @@ impl Catalog {
 
     fn load_all(&self, seq: Option<u64>) {
         let seq = seq.unwrap_or_else(|| self.db.get_seq());
-        if let Ok(results) = self
-            .db
-            .scan(CATALOG_PREFIX, &format!("{}\x7F", CATALOG_PREFIX), seq)
-        {
+        if let Ok(results) = self.db.scan(
+            CATALOG_PREFIX,
+            &format!("{}\u{10ffff}", CATALOG_PREFIX),
+            seq,
+        ) {
             let mut cache = self
                 .cache
                 .write()
@@ -204,32 +211,61 @@ impl Catalog {
 
     pub fn drop_table(&self, name: &str) -> Result<(), String> {
         let name_lower = name.to_lowercase();
-        let table = {
-            let cache = self
-                .cache
-                .read()
-                .expect("catalog cache RwLock poisoned: fatal invariant");
-            cache
-                .get(&name_lower)
-                .cloned()
-                .ok_or_else(|| format!("Table '{}' does not exist", name))?
-        };
+        let mut cache = self
+            .cache
+            .write()
+            .expect("catalog cache RwLock poisoned: fatal invariant");
+        let table = cache
+            .get(&name_lower)
+            .cloned()
+            .ok_or_else(|| format!("Table '{}' does not exist", name))?;
 
-        // Delete all rows
         let prefix = table.row_prefix();
         let seq = self.db.get_seq();
         let rows = self
             .db
-            .scan(&prefix, &format!("{}\x7F", prefix), seq)
+            .scan(&prefix, &format!("{}\u{10ffff}", prefix), seq)
             .map_err(|e| format!("{:?}", e))?;
+        let (index_entry_keys, index_meta_keys) = self
+            .index_manager
+            .collect_drop_index_keys_for_collection_at(&table.name, seq)
+            .map_err(|e| format!("{e:?}"))?;
 
-        // Delete the table rows and catalog entry in one atomic batch. The
-        // scan above must succeed before we build the batch, so corruption
-        // cannot turn DROP into a schema-only delete; one commit also avoids
-        // leaving orphaned rows if the second of two commits would fail.
+        let chunk_cap = WriteBatch::MAX_OPS.saturating_sub(4);
         let mut batch = WriteBatch::new();
-        for (key, _) in &rows {
+        for key in rows
+            .iter()
+            .map(|(k, _)| k.as_str())
+            .chain(index_entry_keys.iter().map(String::as_str))
+        {
             batch.delete(key).map_err(|e| format!("{:?}", e))?;
+            if batch.op_count() >= chunk_cap {
+                self.db
+                    .commit_batch(&batch)
+                    .map_err(|e| format!("{:?}", e))?;
+                batch = WriteBatch::new();
+            }
+        }
+        if !batch.is_empty()
+            && batch
+                .op_count()
+                .saturating_add(index_meta_keys.len())
+                .saturating_add(1)
+                > WriteBatch::MAX_OPS
+        {
+            self.db
+                .commit_batch(&batch)
+                .map_err(|e| format!("{:?}", e))?;
+            batch = WriteBatch::new();
+        }
+        for meta_key in &index_meta_keys {
+            if batch.op_count().saturating_add(1) >= WriteBatch::MAX_OPS {
+                self.db
+                    .commit_batch(&batch)
+                    .map_err(|e| format!("{:?}", e))?;
+                batch = WriteBatch::new();
+            }
+            batch.delete(meta_key).map_err(|e| format!("{:?}", e))?;
         }
         let cat_key = format!("{}{}", CATALOG_PREFIX, name_lower);
         batch.delete(&cat_key).map_err(|e| format!("{:?}", e))?;
@@ -237,10 +273,6 @@ impl Catalog {
             .commit_batch(&batch)
             .map_err(|e| format!("{:?}", e))?;
 
-        let mut cache = self
-            .cache
-            .write()
-            .expect("catalog cache RwLock poisoned: fatal invariant");
         cache.remove(&name_lower);
         Ok(())
     }
@@ -323,6 +355,11 @@ impl Catalog {
         cache.get(&name.to_lowercase()).cloned()
     }
 
+    /// Shared index maintenance/catalog view for SQL planning and DML.
+    pub fn index_manager(&self) -> Arc<IndexManager> {
+        self.index_manager.clone()
+    }
+
     pub fn list_tables(&self) -> Vec<String> {
         let cache = self
             .cache
@@ -350,7 +387,11 @@ impl Catalog {
     ) -> Result<Vec<String>, String> {
         let mut entries: BTreeMap<_, _> = self
             .db
-            .scan(CATALOG_PREFIX, &format!("{}\x7F", CATALOG_PREFIX), seq)
+            .scan(
+                CATALOG_PREFIX,
+                &format!("{}\u{10ffff}", CATALOG_PREFIX),
+                seq,
+            )
             .map_err(|e| format!("Catalog scan failed: {e:?}"))?
             .into_iter()
             .collect();

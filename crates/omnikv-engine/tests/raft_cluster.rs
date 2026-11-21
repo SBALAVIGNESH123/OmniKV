@@ -2122,7 +2122,7 @@ fn test_2pc_happy_path_commit() {
     let participant3 = TwoPhaseParticipant::new(30, db_p3.clone());
 
     // BEGIN distributed transaction
-    let txn_id = coordinator.begin();
+    let txn_id = coordinator.begin().unwrap();
     assert_eq!(coordinator.get_state(txn_id), Some(DistTxnState::Preparing));
 
     // Add writes for each participant
@@ -2215,7 +2215,7 @@ fn test_2pc_abort_on_single_abort_vote() {
     let participant2 = TwoPhaseParticipant::new(20, db_p2.clone());
 
     // BEGIN
-    let txn_id = coordinator.begin();
+    let txn_id = coordinator.begin().unwrap();
 
     coordinator
         .add_write(txn_id, 10, "abort_key1".into(), Some("val1".into()), 0)
@@ -2296,7 +2296,7 @@ fn test_2pc_coordinator_wal_persistence() {
         let participant = TwoPhaseParticipant::new(10, db);
 
         // Run a full 2PC
-        txn_id = coordinator.begin();
+        txn_id = coordinator.begin().unwrap();
         coordinator
             .add_write(
                 txn_id,
@@ -2398,7 +2398,7 @@ fn test_2pc_cross_shard_with_raft_replication() {
     let p3 = TwoPhaseParticipant::new(30, db_s3_primary.clone());
 
     // Create a multi-shard transaction: transfer money across 3 accounts
-    let txn_id = coordinator.begin();
+    let txn_id = coordinator.begin().unwrap();
     coordinator
         .add_write(
             txn_id,
@@ -2537,7 +2537,7 @@ fn test_2pc_concurrent_independent_transactions() {
     let participant2 = TwoPhaseParticipant::new(20, db_p2.clone());
 
     // === Txn1: will COMMIT ===
-    let txn1 = coordinator.begin();
+    let txn1 = coordinator.begin().unwrap();
     coordinator
         .add_write(txn1, 10, "conc_committed_1".into(), Some("yes1".into()), 0)
         .unwrap();
@@ -2546,7 +2546,7 @@ fn test_2pc_concurrent_independent_transactions() {
         .unwrap();
 
     // === Txn2: will ABORT ===
-    let txn2 = coordinator.begin();
+    let txn2 = coordinator.begin().unwrap();
     coordinator
         .add_write(txn2, 10, "conc_aborted_1".into(), Some("no1".into()), 0)
         .unwrap();
@@ -2735,14 +2735,6 @@ fn test_ssi_no_false_positive() {
 }
 
 /// Gap #9d: Overlapping txns — T2 reads a key that T1 writes concurrently.
-///
-/// This is the rw-antidependency conflict (and the shape of the classic
-/// write-skew): T2 snapshotted `chain_y` before T1 committed a new value
-/// for it, so T2's commit must abort. NOTE: despite an earlier name, this
-/// never exercised the "dangerous structure" pivot check — that check was
-/// unreachable dead code and has been removed; the abort here comes from
-/// the plain RW branch, which is what catches the crossing read/write
-/// pair.
 #[test]
 fn test_ssi_rw_antidependency_chain() {
     let (db, _, _d) = create_node("ssi_chain");
@@ -2787,7 +2779,7 @@ fn test_deadlock_across_2pc_participants() {
     db.commit_batch(&batch).unwrap();
 
     // Txn1: write to conflict_key via 2PC
-    let txn1 = coordinator.begin();
+    let txn1 = coordinator.begin().unwrap();
     coordinator
         .add_write(txn1, 10, "conflict_key".into(), Some("txn1_val".into()), 0)
         .unwrap();
@@ -2802,7 +2794,7 @@ fn test_deadlock_across_2pc_participants() {
     coordinator.finalize_commit(txn1).unwrap();
 
     // Txn2: also writes conflict_key — should succeed (no in-memory SSI conflict for 2PC)
-    let txn2 = coordinator.begin();
+    let txn2 = coordinator.begin().unwrap();
     coordinator
         .add_write(txn2, 10, "conflict_key".into(), Some("txn2_val".into()), 0)
         .unwrap();
@@ -4784,7 +4776,7 @@ async fn test_v2_snapshot_missing_history_field_is_rejected() {
     let snapshot = builder.build_snapshot().await.unwrap();
     let mut json: serde_json::Value =
         serde_json::from_slice(&snapshot.snapshot.into_inner()).unwrap();
-    assert_eq!(json["version"], 2, "a current snapshot is version 2");
+    assert_eq!(json["version"], 3, "a current snapshot is version 3");
     json.as_object_mut()
         .expect("snapshot envelope is a JSON object")
         .remove("ssi_history");
@@ -4808,4 +4800,69 @@ async fn test_v2_snapshot_missing_history_field_is_rejected() {
     );
 
     println!("✅ Malformed v2 snapshot (missing history) rejected");
+}
+
+#[tokio::test]
+async fn test_snapshot_install_blocks_pre_install_2pc_prepare_against_plain_writes() {
+    use omni_engine::dist_txn::{DistWrite, TwoPhaseParticipant, Vote};
+    use openraft::storage::RaftSnapshotBuilder;
+
+    let (leader_db, leader, _leader_dir) = create_node("ssi_2pc_snap_leader");
+    let (follower_db, follower, _follower_dir) = create_node("ssi_2pc_snap_follower");
+
+    // Seed follower with higher local sequences than the rebuilt temp DB will
+    // assign during snapshot install, ensuring the fallback get_seq_for_key
+    // check alone would NOT catch a snapshot-carried plain write.
+    for i in 1..=20 {
+        let mut local = omni_engine::WriteBatch::new();
+        local.set(&format!("local_k{i}"), "v".into()).unwrap();
+        follower_db.commit_batch(&local).unwrap();
+    }
+    let pre_install_read_seq = follower_db.get_seq().saturating_sub(1);
+
+    // Leader applies a PLAIN write (not an SSI transaction, so it does not
+    // appear in envelope.ssi_history).
+    leader
+        .append_log(1, "SET snap_plain_k from_leader_plain")
+        .unwrap();
+    apply_range(&leader, 1, 2);
+    let leader_max_seq = leader_db.get_seq();
+
+    let mut builder = leader.clone();
+    let snapshot = builder.build_snapshot().await.unwrap();
+    let mut installer = follower.clone();
+    installer
+        .install_snapshot(&snapshot.meta, snapshot.snapshot)
+        .await
+        .unwrap();
+
+    assert!(
+        follower_db.ssi_history().eviction_floor() >= leader_max_seq,
+        "installed SSI eviction floor must be at least the snapshot's max_seq"
+    );
+
+    let participant = TwoPhaseParticipant::new(2, follower_db.clone());
+    let writes = vec![DistWrite {
+        node_id: 2,
+        key: "snap_plain_k".into(),
+        value: Some("from_2pc".into()),
+        ttl: 0,
+    }];
+    let stale_vote = participant.prepare_with_snapshot((1, 1), &writes, pre_install_read_seq);
+    match stale_vote.vote {
+        Vote::Abort(reason) => assert!(
+            reason.contains("SSI CONFLICT"),
+            "expected SSI conflict on pre-install 2PC prepare, got: {reason}"
+        ),
+        Vote::Commit => panic!(
+            "pre-install 2PC prepare must not vote COMMIT across a snapshot carrying plain writes"
+        ),
+    }
+
+    let fresh_vote = participant.prepare((1, 2), &writes);
+    assert_eq!(
+        fresh_vote.vote,
+        Vote::Commit,
+        "post-install 2PC prepare must still succeed"
+    );
 }

@@ -267,9 +267,17 @@ const COMMIT_STRIPE_COUNT: usize = 64;
 /// The `commit_seq` each entry is recorded at is per-node (every node's
 /// sequence counter is its own), so it is stamped by the apply from the
 /// LOCAL batch marker, never carried across the wire.
+type PreparedKeyOwner = (u64, (u64, u64));
+
 pub struct SsiHistory {
     /// Recently committed transactions, kept for conflict detection.
     committed_txns: Mutex<Vec<CommittedTxn>>,
+    prepared_keys: Mutex<HashMap<String, PreparedKeyOwner>>,
+    plain_write_seqs: Mutex<HashMap<String, u64>>,
+    evicted_max_seq: AtomicU64,
+    plain_evicted_max_seq: AtomicU64,
+    /// Hard ceiling to prevent unbounded growth between prunes.
+    max_entries: usize,
 }
 
 impl SsiHistory {
@@ -282,19 +290,259 @@ impl SsiHistory {
             .committed_txns
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        committed.push(CommittedTxn {
-            txn_id,
-            commit_seq,
-            write_keys: record.write_keys.iter().cloned().collect(),
-            read_keys: record.read_keys.iter().cloned().collect(),
-            read_ranges: record.read_ranges.clone(),
-        });
+        self.push_committed_locked(
+            &mut committed,
+            CommittedTxn {
+                txn_id,
+                commit_seq,
+                write_keys: record.write_keys.iter().cloned().collect(),
+                read_keys: record.read_keys.iter().cloned().collect(),
+                read_ranges: record.read_ranges.clone(),
+            },
+        );
+    }
+
+    pub(crate) fn committed_seq_for_txn(&self, txn_id: TxnId) -> Option<u64> {
+        let committed = self
+            .committed_txns
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        committed
+            .iter()
+            .rev()
+            .find(|c| c.txn_id == txn_id)
+            .map(|c| c.commit_seq)
+    }
+
+    fn push_committed_locked(&self, committed: &mut Vec<CommittedTxn>, entry: CommittedTxn) {
+        if committed.len() >= self.max_entries {
+            let drain_count = self.max_entries / 4;
+            let max_evicted = committed
+                .drain(..drain_count)
+                .map(|c| c.commit_seq)
+                .max()
+                .unwrap_or(0);
+            if max_evicted > 0 {
+                self.evicted_max_seq
+                    .fetch_max(max_evicted, Ordering::SeqCst);
+            }
+        }
+        committed.push(entry);
     }
 
     /// The number of committed transaction records being held for
     /// conflict detection.
     pub fn committed_record_count(&self) -> usize {
         self.committed_txns.lock().map(|c| c.len()).unwrap_or(0)
+    }
+
+    pub(crate) fn reserve_prepared_keys(
+        &self,
+        node_id: u64,
+        txn_id: (u64, u64),
+        keys: &[String],
+    ) -> Result<(), String> {
+        let mut prepared = self.prepared_keys.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((conflict_key, (_, conflict_txn))) = keys.iter().find_map(|key| {
+            prepared
+                .get(key)
+                .copied()
+                .filter(|&owner| owner != (node_id, txn_id))
+                .map(|owner| (key, owner))
+        }) {
+            return Err(format!(
+                "prepared key '{}' is reserved by transaction {:?}",
+                conflict_key, conflict_txn
+            ));
+        }
+        for key in keys {
+            prepared.insert(key.clone(), (node_id, txn_id));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn release_prepared_keys(&self, node_id: u64, txn_id: (u64, u64), keys: &[String]) {
+        let mut prepared = self.prepared_keys.lock().unwrap_or_else(|e| e.into_inner());
+        for key in keys {
+            if prepared
+                .get(key)
+                .is_some_and(|&owner| owner == (node_id, txn_id))
+            {
+                prepared.remove(key);
+            }
+        }
+    }
+
+    pub(crate) fn release_prepared_keys_for_txn(&self, node_id: u64, txn_id: (u64, u64)) {
+        let mut prepared = self.prepared_keys.lock().unwrap_or_else(|e| e.into_inner());
+        prepared.retain(|_, &mut owner| owner != (node_id, txn_id));
+    }
+
+    pub(crate) fn replace_prepared_keys_for_node(
+        &self,
+        node_id: u64,
+        keys: &HashMap<String, (u64, u64)>,
+    ) -> Result<(), String> {
+        let mut prepared = self.prepared_keys.lock().unwrap_or_else(|e| e.into_inner());
+        for key in keys.keys() {
+            if let Some(&(owner_node, owner_txn)) = prepared.get(key)
+                && owner_node != node_id
+            {
+                return Err(format!(
+                    "prepared key '{}' is reserved by transaction {:?}",
+                    key, owner_txn
+                ));
+            }
+        }
+        prepared.retain(|_, (owner_node, _)| *owner_node != node_id);
+        for (key, txn_id) in keys {
+            prepared.insert(key.clone(), (node_id, *txn_id));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn replace_all_prepared_keys(&self, keys: HashMap<String, PreparedKeyOwner>) {
+        let mut prepared = self.prepared_keys.lock().unwrap_or_else(|e| e.into_inner());
+        *prepared = keys;
+    }
+
+    pub(crate) fn merge_prepared_keys(&self, reservations: HashMap<String, PreparedKeyOwner>) {
+        let mut prepared = self.prepared_keys.lock().unwrap_or_else(|e| e.into_inner());
+        for (key, owner) in reservations {
+            prepared.insert(key, owner);
+        }
+    }
+
+    pub(crate) fn check_prepared_write_conflict(&self, key: &str) -> Option<String> {
+        let prepared = self.prepared_keys.lock().unwrap_or_else(|e| e.into_inner());
+        prepared.get(key).map(|(node_id, txn_id)| {
+            format!(
+                "SSI CONFLICT (2PC): prepared key '{}' is reserved by node {} txn {:?}",
+                key, node_id, txn_id
+            )
+        })
+    }
+
+    pub(crate) fn check_batch_prepared_conflicts(&self, batch: &WriteBatch) -> Option<String> {
+        let prepared = self.prepared_keys.lock().unwrap_or_else(|e| e.into_inner());
+        if prepared.is_empty() {
+            return None;
+        }
+        batch
+            .buffered_writes
+            .iter()
+            .map(|(key, _, _)| key.as_slice())
+            .chain(batch.buffered_deletes.iter().map(Vec::as_slice))
+            .find_map(|key| {
+                let key_str = std::str::from_utf8(key).ok()?;
+                prepared.get(key_str).map(|(node_id, txn_id)| {
+                    format!(
+                        "SSI CONFLICT (2PC): prepared key '{}' is reserved by node {} txn {:?}",
+                        key_str, node_id, txn_id
+                    )
+                })
+            })
+    }
+
+    fn check_prepared_txn_write_conflicts(&self, txn: &Transaction) -> Option<String> {
+        let prepared = self.prepared_keys.lock().unwrap_or_else(|e| e.into_inner());
+        txn.write_set.keys().find_map(|key| {
+            prepared.get(key).map(|(node_id, txn_id)| {
+                format!(
+                    "SSI CONFLICT (2PC): prepared key '{}' is reserved by node {} txn {:?}",
+                    key, node_id, txn_id
+                )
+            })
+        })
+    }
+
+    pub(crate) fn record_plain_batch(&self, tx: &crate::WriteBatch, commit_seq: u64) {
+        let mut plain = self
+            .plain_write_seqs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        for key in tx
+            .buffered_writes
+            .iter()
+            .map(|(k, _, _)| k.as_slice())
+            .chain(tx.buffered_deletes.iter().map(Vec::as_slice))
+        {
+            if key.starts_with(b"__sys__/raft/") || key.starts_with(b"__2PC_") {
+                continue;
+            }
+            if let Ok(key_str) = std::str::from_utf8(key) {
+                plain
+                    .entry(key_str.to_string())
+                    .and_modify(|seq| *seq = (*seq).max(commit_seq))
+                    .or_insert(commit_seq);
+            }
+        }
+        if plain.len() > self.max_entries {
+            let mut seqs: Vec<u64> = plain.values().copied().collect();
+            seqs.sort_unstable();
+            let cutoff = seqs[seqs.len() / 4];
+            plain.retain(|_, seq| *seq > cutoff);
+            self.plain_evicted_max_seq
+                .fetch_max(cutoff, Ordering::SeqCst);
+        }
+    }
+
+    pub(crate) fn advance_eviction_floor(&self, seq: u64) {
+        self.evicted_max_seq.fetch_max(seq, Ordering::SeqCst);
+    }
+
+    /// Checks whether a distributed prepare would conflict with a committed
+    /// write that became visible after its snapshot. Distributed transactions
+    /// currently carry writes only (no predicate/read-set payload), so this
+    /// deliberately performs the write-write portion of SSI at prepare time.
+    pub(crate) fn check_write_conflicts(
+        &self,
+        read_seq: u64,
+        write_keys: &[String],
+    ) -> Option<String> {
+        let committed = self
+            .committed_txns
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let plain = self
+            .plain_write_seqs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let evicted_max = self
+            .evicted_max_seq
+            .load(Ordering::SeqCst)
+            .max(self.plain_evicted_max_seq.load(Ordering::SeqCst));
+        if read_seq < evicted_max {
+            return Some(format!(
+                "SSI CONFLICT: snapshot {} predates pruned history at seq {}",
+                read_seq, evicted_max
+            ));
+        }
+        if let Some(conflict) = committed
+            .iter()
+            .filter(|entry| entry.commit_seq > read_seq)
+            .flat_map(|entry| {
+                write_keys
+                    .iter()
+                    .filter(|key| entry.write_keys.contains(*key))
+                    .map(move |key| {
+                        format!(
+                            "SSI CONFLICT (WW): key '{}' written by txn {} at seq {}",
+                            key, entry.txn_id, entry.commit_seq
+                        )
+                    })
+            })
+            .next()
+        {
+            return Some(conflict);
+        }
+        write_keys.iter().find_map(|key| {
+            plain
+                .get(key)
+                .copied()
+                .filter(|&seq| seq > read_seq)
+                .map(|seq| format!("SSI CONFLICT (WW): key '{}' written at seq {}", key, seq))
+        })
     }
 
     /// A serializable snapshot of the committed history, for a raft
@@ -323,15 +571,28 @@ impl SsiHistory {
             .collect()
     }
 
+    /// Returns the current eviction floor for snapshot serialization.
+    pub fn eviction_floor(&self) -> u64 {
+        self.evicted_max_seq.load(Ordering::SeqCst)
+    }
+
     /// Replaces the whole history, used by snapshot install: the data was
     /// replaced wholesale, so the in-memory history must be too, then
     /// refilled from what the snapshot carried.
-    pub fn install_from(&self, entries: Vec<(TxnId, u64, SsiCommitRecord)>) {
+    pub fn install_from(&self, entries: Vec<(TxnId, u64, SsiCommitRecord)>, eviction_floor: u64) {
         let mut committed = self
             .committed_txns
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        let mut plain = self
+            .plain_write_seqs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        self.evicted_max_seq.store(eviction_floor, Ordering::SeqCst);
+        self.plain_evicted_max_seq
+            .store(eviction_floor, Ordering::SeqCst);
         committed.clear();
+        plain.clear();
         for (txn_id, commit_seq, record) in entries {
             committed.push(CommittedTxn {
                 txn_id,
@@ -360,15 +621,15 @@ impl SsiHistory {
         &self,
         txn: &Transaction,
     ) -> (Option<String>, std::sync::MutexGuard<'_, Vec<CommittedTxn>>) {
-        // The only lock SsiHistory takes, so there is no second lock to
-        // order against. Poison-tolerant like the stripes: a panicked
-        // holder never leaves the Vec torn.
+        let prepared_conflict = self.check_prepared_txn_write_conflicts(txn);
         let committed = self
             .committed_txns
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        let evicted_max = self.evicted_max_seq.load(Ordering::SeqCst);
 
-        let found = Self::scan_conflicts(txn, &committed);
+        let found =
+            prepared_conflict.or_else(|| Self::scan_conflicts(txn, &committed, evicted_max));
         (found, committed)
     }
 
@@ -377,7 +638,17 @@ impl SsiHistory {
     /// this mutex) can validate without holding the history lock across
     /// the await-able propose, while the single-node path holds the lock
     /// across both scan and record via `detect_conflicts_locked`.
-    fn scan_conflicts(txn: &Transaction, committed: &[CommittedTxn]) -> Option<String> {
+    fn scan_conflicts(
+        txn: &Transaction,
+        committed: &[CommittedTxn],
+        evicted_max_seq: u64,
+    ) -> Option<String> {
+        if txn.read_seq < evicted_max_seq {
+            return Some(format!(
+                "SSI CONFLICT: snapshot {} predates pruned history at seq {}",
+                txn.read_seq, evicted_max_seq
+            ));
+        }
         let mut found = None;
         'outer: for committed_txn in committed.iter() {
             if committed_txn.commit_seq > txn.read_seq {
@@ -456,11 +727,15 @@ impl SsiHistory {
     /// stall every concurrent commit on the node for each consensus
     /// round trip.
     fn detect_conflicts(&self, txn: &Transaction) -> Option<String> {
+        if let Some(conflict) = self.check_prepared_txn_write_conflicts(txn) {
+            return Some(conflict);
+        }
         let committed = self
             .committed_txns
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        Self::scan_conflicts(txn, &committed)
+        let evicted_max = self.evicted_max_seq.load(Ordering::SeqCst);
+        Self::scan_conflicts(txn, &committed, evicted_max)
     }
 
     /// Removes committed transaction records that are no longer needed
@@ -475,6 +750,14 @@ impl SsiHistory {
             .committed_txns
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        if let Some(max_pruned) = committed
+            .iter()
+            .filter(|c| c.commit_seq < min_active_seq)
+            .map(|c| c.commit_seq)
+            .max()
+        {
+            self.evicted_max_seq.fetch_max(max_pruned, Ordering::SeqCst);
+        }
         committed.retain(|c| c.commit_seq >= min_active_seq);
     }
 }
@@ -483,6 +766,11 @@ impl Default for SsiHistory {
     fn default() -> Self {
         Self {
             committed_txns: Mutex::new(Vec::new()),
+            prepared_keys: Mutex::new(HashMap::new()),
+            plain_write_seqs: Mutex::new(HashMap::new()),
+            evicted_max_seq: AtomicU64::new(0),
+            plain_evicted_max_seq: AtomicU64::new(0),
+            max_entries: 100_000,
         }
     }
 }
@@ -861,19 +1149,45 @@ impl TransactionManager {
         }
 
         // No conflicts! Build the batch the SSI engine would apply.
-        let batch = Self::build_write_batch(txn)?;
-        let commit_seq = self.db.commit_batch_local_locked(&batch)?;
+        let batch = match Self::build_write_batch(txn) {
+            Ok(batch) => batch,
+            Err(error) => {
+                drop(committed_guard);
+                txn.state = TxnState::Aborted;
+                self.cleanup_txn(txn.id, txn.read_seq);
+                self.metrics.txns_aborted.fetch_add(1, Ordering::Relaxed);
+                return Err(error);
+            }
+        };
+        let commit_seq = match self.db.commit_batch_local_locked(&batch) {
+            Ok(seq) => seq,
+            Err(error) => {
+                drop(committed_guard);
+                txn.state = TxnState::Aborted;
+                self.cleanup_txn(txn.id, txn.read_seq);
+                if matches!(&error, OmniError::IoError(msg) if msg.starts_with("SSI CONFLICT")) {
+                    self.metrics
+                        .conflicts_detected
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                self.metrics.txns_aborted.fetch_add(1, Ordering::Relaxed);
+                return Err(error);
+            }
+        };
 
         // Record this transaction by pushing into the guard we still hold
         // — no other txn can have snuck between our validation and this
         // record.
-        committed_guard.push(CommittedTxn {
-            txn_id: txn.id,
-            commit_seq,
-            write_keys: txn.write_set.keys().cloned().collect(),
-            read_keys: txn.read_set.clone(),
-            read_ranges: txn.read_ranges.clone(),
-        });
+        self.history.push_committed_locked(
+            &mut committed_guard,
+            CommittedTxn {
+                txn_id: txn.id,
+                commit_seq,
+                write_keys: txn.write_set.keys().cloned().collect(),
+                read_keys: txn.read_set.clone(),
+                read_ranges: txn.read_ranges.clone(),
+            },
+        );
         drop(committed_guard);
 
         txn.state = TxnState::Committed;
@@ -969,6 +1283,7 @@ impl TransactionManager {
     fn build_write_batch(txn: &Transaction) -> Result<WriteBatch, OmniError> {
         let mut batch = WriteBatch::new();
         for (key, (value, ttl)) in &txn.write_set {
+            OmniKV::validate_client_key_bytes(key.as_bytes())?;
             match value {
                 Some(val) => {
                     if *ttl > 0 {
@@ -1001,7 +1316,7 @@ mod commit_seq_number_space {
     //! clustered commit (whose `read_seq` is exactly that marker) sees the
     //! commit as already visible rather than concurrent.
 
-    use super::{CommittedTxn, Transaction, TransactionManager};
+    use super::{CommittedTxn, SsiHistory, Transaction, TransactionManager};
     use crate::{OmniKV, WriteBatch};
     use std::collections::HashSet;
 
@@ -1122,6 +1437,70 @@ mod commit_seq_number_space {
             mgr.get(&mut t2, "k").expect("read k"),
             Some("v1".into()),
             "a write committed before our snapshot must be visible"
+        );
+    }
+
+    #[test]
+    fn plain_write_eviction_does_not_abort_local_ssi_transactions() {
+        let history = SsiHistory {
+            max_entries: 4,
+            ..Default::default()
+        };
+
+        for idx in 1..=5u64 {
+            let mut batch = WriteBatch::new();
+            batch.set(&format!("plain_{idx}"), "v".into()).unwrap();
+            history.record_plain_batch(&batch, idx * 10);
+        }
+
+        assert_eq!(
+            history.eviction_floor(),
+            0,
+            "plain-write eviction must not advance the local SSI eviction floor"
+        );
+
+        let mut local_txn = Transaction::new(1, 5);
+        local_txn
+            .write_set
+            .insert("local_only".into(), (Some("ok".into()), 0));
+        assert!(
+            history.detect_conflicts(&local_txn).is_none(),
+            "local SSI transaction must not fail closed because of plain-write eviction"
+        );
+
+        let stale_prepare = history.check_write_conflicts(5, &["other".to_string()]);
+        assert!(
+            stale_prepare
+                .as_deref()
+                .is_some_and(|msg| msg.contains("predates pruned history")),
+            "stale 2PC prepare must still fail closed after plain-write eviction, got: {stale_prepare:?}"
+        );
+
+        assert!(
+            history
+                .check_write_conflicts(20, &["other".to_string()])
+                .is_none(),
+            "2PC prepare at the plain eviction cutoff must pass for unaffected keys"
+        );
+        assert!(
+            history
+                .check_write_conflicts(20, &["plain_5".to_string()])
+                .is_some(),
+            "2PC prepare must still detect surviving plain writes above cutoff"
+        );
+
+        history.install_from(Vec::new(), 15);
+        assert!(
+            history
+                .check_write_conflicts(14, &["other".to_string()])
+                .is_some(),
+            "install_from must restore the plain eviction floor"
+        );
+        assert!(
+            history
+                .check_write_conflicts(15, &["other".to_string()])
+                .is_none(),
+            "read_seq at the installed floor must pass"
         );
     }
 }

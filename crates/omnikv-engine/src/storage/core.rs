@@ -1247,6 +1247,9 @@ pub struct OmniKV {
     scan_buffer_pool: Arc<ScanBufferPool>,
     compaction_policy: RwLock<CompactionPolicy>,
 
+    // Wakes writers stalled on L0 compaction backlog.
+    compaction_cv: (std::sync::Mutex<()>, std::sync::Condvar),
+
     // ── Group commit engine ──
     // Batches concurrent fsyncs: N writers → 1 fsync instead of N fsyncs.
     group_commit: crate::hardening::GroupCommitEngine,
@@ -1373,6 +1376,7 @@ impl OmniKV {
             block_cache: moka::sync::Cache::builder().max_capacity(100_000).build(),
             scan_buffer_pool: Arc::new(ScanBufferPool::default()),
             compaction_policy: RwLock::new(CompactionPolicy::default()),
+            compaction_cv: (std::sync::Mutex::new(()), std::sync::Condvar::new()),
             // Group commit: wait up to 200µs for more writers to join each batch.
             // On SSDs, this batches 5-50 concurrent writes into a single fsync.
             group_commit: crate::hardening::GroupCommitEngine::new(200),
@@ -1841,6 +1845,25 @@ impl OmniKV {
         Ok(results)
     }
 
+    /// Collects up to `limit` visible entries in the lexical range `[start_key, end_key]`.
+    pub fn scan_limit(
+        &self,
+        start_key: &str,
+        end_key: &str,
+        read_seq: u64,
+        limit: usize,
+    ) -> Result<Vec<(String, String)>, OmniError> {
+        let mut results = Vec::with_capacity(limit);
+        let mut iter = self.scan_iter_inner(start_key, end_key, read_seq)?;
+        while results.len() < limit {
+            let Some(entry) = iter.try_next()? else {
+                break;
+            };
+            results.push(entry);
+        }
+        Ok(results)
+    }
+
     pub fn set_global_seq(&self, seq: u64) {
         self.global_seq.store(seq, Ordering::SeqCst);
     }
@@ -1885,6 +1908,8 @@ impl OmniKV {
                 pos += n as u64;
             }
         }
+        crate::failpoints::maybe_fail("heap::sync_data")
+            .map_err(|e| OmniError::IoError(format!("heap failure point: {e}")))?;
         heap.sync_data()?;
         self.heap_offset
             .store(offset + data.len() as u64, Ordering::SeqCst);
@@ -1915,7 +1940,22 @@ impl OmniKV {
             .heap_file
             .lock()
             .map_err(|_| OmniError::LockPoisoned("heap_file".into()))?;
+        crate::failpoints::maybe_fail("heap::sync_all")
+            .map_err(|e| OmniError::IoError(format!("heap failure point: {e}")))?;
         heap.sync_all()?;
+        Ok(())
+    }
+
+    pub(crate) fn validate_client_key_bytes(key: &[u8]) -> Result<(), OmniError> {
+        if key.starts_with(b"__sys__/raft/")
+            || key.starts_with(b"__2PC_LOG__/")
+            || key.starts_with(b"__2PC_PREPARE__/")
+            || key.starts_with(b"__2PC_")
+        {
+            return Err(OmniError::IoError(
+                "reserved consensus/transaction system key".into(),
+            ));
+        }
         Ok(())
     }
 
@@ -1929,6 +1969,19 @@ impl OmniKV {
     /// This allows multiple concurrent batches to overlap their CPU-intensive
     /// compression work and only serialize briefly for sequence numbering.
     pub fn commit_batch(&self, tx: &WriteBatch) -> Result<u64, OmniError> {
+        for key in tx
+            .buffered_writes
+            .iter()
+            .map(|(key, _, _)| key.as_slice())
+            .chain(tx.buffered_deletes.iter().map(Vec::as_slice))
+        {
+            Self::validate_client_key_bytes(key)?;
+            if let Ok(key_str) = std::str::from_utf8(key)
+                && let Some(conflict) = self.ssi_history.check_prepared_write_conflict(key_str)
+            {
+                return Err(OmniError::IoError(conflict));
+            }
+        }
         // Clustered: client writes must be consensus-replicated before
         // they are acknowledged. The gateway proposes this batch as one
         // raft entry; raft's state machine (not this call) applies it
@@ -1941,9 +1994,71 @@ impl OmniKV {
         self.commit_batch_local(tx)
     }
 
+    /// Commits engine-internal 2PC metadata, bypassing client key validation.
+    pub(crate) fn commit_2pc_batch(&self, tx: &WriteBatch) -> Result<u64, OmniError> {
+        if let Some(gateway) = self.cluster_gateway.get() {
+            crate::dist_txn::validate_2pc_decision_writes(self, None, tx)?;
+            return gateway.commit_2pc_batch(tx);
+        }
+        let lock = self.sql_table_lock("\x002PC_LOCAL_COMMIT")?;
+        let _guard = lock
+            .lock()
+            .map_err(|_| OmniError::LockPoisoned("2PC local commit".into()))?;
+        crate::dist_txn::validate_2pc_decision_writes(self, None, tx)?;
+        self.commit_batch_local(tx)
+    }
+
+    pub(crate) fn ensure_cluster_linearizable(&self) -> Result<(), OmniError> {
+        if let Some(gateway) = self.cluster_gateway.get() {
+            gateway.probe_blocking().map_err(OmniError::IoError)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn commit_2pc_batch_with_ssi(
+        &self,
+        tx: &WriteBatch,
+        ssi: crate::transaction::SsiCommitRecord,
+    ) -> Result<u64, OmniError> {
+        if let Some(gateway) = self.cluster_gateway.get() {
+            crate::dist_txn::validate_2pc_decision_writes(self, None, tx)?;
+            return gateway.commit_2pc_batch_with_ssi(tx, ssi);
+        }
+        let lock = self.sql_table_lock("\x002PC_LOCAL_COMMIT")?;
+        let _guard = lock
+            .lock()
+            .map_err(|_| OmniError::LockPoisoned("2PC local commit".into()))?;
+        crate::dist_txn::validate_2pc_decision_writes(self, None, tx)?;
+        let _topology_guard = self
+            .transition_guard
+            .read()
+            .map_err(|_| OmniError::LockPoisoned("transition_guard".into()))?;
+        let commit_seq = self.commit_batch_local_locked_skip_prepared(tx)?;
+        self.ssi_history
+            .record_committed(ssi.txn_id, commit_seq, &ssi);
+        self.ssi_history.prune(self.min_active_snapshot());
+        Ok(commit_seq)
+    }
+
     /// The single-node commit path, also used by the raft state machine
     /// itself when it applies entries: raft's own bookkeeping must
     /// never route back through the cluster gateway.
+    pub(crate) fn fence_write_reservation(&self) -> Result<(), OmniError> {
+        let _guard = self
+            .write_mutex
+            .lock()
+            .map_err(|_| OmniError::LockPoisoned("commit_seq".into()))?;
+        Ok(())
+    }
+
+    pub(crate) fn sync_prepared_2pc_reservations(&self) -> Result<(), OmniError> {
+        crate::dist_txn::sync_all_prepared_reservations(self)
+    }
+
+    pub(crate) fn sync_prepared_2pc_from_batch(&self, batch: &WriteBatch) -> Result<(), OmniError> {
+        crate::dist_txn::sync_prepared_reservations_from_batch(self, batch)
+    }
+
     pub(crate) fn commit_batch_local(&self, tx: &WriteBatch) -> Result<u64, OmniError> {
         // Acquire shared topology lock — blocks only during an exclusive
         // snapshot install or a build_snapshot's capture window. Thousands
@@ -1962,6 +2077,21 @@ impl OmniKV {
     /// record missing (or the reverse), and pairing them under the shared lock
     /// is what matches build_snapshot's exclusive capture window.
     pub(crate) fn commit_batch_local_locked(&self, tx: &WriteBatch) -> Result<u64, OmniError> {
+        self.commit_batch_local_locked_inner(tx, false)
+    }
+
+    pub(crate) fn commit_batch_local_locked_skip_prepared(
+        &self,
+        tx: &WriteBatch,
+    ) -> Result<u64, OmniError> {
+        self.commit_batch_local_locked_inner(tx, true)
+    }
+
+    fn commit_batch_local_locked_inner(
+        &self,
+        tx: &WriteBatch,
+        skip_prepared_check: bool,
+    ) -> Result<u64, OmniError> {
         let start_time = std::time::Instant::now();
 
         // Write Backpressure: If L0 SSTables exceed threshold, wait for compaction
@@ -1972,15 +2102,26 @@ impl OmniKV {
         metrics_prometheus::record_compaction_backlog(self.compaction_backlog_sstables());
         if l0_sstables >= compaction_policy.l0_write_stall_threshold {
             let mut stalled = true;
-            for _ in 0..compaction_policy.write_stall_wait_attempts {
-                std::thread::sleep(std::time::Duration::from_millis(
-                    compaction_policy.write_stall_wait_ms,
-                ));
-                if self.sstable_count() < compaction_policy.l0_write_stall_threshold {
-                    stalled = false;
-                    break;
+            let (ref stall_lock, ref cv) = self.compaction_cv;
+            let mut guard = stall_lock.lock().unwrap_or_else(|e| e.into_inner());
+            if self.sstable_count() < compaction_policy.l0_write_stall_threshold {
+                stalled = false;
+            } else {
+                for _ in 0..compaction_policy.write_stall_wait_attempts {
+                    let (returned, _timeout) = cv
+                        .wait_timeout(
+                            guard,
+                            std::time::Duration::from_millis(compaction_policy.write_stall_wait_ms),
+                        )
+                        .unwrap_or_else(|e| e.into_inner());
+                    guard = returned;
+                    if self.sstable_count() < compaction_policy.l0_write_stall_threshold {
+                        stalled = false;
+                        break;
+                    }
                 }
             }
+            drop(guard);
             if stalled {
                 metrics_prometheus::record_write_stall();
                 return Err(OmniError::WriteStall);
@@ -2031,10 +2172,53 @@ impl OmniKV {
                 .write_mutex
                 .lock()
                 .map_err(|_| OmniError::LockPoisoned("commit_seq".into()))?;
+            if !skip_prepared_check
+                && let Some(conflict) = self.ssi_history.check_batch_prepared_conflicts(tx)
+            {
+                return Err(OmniError::IoError(conflict));
+            }
             let seq = self.global_seq.fetch_add(num_records + 1, Ordering::SeqCst);
+            let commit_marker_seq = seq + num_records;
+            let mut stamped_any = false;
+            if skip_prepared_check {
+                for ((key, value, _), prepped) in
+                    tx.buffered_writes.iter().zip(prepped_writes.iter_mut())
+                {
+                    if let Some(stamped) =
+                        crate::dist_txn::stamp_2pc_commit_seq(key, value, commit_marker_seq)
+                    {
+                        let payload_bytes = stamped.as_bytes();
+                        let (final_bytes, length) = if payload_bytes.len() < 64 {
+                            (
+                                payload_bytes.to_vec(),
+                                (payload_bytes.len() as u64) | UNCOMPRESSED_FLAG,
+                            )
+                        } else {
+                            let comp = lz4_flex::compress_prepend_size(payload_bytes);
+                            let len = comp.len() as u64;
+                            (comp, len)
+                        };
+                        let mut hasher = crc32fast::Hasher::new();
+                        hasher.update(&final_bytes);
+                        prepped.1 = final_bytes;
+                        prepped.2 = length;
+                        prepped.3 = hasher.finalize();
+                        stamped_any = true;
+                    }
+                }
+            }
+            let effective_heap_bytes = if stamped_any {
+                prepped_writes
+                    .iter()
+                    .map(|(_, _, length, _, _)| length & !UNCOMPRESSED_FLAG)
+                    .sum()
+            } else {
+                total_heap_bytes
+            };
             let offset = self
                 .heap_offset
-                .fetch_add(total_heap_bytes, Ordering::SeqCst);
+                .fetch_add(effective_heap_bytes, Ordering::SeqCst);
+            self.ssi_history.record_plain_batch(tx, commit_marker_seq);
             (seq, offset)
         };
         // write_mutex is RELEASED here â€” other batches can now reserve their sequences
@@ -2191,9 +2375,12 @@ impl OmniKV {
             .lock()
             .map_err(|_| OmniError::LockPoisoned("wal lock".into()))?;
 
-        let result = heap
-            .sync_data()
-            .map_err(|e| OmniError::IoError(format!("group commit heap fsync failed: {e}")))
+        let result = crate::failpoints::maybe_fail("heap::sync_data")
+            .map_err(|e| OmniError::IoError(format!("heap failure point: {e}")))
+            .and_then(|()| {
+                heap.sync_data()
+                    .map_err(|e| OmniError::IoError(format!("group commit heap fsync failed: {e}")))
+            })
             .and_then(|()| {
                 wal.sync()
                     .map_err(|e| OmniError::IoError(format!("group commit wal fsync failed: {e}")))
@@ -2308,7 +2495,9 @@ impl OmniKV {
         let shard = shard_idx(&target_key);
 
         let memtable = self.roots.load().memtable.clone();
-        for entry in memtable[shard].range((target_key.clone(), Reverse(read_seq))..) {
+        // Reverse(seq) ordering: exclusive lower bound at Reverse(read_seq+1) includes read_seq.
+        let memtable_start = Reverse(read_seq.saturating_add(1));
+        for entry in memtable[shard].range((target_key.clone(), memtable_start)..) {
             if entry.key().0 != target_key {
                 break;
             }
@@ -2330,7 +2519,8 @@ impl OmniKV {
 
         let frozen_memtables = self.roots.load().frozen_memtables.clone();
         for frozen in frozen_memtables.iter().rev() {
-            for entry in frozen[shard].range((target_key.clone(), Reverse(read_seq))..) {
+            let frozen_start = Reverse(read_seq.saturating_add(1));
+            for entry in frozen[shard].range((target_key.clone(), frozen_start)..) {
                 if entry.key().0 != target_key {
                     break;
                 }
@@ -2449,7 +2639,8 @@ impl OmniKV {
         // Memtable (highest priority â€” newest data)
         let active_mem = self.roots.load().memtable.clone();
         for shard in active_mem.iter() {
-            for entry in shard.range((start_key.clone(), Reverse(read_seq))..) {
+            let memtable_start = Reverse(read_seq.saturating_add(1));
+            for entry in shard.range((start_key.clone(), memtable_start)..) {
                 let key = entry.key().0.clone();
                 if key > end_key {
                     break;
@@ -2472,7 +2663,8 @@ impl OmniKV {
         let frozen = self.roots.load().frozen_memtables.clone();
         for f_mem in frozen.iter().rev() {
             for shard in f_mem.iter() {
-                for entry in shard.range((start_key.clone(), Reverse(read_seq))..) {
+                let frozen_start = Reverse(read_seq.saturating_add(1));
+                for entry in shard.range((start_key.clone(), frozen_start)..) {
                     let key = entry.key().0.clone();
                     if key > end_key {
                         break;
@@ -2579,7 +2771,8 @@ impl OmniKV {
 
         // 1. Active memtable
         let memtable = self.roots.load().memtable.clone();
-        for entry in memtable[shard].range((target_key.clone(), Reverse(read_seq))..) {
+        let memtable_start = Reverse(read_seq.saturating_add(1));
+        for entry in memtable[shard].range((target_key.clone(), memtable_start)..) {
             if entry.key().0 != target_key {
                 break;
             }
@@ -2591,7 +2784,8 @@ impl OmniKV {
         // 2. Frozen memtables
         let frozen_memtables = self.roots.load().frozen_memtables.clone();
         for frozen in frozen_memtables.iter().rev() {
-            for entry in frozen[shard].range((target_key.clone(), Reverse(read_seq))..) {
+            let frozen_start = Reverse(read_seq.saturating_add(1));
+            for entry in frozen[shard].range((target_key.clone(), frozen_start)..) {
                 if entry.key().0 != target_key {
                     break;
                 }
@@ -2679,7 +2873,9 @@ impl OmniKV {
             .transition_guard
             .read()
             .map_err(|_| OmniError::LockPoisoned("transition_guard".into()))?;
-        self.compact_sstables_locked()
+        let result = self.compact_sstables_locked();
+        self.compaction_cv.1.notify_all();
+        result
     }
 
     /// Compacts the active memtable while the caller already holds the
@@ -2877,6 +3073,7 @@ impl OmniKV {
             });
 
             stats.record("l0_to_l1", started_at, self.compaction_backlog_sstables());
+            self.compaction_cv.1.notify_all();
             return Ok(());
         }
 
@@ -2941,6 +3138,7 @@ impl OmniKV {
         });
 
         stats.record("l0_to_l1", started_at, self.compaction_backlog_sstables());
+        self.compaction_cv.1.notify_all();
         Ok(())
     }
 

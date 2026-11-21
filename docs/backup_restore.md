@@ -46,6 +46,25 @@ restore_backup("backups/omnikv.tar.gz", "restore")?;
 let restored = OmniKV::open("restore/manifest.json", "restore/wal.bin")?;
 ```
 
+## REST operator endpoints
+
+The REST server stores plain backups under the configured `storage.backup_dir`.
+`POST /admin/backup` requires a `backup` or `admin` token and returns only the
+generated backup filename, not a host filesystem path. `POST /admin/restore`
+requires a `restore` or `admin` token and accepts a JSON body such as:
+
+```json
+{
+  "backup_path": "backup_1730000000000.tar.gz",
+  "restore_dir": "restore-drill"
+}
+```
+
+Both paths are relative to their configured roots. Absolute paths, parent
+traversal, current-directory components, and symlink escapes are rejected. The
+restore endpoint writes into a new directory; do not point it at the active
+database directory.
+
 ## Encrypted backup
 
 Encrypted backups use AES-256-GCM with Argon2id-based key derivation.

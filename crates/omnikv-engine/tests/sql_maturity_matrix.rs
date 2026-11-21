@@ -1,9 +1,11 @@
 use omni_engine::OmniKV;
+use omni_engine::catalog::Catalog;
 use omni_engine::optimizer::{AccessMethod, Optimizer, PlanNode, TableStats};
 use omni_engine::plan_exec::PlanCache;
 use omni_engine::prepared::QueryEngine;
 use omni_engine::secondary_index::{IndexDefinition, IndexFieldType};
 use omni_engine::sql::parse_sql;
+use omni_engine::sql_exec::{ExecResult, SqlExecutor};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tempfile::TempDir;
@@ -178,6 +180,137 @@ fn planner_falls_back_to_seq_scan_without_matching_index() {
         matches!(scan_access(&plan), AccessMethod::SeqScan),
         "expected sequential scan fallback, got {:?}",
         scan_access(&plan)
+    );
+}
+
+#[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "This regression covers the complete SQL secondary-index lifecycle in one isolated database."
+)]
+fn sql_dml_maintains_and_executes_secondary_indexes() {
+    let (db, _dir) = open_temp_db();
+    let catalog = Arc::new(Catalog::new(db.clone()));
+    let executor = SqlExecutor::new(db.clone(), catalog);
+    executor
+        .execute(
+            &parse_sql("CREATE TABLE users (id INTEGER PRIMARY KEY, email TEXT, age INTEGER)")
+                .unwrap(),
+        )
+        .expect("create table");
+    executor
+        .execute(&parse_sql("INSERT INTO users VALUES (1, 'old@example.com', 19)").unwrap())
+        .expect("insert initial row");
+
+    let index_manager = omni_engine::secondary_index::IndexManager::new(db.clone());
+    index_manager
+        .create_index(
+            "users_email_idx",
+            "users",
+            vec![("email".into(), IndexFieldType::String)],
+            true,
+        )
+        .expect("create index");
+    index_manager
+        .rebuild_index("users_email_idx")
+        .expect("rebuild index");
+    index_manager
+        .create_index(
+            "users_age_idx",
+            "users",
+            vec![("age".into(), IndexFieldType::Integer)],
+            false,
+        )
+        .expect("create numeric index");
+    index_manager
+        .rebuild_index("users_age_idx")
+        .expect("rebuild numeric index");
+
+    // Reopen the catalog so the SQL executor sees the persisted index catalog.
+    let executor = SqlExecutor::new(db.clone(), Arc::new(Catalog::new(db)));
+    assert_eq!(
+        index_manager
+            .lookup("users_email_idx", &[serde_json::json!("old@example.com")])
+            .unwrap(),
+        vec!["1".to_string()]
+    );
+    executor
+        .execute(&parse_sql("INSERT INTO users VALUES (2, 'new@example.com', 30)").unwrap())
+        .expect("indexed insert");
+
+    let ExecResult::Rows { rows, .. } = executor
+        .execute(&parse_sql("SELECT id FROM users WHERE email = 'new@example.com'").unwrap())
+        .expect("indexed select")
+    else {
+        panic!("expected rows");
+    };
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].as_deref(), Some("2"));
+
+    let ExecResult::Rows { rows, .. } = executor
+        .execute(
+            &parse_sql("SELECT id FROM users WHERE age >= 20 AND age <= 40 ORDER BY id").unwrap(),
+        )
+        .expect("numeric indexed range select")
+    else {
+        panic!("expected numeric range rows");
+    };
+    assert_eq!(
+        rows.into_iter()
+            .map(|row| row[0].clone())
+            .collect::<Vec<_>>(),
+        vec![Some("2".to_string())]
+    );
+
+    executor
+        .execute(&parse_sql("UPDATE users SET email = 'updated@example.com' WHERE id = 2").unwrap())
+        .expect("indexed update");
+    assert_eq!(
+        index_manager
+            .lookup("users_email_idx", &[serde_json::json!("new@example.com")])
+            .unwrap(),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        index_manager
+            .lookup(
+                "users_email_idx",
+                &[serde_json::json!("updated@example.com")]
+            )
+            .unwrap(),
+        vec!["2".to_string()]
+    );
+    executor
+        .execute(&parse_sql("UPDATE users SET email = 'updated@example.com' WHERE id = 2").unwrap())
+        .expect("unchanged indexed update");
+    assert_eq!(
+        index_manager
+            .lookup(
+                "users_email_idx",
+                &[serde_json::json!("updated@example.com")]
+            )
+            .unwrap(),
+        vec!["2".to_string()]
+    );
+
+    let duplicate = executor
+        .execute(&parse_sql("INSERT INTO users VALUES (3, 'updated@example.com', 40)").unwrap());
+    assert!(
+        duplicate.is_err(),
+        "unique index must reject duplicate values"
+    );
+
+    executor
+        .execute(&parse_sql("DELETE FROM users WHERE id = 2").unwrap())
+        .expect("indexed delete");
+    assert_eq!(
+        index_manager
+            .lookup(
+                "users_email_idx",
+                &[serde_json::json!("updated@example.com")]
+            )
+            .unwrap(),
+        Vec::<String>::new()
     );
 }
 

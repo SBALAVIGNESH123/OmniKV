@@ -9,7 +9,8 @@ use crate::optimizer::{AccessMethod, PlanNode};
 use crate::sql::{AggFunc, JoinType, SelectColumn, WhereExpr};
 use crate::sql_exec::Row;
 use crate::volcano::{
-    ColumnTypeMap, eval_where_typed, legacy_pk_needs_scan, qualify_row, row_lookup, type_lookup,
+    ColumnTypeMap, RowIterator, eval_where_typed, legacy_pk_needs_scan, qualify_row, row_lookup,
+    type_lookup,
 };
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -249,7 +250,7 @@ impl PlanExecutor {
             AccessMethod::PkLookup { key_value } => {
                 let key_value = crate::volcano::canonicalize_pk_key(&table, key_value);
                 let key = format!("{}{}", table.row_prefix(), key_value);
-                let end = format!("{}{}\x7F", table.row_prefix(), key_value);
+                let end = format!("{}{}\u{10ffff}", table.row_prefix(), key_value);
                 let seq = self.read_seq();
                 self.db
                     .scan(&key, &end, seq)
@@ -267,9 +268,19 @@ impl PlanExecutor {
                     })
                     .collect::<Result<Vec<_>, _>>()?
             }
-            AccessMethod::IndexScan { .. } | AccessMethod::SeqScan => {
-                self.load_table_rows(&table)?
+            AccessMethod::IndexScan { index_name, .. } => {
+                let mut iter = crate::volcano::IndexScanIter::with_scan(
+                    &self.db,
+                    &self.catalog,
+                    &table,
+                    index_name,
+                    filter,
+                    self.read_seq(),
+                    None,
+                );
+                iter.try_collect_all()?
             }
+            AccessMethod::SeqScan => self.load_table_rows(&table)?,
         };
 
         if let Some(expr) = filter {
@@ -309,7 +320,7 @@ impl PlanExecutor {
         let seq = self.read_seq();
         let stored = self
             .db
-            .scan(&prefix, &format!("{}\x7F", prefix), seq)
+            .scan(&prefix, &format!("{}\u{10ffff}", prefix), seq)
             .map_err(|error| format!("storage scan failed for table '{}': {error}", table.name))?;
         stored
             .into_iter()
@@ -321,11 +332,6 @@ impl PlanExecutor {
     }
 
     /// Load only specific columns (column pruning).
-    ///
-    /// This compatibility wrapper preserves the original infallible public
-    /// API. New SQL execution paths should use
-    /// [`Self::load_table_rows_pruned_checked`] so storage and decode errors
-    /// remain visible to callers.
     pub fn load_table_rows_pruned(&self, table: &TableDef, needed_cols: &[String]) -> Vec<Row> {
         self.load_table_rows_pruned_checked(table, needed_cols)
             .unwrap_or_default()
@@ -341,7 +347,7 @@ impl PlanExecutor {
         let seq = self.read_seq();
         let stored = self
             .db
-            .scan(&prefix, &format!("{}\x7F", prefix), seq)
+            .scan(&prefix, &format!("{}\u{10ffff}", prefix), seq)
             .map_err(|error| format!("storage scan failed for table '{}': {error}", table.name))?;
         stored
             .into_iter()

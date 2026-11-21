@@ -24,7 +24,7 @@ const RAFT_META_KEY: &str = "__sys__/raft/meta";
 /// history — losing every conflict record for commits the snapshot's data
 /// actually carries. Keeping the version in lockstep with the format means
 /// a legacy snapshot is rejected instead of silently corrupting history.
-const SNAPSHOT_VERSION: u32 = 2;
+const SNAPSHOT_VERSION: u32 = 3;
 
 /// Versioned snapshot envelope — adding version field now prevents future migration pain.
 #[derive(Serialize, Deserialize, Debug)]
@@ -46,6 +46,8 @@ struct SnapshotEnvelope {
     /// field and a missing one is a malformed snapshot that must fail
     /// loudly rather than silently install an empty history.
     ssi_history: Vec<SsiHistoryEntry>,
+    /// SSI eviction floor carried with the snapshot history.
+    ssi_eviction_floor: u64,
 }
 
 /// One committed transaction in a snapshot envelope: the SSI record plus
@@ -293,6 +295,7 @@ impl RaftSnapshotBuilder<TypeConfig> for OmniRaftStorage {
                 record,
             })
             .collect();
+        let ssi_eviction_floor = self.db.ssi_history().eviction_floor();
 
         let mut entries = Vec::new();
         let (snap_meta, max_seq) = {
@@ -340,6 +343,7 @@ impl RaftSnapshotBuilder<TypeConfig> for OmniRaftStorage {
             max_seq,
             entries,
             ssi_history,
+            ssi_eviction_floor,
         };
         let serialized = serde_json::to_vec(&envelope).map_err(|e| StorageError::IO {
             source: StorageIOError::new(
@@ -718,7 +722,18 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
                 .transition_guard
                 .read()
                 .map_err(|_| crate::OmniError::LockPoisoned("transition_guard".into()))?;
-            let marker = self.db.commit_batch_local_locked(batch)?;
+            let touches_2pc = batch
+                .buffered_writes
+                .iter()
+                .any(|(key, _, _)| key.starts_with(b"__2PC_PREPARE__/"))
+                || batch
+                    .buffered_deletes
+                    .iter()
+                    .any(|key| key.starts_with(b"__2PC_PREPARE__/"));
+            let marker = self.db.commit_batch_local_locked_skip_prepared(batch)?;
+            if touches_2pc {
+                self.db.sync_prepared_2pc_from_batch(batch)?;
+            }
             let history = self.db.ssi_history();
             // Entries sharing a batch committed atomically at one marker —
             // a transaction whose read_seq equals it sees all of them.
@@ -758,7 +773,10 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
                             .iter()
                             .any(|op| op.key.starts_with("__sys__/raft/"))
                             || cmd.dels.iter().any(|k| k.starts_with("__sys__/raft/"));
-                        if system_key || cmd.is_empty() {
+                        let conflicting_2pc =
+                            crate::dist_txn::conflicts_with_2pc_decision(&self.db, &batch, &cmd)
+                                .map_err(io_err)?;
+                        if system_key || conflicting_2pc || cmd.is_empty() {
                             res.push("ERR".to_string());
                             // A rejected entry is still DECIDED and applied —
                             // record the index so openraft advances past it.
@@ -982,7 +1000,7 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
             // installs without BatchTooLarge.
             if batch.op_count() >= crate::WriteBatch::MAX_OPS {
                 tmp_db
-                    .commit_batch(&batch)
+                    .commit_batch_local(&batch)
                     .map_err(|e| io_err(&format!("commit snapshot batch: {}", e)))?;
                 batch = crate::WriteBatch::new();
             }
@@ -998,7 +1016,7 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
         // apply path): data before pointer.
         if batch.op_count() >= crate::WriteBatch::MAX_OPS {
             tmp_db
-                .commit_batch(&batch)
+                .commit_batch_local(&batch)
                 .map_err(|e| io_err(&format!("commit snapshot batch: {}", e)))?;
             batch = crate::WriteBatch::new();
         }
@@ -1018,7 +1036,7 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
 
         if !batch.is_empty() {
             tmp_db
-                .commit_batch(&batch)
+                .commit_batch_local(&batch)
                 .map_err(|e| io_err(&format!("commit snapshot batch: {}", e)))?;
             tmp_db
                 .compact_sstables()
@@ -1172,13 +1190,20 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
             .heap_offset
             .store(recovered.heap_offset, Ordering::Release);
 
-        // CRITICAL: Advance global_seq to at least snapshot max_seq.
+        // CRITICAL: Advance global_seq strictly past the snapshot's max_seq,
+        // the rebuilt storage's max_seq, this node's prior sequence, and any
+        // prior SSI eviction floor so every pre-install read_seq sits below
+        // the new floor while post-install snapshots (global_seq - 1) pass.
         let cur_seq = self.db.global_seq.load(Ordering::SeqCst);
-        if envelope.max_seq >= cur_seq {
-            self.db
-                .global_seq
-                .store(envelope.max_seq + 1, Ordering::SeqCst);
-        }
+        let prev_floor = self.db.ssi_history().eviction_floor();
+        let snapshot_floor = envelope
+            .max_seq
+            .max(recovered.max_seq)
+            .max(cur_seq)
+            .max(prev_floor);
+        self.db
+            .global_seq
+            .store(snapshot_floor.saturating_add(1), Ordering::SeqCst);
 
         // The snapshot replaced the data wholesale, so the committed
         // history must be replaced too — otherwise a node promoted after
@@ -1193,7 +1218,12 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
                 .into_iter()
                 .map(|e| (e.txn_id, e.commit_seq, e.record))
                 .collect(),
+            envelope.ssi_eviction_floor,
         );
+        self.db.ssi_history().advance_eviction_floor(snapshot_floor);
+        self.db
+            .sync_prepared_2pc_reservations()
+            .map_err(|e| io_err(&format!("sync 2PC prepared reservations: {e}")))?;
 
         // ── Phase I: Release exclusive lock (writers resume on new topology) ──
         drop(_exclusive);

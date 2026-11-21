@@ -340,25 +340,54 @@ impl SqlExecutor {
         let mut pending_slot = self.pending_batch.borrow_mut();
         match pending_slot.as_mut() {
             Some(pending) => {
-                for (key, value, ttl) in batch.buffered_writes {
-                    pending.buffered_writes.retain(|(k, _, _)| *k != key);
-                    pending.buffered_deletes.retain(|k| *k != key);
-                    let key_str = String::from_utf8_lossy(&key).into_owned();
-                    if ttl > 0 {
-                        pending
-                            .set_with_ttl(&key_str, value, ttl)
-                            .map_err(|e| format!("{:?}", e))?;
-                    } else {
-                        pending
-                            .set(&key_str, value)
-                            .map_err(|e| format!("{:?}", e))?;
+                let delete_keys: std::collections::HashSet<Vec<u8>> =
+                    batch.buffered_deletes.iter().cloned().collect();
+                let mut incoming_keys = delete_keys.clone();
+                let mut seen_writes =
+                    std::collections::HashSet::with_capacity(batch.buffered_writes.len());
+                let mut deduped_writes = Vec::with_capacity(batch.buffered_writes.len());
+                for (key, value, ttl) in batch.buffered_writes.into_iter().rev() {
+                    incoming_keys.insert(key.clone());
+                    if !delete_keys.contains(&key) && seen_writes.insert(key.clone()) {
+                        deduped_writes.push((key, value, ttl));
                     }
                 }
+                deduped_writes.reverse();
+
+                let mut seen_deletes =
+                    std::collections::HashSet::with_capacity(batch.buffered_deletes.len());
+                let mut deduped_deletes = Vec::with_capacity(batch.buffered_deletes.len());
                 for key in batch.buffered_deletes {
-                    pending.buffered_writes.retain(|(k, _, _)| *k != key);
-                    let key_str = String::from_utf8_lossy(&key).into_owned();
-                    pending.delete(&key_str).map_err(|e| format!("{:?}", e))?;
+                    if seen_deletes.insert(key.clone()) {
+                        deduped_deletes.push(key);
+                    }
                 }
+
+                let mut merged = WriteBatch {
+                    buffered_writes: pending
+                        .buffered_writes
+                        .iter()
+                        .filter(|(k, _, _)| !incoming_keys.contains(k))
+                        .cloned()
+                        .collect(),
+                    buffered_deletes: pending
+                        .buffered_deletes
+                        .iter()
+                        .filter(|k| !incoming_keys.contains(*k))
+                        .cloned()
+                        .collect(),
+                };
+                for (key, value, ttl) in deduped_writes {
+                    let key_str = String::from_utf8_lossy(&key).into_owned();
+                    merged
+                        .set_with_expiry(&key_str, value, ttl)
+                        .map_err(|e| format!("{:?}", e))?;
+                }
+                for key in deduped_deletes {
+                    let key_str = String::from_utf8_lossy(&key).into_owned();
+                    merged.delete(&key_str).map_err(|e| format!("{:?}", e))?;
+                }
+                *pending = merged;
                 Ok(())
             }
             None => self
@@ -367,6 +396,35 @@ impl SqlExecutor {
                 .map(|_| ())
                 .map_err(|e| format!("{:?}", e)),
         }
+    }
+
+    /// Merges earlier statements' index mutations for cross-statement uniqueness.
+    fn seed_pending_indexes(&self, batch: &mut WriteBatch) -> Result<(), String> {
+        let pending = self.pending_batch.borrow();
+        let Some(pending) = pending.as_ref() else {
+            return Ok(());
+        };
+        let existing_keys: std::collections::HashSet<Vec<u8>> = batch
+            .buffered_writes
+            .iter()
+            .map(|(k, _, _)| k.clone())
+            .chain(batch.buffered_deletes.iter().cloned())
+            .collect();
+        for (key, value, expiry) in &pending.buffered_writes {
+            if key.starts_with(b"\x00IDX\x00") && !existing_keys.contains(key) {
+                let key = std::str::from_utf8(key).map_err(|error| error.to_string())?;
+                batch
+                    .set_with_expiry(key, value.clone(), *expiry)
+                    .map_err(|error| error.to_string())?;
+            }
+        }
+        for key in &pending.buffered_deletes {
+            if key.starts_with(b"\x00IDX\x00") && !existing_keys.contains(key) {
+                let key = std::str::from_utf8(key).map_err(|error| error.to_string())?;
+                batch.delete(key).map_err(|error| error.to_string())?;
+            }
+        }
+        Ok(())
     }
 
     /// The staged writes of this transaction as an overlay storage key →
@@ -406,6 +464,12 @@ impl SqlExecutor {
         } else {
             None
         };
+
+        // Refresh index catalog at this statement's read point.
+        self.catalog
+            .index_manager()
+            .refresh_catalog_at(self.statement_read_seq())
+            .map_err(|error| format!("index catalog read failed: {error}"))?;
 
         // A transactional executor's catalog overlay: staged DDL from
         // earlier statements in the block becomes visible to this
@@ -504,10 +568,14 @@ impl SqlExecutor {
             }
             SqlStatement::Explain(inner) => {
                 self.refresh_statement_catalog_for(inner, self.statement_read_seq())?;
-                // Use the cost-based optimizer for real EXPLAIN output
+                let index_catalog = self
+                    .catalog
+                    .index_manager()
+                    .catalog_snapshot_at(self.statement_read_seq())
+                    .map_err(|error| format!("index catalog read failed: {error}"))?;
                 let stats = crate::optimizer::gather_stats_at_checked(
                     &self.catalog,
-                    None,
+                    Some(&index_catalog),
                     &self.db,
                     self.statement_read_seq(),
                 )?;
@@ -532,10 +600,14 @@ impl SqlExecutor {
             }
             SqlStatement::ExplainAnalyze(inner) => {
                 self.refresh_statement_catalog_for(inner, self.statement_read_seq())?;
-                // Run the query through the plan executor and collect stats
+                let index_catalog = self
+                    .catalog
+                    .index_manager()
+                    .catalog_snapshot_at(self.statement_read_seq())
+                    .map_err(|error| format!("index catalog read failed: {error}"))?;
                 let stats = crate::optimizer::gather_stats_at_checked(
                     &self.catalog,
-                    None,
+                    Some(&index_catalog),
                     &self.db,
                     self.statement_read_seq(),
                 )?;
@@ -736,6 +808,7 @@ impl SqlExecutor {
         // statements. Outside one, the catalog's autocommit path handles.
         if self.is_transactional() {
             self.record_catalog_read(name);
+            let read_seq = self.statement_read_seq();
             // The table's own rows go through the normal DML staging: the
             // row reads use this statement's snapshot+overlay, so only
             // rows that exist for this transaction are deleted.
@@ -750,6 +823,13 @@ impl SqlExecutor {
                 let key = format!("{}{}", table.row_prefix(), pk);
                 batch.delete(&key).map_err(|e| format!("{:?}", e))?;
             }
+            self.seed_pending_indexes(&mut batch)?;
+            let (idx_start, idx_end) = crate::secondary_index::IndexCatalog::catalog_scan_range();
+            self.record_range_read(idx_start, idx_end);
+            self.catalog
+                .index_manager()
+                .append_drop_indexes_for_collection_at(&table.name, read_seq, &mut batch)
+                .map_err(|e| format!("{:?}", e))?;
             let cat_key = Catalog::staged_drop_key(name);
             batch.delete(&cat_key).map_err(|e| format!("{:?}", e))?;
             self.stage_or_commit(batch)?;
@@ -763,6 +843,20 @@ impl SqlExecutor {
     /// The table definition as recorded at this statement's read point. The
     /// catalog cache can lag a migration, and a stale `row_format` would
     /// re-migrate rows that are already typed.
+    fn dml_index_catalog(&self, seq: u64) -> Result<crate::secondary_index::IndexCatalog, String> {
+        let (start, end) = crate::secondary_index::IndexCatalog::catalog_scan_range();
+        self.record_range_read(start, end);
+        let mut catalog = self
+            .catalog
+            .index_manager()
+            .catalog_snapshot_at(seq)
+            .map_err(|e| format!("Index catalog snapshot failed: {e}"))?;
+        if let Some(overlay) = self.pending_overlay() {
+            catalog.apply_overlay(&overlay);
+        }
+        Ok(catalog)
+    }
+
     fn effective_table(&self, name: &str, seq: u64) -> Result<Option<TableDef>, String> {
         let key = Catalog::catalog_key(name);
         if let Some(overlay) = self.pending_overlay()
@@ -773,14 +867,11 @@ impl SqlExecutor {
                 .and_then(|v| serde_json::from_str::<TableDef>(v).ok()));
         }
         self.record_point_read(&key);
-        let end = format!("{key}\x7F");
         Ok(self
             .db
-            .scan(&key, &end, seq)
+            .find(&key, seq)
             .map_err(|e| format!("{:?}", e))?
-            .into_iter()
-            .next()
-            .and_then(|(_, value)| serde_json::from_str::<TableDef>(&value).ok()))
+            .and_then(|value| serde_json::from_str::<TableDef>(&value).ok()))
     }
 
     /// Builds the batch that rewrites a legacy table's rows to the typed
@@ -804,7 +895,7 @@ impl SqlExecutor {
         }
 
         let prefix = table.row_prefix();
-        let end = format!("{}\u{7F}", prefix);
+        let end = format!("{}\u{10ffff}", prefix);
         self.record_range_read(&prefix, &end);
         let mut stored = self
             .db
@@ -825,9 +916,13 @@ impl SqlExecutor {
         }
 
         let mut batch = WriteBatch::new();
+        self.seed_pending_indexes(&mut batch)?;
+        let index_manager = self.catalog.index_manager();
+        let index_catalog = self.dml_index_catalog(seq)?;
         // The typed path keys and compares a numeric primary key canonically,
         // so a legacy row stored at ...007 is re-keyed to ...7.
         let mut canonical_keys: HashMap<String, &str> = HashMap::new();
+        let mut migrated_keys = Vec::new();
         for (key, serialized) in &stored {
             let mut row =
                 crate::plan_exec::PlanExecutor::deserialize_row(serialized, table.row_format)
@@ -837,6 +932,8 @@ impl SqlExecutor {
                             table.name
                         )
                     })?;
+            let old_document = serde_json::to_value(&row)
+                .map_err(|e| format!("Serialize old index document: {e}"))?;
 
             let stored_suffix = key.strip_prefix(prefix.as_str()).unwrap_or_default();
             let canonical_suffix = crate::volcano::canonicalize_pk_key(table, stored_suffix);
@@ -859,10 +956,27 @@ impl SqlExecutor {
                 batch
                     .set(&canonical_key, typed)
                     .map_err(|e| format!("{:?}", e))?;
+                migrated_keys.push((key.clone(), canonical_key.clone()));
             } else if &typed != serialized {
                 batch.set(key, typed).map_err(|e| format!("{:?}", e))?;
             }
+            let new_document = serde_json::to_value(&row)
+                .map_err(|e| format!("Serialize new index document: {e}"))?;
+            let mut reads = self.pending_reads.borrow_mut();
+            index_manager
+                .replace_document_indexes_with_catalog_and_reads(
+                    &index_catalog,
+                    &table.name,
+                    stored_suffix,
+                    &old_document,
+                    &canonical_suffix,
+                    &new_document,
+                    &mut batch,
+                    reads.as_mut(),
+                )
+                .map_err(|e| format!("Index maintenance failed: {e}"))?;
         }
+        self.move_rename_stage_markers(&table.name, &migrated_keys, &mut batch, seq)?;
 
         let mut updated = table.clone();
         updated.row_format = crate::catalog::RowFormat::Typed;
@@ -937,6 +1051,9 @@ impl SqlExecutor {
             WriteBatch::new()
         };
         let mut count = 0;
+        self.seed_pending_indexes(&mut batch)?;
+        let index_manager = self.catalog.index_manager();
+        let index_catalog = self.dml_index_catalog(read_seq)?;
 
         for row_vals in values {
             let mut row_map = Row::new();
@@ -976,6 +1093,19 @@ impl SqlExecutor {
             }
             let value = serde_json::to_string(&row_map).map_err(|e| format!("Serialize: {}", e))?;
             batch.set(&key, value).map_err(|e| format!("{:?}", e))?;
+            let document = serde_json::to_value(&row_map)
+                .map_err(|e| format!("Serialize index document: {e}"))?;
+            let mut reads = self.pending_reads.borrow_mut();
+            index_manager
+                .index_document_with_catalog_and_reads(
+                    &index_catalog,
+                    &table.name,
+                    &canonical_pk,
+                    &document,
+                    &mut batch,
+                    reads.as_mut(),
+                )
+                .map_err(|e| format!("Index maintenance failed: {e}"))?;
             count += 1;
         }
 
@@ -1002,10 +1132,10 @@ impl SqlExecutor {
         // aborts this transaction's COMMIT (phantom/write-skew
         // protection). Autocommit executors collect nothing (their
         // collector is None — nothing to abort).
-        self.record_range_read(&prefix, &format!("{}\x7F", prefix));
+        self.record_range_read(&prefix, &format!("{}\u{10ffff}", prefix));
         let mut results = self
             .db
-            .scan(&prefix, &format!("{}\x7F", prefix), seq)
+            .scan(&prefix, &format!("{}\u{10ffff}", prefix), seq)
             .map_err(|error| format!("storage scan failed for table '{}': {error}", table.name))?;
 
         // Read-your-own-writes: staged rows replace their stored copies,
@@ -1129,9 +1259,17 @@ impl SqlExecutor {
             offset: None, // offset handled in post-processing below
         };
 
+        let mut index_catalog = self
+            .catalog
+            .index_manager()
+            .catalog_snapshot_at(self.statement_read_seq())
+            .map_err(|error| format!("index catalog read failed: {error}"))?;
+        if let Some(overlay) = self.pending_overlay() {
+            index_catalog.apply_overlay(&overlay);
+        }
         let stats = crate::optimizer::gather_stats_at_checked(
             &self.catalog,
-            None,
+            Some(&index_catalog),
             &self.db,
             self.statement_read_seq(),
         )?;
@@ -2134,7 +2272,15 @@ impl SqlExecutor {
             WriteBatch::new()
         };
         let count = rows.len();
+        self.seed_pending_indexes(&mut batch)?;
+        let index_manager = self.catalog.index_manager();
+        let index_catalog = self.dml_index_catalog(read_seq)?;
+        let mut new_keys = std::collections::HashSet::with_capacity(rows.len());
+        let mut stale_keys = Vec::new();
+        let mut moved_keys = Vec::new();
         for (row, old_key) in rows.iter_mut().zip(old_keys) {
+            let mut old_document = serde_json::to_value(&*row)
+                .map_err(|e| format!("Serialize old index document: {e}"))?;
             for (resolved, val) in &assignments {
                 let stored = match val {
                     SqlValue::Null => None,
@@ -2155,22 +2301,74 @@ impl SqlExecutor {
                 .ok_or_else(|| format!("primary key cannot be NULL in table '{}'", table.name))?;
             // A legacy row may be stored under a non-canonical key ("007");
             // the typed path addresses it as "7".
-            let key = format!(
-                "{}{}",
-                table.row_prefix(),
-                crate::volcano::canonicalize_pk_key(&table, &pk)
-            );
+            let canonical_pk = crate::volcano::canonicalize_pk_key(&table, &pk);
+            let key = format!("{}{}", table.row_prefix(), canonical_pk);
             if !available_keys.insert(key.clone()) {
                 return Err(format!(
                     "duplicate key value violates primary key of table '{}'",
                     table.name
                 ));
             }
+            let raw_old_pk = &old_key[table.row_prefix().len()..];
+            let effective_old_pk = if table.row_format == crate::catalog::RowFormat::Legacy {
+                let migrated_pk = crate::volcano::canonicalize_pk_key(&table, raw_old_pk);
+                if let Some(obj) = old_document.as_object_mut()
+                    && let Some(slot) = obj.get_mut(&table.primary_key)
+                    && let Some(old_val) = slot.as_str().map(str::to_string)
+                {
+                    *slot = serde_json::Value::String(crate::volcano::canonicalize_pk_key(
+                        &table, &old_val,
+                    ));
+                }
+                migrated_pk
+            } else {
+                raw_old_pk.to_string()
+            };
+            let migrated_old_key = format!("{}{}", table.row_prefix(), effective_old_pk);
+            new_keys.insert(key.clone());
             if old_key != key {
-                batch.delete(&old_key).map_err(|e| format!("{:?}", e))?;
+                stale_keys.push(old_key.clone());
+                moved_keys.push((old_key.clone(), key.clone()));
+            }
+            if migrated_old_key != old_key && migrated_old_key != key {
+                stale_keys.push(migrated_old_key.clone());
+                moved_keys.push((migrated_old_key.clone(), key.clone()));
             }
             let value = serde_json::to_string(&row).map_err(|e| format!("{}", e))?;
+            batch
+                .buffered_writes
+                .retain(|(k, _, _)| k.as_slice() != key.as_bytes());
+            batch
+                .buffered_deletes
+                .retain(|k| k.as_slice() != key.as_bytes());
             batch.set(&key, value).map_err(|e| format!("{:?}", e))?;
+            let new_document = serde_json::to_value(&*row)
+                .map_err(|e| format!("Serialize new index document: {e}"))?;
+            let mut reads = self.pending_reads.borrow_mut();
+            index_manager
+                .replace_document_indexes_with_catalog_and_reads(
+                    &index_catalog,
+                    &table.name,
+                    &effective_old_pk,
+                    &old_document,
+                    &canonical_pk,
+                    &new_document,
+                    &mut batch,
+                    reads.as_mut(),
+                )
+                .map_err(|e| format!("Index maintenance failed: {e}"))?;
+        }
+        self.move_rename_stage_markers(&table.name, &moved_keys, &mut batch, read_seq)?;
+        for stale in stale_keys {
+            if !new_keys.contains(&stale) {
+                batch
+                    .buffered_writes
+                    .retain(|(k, _, _)| k.as_slice() != stale.as_bytes());
+                batch
+                    .buffered_deletes
+                    .retain(|k| k.as_slice() != stale.as_bytes());
+                batch.delete(&stale).map_err(|e| format!("{:?}", e))?;
+            }
         }
 
         if !batch.is_empty() {
@@ -2215,6 +2413,14 @@ impl SqlExecutor {
             WriteBatch::new()
         };
         let count = rows.len();
+        self.seed_pending_indexes(&mut batch)?;
+        let index_manager = self.catalog.index_manager();
+        let index_catalog = self.dml_index_catalog(read_seq)?;
+        let active_stages = if rows.is_empty() {
+            Vec::new()
+        } else {
+            self.active_rename_stages(&table.name, read_seq)?
+        };
         for row in &rows {
             let pk = row
                 .get(&table.primary_key)
@@ -2226,7 +2432,27 @@ impl SqlExecutor {
                 table.row_prefix(),
                 crate::volcano::canonicalize_pk_key(&table, &pk)
             );
+            let document = serde_json::to_value(row)
+                .map_err(|e| format!("Serialize old index document: {e}"))?;
+            index_manager
+                .remove_document_indexes_with_catalog(
+                    &index_catalog,
+                    &table.name,
+                    &crate::volcano::canonicalize_pk_key(&table, &pk),
+                    &document,
+                    &mut batch,
+                )
+                .map_err(|e| format!("Index maintenance failed: {e}"))?;
             batch.delete(&key).map_err(|e| format!("{:?}", e))?;
+            for stage_key in &active_stages {
+                let marker = crate::schema::SchemaManager::rename_row_stage_key(stage_key, &key);
+                if self
+                    .find_row_stage_marker_with_batch(Some(&batch), &marker, read_seq)?
+                    .is_some()
+                {
+                    Self::stage_batch_delete(&mut batch, &marker)?;
+                }
+            }
         }
 
         if !batch.is_empty() {
@@ -2241,6 +2467,117 @@ impl SqlExecutor {
             count,
             command: format!("DELETE {}", count),
         })
+    }
+
+    fn active_rename_stages(&self, table_name: &str, read_seq: u64) -> Result<Vec<String>, String> {
+        let prefix = format!("\x00SCHEMA\x00rename_stage:{}:", table_name.to_lowercase());
+        let end = format!("{prefix}\u{10ffff}");
+        self.db
+            .scan(&prefix, &end, read_seq)
+            .map(|entries| entries.into_iter().map(|(k, _)| k).collect())
+            .map_err(|e| format!("{:?}", e))
+    }
+
+    fn move_rename_stage_markers(
+        &self,
+        table_name: &str,
+        moved_keys: &[(String, String)],
+        batch: &mut WriteBatch,
+        read_seq: u64,
+    ) -> Result<(), String> {
+        if moved_keys.is_empty() {
+            return Ok(());
+        }
+        let active_stages = self.active_rename_stages(table_name, read_seq)?;
+        if active_stages.is_empty() {
+            return Ok(());
+        }
+        let mut moved_markers = Vec::new();
+        for stage_key in &active_stages {
+            for (from_key, to_key) in moved_keys {
+                let old_marker =
+                    crate::schema::SchemaManager::rename_row_stage_key(stage_key, from_key);
+                if let Some(val) =
+                    self.find_row_stage_marker_with_batch(Some(batch), &old_marker, read_seq)?
+                {
+                    let new_marker =
+                        crate::schema::SchemaManager::rename_row_stage_key(stage_key, to_key);
+                    moved_markers.push((old_marker, new_marker, val));
+                }
+            }
+        }
+        for (old_marker, _, _) in &moved_markers {
+            Self::stage_batch_delete(batch, old_marker)?;
+        }
+        for (_, new_marker, val) in moved_markers {
+            Self::stage_batch_set(batch, &new_marker, val)?;
+        }
+        Ok(())
+    }
+
+    fn find_row_stage_marker_with_batch(
+        &self,
+        batch: Option<&WriteBatch>,
+        marker_key: &str,
+        read_seq: u64,
+    ) -> Result<Option<String>, String> {
+        if let Some(batch) = batch {
+            if batch
+                .buffered_deletes
+                .iter()
+                .any(|k| k.as_slice() == marker_key.as_bytes())
+            {
+                return Ok(None);
+            }
+            if let Some((_, val, _)) = batch
+                .buffered_writes
+                .iter()
+                .rev()
+                .find(|(k, _, _)| k.as_slice() == marker_key.as_bytes())
+            {
+                return Ok(Some(val.clone()));
+            }
+        }
+        if let Some(pending) = self.pending_batch.borrow().as_ref() {
+            if pending
+                .buffered_deletes
+                .iter()
+                .any(|k| k.as_slice() == marker_key.as_bytes())
+            {
+                return Ok(None);
+            }
+            if let Some((_, val, _)) = pending
+                .buffered_writes
+                .iter()
+                .rev()
+                .find(|(k, _, _)| k.as_slice() == marker_key.as_bytes())
+            {
+                return Ok(Some(val.clone()));
+            }
+        }
+        self.db
+            .find(marker_key, read_seq)
+            .map_err(|e| format!("{:?}", e))
+    }
+
+    fn stage_batch_set(batch: &mut WriteBatch, key: &str, val: String) -> Result<(), String> {
+        batch
+            .buffered_writes
+            .retain(|(k, _, _)| k.as_slice() != key.as_bytes());
+        batch
+            .buffered_deletes
+            .retain(|k| k.as_slice() != key.as_bytes());
+        batch.set(key, val).map_err(|e| format!("{:?}", e))
+    }
+
+    fn stage_batch_delete(batch: &mut WriteBatch, key: &str) -> Result<(), String> {
+        batch
+            .buffered_writes
+            .retain(|(k, _, _)| k.as_slice() != key.as_bytes());
+        batch
+            .buffered_deletes
+            .retain(|k| k.as_slice() != key.as_bytes());
+        batch.delete(key).map_err(|e| format!("{:?}", e))
     }
 }
 

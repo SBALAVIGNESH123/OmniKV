@@ -31,7 +31,7 @@ with `--features failpoints`, the hooks are compiled in regardless of profile.
 ```rust
 use omni_engine::failpoints::FailRegistry;
 
-// Arm a point to panic on the 3rd call:
+// Arm a point to make every matching operation fail until it is disarmed:
 let registry = FailRegistry::new();
 registry.arm("wal::sync");
 

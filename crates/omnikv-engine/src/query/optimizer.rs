@@ -95,7 +95,7 @@ pub fn gather_stats_at_checked(
         if let Some(table) = catalog.get_table(&table_name) {
             let prefix = table.row_prefix();
             let sample = db
-                .scan(&prefix, &format!("{}\x7F", prefix), seq)
+                .scan(&prefix, &format!("{}\u{10ffff}", prefix), seq)
                 .map_err(|error| {
                     format!(
                         "storage statistics scan failed for table '{}': {error}",
@@ -115,6 +115,10 @@ pub fn gather_stats_at_checked(
             let indexes: Vec<IndexDefinition> = if let Some(ic) = index_catalog {
                 ic.indexes_for_collection(&table_name)
                     .into_iter()
+                    .filter(|definition| {
+                        ic.is_ready(definition.id)
+                            && table.row_format == crate::catalog::RowFormat::Typed
+                    })
                     .cloned()
                     .collect()
             } else {
@@ -820,26 +824,32 @@ impl Optimizer {
     /// Find the best index for a WHERE predicate.
     fn find_best_index(&self, table_name: &str, expr: &WhereExpr) -> Option<IndexDefinition> {
         let stats = self.stats.get(table_name)?;
-        // Index fields are bare column names, so match the predicate's bare
-        // components whether or not they are qualified.
-        let columns_used = extract_where_columns(Some(expr))
-            .into_iter()
-            .map(|c| bare_name(&c).to_string())
-            .collect::<Vec<_>>();
-
-        // Score each index by how many of its fields match the WHERE columns
-        let mut best: Option<(IndexDefinition, usize)> = None;
-        for idx in &stats.indexes {
-            let matched = idx
-                .fields
-                .iter()
-                .take_while(|(f, _)| columns_used.contains(f))
-                .count();
-            if matched > 0 && best.as_ref().map(|(_, s)| matched > *s).unwrap_or(true) {
-                best = Some((idx.clone(), matched));
-            }
-        }
-        best.map(|(idx, _)| idx)
+        let conjuncts = split_conjuncts(expr);
+        let mut candidates: Vec<&IndexDefinition> = stats
+            .indexes
+            .iter()
+            .filter(|index| {
+                index.fields.len() == 1
+                    && conjuncts.iter().any(|conjunct| {
+                        let WhereExpr::Comparison { column, op, value } = conjunct else {
+                            return false;
+                        };
+                        let (field, field_type) = &index.fields[0];
+                        let qualified = column
+                            .split_once('.')
+                            .is_none_or(|(table, _)| table.eq_ignore_ascii_case(table_name));
+                        qualified
+                            && bare_name(column).eq_ignore_ascii_case(field)
+                            && matches!(
+                                op,
+                                CmpOp::Eq | CmpOp::Gt | CmpOp::Gte | CmpOp::Lt | CmpOp::Lte
+                            )
+                            && crate::secondary_index::sql_index_bound(value, field_type).is_some()
+                    })
+            })
+            .collect();
+        candidates.sort_by_key(|idx| &idx.name);
+        candidates.first().copied().cloned()
     }
 
     /// Check if filter was already pushed into scan node.

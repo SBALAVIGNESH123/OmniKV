@@ -1,0 +1,3 @@
+# chrono is a transitive dep of openraft; no fixed upgrade available.
+[advisories]
+ignore = ["RUSTSEC-2026-0543"]

@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 
 pub const DEV_JWT_SECRET: &str = "dev-secret-do-not-use-in-production";
 pub const DEV_BOOTSTRAP_ADMIN_KEY: &str = "dev-bootstrap-admin-key-do-not-use-in-production";
+pub const DEV_RAFT_AUTH_TOKEN: &str = "dev-raft-peer-token-do-not-use-in-production";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
@@ -101,30 +102,53 @@ impl StorageConfig {
 /// `peers` are the OTHER nodes' raft addresses ("host:port"), used only
 /// at bootstrap to seed cluster membership; a node joining an existing
 /// cluster learns the full membership from the leader.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RaftConfig {
     /// This node's cluster ID (openraft NodeId). 1-based.
     pub node_id: Option<u64>,
-    /// The plaintext listener for consensus traffic (etcd's peer-port
-    /// model: client TLS never terminates here). This is the BIND
-    /// address — `0.0.0.0:port` is valid here.
+    /// Bind address for consensus traffic (`0.0.0.0:port` is valid).
     pub raft_addr: Option<String>,
-    /// What PEERS dial to reach this node — the address that goes into
-    /// cluster membership. Must be routable FROM other nodes; a
-    /// wildcard (0.0.0.0/::) is refused by validation because it would
-    /// resolve to the dialer itself. When unset, the bind address is
-    /// advertised (fine for specific-IP/loopback binds; a wildcard bind
-    /// REQUIRES this override).
+    /// Routable address peers use to reach this node. Defaults to raft_addr.
     #[serde(default)]
     pub advertise_addr: Option<String>,
     /// The other initial members, "host:port" per entry. Empty means
     /// single-node cluster when raft_addr is set.
     pub peers: Vec<String>,
+    /// Shared bearer token for peer RPC authentication.
+    #[serde(default = "default_raft_auth_token")]
+    pub auth_token: String,
+    /// Enable TLS for peer RPCs.
+    #[serde(default)]
+    pub tls: bool,
+    /// PEM CA bundle for peer certificate verification.
+    #[serde(default)]
+    pub tls_ca_path: Option<String>,
     /// Override election/heartbeat tuning (defaults suit tests and LANs).
     pub heartbeat_interval_ms: Option<u64>,
     pub election_timeout_min_ms: Option<u64>,
     pub election_timeout_max_ms: Option<u64>,
+}
+
+fn default_raft_auth_token() -> String {
+    DEV_RAFT_AUTH_TOKEN.into()
+}
+
+impl Default for RaftConfig {
+    fn default() -> Self {
+        Self {
+            node_id: None,
+            raft_addr: None,
+            advertise_addr: None,
+            peers: Vec::new(),
+            auth_token: default_raft_auth_token(),
+            tls: false,
+            tls_ca_path: None,
+            heartbeat_interval_ms: None,
+            election_timeout_min_ms: None,
+            election_timeout_max_ms: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -368,10 +392,10 @@ impl ServerConfig {
             self.rate_limit_max_users = parse_env_value("OMNIKV_RATE_LIMIT_MAX_USERS", &v)?;
         }
         if let Ok(v) = std::env::var("OMNIKV_TLS_CERT_PATH") {
-            self.tls_cert_path = Some(v);
+            self.tls_cert_path = if v.is_empty() { None } else { Some(v) };
         }
         if let Ok(v) = std::env::var("OMNIKV_TLS_KEY_PATH") {
-            self.tls_key_path = Some(v);
+            self.tls_key_path = if v.is_empty() { None } else { Some(v) };
         }
         if let Ok(v) = std::env::var("OMNIKV_TLS_INSECURE_SKIP") {
             self.tls_insecure_skip = parse_env_value("OMNIKV_TLS_INSECURE_SKIP", &v)?;
@@ -453,6 +477,15 @@ impl ServerConfig {
                 .map(str::to_string)
                 .collect();
         }
+        if let Ok(v) = std::env::var("OMNIKV_RAFT_AUTH_TOKEN") {
+            self.raft.auth_token = v;
+        }
+        if let Ok(v) = std::env::var("OMNIKV_RAFT_TLS") {
+            self.raft.tls = parse_env_value("OMNIKV_RAFT_TLS", &v)?;
+        }
+        if let Ok(v) = std::env::var("OMNIKV_RAFT_TLS_CA_PATH") {
+            self.raft.tls_ca_path = if v.is_empty() { None } else { Some(v) };
+        }
         if let Ok(v) = std::env::var("OMNIKV_RAFT_HEARTBEAT_MS") {
             self.raft.heartbeat_interval_ms = Some(
                 v.parse()
@@ -475,84 +508,23 @@ impl ServerConfig {
     }
 
     pub fn validate_runtime(&self) -> Result<(), ConfigError> {
-        // A node id without a raft listener, or a listener without a
-        // node id, is a half-configured cluster: refuse to boot rather
-        // than silently degrade to single-node.
-        if self.raft.node_id.is_some() != self.raft.raft_addr.is_some() {
-            return Err(ConfigError(
-                "raft.node_id and raft.raft_addr must be set together (OMNIKV_NODE_ID / OMNIKV_RAFT_ADDR)".into(),
-            ));
-        }
-        if self.raft.election_timeout_min_ms.unwrap_or(0)
-            > self.raft.election_timeout_max_ms.unwrap_or(u64::MAX)
-        {
-            return Err(ConfigError(
-                "raft.election_timeout_min_ms must be <= election_timeout_max_ms".into(),
-            ));
-        }
-        // The ADVERTISED address is what peers dial — it must never be
-        // a wildcard. When the explicit override is set, validate it;
-        // when it is not, the bind address is the advertised one, so a
-        // wildcard bind requires the override (a cluster member bound
-        // to 0.0.0.0 without a routable advertise address would poison
-        // every peer's routing table with an address that resolves to
-        // the dialer itself).
-        let advertised = self
-            .raft
-            .advertise_addr
-            .as_deref()
-            .or(self.raft.raft_addr.as_deref());
-        if let Some(addr) = advertised
-            && is_wildcard_addr(addr)
-        {
-            return Err(ConfigError(
-                "raft advertise address must be routable by peers (got a wildcard; set \
-                 OMNIKV_RAFT_ADVERTISE_ADDR to this node's reachable host:port)"
-                    .into(),
-            ));
-        }
-        // Shape check on the explicit override only: "host:port" with a
-        // non-empty host and a valid port. Hostnames (the container
-        // pattern: omni-node-1:9090) are valid here — peers resolve them
-        // through the compose network.
-        if let Some(advertise) = &self.raft.advertise_addr {
-            validate_raft_endpoint(advertise, "raft.advertise_addr")?;
-        }
-        // Each network address must map to exactly one peer identity:
-        // duplicate peer endpoints (or a peer that duplicates this node's
-        // advertised address) let openraft route several member ids to one
-        // listener, which breaks quorum arithmetic in subtle ways.
-        //
-        // Every peer is also dialed exactly as written (boot_cluster_node
-        // copies it into openraft::BasicNode.addr and OmniNetwork builds
-        // the RPC URL from it), so a malformed, wildcard, or port-zero
-        // peer is not a typo an operator can recover from later — it is a
-        // member that can never be reached. Validate each one up front,
-        // with the same rules as the advertised address.
-        if let Some(me) = advertised {
-            let mut seen = std::collections::HashSet::new();
-            for peer in &self.raft.peers {
-                if peer == me {
-                    return Err(ConfigError(
-                        "raft peers must not include this node's own advertised address".into(),
-                    ));
-                }
-                validate_raft_endpoint(peer, "raft peer")?;
-                if !seen.insert(peer) {
-                    return Err(ConfigError(format!(
-                        "raft peers must be unique (duplicate: {peer})"
-                    )));
-                }
-            }
-        }
+        self.validate_cluster(self.mode == ServerMode::Production)?;
         self.validate_common()?;
         if self.mode == ServerMode::Production {
             self.validate_production()?;
+        }
+        if self.tls_insecure_skip {
+            eprintln!(
+                "WARNING: OMNIKV_TLS_INSECURE_SKIP is enabled — \
+                 peer certificate verification is disabled. \
+                 Do NOT use this in production."
+            );
         }
         Ok(())
     }
 
     pub fn validate_production(&self) -> Result<(), ConfigError> {
+        self.validate_cluster(true)?;
         self.validate_common()?;
         if self.jwt_secret == DEV_JWT_SECRET {
             return Err(ConfigError(
@@ -598,6 +570,123 @@ impl ServerConfig {
             }
         } else {
             eprintln!("WARNING: TLS verification is disabled (OMNIKV_TLS_INSECURE_SKIP=true)");
+        }
+        Ok(())
+    }
+
+    fn validate_cluster(&self, production_mode: bool) -> Result<(), ConfigError> {
+        if self.raft.node_id.is_some() != self.raft.raft_addr.is_some() {
+            return Err(ConfigError(
+                "raft.node_id and raft.raft_addr must be set together (OMNIKV_NODE_ID / OMNIKV_RAFT_ADDR)".into(),
+            ));
+        }
+        if self.raft.node_id.is_some() {
+            if self.raft.auth_token.trim().is_empty() {
+                return Err(ConfigError(
+                    "cluster mode requires OMNIKV_RAFT_AUTH_TOKEN to authenticate peer RPCs".into(),
+                ));
+            }
+            if self.raft.auth_token.trim_matches([' ', '\t', '\r', '\n']) != self.raft.auth_token
+                || !self
+                    .raft
+                    .auth_token
+                    .bytes()
+                    .all(|b| matches!(b, b'\t' | b' '..=b'~'))
+            {
+                return Err(ConfigError(
+                    "raft.auth_token (OMNIKV_RAFT_AUTH_TOKEN) must be a valid HTTP header value without leading/trailing whitespace or control characters"
+                        .into(),
+                ));
+            }
+            if production_mode {
+                if self.tls_insecure_skip {
+                    return Err(ConfigError(
+                        "production cluster mode forbids OMNIKV_TLS_INSECURE_SKIP; Raft peer certificates must be verified".into(),
+                    ));
+                }
+                if self.raft.auth_token == DEV_RAFT_AUTH_TOKEN {
+                    return Err(ConfigError(
+                        "production cluster mode requires a non-default Raft peer auth token"
+                            .into(),
+                    ));
+                }
+                if self.raft.auth_token.len() < 32 {
+                    return Err(ConfigError(
+                        "Raft peer auth token must be at least 32 characters in production".into(),
+                    ));
+                }
+                if !self.raft.tls {
+                    return Err(ConfigError(
+                        "production cluster mode requires OMNIKV_RAFT_TLS=true for encrypted peer RPCs"
+                            .into(),
+                    ));
+                }
+                if self.raft.tls_ca_path.is_none() {
+                    return Err(ConfigError(
+                        "production cluster mode requires OMNIKV_RAFT_TLS_CA_PATH to verify peer certificates"
+                            .into(),
+                    ));
+                }
+                if self.tls_cert_path.is_none() || self.tls_key_path.is_none() {
+                    return Err(ConfigError(
+                        "production cluster mode requires operator TLS certificate and key paths for mutual Raft TLS"
+                            .into(),
+                    ));
+                }
+            } else if self.raft.tls && self.raft.tls_ca_path.is_none() && !self.tls_insecure_skip {
+                return Err(ConfigError(
+                    "Raft TLS requires OMNIKV_RAFT_TLS_CA_PATH, or the explicit development-only TLS_INSECURE_SKIP opt-in"
+                        .into(),
+                ));
+            } else if self.raft.tls
+                && self.raft.tls_ca_path.is_some()
+                && (self.tls_cert_path.is_none() || self.tls_key_path.is_none())
+            {
+                return Err(ConfigError(
+                    "Raft mTLS requires tls_cert_path and tls_key_path when a peer CA bundle is configured"
+                        .into(),
+                ));
+            }
+        }
+        if self.raft.election_timeout_min_ms.unwrap_or(0)
+            > self.raft.election_timeout_max_ms.unwrap_or(u64::MAX)
+        {
+            return Err(ConfigError(
+                "raft.election_timeout_min_ms must be <= election_timeout_max_ms".into(),
+            ));
+        }
+        let advertised = self
+            .raft
+            .advertise_addr
+            .as_deref()
+            .or(self.raft.raft_addr.as_deref());
+        if let Some(addr) = advertised
+            && is_wildcard_addr(addr)
+        {
+            return Err(ConfigError(
+                "raft advertise address must be routable by peers (got a wildcard; set \
+                 OMNIKV_RAFT_ADVERTISE_ADDR to this node's reachable host:port)"
+                    .into(),
+            ));
+        }
+        if let Some(advertise) = &self.raft.advertise_addr {
+            validate_raft_endpoint(advertise, "raft.advertise_addr")?;
+        }
+        if let Some(me) = advertised {
+            let mut seen = std::collections::HashSet::new();
+            for peer in &self.raft.peers {
+                if peer == me {
+                    return Err(ConfigError(
+                        "raft peers must not include this node's own advertised address".into(),
+                    ));
+                }
+                validate_raft_endpoint(peer, "raft peer")?;
+                if !seen.insert(peer) {
+                    return Err(ConfigError(format!(
+                        "raft peers must be unique (duplicate: {peer})"
+                    )));
+                }
+            }
         }
         Ok(())
     }
