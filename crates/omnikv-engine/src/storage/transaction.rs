@@ -1449,7 +1449,9 @@ mod commit_seq_number_space {
 
         for idx in 1..=5u64 {
             let mut batch = WriteBatch::new();
-            batch.set(&format!("plain_{idx}"), "v".into()).unwrap();
+            batch
+                .set(&format!("plain_{idx}"), "v".into())
+                .expect("stage plain write");
             history.record_plain_batch(&batch, idx * 10);
         }
 

@@ -878,7 +878,12 @@ impl SqlExecutor {
     /// encoding and records the new format in the catalog. The caller merges
     /// this with its own writes and commits both together, so a statement
     /// that fails validation leaves the table exactly as it was.
-    fn migration_batch(&self, table: &TableDef, seq: u64) -> Result<WriteBatch, String> {
+    fn migration_batch(
+        &self,
+        table: &TableDef,
+        seq: u64,
+        reserved_statement_ops: usize,
+    ) -> Result<(WriteBatch, u64), String> {
         // Use one read point for the catalog format and the rows. An
         // autocommit executor can otherwise observe a concurrent migration
         // between these two reads and decode typed rows with legacy rules.
@@ -891,7 +896,7 @@ impl SqlExecutor {
         // cached copy so its own later reads decode rows as typed.
         if persisted.row_format == crate::catalog::RowFormat::Typed {
             self.catalog.insert_staged(persisted);
-            return Ok(WriteBatch::new());
+            return Ok((WriteBatch::new(), seq));
         }
 
         let prefix = table.row_prefix();
@@ -915,14 +920,11 @@ impl SqlExecutor {
             }
         }
 
-        let mut batch = WriteBatch::new();
-        self.seed_pending_indexes(&mut batch)?;
-        let index_manager = self.catalog.index_manager();
-        let index_catalog = self.dml_index_catalog(seq)?;
-        // The typed path keys and compares a numeric primary key canonically,
-        // so a legacy row stored at ...007 is re-keyed to ...7.
-        let mut canonical_keys: HashMap<String, &str> = HashMap::new();
-        let mut migrated_keys = Vec::new();
+        // Validate every legacy row and check canonical PK uniqueness before
+        // committing any bounded chunk, so an invalid table is never partially
+        // mutated.
+        let mut canonical_keys: HashMap<String, String> = HashMap::new();
+        let mut planned_rows = Vec::with_capacity(stored.len());
         for (key, serialized) in &stored {
             let mut row =
                 crate::plan_exec::PlanExecutor::deserialize_row(serialized, table.row_format)
@@ -935,9 +937,14 @@ impl SqlExecutor {
             let old_document = serde_json::to_value(&row)
                 .map_err(|e| format!("Serialize old index document: {e}"))?;
 
-            let stored_suffix = key.strip_prefix(prefix.as_str()).unwrap_or_default();
-            let canonical_suffix = crate::volcano::canonicalize_pk_key(table, stored_suffix);
-            if let Some(first) = canonical_keys.insert(canonical_suffix.clone(), stored_suffix) {
+            let stored_suffix = key
+                .strip_prefix(prefix.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let canonical_suffix = crate::volcano::canonicalize_pk_key(table, &stored_suffix);
+            if let Some(first) =
+                canonical_keys.insert(canonical_suffix.clone(), stored_suffix.clone())
+            {
                 return Err(format!(
                     "primary key values '{first}' and '{stored_suffix}' in table '{}' both canonicalize to '{canonical_suffix}'",
                     table.name
@@ -951,23 +958,83 @@ impl SqlExecutor {
 
             let typed = serde_json::to_string(&row).map_err(|e| format!("{}", e))?;
             let canonical_key = format!("{prefix}{canonical_suffix}");
-            if &canonical_key != key {
-                batch.delete(key).map_err(|e| format!("{:?}", e))?;
+            let new_document = serde_json::to_value(&row)
+                .map_err(|e| format!("Serialize new index document: {e}"))?;
+            planned_rows.push((
+                key.clone(),
+                serialized.clone(),
+                stored_suffix,
+                canonical_suffix,
+                canonical_key,
+                typed,
+                old_document,
+                new_document,
+            ));
+        }
+
+        let mut batch = WriteBatch::new();
+        self.seed_pending_indexes(&mut batch)?;
+        let index_manager = self.catalog.index_manager();
+        let index_catalog = self.dml_index_catalog(seq)?;
+        let active_stages = self.active_rename_stages(&table.name, seq)?;
+        let index_count = index_catalog.indexes_for_collection(&table.name).len();
+        let per_row_budget = 2 + 2 * index_count + 2 * active_stages.len();
+        let tail_reserve = reserved_statement_ops.saturating_add(1);
+        let can_chunk = self.pending_batch.borrow().is_none();
+        let mut flushed_any = false;
+
+        let chunk_limit = WriteBatch::MAX_OPS.saturating_sub(per_row_budget);
+        for (
+            key,
+            serialized,
+            stored_suffix,
+            canonical_suffix,
+            canonical_key,
+            typed,
+            old_document,
+            new_document,
+        ) in planned_rows
+        {
+            let needs_rekey = canonical_key != key;
+            let needs_rewrite = typed != serialized;
+            if !needs_rekey && !needs_rewrite && old_document == new_document {
+                continue;
+            }
+            if can_chunk && !batch.is_empty() && batch.op_count() > chunk_limit {
+                self.db
+                    .commit_batch(&batch)
+                    .map_err(|e| format!("{:?}", e))?;
+                batch = WriteBatch::new();
+                flushed_any = true;
+            }
+            if needs_rekey {
+                batch.delete(&key).map_err(|e| format!("{:?}", e))?;
                 batch
                     .set(&canonical_key, typed)
                     .map_err(|e| format!("{:?}", e))?;
-                migrated_keys.push((key.clone(), canonical_key.clone()));
-            } else if &typed != serialized {
-                batch.set(key, typed).map_err(|e| format!("{:?}", e))?;
+                for stage_key in &active_stages {
+                    let old_marker =
+                        crate::schema::SchemaManager::rename_row_stage_key(stage_key, &key);
+                    if let Some(val) =
+                        self.find_row_stage_marker_with_batch(Some(&batch), &old_marker, seq)?
+                    {
+                        let new_marker = crate::schema::SchemaManager::rename_row_stage_key(
+                            stage_key,
+                            &canonical_key,
+                        );
+                        Self::stage_batch_delete(&mut batch, &old_marker)?;
+                        Self::stage_batch_set(&mut batch, &new_marker, val)?;
+                    }
+                }
+            } else if needs_rewrite {
+                batch.set(&key, typed).map_err(|e| format!("{:?}", e))?;
             }
-            let new_document = serde_json::to_value(&row)
-                .map_err(|e| format!("Serialize new index document: {e}"))?;
             let mut reads = self.pending_reads.borrow_mut();
             index_manager
                 .replace_document_indexes_with_catalog_and_reads(
                     &index_catalog,
                     &table.name,
-                    stored_suffix,
+                    &stored_suffix,
                     &old_document,
                     &canonical_suffix,
                     &new_document,
@@ -976,7 +1043,16 @@ impl SqlExecutor {
                 )
                 .map_err(|e| format!("Index maintenance failed: {e}"))?;
         }
-        self.move_rename_stage_markers(&table.name, &migrated_keys, &mut batch, seq)?;
+        if can_chunk
+            && !batch.is_empty()
+            && batch.op_count().saturating_add(tail_reserve) > WriteBatch::MAX_OPS
+        {
+            self.db
+                .commit_batch(&batch)
+                .map_err(|e| format!("{:?}", e))?;
+            batch = WriteBatch::new();
+            flushed_any = true;
+        }
 
         let mut updated = table.clone();
         updated.row_format = crate::catalog::RowFormat::Typed;
@@ -984,7 +1060,8 @@ impl SqlExecutor {
         batch
             .set(&cat_key, cat_value)
             .map_err(|e| format!("{:?}", e))?;
-        Ok(batch)
+        let effective_seq = if flushed_any { self.db.get_seq() } else { seq };
+        Ok((batch, effective_seq))
     }
 
     fn exec_insert(
@@ -1042,18 +1119,22 @@ impl SqlExecutor {
             occupied_keys.insert(format!("{}{}", table.row_prefix(), canonical));
         }
 
+        let index_manager = self.catalog.index_manager();
+        let index_catalog = self.dml_index_catalog(read_seq)?;
+        let insert_reserved_ops = values
+            .len()
+            .saturating_mul(1 + index_catalog.indexes_for_collection(&table.name).len());
         // The migration and the inserts commit in one batch, so a ROLLBACK
         // (or a later failure) drops the row rewrites and the format flip
         // together.
         let mut batch = if table.row_format == crate::catalog::RowFormat::Legacy {
-            self.migration_batch(&table, read_seq)?
+            self.migration_batch(&table, read_seq, insert_reserved_ops)?
+                .0
         } else {
             WriteBatch::new()
         };
         let mut count = 0;
         self.seed_pending_indexes(&mut batch)?;
-        let index_manager = self.catalog.index_manager();
-        let index_catalog = self.dml_index_catalog(read_seq)?;
 
         for row_vals in values {
             let mut row_map = Row::new();
@@ -2264,17 +2345,27 @@ impl SqlExecutor {
             old_keys.push(old_key);
         }
 
+        let index_manager = self.catalog.index_manager();
+        let index_catalog = self.dml_index_catalog(read_seq)?;
+        let update_stage_count = if rows.is_empty() {
+            0
+        } else {
+            self.active_rename_stages(&table.name, read_seq)?.len()
+        };
+        let update_reserved_ops = rows.len().saturating_mul(
+            2 + 2 * index_catalog.indexes_for_collection(&table.name).len()
+                + 2 * update_stage_count,
+        );
         // The migration batch lands first so its rewrite of an untouched
         // row loses to this statement's write of the same (canonical) key.
-        let mut batch = if table.row_format == crate::catalog::RowFormat::Legacy {
-            self.migration_batch(&table, read_seq)?
+        let (mut batch, marker_read_seq) = if table.row_format == crate::catalog::RowFormat::Legacy
+        {
+            self.migration_batch(&table, read_seq, update_reserved_ops)?
         } else {
-            WriteBatch::new()
+            (WriteBatch::new(), read_seq)
         };
         let count = rows.len();
         self.seed_pending_indexes(&mut batch)?;
-        let index_manager = self.catalog.index_manager();
-        let index_catalog = self.dml_index_catalog(read_seq)?;
         let mut new_keys = std::collections::HashSet::with_capacity(rows.len());
         let mut stale_keys = Vec::new();
         let mut moved_keys = Vec::new();
@@ -2358,7 +2449,7 @@ impl SqlExecutor {
                 )
                 .map_err(|e| format!("Index maintenance failed: {e}"))?;
         }
-        self.move_rename_stage_markers(&table.name, &moved_keys, &mut batch, read_seq)?;
+        self.move_rename_stage_markers(&table.name, &moved_keys, &mut batch, marker_read_seq)?;
         for stale in stale_keys {
             if !new_keys.contains(&stale) {
                 batch
@@ -2405,15 +2496,6 @@ impl SqlExecutor {
             rows.retain(|row| eval_where_typed(row, expr, &col_types));
         }
 
-        // Deletes commit after the migration's rewrites inside one batch, so
-        // a row the statement removes disappears even if migration moved it.
-        let mut batch = if table.row_format == crate::catalog::RowFormat::Legacy {
-            self.migration_batch(&table, read_seq)?
-        } else {
-            WriteBatch::new()
-        };
-        let count = rows.len();
-        self.seed_pending_indexes(&mut batch)?;
         let index_manager = self.catalog.index_manager();
         let index_catalog = self.dml_index_catalog(read_seq)?;
         let active_stages = if rows.is_empty() {
@@ -2421,6 +2503,19 @@ impl SqlExecutor {
         } else {
             self.active_rename_stages(&table.name, read_seq)?
         };
+        let delete_reserved_ops = rows.len().saturating_mul(
+            1 + index_catalog.indexes_for_collection(&table.name).len() + active_stages.len(),
+        );
+        // Deletes commit after the migration's rewrites inside one batch, so
+        // a row the statement removes disappears even if migration moved it.
+        let (mut batch, marker_read_seq) = if table.row_format == crate::catalog::RowFormat::Legacy
+        {
+            self.migration_batch(&table, read_seq, delete_reserved_ops)?
+        } else {
+            (WriteBatch::new(), read_seq)
+        };
+        let count = rows.len();
+        self.seed_pending_indexes(&mut batch)?;
         for row in &rows {
             let pk = row
                 .get(&table.primary_key)
@@ -2447,7 +2542,7 @@ impl SqlExecutor {
             for stage_key in &active_stages {
                 let marker = crate::schema::SchemaManager::rename_row_stage_key(stage_key, &key);
                 if self
-                    .find_row_stage_marker_with_batch(Some(&batch), &marker, read_seq)?
+                    .find_row_stage_marker_with_batch(Some(&batch), &marker, marker_read_seq)?
                     .is_some()
                 {
                     Self::stage_batch_delete(&mut batch, &marker)?;
@@ -2470,7 +2565,7 @@ impl SqlExecutor {
     }
 
     fn active_rename_stages(&self, table_name: &str, read_seq: u64) -> Result<Vec<String>, String> {
-        let prefix = format!("\x00SCHEMA\x00rename_stage:{}:", table_name.to_lowercase());
+        let prefix = crate::schema::SchemaManager::rename_stage_prefix_for_table(table_name);
         let end = format!("{prefix}\u{10ffff}");
         self.db
             .scan(&prefix, &end, read_seq)

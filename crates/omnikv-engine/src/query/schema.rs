@@ -604,12 +604,21 @@ impl SchemaManager {
         }
     }
 
-    fn rename_stage_key(collection: &str, old_name: &str, new_name: &str) -> String {
+    pub(crate) fn rename_stage_prefix_for_table(collection: &str) -> String {
+        let col = collection.to_lowercase();
+        format!("\x00SCHEMA\x00rename_stage:{}:{}:", col.len(), col)
+    }
+
+    pub(crate) fn rename_stage_key(collection: &str, old_name: &str, new_name: &str) -> String {
+        let old = old_name.to_lowercase();
+        let new = new_name.to_lowercase();
         format!(
-            "\x00SCHEMA\x00rename_stage:{}:{}:{}",
-            collection.to_lowercase(),
-            old_name.to_lowercase(),
-            new_name.to_lowercase()
+            "{}{}:{}:{}:{}",
+            Self::rename_stage_prefix_for_table(collection),
+            old.len(),
+            old,
+            new.len(),
+            new
         )
     }
 
@@ -617,7 +626,7 @@ impl SchemaManager {
         let suffix = stage_key
             .strip_prefix("\x00SCHEMA\x00rename_stage:")
             .unwrap_or(stage_key);
-        format!("\x00SCHEMA\x00rename_row:{suffix}\x00")
+        format!("\x00SCHEMA\x00rename_row:{}:{suffix}\x00", suffix.len())
     }
 
     pub(crate) fn rename_row_stage_key(stage_key: &str, row_key: &str) -> String {

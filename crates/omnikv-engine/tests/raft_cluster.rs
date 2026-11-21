@@ -4808,7 +4808,7 @@ async fn test_snapshot_install_blocks_pre_install_2pc_prepare_against_plain_writ
     use openraft::storage::RaftSnapshotBuilder;
 
     let (leader_db, leader, _leader_dir) = create_node("ssi_2pc_snap_leader");
-    let (follower_db, follower, _follower_dir) = create_node("ssi_2pc_snap_follower");
+    let (follower_db, follower, follower_dir) = create_node("ssi_2pc_snap_follower");
 
     // Seed follower with higher local sequences than the rebuilt temp DB will
     // assign during snapshot install, ensuring the fallback get_seq_for_key
@@ -4840,6 +4840,17 @@ async fn test_snapshot_install_blocks_pre_install_2pc_prepare_against_plain_writ
         follower_db.ssi_history().eviction_floor() >= leader_max_seq,
         "installed SSI eviction floor must be at least the snapshot's max_seq"
     );
+    assert_eq!(
+        follower_db
+            .find("snap_plain_k", follower_db.get_seq())
+            .unwrap(),
+        Some("from_leader_plain".into()),
+        "installed snapshot must deliver the leader's plain write"
+    );
+    assert!(
+        follower_db.get_seq_for_key("snap_plain_k", u64::MAX) <= pre_install_read_seq,
+        "rebuilt snapshot key sequence must not exceed pre_install_read_seq, proving the eviction floor is what catches the conflict"
+    );
 
     let participant = TwoPhaseParticipant::new(2, follower_db.clone());
     let writes = vec![DistWrite {
@@ -4864,5 +4875,128 @@ async fn test_snapshot_install_blocks_pre_install_2pc_prepare_against_plain_writ
         fresh_vote.vote,
         Vote::Commit,
         "post-install 2PC prepare must still succeed"
+    );
+    participant.abort((1, 2)).unwrap();
+
+    // Reopen the follower from disk immediately after snapshot install and verify
+    // the persisted sequence boundary still rejects the pre-install read_seq.
+    drop(participant);
+    drop(installer);
+    drop(follower);
+    drop(follower_db);
+
+    let (reopened_db, _reopened_follower) =
+        create_node_in_dir(follower_dir.path(), "ssi_2pc_snap_follower");
+    assert_eq!(
+        reopened_db
+            .find("snap_plain_k", reopened_db.get_seq())
+            .unwrap(),
+        Some("from_leader_plain".into()),
+        "reopened follower must still hold the installed snapshot key"
+    );
+    let reopened_participant = TwoPhaseParticipant::new(2, reopened_db);
+    let reopened_stale =
+        reopened_participant.prepare_with_snapshot((1, 3), &writes, pre_install_read_seq);
+    match reopened_stale.vote {
+        Vote::Abort(reason) => assert!(
+            reason.contains("SSI CONFLICT"),
+            "expected SSI conflict after reopen on pre-install 2PC prepare, got: {reason}"
+        ),
+        Vote::Commit => {
+            panic!("pre-install 2PC prepare must remain rejected after restarting the follower")
+        }
+    }
+    let reopened_fresh = reopened_participant.prepare((1, 4), &writes);
+    assert_eq!(
+        reopened_fresh.vote,
+        Vote::Commit,
+        "fresh post-restart 2PC prepare must succeed"
+    );
+}
+
+#[tokio::test]
+async fn test_grouped_raft_apply_preserves_delete_before_2pc_commit_order() {
+    use omni_engine::WriteBatch;
+    use omni_engine::raft_command::RaftCommand;
+    use openraft::{CommittedLeaderId, Entry, EntryPayload, LogId, RaftStorage};
+
+    let (grouped_db, mut grouped_storage, _g_dir) = create_node("grouped_del_2pc");
+    let (separate_db, mut separate_storage, _s_dir) = create_node("separate_del_2pc");
+
+    // Seed both replicas with initial key K.
+    for db in [&grouped_db, &separate_db] {
+        let mut init = WriteBatch::new();
+        init.set("k_order", "initial".into()).unwrap();
+        db.commit_batch(&init).unwrap();
+    }
+
+    let mut del_batch = WriteBatch::new();
+    del_batch.delete("k_order").unwrap();
+    let del_cmd = RaftCommand::from_batch(&del_batch);
+
+    let prepare_key = "__2PC_PREPARE__/2/1_1";
+    let prepare_json = serde_json::json!({
+        "txn_id": [1, 1],
+        "node_id": 2,
+        "state": "PREPARED",
+        "writes": [{"node_id": 2, "key": "k_order", "value": "committed_val", "ttl": 0}],
+        "prepare_seq": 1,
+        "commit_seq": null
+    })
+    .to_string();
+    let mut prep_batch = WriteBatch::new();
+    prep_batch.set(prepare_key, prepare_json).unwrap();
+    let prep_cmd = RaftCommand::from_batch(&prep_batch);
+
+    let commit_json = serde_json::json!({
+        "txn_id": [1, 1],
+        "node_id": 2,
+        "state": "COMMITTED",
+        "writes": [{"node_id": 2, "key": "k_order", "value": "committed_val", "ttl": 0}],
+        "prepare_seq": 1,
+        "commit_seq": null
+    })
+    .to_string();
+    let mut commit_batch = WriteBatch::new();
+    commit_batch.set("k_order", "committed_val".into()).unwrap();
+    commit_batch.set(prepare_key, commit_json).unwrap();
+    let commit_cmd = RaftCommand::from_batch(&commit_batch);
+
+    let leader = CommittedLeaderId::new(1, 1);
+    let entries = [
+        Entry {
+            log_id: LogId::new(leader, 1),
+            payload: EntryPayload::Normal(del_cmd.encode()),
+        },
+        Entry {
+            log_id: LogId::new(leader, 2),
+            payload: EntryPayload::Normal(prep_cmd.encode()),
+        },
+        Entry {
+            log_id: LogId::new(leader, 3),
+            payload: EntryPayload::Normal(commit_cmd.encode()),
+        },
+    ];
+
+    grouped_storage
+        .apply_to_state_machine(&entries)
+        .await
+        .unwrap();
+    for entry in &entries {
+        separate_storage
+            .apply_to_state_machine(std::slice::from_ref(entry))
+            .await
+            .unwrap();
+    }
+
+    assert_eq!(
+        grouped_db.find("k_order", grouped_db.get_seq()).unwrap(),
+        Some("committed_val".into()),
+        "grouped Raft apply must not let an earlier DELETE overwrite a later 2PC COMMIT set"
+    );
+    assert_eq!(
+        grouped_db.find("k_order", grouped_db.get_seq()).unwrap(),
+        separate_db.find("k_order", separate_db.get_seq()).unwrap(),
+        "grouped and separate Raft applies must converge to identical state"
     );
 }

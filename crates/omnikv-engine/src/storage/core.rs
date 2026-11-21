@@ -568,7 +568,7 @@ impl BloomFilter {
 /// install can carry far more ops than a client batch, so they commit
 /// in chunks of this size (`WriteBatch::MAX_OPS`).
 pub const MAX_BATCH_SIZE: usize = 10_000;
-const MAX_VALUE_SIZE: usize = 10 * 1024 * 1024; // 10 MB
+pub(crate) const MAX_VALUE_SIZE: usize = 10 * 1024 * 1024; // 10 MB
 const UNCOMPRESSED_FLAG: u64 = 1 << 63;
 const NUM_SHARDS: usize = 16;
 
@@ -1360,9 +1360,12 @@ impl OmniKV {
             heap_reader: recovered.heap_reader,
         };
 
+        let ssi_history = std::sync::Arc::new(crate::transaction::SsiHistory::default());
+        ssi_history.advance_eviction_floor(recovered.max_seq);
+
         Ok(Arc::new(Self {
             roots: ArcSwap::from_pointee(initial_roots),
-            global_seq: AtomicU64::new(recovered.max_seq + 1),
+            global_seq: AtomicU64::new(recovered.max_seq.saturating_add(1)),
             heap_file: Mutex::new(recovered.heap_file),
             heap_offset: AtomicU64::new(recovered.heap_offset),
             wal: Mutex::new(recovered.wal),
@@ -1382,7 +1385,7 @@ impl OmniKV {
             group_commit: crate::hardening::GroupCommitEngine::new(200),
             transition_guard: RwLock::new(()),
             cluster_gateway: std::sync::OnceLock::new(),
-            ssi_history: std::sync::Arc::new(crate::transaction::SsiHistory::default()),
+            ssi_history,
             // Start from a process-unique seed so reopening a database does
             // not immediately reuse the previous instance's token sequence.
             file_seq: std::sync::atomic::AtomicU64::new(rand::random()),
@@ -2101,25 +2104,28 @@ impl OmniKV {
         let l0_sstables = self.sstable_count();
         metrics_prometheus::record_compaction_backlog(self.compaction_backlog_sstables());
         if l0_sstables >= compaction_policy.l0_write_stall_threshold {
+            let total_wait = std::time::Duration::from_millis(
+                compaction_policy
+                    .write_stall_wait_ms
+                    .saturating_mul(compaction_policy.write_stall_wait_attempts as u64),
+            );
+            let deadline = std::time::Instant::now() + total_wait;
             let mut stalled = true;
             let (ref stall_lock, ref cv) = self.compaction_cv;
             let mut guard = stall_lock.lock().unwrap_or_else(|e| e.into_inner());
-            if self.sstable_count() < compaction_policy.l0_write_stall_threshold {
-                stalled = false;
-            } else {
-                for _ in 0..compaction_policy.write_stall_wait_attempts {
-                    let (returned, _timeout) = cv
-                        .wait_timeout(
-                            guard,
-                            std::time::Duration::from_millis(compaction_policy.write_stall_wait_ms),
-                        )
-                        .unwrap_or_else(|e| e.into_inner());
-                    guard = returned;
-                    if self.sstable_count() < compaction_policy.l0_write_stall_threshold {
-                        stalled = false;
-                        break;
-                    }
+            loop {
+                if self.sstable_count() < compaction_policy.l0_write_stall_threshold {
+                    stalled = false;
+                    break;
                 }
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                let (returned, _timeout) = cv
+                    .wait_timeout(guard, remaining)
+                    .unwrap_or_else(|e| e.into_inner());
+                guard = returned;
             }
             drop(guard);
             if stalled {
@@ -2867,6 +2873,12 @@ impl OmniKV {
         0
     }
 
+    fn notify_compaction_waiters(&self) {
+        let (ref stall_lock, ref cv) = self.compaction_cv;
+        let _guard = stall_lock.lock().unwrap_or_else(|e| e.into_inner());
+        cv.notify_all();
+    }
+
     /// Flushes the active memtable to disk as an L0 SSTable.
     pub fn compact_sstables(&self) -> Result<(), OmniError> {
         let _topology_guard = self
@@ -2874,7 +2886,7 @@ impl OmniKV {
             .read()
             .map_err(|_| OmniError::LockPoisoned("transition_guard".into()))?;
         let result = self.compact_sstables_locked();
-        self.compaction_cv.1.notify_all();
+        self.notify_compaction_waiters();
         result
     }
 
@@ -3073,7 +3085,7 @@ impl OmniKV {
             });
 
             stats.record("l0_to_l1", started_at, self.compaction_backlog_sstables());
-            self.compaction_cv.1.notify_all();
+            self.notify_compaction_waiters();
             return Ok(());
         }
 
@@ -3138,7 +3150,7 @@ impl OmniKV {
         });
 
         stats.record("l0_to_l1", started_at, self.compaction_backlog_sstables());
-        self.compaction_cv.1.notify_all();
+        self.notify_compaction_waiters();
         Ok(())
     }
 
@@ -4206,6 +4218,69 @@ mod tests {
         assert_eq!(
             no_leader.to_string(),
             "not the leader; no leader elected yet"
+        );
+    }
+
+    #[test]
+    fn write_stall_wait_ignores_no_progress_wakeup_and_proceeds_when_l0_clears() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db = OmniKV::open(
+            dir.path()
+                .join("manifest.json")
+                .to_str()
+                .expect("manifest path"),
+            dir.path().join("wal.bin").to_str().expect("wal path"),
+        )
+        .expect("open db");
+
+        // Raise threshold while seeding 2 L0 SSTables.
+        db.set_compaction_policy(CompactionPolicy {
+            l0_compaction_trigger: 1,
+            l1_compaction_trigger: 1,
+            l0_write_stall_threshold: 4,
+            write_stall_wait_attempts: 1,
+            write_stall_wait_ms: 500,
+        })
+        .expect("set seed policy");
+        for i in 0..2 {
+            let mut b = WriteBatch::new();
+            b.set(&format!("seed_{i}"), "v".into())
+                .expect("stage seed key");
+            db.commit_batch(&b).expect("commit seed key");
+            db.compact_sstables().expect("flush L0");
+        }
+        assert_eq!(db.sstable_count(), 2);
+
+        // Stall at 2 L0 SSTables with 1 attempt of 500ms.
+        db.set_compaction_policy(CompactionPolicy {
+            l0_compaction_trigger: 1,
+            l1_compaction_trigger: 1,
+            l0_write_stall_threshold: 2,
+            write_stall_wait_attempts: 1,
+            write_stall_wait_ms: 500,
+        })
+        .expect("set stall policy");
+
+        let db_bg = db.clone();
+        let bg = std::thread::spawn(move || {
+            // Spurious / no-progress notification while L0 is still stalled.
+            std::thread::sleep(std::time::Duration::from_millis(25));
+            db_bg.notify_compaction_waiters();
+            // Clear L0 shortly afterwards, well within the 500ms budget.
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            db_bg.compact_l0_to_l1().expect("compact L0 to L1");
+        });
+
+        let mut writer_batch = WriteBatch::new();
+        writer_batch
+            .set("after_stall", "ok".into())
+            .expect("stage writer key");
+        db.commit_batch(&writer_batch)
+            .expect("writer must wait through no-progress wakeup until compaction clears L0");
+        bg.join().expect("background compactor joined");
+        assert_eq!(
+            db.find("after_stall", db.get_seq()).expect("read key"),
+            Some("ok".into())
         );
     }
 }

@@ -683,6 +683,8 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
         // batch flushes, and the record — if any — is entered into this
         // node's committed history at that same marker.
         let mut staged_slots: Vec<(usize, Option<SsiCommitRecord>)> = Vec::new();
+        let mut staged_deletes: std::collections::HashSet<Vec<u8>> =
+            std::collections::HashSet::new();
         // Flushes the staged batch (if non-empty) and stamps every entry
         // staged in it with the batch's COMMIT MARKER, which the proposer
         // reads back through client_write's response as the sequence its
@@ -703,6 +705,7 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
         // has every pre-failover commit in its history when it first leads.
         let flush_staged = |batch: &mut WriteBatch,
                             slots: &mut Vec<(usize, Option<SsiCommitRecord>)>,
+                            deletes: &mut std::collections::HashSet<Vec<u8>>,
                             res: &mut Vec<String>|
          -> Result<(), crate::OmniError> {
             if batch.is_empty() {
@@ -754,6 +757,7 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
             // (never runs a local COMMIT) does not grow without bound.
             history.prune(self.db.min_active_snapshot());
             slots.clear();
+            deletes.clear();
             batch.clear();
             Ok(())
         };
@@ -788,17 +792,27 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
                         }
                         // Flush at the ENTRY boundary (never mid-command):
                         // a reader or crash between commits must never see
-                        // part of this entry's writes. `>=`, not `>`: an
-                        // apply whose ops sum to EXACTLY the cap must still
-                        // leave the batch strictly under it so the next
-                        // entry (and the meta record appended after the
-                        // loop) always has a slot.
+                        // part of this entry's writes. Also flush whenever
+                        // this entry sets a key deleted by an earlier staged
+                        // entry, because WriteBatch applies all sets before
+                        // all deletes and grouping them would invert order.
+                        let sets_staged_delete = !staged_deletes.is_empty()
+                            && cmd
+                                .sets
+                                .iter()
+                                .any(|op| staged_deletes.contains(op.key.as_bytes()));
                         if !batch.is_empty()
-                            && batch.op_count() + cmd.sets.len() + cmd.dels.len()
-                                >= WriteBatch::MAX_OPS
+                            && (sets_staged_delete
+                                || batch.op_count() + cmd.sets.len() + cmd.dels.len()
+                                    >= WriteBatch::MAX_OPS)
                         {
-                            flush_staged(&mut batch, &mut staged_slots, &mut res)
-                                .map_err(io_err)?;
+                            flush_staged(
+                                &mut batch,
+                                &mut staged_slots,
+                                &mut staged_deletes,
+                                &mut res,
+                            )
+                            .map_err(io_err)?;
                         }
                         for op in cmd.sets {
                             // The entry carries the ABSOLUTE expiry the
@@ -812,6 +826,7 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
                         }
                         for key in &cmd.dels {
                             batch.delete(key).map_err(|e| storage_write_err(&e))?;
+                            staged_deletes.insert(key.as_bytes().to_vec());
                         }
                         // Placeholder: stamped with the batch's commit
                         // marker when it flushes. Empty until then.
@@ -820,9 +835,18 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
                     } else if let Some(rest) = req.strip_prefix("SET ") {
                         let parts: Vec<&str> = rest.splitn(2, ' ').collect();
                         if parts.len() == 2 && !parts[0].starts_with("__sys__/raft/") {
-                            if !batch.is_empty() && batch.op_count() + 1 >= WriteBatch::MAX_OPS {
-                                flush_staged(&mut batch, &mut staged_slots, &mut res)
-                                    .map_err(io_err)?;
+                            let sets_staged_delete = staged_deletes.contains(parts[0].as_bytes());
+                            if !batch.is_empty()
+                                && (sets_staged_delete
+                                    || batch.op_count() + 1 >= WriteBatch::MAX_OPS)
+                            {
+                                flush_staged(
+                                    &mut batch,
+                                    &mut staged_slots,
+                                    &mut staged_deletes,
+                                    &mut res,
+                                )
+                                .map_err(io_err)?;
                             }
                             batch
                                 .set(parts[0], parts[1].to_string())
@@ -851,7 +875,8 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
         // the pre-crash last_applied. Flushing here (rather than letting
         // data ride along with the meta op) removes the exact-cap special
         // case: the batch is empty when the single meta op is appended.
-        flush_staged(&mut batch, &mut staged_slots, &mut res).map_err(io_err)?;
+        flush_staged(&mut batch, &mut staged_slots, &mut staged_deletes, &mut res)
+            .map_err(io_err)?;
 
         if last_applied.is_some() || new_membership.is_some() {
             // Scoped: the guard must be released before the final commit
@@ -1080,6 +1105,15 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
             );
         }
         installed_manifest.l1_sstables = rebased_l1_sstables;
+        let cur_seq = self.db.global_seq.load(Ordering::SeqCst);
+        let prev_floor = self.db.ssi_history().eviction_floor();
+        let snapshot_floor = envelope
+            .max_seq
+            .max(installed_manifest.max_seq)
+            .max(cur_seq)
+            .max(prev_floor)
+            .max(envelope.ssi_eviction_floor);
+        installed_manifest.max_seq = snapshot_floor;
         installed_manifest
             .save(&tmp_manifest_path)
             .map_err(|e| io_err(&format!("save installed snapshot manifest: {e}")))?;
@@ -1190,20 +1224,13 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
             .heap_offset
             .store(recovered.heap_offset, Ordering::Release);
 
-        // CRITICAL: Advance global_seq strictly past the snapshot's max_seq,
-        // the rebuilt storage's max_seq, this node's prior sequence, and any
-        // prior SSI eviction floor so every pre-install read_seq sits below
-        // the new floor while post-install snapshots (global_seq - 1) pass.
-        let cur_seq = self.db.global_seq.load(Ordering::SeqCst);
-        let prev_floor = self.db.ssi_history().eviction_floor();
-        let snapshot_floor = envelope
-            .max_seq
-            .max(recovered.max_seq)
-            .max(cur_seq)
-            .max(prev_floor);
+        // CRITICAL: Advance global_seq strictly past the persisted snapshot
+        // floor (and any recovered sequence) so every pre-install read_seq sits
+        // below the new floor while post-install snapshots (global_seq - 1) pass.
+        let final_floor = snapshot_floor.max(recovered.max_seq);
         self.db
             .global_seq
-            .store(snapshot_floor.saturating_add(1), Ordering::SeqCst);
+            .store(final_floor.saturating_add(1), Ordering::SeqCst);
 
         // The snapshot replaced the data wholesale, so the committed
         // history must be replaced too — otherwise a node promoted after
@@ -1220,7 +1247,7 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
                 .collect(),
             envelope.ssi_eviction_floor,
         );
-        self.db.ssi_history().advance_eviction_floor(snapshot_floor);
+        self.db.ssi_history().advance_eviction_floor(final_floor);
         self.db
             .sync_prepared_2pc_reservations()
             .map_err(|e| io_err(&format!("sync 2PC prepared reservations: {e}")))?;

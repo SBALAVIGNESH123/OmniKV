@@ -548,20 +548,16 @@ fn large_online_rename_recovers_staged_rows_and_completed_steps() {
         db.commit_batch(&seed).unwrap();
     }
 
+    let stage_key = test_rename_stage_key("big_rename", "old_col", "new_col");
+    let row_marker_k0001 = test_rename_row_stage_key(&stage_key, "\u{0}T\u{0}big_rename\u{0}k0001");
     let mut partial = WriteBatch::new();
     for (k, v) in [
-        (
-            "\u{0}SCHEMA\u{0}rename_stage:big_rename:old_col:new_col",
-            "old_col",
-        ),
+        (stage_key.as_str(), "old_col"),
         (
             "\u{0}T\u{0}big_rename\u{0}k0000",
             "{\"id\":\"k0000\",\"old_col\":\"v0\",\"new_col\":\"v0\"}",
         ),
-        (
-            "\u{0}SCHEMA\u{0}rename_row:big_rename:old_col:new_col\u{0}\u{0}T\u{0}big_rename\u{0}k0001",
-            "1",
-        ),
+        (row_marker_k0001.as_str(), "1"),
         (
             "\u{0}T\u{0}big_rename\u{0}k0001",
             "{\"id\":\"k0001\",\"old_col\":\"v1\",\"new_col\":\"v1\"}",
@@ -731,6 +727,31 @@ fn failed_unique_index_rebuild_over_batch_limit_cleans_up_and_allows_retry() {
     assert!(idx_mgr.definition("big_idx_code_uq").is_ok());
 }
 
+fn test_rename_stage_key(collection: &str, old_name: &str, new_name: &str) -> String {
+    let col = collection.to_lowercase();
+    let old = old_name.to_lowercase();
+    let new = new_name.to_lowercase();
+    format!(
+        "\u{0}SCHEMA\u{0}rename_stage:{}:{}:{}:{}:{}:{}",
+        col.len(),
+        col,
+        old.len(),
+        old,
+        new.len(),
+        new
+    )
+}
+
+fn test_rename_row_stage_key(stage_key: &str, row_key: &str) -> String {
+    let suffix = stage_key
+        .strip_prefix("\u{0}SCHEMA\u{0}rename_stage:")
+        .unwrap_or(stage_key);
+    format!(
+        "\u{0}SCHEMA\u{0}rename_row:{}:{suffix}\u{0}{row_key}",
+        suffix.len()
+    )
+}
+
 #[test]
 fn legacy_table_online_rename_propagates_stage_markers_across_lazy_migration_update_and_delete() {
     use omni_engine::schema::{Migration, SchemaManager, SchemaOp};
@@ -742,29 +763,24 @@ fn legacy_table_online_rename_propagates_stage_markers_across_lazy_migration_upd
     )
     .unwrap();
 
+    let stage_key = test_rename_stage_key("legacy_rename", "old_col", "new_col");
+    let orphan_marker = test_rename_row_stage_key(&stage_key, "\u{0}T\u{0}legacy_rename\u{0}999");
     let manifest = "{\"name\":\"legacy_rename\",\"columns\":[{\"name\":\"id\",\"col_type\":\"Integer\",\"nullable\":false,\"primary_key\":true,\"default\":null},{\"name\":\"old_col\",\"col_type\":\"Text\",\"nullable\":true,\"primary_key\":false,\"default\":null}],\"primary_key\":\"id\",\"created_at\":1000}";
     let mut seed = WriteBatch::new();
     seed.set("\u{0}CATALOG\u{0}legacy_rename", manifest.to_string())
         .unwrap();
     for (raw_id, val) in [("001", "v1"), ("002", "v2"), ("003", "v3")] {
+        let row_key = format!("\u{0}T\u{0}legacy_rename\u{0}{raw_id}");
         seed.set(
-            &format!("\u{0}T\u{0}legacy_rename\u{0}{raw_id}"),
+            &row_key,
             format!("{{\"id\":\"{raw_id}\",\"old_col\":\"{val}\",\"new_col\":\"{val}\"}}"),
         )
         .unwrap();
-        seed.set(
-            &format!(
-                "\u{0}SCHEMA\u{0}rename_row:legacy_rename:old_col:new_col\u{0}\u{0}T\u{0}legacy_rename\u{0}{raw_id}"
-            ),
-            "1".into(),
-        )
-        .unwrap();
+        seed.set(&test_rename_row_stage_key(&stage_key, &row_key), "1".into())
+            .unwrap();
     }
-    seed.set(
-        "\u{0}SCHEMA\u{0}rename_stage:legacy_rename:old_col:new_col",
-        "old_col".into(),
-    )
-    .unwrap();
+    seed.set(&orphan_marker, "1".into()).unwrap();
+    seed.set(&stage_key, "old_col".into()).unwrap();
     db.commit_batch(&seed).unwrap();
 
     let executor = SqlExecutor::new(db.clone(), Arc::new(Catalog::new(db.clone())));
@@ -777,11 +793,10 @@ fn legacy_table_online_rename_propagates_stage_markers_across_lazy_migration_upd
 
     // Verify markers migrated cleanly: 001 -> 100, 003 -> 3, and 002/2 deleted
     for old_raw in ["001", "002", "003", "1", "2"] {
+        let row_key = format!("\u{0}T\u{0}legacy_rename\u{0}{old_raw}");
         assert_eq!(
             db.find(
-                &format!(
-                    "\u{0}SCHEMA\u{0}rename_row:legacy_rename:old_col:new_col\u{0}\u{0}T\u{0}legacy_rename\u{0}{old_raw}"
-                ),
+                &test_rename_row_stage_key(&stage_key, &row_key),
                 db.get_seq()
             )
             .unwrap(),
@@ -790,11 +805,10 @@ fn legacy_table_online_rename_propagates_stage_markers_across_lazy_migration_upd
         );
     }
     for live_id in ["100", "3"] {
+        let row_key = format!("\u{0}T\u{0}legacy_rename\u{0}{live_id}");
         assert_eq!(
             db.find(
-                &format!(
-                    "\u{0}SCHEMA\u{0}rename_row:legacy_rename:old_col:new_col\u{0}\u{0}T\u{0}legacy_rename\u{0}{live_id}"
-                ),
+                &test_rename_row_stage_key(&stage_key, &row_key),
                 db.get_seq()
             )
             .unwrap(),
@@ -818,6 +832,12 @@ fn legacy_table_online_rename_propagates_stage_markers_across_lazy_migration_upd
         })
         .unwrap();
 
+    assert_eq!(
+        db.find(&orphan_marker, db.get_seq()).unwrap(),
+        None,
+        "orphan row marker with no live row must be swept during rename cleanup"
+    );
+
     let refreshed = SqlExecutor::new(db.clone(), Arc::new(Catalog::new(db)));
     assert_eq!(
         rows(
@@ -828,5 +848,146 @@ fn legacy_table_online_rename_propagates_stage_markers_across_lazy_migration_upd
             vec![Some("3".into()), Some("v3".into())],
             vec![Some("100".into()), Some("v1_updated".into())],
         ]
+    );
+}
+
+#[test]
+fn online_rename_cleanup_does_not_delete_markers_of_prefix_overlapping_field_rename() {
+    use omni_engine::schema::{Migration, SchemaManager, SchemaOp};
+
+    let dir = TempDir::new().unwrap();
+    let db = OmniKV::open(
+        dir.path().join("manifest.json").to_str().unwrap(),
+        dir.path().join("wal.bin").to_str().unwrap(),
+    )
+    .unwrap();
+
+    let stage_one = test_rename_stage_key("docs", "a:b", "c");
+    let stage_two = test_rename_stage_key("docs", "a", "b:c\u{0}tail");
+    let row_key = "docs:1";
+    let marker_one = test_rename_row_stage_key(&stage_one, row_key);
+    let marker_two = test_rename_row_stage_key(&stage_two, row_key);
+
+    let mut seed = WriteBatch::new();
+    seed.set(
+        row_key,
+        "{\"a:b\":\"v1\",\"c\":\"v1\",\"a\":\"v2\",\"b:c\\u0000tail\":\"v2_old\"}".into(),
+    )
+    .unwrap();
+    seed.set(&stage_one, "a:b".into()).unwrap();
+    seed.set(&marker_one, "1".into()).unwrap();
+    seed.set(&stage_two, "a".into()).unwrap();
+    seed.set(&marker_two, "1".into()).unwrap();
+    db.commit_batch(&seed).unwrap();
+
+    let schema = SchemaManager::new(db.clone(), Arc::new(IndexManager::new(db.clone())));
+    schema
+        .migrate_up(&Migration {
+            version: 1,
+            description: "complete first rename with colon in field name".into(),
+            up: vec![SchemaOp::RenameField {
+                collection: "docs".into(),
+                old_name: "a:b".into(),
+                new_name: "c".into(),
+            }],
+            down: vec![],
+        })
+        .unwrap();
+
+    assert_eq!(db.find(&marker_one, db.get_seq()).unwrap(), None);
+    assert_eq!(
+        db.find(&marker_two, db.get_seq()).unwrap(),
+        Some("1".into()),
+        "cleanup of a:b -> c must not delete markers belonging to a -> b:c\\0tail"
+    );
+
+    // Retry of the second rename must still recognize its staged row marker
+    // even though `a` changed after staging.
+    schema
+        .migrate_up(&Migration {
+            version: 2,
+            description: "retry second rename with embedded NUL in destination".into(),
+            up: vec![SchemaOp::RenameField {
+                collection: "docs".into(),
+                old_name: "a".into(),
+                new_name: "b:c\u{0}tail".into(),
+            }],
+            down: vec![],
+        })
+        .unwrap();
+    assert_eq!(db.find(&marker_two, db.get_seq()).unwrap(), None);
+}
+
+#[test]
+fn legacy_table_migration_with_rename_markers_over_batch_limit_completes_insert() {
+    let dir = TempDir::new().unwrap();
+    let db = OmniKV::open(
+        dir.path().join("manifest.json").to_str().unwrap(),
+        dir.path().join("wal.bin").to_str().unwrap(),
+    )
+    .unwrap();
+
+    let stage_key = test_rename_stage_key("big_legacy", "old_col", "new_col");
+    let manifest = "{\"name\":\"big_legacy\",\"columns\":[{\"name\":\"id\",\"col_type\":\"Integer\",\"nullable\":false,\"primary_key\":true,\"default\":null},{\"name\":\"old_col\",\"col_type\":\"Text\",\"nullable\":true,\"primary_key\":false,\"default\":null}],\"primary_key\":\"id\",\"created_at\":1000}";
+    let mut seed = WriteBatch::new();
+    seed.set("\u{0}CATALOG\u{0}big_legacy", manifest.to_string())
+        .unwrap();
+    seed.set(&stage_key, "old_col".into()).unwrap();
+    db.commit_batch(&seed).unwrap();
+
+    // MAX_OPS / 3 zero-padded keys + 1 rename marker each = 4 ops/row (> MAX_OPS total).
+    let row_count = WriteBatch::MAX_OPS / 3 + 10;
+    let mut batch = WriteBatch::new();
+    for i in 1..=row_count {
+        if batch.op_count() >= 500 {
+            db.commit_batch(&batch).unwrap();
+            batch = WriteBatch::new();
+        }
+        let raw_id = format!("{i:06}");
+        let row_key = format!("\u{0}T\u{0}big_legacy\u{0}{raw_id}");
+        batch
+            .set(
+                &row_key,
+                format!("{{\"id\":\"{raw_id}\",\"old_col\":\"v{i}\",\"new_col\":\"v{i}\"}}"),
+            )
+            .unwrap();
+        batch
+            .set(&test_rename_row_stage_key(&stage_key, &row_key), "1".into())
+            .unwrap();
+    }
+    if !batch.is_empty() {
+        db.commit_batch(&batch).unwrap();
+    }
+
+    let executor = SqlExecutor::new(db.clone(), Arc::new(Catalog::new(db.clone())));
+    execute(
+        &executor,
+        "INSERT INTO big_legacy (id, old_col) VALUES (999999, 'fresh_row')",
+    );
+
+    assert_eq!(
+        rows(
+            &executor,
+            "SELECT old_col FROM big_legacy WHERE id = 999999"
+        ),
+        vec![vec![Some("fresh_row".into())]]
+    );
+    assert_eq!(
+        db.find(
+            &test_rename_row_stage_key(&stage_key, "\u{0}T\u{0}big_legacy\u{0}1"),
+            db.get_seq()
+        )
+        .unwrap(),
+        Some("1".into()),
+        "canonical rename marker must survive bounded lazy migration"
+    );
+    assert_eq!(
+        db.find(
+            &test_rename_row_stage_key(&stage_key, "\u{0}T\u{0}big_legacy\u{0}000001"),
+            db.get_seq()
+        )
+        .unwrap(),
+        None,
+        "old non-canonical rename marker must be removed atomically with its row"
     );
 }

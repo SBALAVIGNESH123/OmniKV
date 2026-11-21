@@ -773,12 +773,101 @@ fn opposite_2pc_decision_key(key: &str) -> Option<String> {
     None
 }
 
+fn is_authoritative_participant_key(key: &str) -> bool {
+    key.strip_prefix("__2PC_PREPARE__/")
+        .is_some_and(|rest| rest.contains('/'))
+}
+
 fn parse_participant_entry(key: &str, value: &str) -> Option<ParticipantLogEntry> {
-    let rest = key.strip_prefix("__2PC_PREPARE__/")?;
-    if !rest.contains('/') {
+    if !is_authoritative_participant_key(key) {
         return None;
     }
     serde_json::from_str(value).ok()
+}
+
+fn commit_entry_exceeds_storage_limit(
+    node_id: u64,
+    txn_id: GlobalTxnId,
+    writes: &[DistWrite],
+    write_keys: &[String],
+    clustered: bool,
+) -> Result<bool, OmniError> {
+    let worst_committed = ParticipantLogEntry {
+        txn_id,
+        node_id,
+        state: "COMMITTED".into(),
+        writes: writes.to_vec(),
+        prepare_seq: u64::MAX,
+        commit_seq: Some(u64::MAX),
+    };
+    let committed_encoded = serde_json::to_string(&worst_committed)
+        .map_err(|error| OmniError::IoError(format!("commit log serialization failed: {error}")))?;
+    if committed_encoded.len() > crate::storage::core::MAX_VALUE_SIZE {
+        return Ok(true);
+    }
+    if !clustered {
+        return Ok(false);
+    }
+
+    let mut commit_batch = WriteBatch::new();
+    for write in writes {
+        match &write.value {
+            Some(val) if write.ttl > 0 => {
+                if commit_batch
+                    .set_with_expiry(&write.key, val.clone(), u64::MAX)
+                    .is_err()
+                {
+                    return Ok(true);
+                }
+            }
+            Some(val) => {
+                if commit_batch.set(&write.key, val.clone()).is_err() {
+                    return Ok(true);
+                }
+            }
+            None => {
+                if commit_batch.delete(&write.key).is_err() {
+                    return Ok(true);
+                }
+            }
+        }
+    }
+    if commit_batch
+        .set(&participant_prepare_key(node_id, txn_id), committed_encoded)
+        .is_err()
+    {
+        return Ok(true);
+    }
+    if commit_batch
+        .set(
+            &legacy_participant_prepare_key(txn_id),
+            format!("COMMITTED:{node_id}"),
+        )
+        .is_err()
+    {
+        return Ok(true);
+    }
+
+    let cmd = crate::raft_command::RaftCommand::from_batch_with_ssi(
+        &commit_batch,
+        crate::transaction::SsiCommitRecord {
+            txn_id: u64::MAX,
+            write_keys: write_keys.to_vec(),
+            read_keys: Vec::new(),
+            read_ranges: Vec::new(),
+        },
+    );
+    let raft_entry = openraft::Entry::<crate::raft_impl::TypeConfig> {
+        log_id: openraft::LogId::new(
+            openraft::CommittedLeaderId::new(u64::MAX, u64::MAX),
+            u64::MAX,
+        ),
+        payload: openraft::EntryPayload::Normal(cmd.encode()),
+    };
+    let raft_encoded_len = serde_json::to_string(&raft_entry)
+        .map_err(|error| OmniError::IoError(format!("raft commit serialization failed: {error}")))?
+        .len();
+    Ok(raft_encoded_len > crate::storage::core::MAX_VALUE_SIZE)
 }
 
 fn is_illegal_participant_transition(prev_state: &str, next_state: &str) -> bool {
@@ -822,9 +911,23 @@ fn check_2pc_participant_writes(
     let mut has_incoming_prepared = false;
     let mut seen_entries: HashMap<&str, ParticipantLogEntry> = HashMap::new();
     for &(key, value) in incoming_writes {
-        let Some(entry) = parse_participant_entry(key, value) else {
+        if !is_authoritative_participant_key(key) {
             continue;
+        }
+        let entry: ParticipantLogEntry = match serde_json::from_str(value) {
+            Ok(entry) => entry,
+            Err(error) => {
+                return Ok(Some(format!(
+                    "invalid 2PC participant record for key '{key}': {error}"
+                )));
+            }
         };
+        if !matches!(entry.state.as_str(), "PREPARED" | "COMMITTED" | "ABORTED") {
+            return Ok(Some(format!(
+                "invalid 2PC participant state '{}' for key '{key}'",
+                entry.state
+            )));
+        }
         if participant_prepare_key(entry.node_id, entry.txn_id) != key {
             return Ok(Some(format!(
                 "mismatched 2PC participant record key '{key}' for node {} txn {:?}",
@@ -1333,16 +1436,34 @@ impl TwoPhaseParticipant {
                 };
             }
         };
-        // Reject if the COMMITTED version would exceed MAX_VALUE_SIZE.
-        let max_value = 10 * 1024 * 1024;
-        if encoded.len() + 32 > max_value {
-            self.release_key_locks(txn_id, &write_keys);
-            return PrepareResult {
-                node_id: self.node_id,
-                txn_id,
-                vote: Vote::Abort("decision record would exceed value size limit".into()),
-                prepare_seq: 0,
-            };
+        // Reject if the COMMITTED record or its clustered Raft log entry would
+        // exceed MAX_VALUE_SIZE.
+        match commit_entry_exceeds_storage_limit(
+            self.node_id,
+            txn_id,
+            writes,
+            &write_keys,
+            self.db.is_clustered(),
+        ) {
+            Ok(false) => {}
+            Ok(true) => {
+                self.release_key_locks(txn_id, &write_keys);
+                return PrepareResult {
+                    node_id: self.node_id,
+                    txn_id,
+                    vote: Vote::Abort("decision record would exceed value size limit".into()),
+                    prepare_seq: 0,
+                };
+            }
+            Err(error) => {
+                self.release_key_locks(txn_id, &write_keys);
+                return PrepareResult {
+                    node_id: self.node_id,
+                    txn_id,
+                    vote: Vote::Abort(error.to_string()),
+                    prepare_seq: 0,
+                };
+            }
         }
         if let Err(error) = prepare_batch.set(&prepare_key, encoded) {
             self.release_key_locks(txn_id, &write_keys);
@@ -2376,5 +2497,99 @@ mod tests {
         let mut ghost_plain = WriteBatch::new();
         ghost_plain.set("k_ghost", "freed".into()).unwrap();
         assert!(db.commit_batch(&ghost_plain).is_ok());
+    }
+
+    #[test]
+    fn malformed_authoritative_participant_record_is_rejected_while_legacy_keys_pass() {
+        let (db, _dir) = test_db();
+        let t1 = (1, 301);
+        let auth_key = participant_prepare_key(2, t1);
+        let valid_entry = ParticipantLogEntry {
+            txn_id: t1,
+            node_id: 2,
+            state: "PREPARED".into(),
+            writes: vec![DistWrite {
+                node_id: 2,
+                key: "k_keep_valid".into(),
+                value: Some("v".into()),
+                ttl: 0,
+            }],
+            prepare_seq: 1,
+            commit_seq: None,
+        };
+        let mut init = WriteBatch::new();
+        init.set(&auth_key, serde_json::to_string(&valid_entry).unwrap())
+            .unwrap();
+        init.set(&legacy_participant_prepare_key(t1), "PREPARED:2".into())
+            .unwrap();
+        db.commit_2pc_batch(&init).unwrap();
+
+        let mut malformed = WriteBatch::new();
+        malformed.set(&auth_key, "{not valid json".into()).unwrap();
+        assert!(
+            db.commit_2pc_batch(&malformed).is_err(),
+            "malformed JSON on authoritative participant key must be rejected"
+        );
+
+        let bad_cmd = crate::raft_command::RaftCommand::from_batch(&malformed);
+        let mut raft_storage = crate::raft_storage::OmniRaftStorage::new(db.clone());
+        let leader = openraft::CommittedLeaderId::new(1, 1);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let responses = rt
+            .block_on(openraft::RaftStorage::apply_to_state_machine(
+                &mut raft_storage,
+                &[openraft::Entry {
+                    log_id: openraft::LogId::new(leader, 1),
+                    payload: openraft::EntryPayload::Normal(bad_cmd.encode()),
+                }],
+            ))
+            .unwrap();
+        assert_eq!(
+            responses[0], "ERR",
+            "Raft apply must reject malformed authoritative participant JSON"
+        );
+
+        let participant = TwoPhaseParticipant::new(2, db.clone());
+        assert_eq!(
+            participant.recover().unwrap(),
+            1,
+            "existing valid PREPARED record must remain intact after malformed write rejection"
+        );
+    }
+
+    #[test]
+    fn commit_entry_size_check_accounts_for_clustered_raft_duplicate_payload() {
+        let six_mib = "a".repeat(6 * 1024 * 1024);
+        let big_writes = vec![DistWrite {
+            node_id: 2,
+            key: "big_k".into(),
+            value: Some(six_mib),
+            ttl: 0,
+        }];
+        let big_keys = vec!["big_k".to_string()];
+
+        assert!(
+            !commit_entry_exceeds_storage_limit(2, (1, 1), &big_writes, &big_keys, false).unwrap(),
+            "single-node commit fits a 6 MiB value within MAX_VALUE_SIZE"
+        );
+        assert!(
+            commit_entry_exceeds_storage_limit(2, (1, 1), &big_writes, &big_keys, true).unwrap(),
+            "clustered Raft COMMIT carries two copies of the 6 MiB payload and must be rejected at prepare"
+        );
+
+        let four_mib = "b".repeat(4 * 1024 * 1024);
+        let fit_writes = vec![DistWrite {
+            node_id: 2,
+            key: "fit_k".into(),
+            value: Some(four_mib),
+            ttl: 0,
+        }];
+        let fit_keys = vec!["fit_k".to_string()];
+        assert!(
+            !commit_entry_exceeds_storage_limit(2, (1, 2), &fit_writes, &fit_keys, true).unwrap(),
+            "clustered Raft COMMIT whose complete encoded entry fits MAX_VALUE_SIZE must still be accepted"
+        );
     }
 }
