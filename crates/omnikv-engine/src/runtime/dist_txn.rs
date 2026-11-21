@@ -820,27 +820,38 @@ fn check_2pc_participant_writes(
     incoming_deletes: &[&str],
 ) -> Result<Option<String>, OmniError> {
     let mut has_incoming_prepared = false;
-    let mut seen_states: HashMap<&str, String> = HashMap::new();
+    let mut seen_entries: HashMap<&str, ParticipantLogEntry> = HashMap::new();
     for &(key, value) in incoming_writes {
         let Some(entry) = parse_participant_entry(key, value) else {
             continue;
         };
-        let prev_state = match seen_states.get(key) {
-            Some(state) => Some(state.clone()),
-            None => latest_participant_entry(db, staged, key)?.map(|prev| prev.state),
-        };
-        if let Some(prev) = prev_state
-            && is_illegal_participant_transition(&prev, &entry.state)
-        {
+        if participant_prepare_key(entry.node_id, entry.txn_id) != key {
             return Ok(Some(format!(
-                "conflicting 2PC participant decision for key '{key}': {prev} -> {}",
-                entry.state
+                "mismatched 2PC participant record key '{key}' for node {} txn {:?}",
+                entry.node_id, entry.txn_id
             )));
+        }
+        let prev_entry = match seen_entries.get(key) {
+            Some(prev) => Some(prev.clone()),
+            None => latest_participant_entry(db, staged, key)?,
+        };
+        if let Some(prev) = prev_entry {
+            if is_illegal_participant_transition(&prev.state, &entry.state) {
+                return Ok(Some(format!(
+                    "conflicting 2PC participant decision for key '{key}': {} -> {}",
+                    prev.state, entry.state
+                )));
+            }
+            if prev.state == "PREPARED" && prev.writes != entry.writes {
+                return Ok(Some(format!(
+                    "conflicting 2PC participant writes for key '{key}'"
+                )));
+            }
         }
         if entry.state == "PREPARED" {
             has_incoming_prepared = true;
         }
-        seen_states.insert(key, entry.state);
+        seen_entries.insert(key, entry);
     }
     if !has_incoming_prepared {
         return Ok(None);
@@ -1030,16 +1041,10 @@ pub(crate) fn stamp_2pc_commit_seq(
 }
 
 pub(crate) fn sync_all_prepared_reservations(db: &OmniKV) -> Result<(), OmniError> {
-    let entries = db.scan("__2PC_PREPARE__/", "__2PC_PREPARE__/~", db.get_seq())?;
+    let entries = db.scan("__2PC_PREPARE__/", "__2PC_PREPARE__/~", u64::MAX)?;
     let mut reserved = HashMap::new();
     for (key, value) in entries {
-        let Some(rest) = key.strip_prefix("__2PC_PREPARE__/") else {
-            continue;
-        };
-        if !rest.contains('/') {
-            continue;
-        }
-        let Ok(entry) = serde_json::from_str::<ParticipantLogEntry>(&value) else {
+        let Some(entry) = parse_participant_entry(&key, &value) else {
             continue;
         };
         if entry.state != "PREPARED" {
@@ -1057,18 +1062,18 @@ pub(crate) fn sync_prepared_reservations_from_batch(
     db: &OmniKV,
     batch: &WriteBatch,
 ) -> Result<(), OmniError> {
-    let seq = db.get_seq();
+    if batch
+        .buffered_deletes
+        .iter()
+        .any(|key| key.starts_with(b"__2PC_PREPARE__/"))
+    {
+        return sync_all_prepared_reservations(db);
+    }
     for (key_bytes, value, _) in &batch.buffered_writes {
         let Ok(key) = std::str::from_utf8(key_bytes) else {
             continue;
         };
-        let Some(rest) = key.strip_prefix("__2PC_PREPARE__/") else {
-            continue;
-        };
-        if !rest.contains('/') {
-            continue;
-        }
-        let Ok(entry) = serde_json::from_str::<ParticipantLogEntry>(value) else {
+        let Some(entry) = parse_participant_entry(key, value) else {
             continue;
         };
         match entry.state.as_str() {
@@ -1085,21 +1090,6 @@ pub(crate) fn sync_prepared_reservations_from_batch(
                     .release_prepared_keys(entry.node_id, entry.txn_id, &keys);
             }
             _ => {}
-        }
-    }
-    for key_bytes in &batch.buffered_deletes {
-        let Ok(key) = std::str::from_utf8(key_bytes) else {
-            continue;
-        };
-        if !key.starts_with("__2PC_PREPARE__/") {
-            continue;
-        }
-        if let Ok(Some(old_value)) = db.find(key, seq)
-            && let Ok(entry) = serde_json::from_str::<ParticipantLogEntry>(&old_value)
-        {
-            let keys: Vec<String> = entry.writes.iter().map(|w| w.key.clone()).collect();
-            db.ssi_history
-                .release_prepared_keys(entry.node_id, entry.txn_id, &keys);
         }
     }
     Ok(())

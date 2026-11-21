@@ -2501,6 +2501,13 @@ impl SqlExecutor {
         read_seq: u64,
     ) -> Result<Option<String>, String> {
         if let Some(pending) = self.pending_batch.borrow().as_ref() {
+            if pending
+                .buffered_deletes
+                .iter()
+                .any(|k| k.as_slice() == marker_key.as_bytes())
+            {
+                return Ok(None);
+            }
             if let Some((_, val, _)) = pending
                 .buffered_writes
                 .iter()
@@ -2508,13 +2515,6 @@ impl SqlExecutor {
                 .find(|(k, _, _)| k.as_slice() == marker_key.as_bytes())
             {
                 return Ok(Some(val.clone()));
-            }
-            if pending
-                .buffered_deletes
-                .iter()
-                .any(|k| k.as_slice() == marker_key.as_bytes())
-            {
-                return Ok(None);
             }
         }
         self.db

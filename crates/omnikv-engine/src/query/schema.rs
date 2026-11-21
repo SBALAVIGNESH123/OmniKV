@@ -1035,7 +1035,18 @@ impl SchemaManager {
 
         let row_marker_prefix = Self::rename_row_stage_prefix(stage_key);
         let row_marker_end = format!("{row_marker_prefix}\u{10ffff}");
-        for (marker_key, _) in self.db.scan(&row_marker_prefix, &row_marker_end, seq)? {
+        let latest_seq = self.db.get_seq();
+        for (marker_key, _) in self
+            .db
+            .scan(&row_marker_prefix, &row_marker_end, latest_seq)?
+        {
+            if batch
+                .buffered_deletes
+                .iter()
+                .any(|k| k.as_slice() == marker_key.as_bytes())
+            {
+                continue;
+            }
             if batch.op_count() >= WriteBatch::MAX_OPS / 2 && !batch.is_empty() {
                 self.db.commit_batch(&batch)?;
                 batch = WriteBatch::new();
