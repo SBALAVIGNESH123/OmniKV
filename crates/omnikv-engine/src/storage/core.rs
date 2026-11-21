@@ -1996,10 +1996,15 @@ impl OmniKV {
 
     /// Commits engine-internal 2PC metadata, bypassing client key validation.
     pub(crate) fn commit_2pc_batch(&self, tx: &WriteBatch) -> Result<u64, OmniError> {
-        crate::dist_txn::validate_2pc_decision_writes(self, None, tx)?;
         if let Some(gateway) = self.cluster_gateway.get() {
+            crate::dist_txn::validate_2pc_decision_writes(self, None, tx)?;
             return gateway.commit_2pc_batch(tx);
         }
+        let lock = self.sql_table_lock("\x002PC_LOCAL_COMMIT")?;
+        let _guard = lock
+            .lock()
+            .map_err(|_| OmniError::LockPoisoned("2PC local commit".into()))?;
+        crate::dist_txn::validate_2pc_decision_writes(self, None, tx)?;
         self.commit_batch_local(tx)
     }
 
@@ -2016,8 +2021,14 @@ impl OmniKV {
         ssi: crate::transaction::SsiCommitRecord,
     ) -> Result<u64, OmniError> {
         if let Some(gateway) = self.cluster_gateway.get() {
+            crate::dist_txn::validate_2pc_decision_writes(self, None, tx)?;
             return gateway.commit_2pc_batch_with_ssi(tx, ssi);
         }
+        let lock = self.sql_table_lock("\x002PC_LOCAL_COMMIT")?;
+        let _guard = lock
+            .lock()
+            .map_err(|_| OmniError::LockPoisoned("2PC local commit".into()))?;
+        crate::dist_txn::validate_2pc_decision_writes(self, None, tx)?;
         let _topology_guard = self
             .transition_guard
             .read()

@@ -275,6 +275,7 @@ pub struct SsiHistory {
     prepared_keys: Mutex<HashMap<String, PreparedKeyOwner>>,
     plain_write_seqs: Mutex<HashMap<String, u64>>,
     evicted_max_seq: AtomicU64,
+    plain_evicted_max_seq: AtomicU64,
     /// Hard ceiling to prevent unbounded growth between prunes.
     max_entries: usize,
 }
@@ -476,7 +477,8 @@ impl SsiHistory {
             seqs.sort_unstable();
             let cutoff = seqs[seqs.len() / 4];
             plain.retain(|_, seq| *seq > cutoff);
-            self.evicted_max_seq.fetch_max(cutoff, Ordering::SeqCst);
+            self.plain_evicted_max_seq
+                .fetch_max(cutoff, Ordering::SeqCst);
         }
     }
 
@@ -501,7 +503,10 @@ impl SsiHistory {
             .plain_write_seqs
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let evicted_max = self.evicted_max_seq.load(Ordering::SeqCst);
+        let evicted_max = self
+            .evicted_max_seq
+            .load(Ordering::SeqCst)
+            .max(self.plain_evicted_max_seq.load(Ordering::SeqCst));
         if read_seq < evicted_max {
             return Some(format!(
                 "SSI CONFLICT: snapshot {} predates pruned history at seq {}",
@@ -579,6 +584,8 @@ impl SsiHistory {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         self.evicted_max_seq.store(eviction_floor, Ordering::SeqCst);
+        self.plain_evicted_max_seq
+            .store(eviction_floor, Ordering::SeqCst);
         committed.clear();
         plain.clear();
         for (txn_id, commit_seq, record) in entries {
@@ -757,6 +764,7 @@ impl Default for SsiHistory {
             prepared_keys: Mutex::new(HashMap::new()),
             plain_write_seqs: Mutex::new(HashMap::new()),
             evicted_max_seq: AtomicU64::new(0),
+            plain_evicted_max_seq: AtomicU64::new(0),
             max_entries: 100_000,
         }
     }
@@ -1303,7 +1311,7 @@ mod commit_seq_number_space {
     //! clustered commit (whose `read_seq` is exactly that marker) sees the
     //! commit as already visible rather than concurrent.
 
-    use super::{CommittedTxn, Transaction, TransactionManager};
+    use super::{CommittedTxn, SsiHistory, Transaction, TransactionManager};
     use crate::{OmniKV, WriteBatch};
     use std::collections::HashSet;
 
@@ -1424,6 +1432,70 @@ mod commit_seq_number_space {
             mgr.get(&mut t2, "k").expect("read k"),
             Some("v1".into()),
             "a write committed before our snapshot must be visible"
+        );
+    }
+
+    #[test]
+    fn plain_write_eviction_does_not_abort_local_ssi_transactions() {
+        let history = SsiHistory {
+            max_entries: 4,
+            ..Default::default()
+        };
+
+        for idx in 1..=5u64 {
+            let mut batch = WriteBatch::new();
+            batch.set(&format!("plain_{idx}"), "v".into()).unwrap();
+            history.record_plain_batch(&batch, idx * 10);
+        }
+
+        assert_eq!(
+            history.eviction_floor(),
+            0,
+            "plain-write eviction must not advance the local SSI eviction floor"
+        );
+
+        let mut local_txn = Transaction::new(1, 5);
+        local_txn
+            .write_set
+            .insert("local_only".into(), (Some("ok".into()), 0));
+        assert!(
+            history.detect_conflicts(&local_txn).is_none(),
+            "local SSI transaction must not fail closed because of plain-write eviction"
+        );
+
+        let stale_prepare = history.check_write_conflicts(5, &["other".to_string()]);
+        assert!(
+            stale_prepare
+                .as_deref()
+                .is_some_and(|msg| msg.contains("predates pruned history")),
+            "stale 2PC prepare must still fail closed after plain-write eviction, got: {stale_prepare:?}"
+        );
+
+        assert!(
+            history
+                .check_write_conflicts(20, &["other".to_string()])
+                .is_none(),
+            "2PC prepare at the plain eviction cutoff must pass for unaffected keys"
+        );
+        assert!(
+            history
+                .check_write_conflicts(20, &["plain_5".to_string()])
+                .is_some(),
+            "2PC prepare must still detect surviving plain writes above cutoff"
+        );
+
+        history.install_from(Vec::new(), 15);
+        assert!(
+            history
+                .check_write_conflicts(14, &["other".to_string()])
+                .is_some(),
+            "install_from must restore the plain eviction floor"
+        );
+        assert!(
+            history
+                .check_write_conflicts(15, &["other".to_string()])
+                .is_none(),
+            "read_seq at the installed floor must pass"
         );
     }
 }

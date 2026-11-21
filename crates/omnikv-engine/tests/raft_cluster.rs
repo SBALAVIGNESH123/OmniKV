@@ -4801,3 +4801,68 @@ async fn test_v2_snapshot_missing_history_field_is_rejected() {
 
     println!("✅ Malformed v2 snapshot (missing history) rejected");
 }
+
+#[tokio::test]
+async fn test_snapshot_install_blocks_pre_install_2pc_prepare_against_plain_writes() {
+    use omni_engine::dist_txn::{DistWrite, TwoPhaseParticipant, Vote};
+    use openraft::storage::RaftSnapshotBuilder;
+
+    let (leader_db, leader, _leader_dir) = create_node("ssi_2pc_snap_leader");
+    let (follower_db, follower, _follower_dir) = create_node("ssi_2pc_snap_follower");
+
+    // Seed follower with higher local sequences than the rebuilt temp DB will
+    // assign during snapshot install, ensuring the fallback get_seq_for_key
+    // check alone would NOT catch a snapshot-carried plain write.
+    for i in 1..=20 {
+        let mut local = omni_engine::WriteBatch::new();
+        local.set(&format!("local_k{i}"), "v".into()).unwrap();
+        follower_db.commit_batch(&local).unwrap();
+    }
+    let pre_install_read_seq = follower_db.get_seq().saturating_sub(1);
+
+    // Leader applies a PLAIN write (not an SSI transaction, so it does not
+    // appear in envelope.ssi_history).
+    leader
+        .append_log(1, "SET snap_plain_k from_leader_plain")
+        .unwrap();
+    apply_range(&leader, 1, 2);
+    let leader_max_seq = leader_db.get_seq();
+
+    let mut builder = leader.clone();
+    let snapshot = builder.build_snapshot().await.unwrap();
+    let mut installer = follower.clone();
+    installer
+        .install_snapshot(&snapshot.meta, snapshot.snapshot)
+        .await
+        .unwrap();
+
+    assert!(
+        follower_db.ssi_history().eviction_floor() >= leader_max_seq,
+        "installed SSI eviction floor must be at least the snapshot's max_seq"
+    );
+
+    let participant = TwoPhaseParticipant::new(2, follower_db.clone());
+    let writes = vec![DistWrite {
+        node_id: 2,
+        key: "snap_plain_k".into(),
+        value: Some("from_2pc".into()),
+        ttl: 0,
+    }];
+    let stale_vote = participant.prepare_with_snapshot((1, 1), &writes, pre_install_read_seq);
+    match stale_vote.vote {
+        Vote::Abort(reason) => assert!(
+            reason.contains("SSI CONFLICT"),
+            "expected SSI conflict on pre-install 2PC prepare, got: {reason}"
+        ),
+        Vote::Commit => panic!(
+            "pre-install 2PC prepare must not vote COMMIT across a snapshot carrying plain writes"
+        ),
+    }
+
+    let fresh_vote = participant.prepare((1, 2), &writes);
+    assert_eq!(
+        fresh_vote.vote,
+        Vote::Commit,
+        "post-install 2PC prepare must still succeed"
+    );
+}

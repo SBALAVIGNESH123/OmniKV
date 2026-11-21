@@ -773,15 +773,143 @@ fn opposite_2pc_decision_key(key: &str) -> Option<String> {
     None
 }
 
+fn parse_participant_entry(key: &str, value: &str) -> Option<ParticipantLogEntry> {
+    let rest = key.strip_prefix("__2PC_PREPARE__/")?;
+    if !rest.contains('/') {
+        return None;
+    }
+    serde_json::from_str(value).ok()
+}
+
+fn is_illegal_participant_transition(prev_state: &str, next_state: &str) -> bool {
+    matches!(prev_state, "COMMITTED" | "ABORTED") && prev_state != next_state
+}
+
+fn latest_participant_entry(
+    db: &OmniKV,
+    staged: Option<&WriteBatch>,
+    key: &str,
+) -> Result<Option<ParticipantLogEntry>, OmniError> {
+    if let Some(staged) = staged {
+        let key_bytes = key.as_bytes();
+        if staged
+            .buffered_deletes
+            .iter()
+            .any(|k| k.as_slice() == key_bytes)
+        {
+            return Ok(None);
+        }
+        if let Some((_, value, _)) = staged
+            .buffered_writes
+            .iter()
+            .rev()
+            .find(|(k, _, _)| k.as_slice() == key_bytes)
+        {
+            return Ok(parse_participant_entry(key, value));
+        }
+    }
+    Ok(db
+        .find_latest_internal(key)?
+        .and_then(|value| parse_participant_entry(key, &value)))
+}
+
+fn check_2pc_participant_writes(
+    db: &OmniKV,
+    staged: Option<&WriteBatch>,
+    incoming_writes: &[(&str, &str)],
+    incoming_deletes: &[&str],
+) -> Result<Option<String>, OmniError> {
+    let mut has_incoming_prepared = false;
+    let mut seen_states: HashMap<&str, String> = HashMap::new();
+    for &(key, value) in incoming_writes {
+        let Some(entry) = parse_participant_entry(key, value) else {
+            continue;
+        };
+        let prev_state = match seen_states.get(key) {
+            Some(state) => Some(state.clone()),
+            None => latest_participant_entry(db, staged, key)?.map(|prev| prev.state),
+        };
+        if let Some(prev) = prev_state
+            && is_illegal_participant_transition(&prev, &entry.state)
+        {
+            return Ok(Some(format!(
+                "conflicting 2PC participant decision for key '{key}': {prev} -> {}",
+                entry.state
+            )));
+        }
+        if entry.state == "PREPARED" {
+            has_incoming_prepared = true;
+        }
+        seen_states.insert(key, entry.state);
+    }
+    if !has_incoming_prepared {
+        return Ok(None);
+    }
+
+    let mut active_records: HashMap<String, String> = db
+        .scan("__2PC_PREPARE__/", "__2PC_PREPARE__/~", u64::MAX)?
+        .into_iter()
+        .collect();
+    if let Some(staged) = staged {
+        for (key_bytes, val, _) in &staged.buffered_writes {
+            if let Ok(key) = std::str::from_utf8(key_bytes)
+                && key.starts_with("__2PC_PREPARE__/")
+            {
+                active_records.insert(key.to_string(), val.clone());
+            }
+        }
+        for del in &staged.buffered_deletes {
+            if let Ok(key) = std::str::from_utf8(del) {
+                active_records.remove(key);
+            }
+        }
+    }
+    for &(key, val) in incoming_writes {
+        if key.starts_with("__2PC_PREPARE__/") {
+            active_records.insert(key.to_string(), val.to_string());
+        }
+    }
+    for &del in incoming_deletes {
+        active_records.remove(del);
+    }
+
+    let mut owners: HashMap<String, (u64, GlobalTxnId)> = HashMap::new();
+    for (key, val) in active_records {
+        let Some(entry) = parse_participant_entry(&key, &val) else {
+            continue;
+        };
+        if entry.state != "PREPARED" {
+            continue;
+        }
+        let owner = (entry.node_id, entry.txn_id);
+        for write in entry.writes {
+            if let Some(&existing) = owners.get(&write.key)
+                && existing != owner
+            {
+                return Ok(Some(format!(
+                    "conflicting 2PC prepared reservation for key '{}'",
+                    write.key
+                )));
+            }
+            owners.insert(write.key, owner);
+        }
+    }
+    Ok(None)
+}
+
 pub(crate) fn validate_2pc_decision_writes(
     db: &OmniKV,
     staged: Option<&WriteBatch>,
     batch: &WriteBatch,
 ) -> Result<(), OmniError> {
+    let mut touches_prepare = false;
     for (key_bytes, _, _) in &batch.buffered_writes {
         let Ok(key) = std::str::from_utf8(key_bytes) else {
             continue;
         };
+        if key.starts_with("__2PC_PREPARE__/") {
+            touches_prepare = true;
+        }
         let Some(opposite_key) = opposite_2pc_decision_key(key) else {
             continue;
         };
@@ -813,6 +941,23 @@ pub(crate) fn validate_2pc_decision_writes(
             )));
         }
     }
+    if touches_prepare {
+        let incoming_writes: Vec<(&str, &str)> = batch
+            .buffered_writes
+            .iter()
+            .filter_map(|(k, v, _)| std::str::from_utf8(k).ok().map(|s| (s, v.as_str())))
+            .collect();
+        let incoming_deletes: Vec<&str> = batch
+            .buffered_deletes
+            .iter()
+            .filter_map(|k| std::str::from_utf8(k).ok())
+            .collect();
+        if let Some(reason) =
+            check_2pc_participant_writes(db, staged, &incoming_writes, &incoming_deletes)?
+        {
+            return Err(OmniError::IoError(reason));
+        }
+    }
     Ok(())
 }
 
@@ -821,7 +966,11 @@ pub(crate) fn conflicts_with_2pc_decision(
     staged: &WriteBatch,
     cmd: &crate::raft_command::RaftCommand,
 ) -> Result<bool, OmniError> {
+    let mut touches_prepare = false;
     for op in &cmd.sets {
+        if op.key.starts_with("__2PC_PREPARE__/") {
+            touches_prepare = true;
+        }
         let Some(opposite_key) = opposite_2pc_decision_key(&op.key) else {
             continue;
         };
@@ -844,6 +993,19 @@ pub(crate) fn conflicts_with_2pc_decision(
         let conflict_in_db =
             !deleted_in_cmd_or_staged && db.find_latest_internal(&opposite_key)?.is_some();
         if conflict_in_cmd || conflict_in_staged || conflict_in_db {
+            return Ok(true);
+        }
+    }
+    if touches_prepare {
+        let incoming_writes: Vec<(&str, &str)> = cmd
+            .sets
+            .iter()
+            .map(|op| (op.key.as_str(), op.value.as_str()))
+            .collect();
+        let incoming_deletes: Vec<&str> = cmd.dels.iter().map(String::as_str).collect();
+        if check_2pc_participant_writes(db, Some(staged), &incoming_writes, &incoming_deletes)?
+            .is_some()
+        {
             return Ok(true);
         }
     }
@@ -1236,7 +1398,7 @@ impl TwoPhaseParticipant {
                 }
             }
             Err(e) => {
-                self.release_key_locks(txn_id, &write_keys);
+                self.reconcile_failed_prepare(txn_id, writes, &write_keys, &e);
                 PrepareResult {
                     node_id: self.node_id,
                     txn_id,
@@ -1244,6 +1406,50 @@ impl TwoPhaseParticipant {
                     prepare_seq: 0,
                 }
             }
+        }
+    }
+
+    fn reconcile_failed_prepare(
+        &self,
+        txn_id: GlobalTxnId,
+        writes: &[DistWrite],
+        write_keys: &[String],
+        error: &OmniError,
+    ) {
+        if matches!(error, OmniError::NotLeader { .. }) {
+            self.release_key_locks(txn_id, write_keys);
+            return;
+        }
+        if !self.db.is_clustered() && matches!(self.load_participant_log(txn_id), Ok(None)) {
+            self.release_key_locks(txn_id, write_keys);
+            return;
+        }
+        let abort_entry = ParticipantLogEntry {
+            txn_id,
+            node_id: self.node_id,
+            state: "ABORTED".into(),
+            writes: writes.to_vec(),
+            prepare_seq: 0,
+            commit_seq: None,
+        };
+        let mut abort_batch = WriteBatch::new();
+        let abort_committed = serde_json::to_string(&abort_entry)
+            .ok()
+            .and_then(|encoded| {
+                abort_batch
+                    .set(&participant_prepare_key(self.node_id, txn_id), encoded)
+                    .ok()?;
+                let _ = abort_batch.set(
+                    &legacy_participant_prepare_key(txn_id),
+                    format!("ABORTED:{}", self.node_id),
+                );
+                self.db.commit_2pc_batch(&abort_batch).ok()
+            })
+            .is_some();
+        if abort_committed {
+            self.release_key_locks(txn_id, write_keys);
+        } else {
+            self.needs_recovery.store(true, Ordering::SeqCst);
         }
     }
 
@@ -1812,5 +2018,175 @@ mod tests {
 
         participant.abort(aborted_txn).unwrap();
         assert!(db.commit_batch(&plain_a).is_ok());
+    }
+
+    #[test]
+    fn prepared_participant_records_enforce_exclusive_ownership_and_terminal_transitions() {
+        let (db, _dir) = test_db();
+        let make_batch = |node_id: u64, txn_id: GlobalTxnId, state: &str, key: &str| {
+            let entry = ParticipantLogEntry {
+                txn_id,
+                node_id,
+                state: state.into(),
+                writes: vec![DistWrite {
+                    node_id,
+                    key: key.into(),
+                    value: Some("v".into()),
+                    ttl: 0,
+                }],
+                prepare_seq: 1,
+                commit_seq: None,
+            };
+            let mut batch = WriteBatch::new();
+            batch
+                .set(
+                    &participant_prepare_key(node_id, txn_id),
+                    serde_json::to_string(&entry).unwrap(),
+                )
+                .unwrap();
+            batch
+        };
+
+        let t1 = (1, 1);
+        let t2 = (1, 2);
+        let t3 = (1, 3);
+        let t4 = (1, 4);
+
+        db.commit_2pc_batch(&make_batch(2, t1, "PREPARED", "shared_k"))
+            .unwrap();
+        db.commit_2pc_batch(&make_batch(2, t1, "PREPARED", "shared_k"))
+            .unwrap();
+        assert!(
+            db.commit_2pc_batch(&make_batch(2, t2, "PREPARED", "shared_k"))
+                .is_err(),
+            "local 2PC commit must reject overlapping PREPARED key ownership"
+        );
+
+        let mut raft_storage = crate::raft_storage::OmniRaftStorage::new(db.clone());
+        let leader = openraft::CommittedLeaderId::new(1, 1);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let t2_cmd = crate::raft_command::RaftCommand::from_batch(&make_batch(
+            2, t2, "PREPARED", "shared_k",
+        ));
+        let t3_cmd = crate::raft_command::RaftCommand::from_batch(&make_batch(
+            2,
+            t3,
+            "PREPARED",
+            "grouped_k",
+        ));
+        let t4_cmd = crate::raft_command::RaftCommand::from_batch(&make_batch(
+            2,
+            t4,
+            "PREPARED",
+            "grouped_k",
+        ));
+        let entries = [
+            openraft::Entry {
+                log_id: openraft::LogId::new(leader, 1),
+                payload: openraft::EntryPayload::Normal(t2_cmd.encode()),
+            },
+            openraft::Entry {
+                log_id: openraft::LogId::new(leader, 2),
+                payload: openraft::EntryPayload::Normal(t3_cmd.encode()),
+            },
+            openraft::Entry {
+                log_id: openraft::LogId::new(leader, 3),
+                payload: openraft::EntryPayload::Normal(t4_cmd.encode()),
+            },
+        ];
+        let responses = rt
+            .block_on(openraft::RaftStorage::apply_to_state_machine(
+                &mut raft_storage,
+                &entries,
+            ))
+            .unwrap();
+        assert_eq!(
+            responses[0], "ERR",
+            "Raft apply must reject PREPARED record overlapping durable PREPARED owner"
+        );
+        assert!(
+            responses[1].parse::<u64>().is_ok(),
+            "non-overlapping PREPARED record in grouped apply must succeed"
+        );
+        assert_eq!(
+            responses[2], "ERR",
+            "Raft apply must reject second PREPARED record overlapping staged PREPARED owner"
+        );
+
+        let restarted = TwoPhaseParticipant::new(2, db.clone());
+        assert_eq!(
+            restarted.recover().unwrap(),
+            2,
+            "participant recovery must see only non-overlapping durable PREPARED records"
+        );
+
+        db.commit_2pc_batch(&make_batch(2, t1, "ABORTED", "shared_k"))
+            .unwrap();
+        assert!(
+            db.commit_2pc_batch(&make_batch(2, t1, "PREPARED", "shared_k"))
+                .is_err(),
+            "ABORTED participant record must not regress to PREPARED"
+        );
+        db.commit_2pc_batch(&make_batch(2, t2, "PREPARED", "shared_k"))
+            .unwrap();
+    }
+
+    #[test]
+    fn reconcile_failed_prepare_aborts_durable_prepared_record_before_releasing_locks() {
+        let (db, _dir) = test_db();
+        let participant = TwoPhaseParticipant::new(2, db.clone());
+        let t1 = (1, 100);
+        let t2 = (1, 101);
+        let writes = vec![DistWrite {
+            node_id: 2,
+            key: "indeterminate_k".into(),
+            value: Some("v1".into()),
+            ttl: 0,
+        }];
+        let write_keys = vec!["indeterminate_k".to_string()];
+
+        participant
+            .key_locks
+            .lock()
+            .unwrap()
+            .insert("indeterminate_k".into(), t1);
+        db.ssi_history
+            .reserve_prepared_keys(2, t1, &write_keys)
+            .unwrap();
+        let durable_prepare = ParticipantLogEntry {
+            txn_id: t1,
+            node_id: 2,
+            state: "PREPARED".into(),
+            writes: writes.clone(),
+            prepare_seq: 0,
+            commit_seq: None,
+        };
+        let mut prepare_batch = WriteBatch::new();
+        prepare_batch
+            .set(
+                &participant_prepare_key(2, t1),
+                serde_json::to_string(&durable_prepare).unwrap(),
+            )
+            .unwrap();
+        db.commit_2pc_batch(&prepare_batch).unwrap();
+
+        participant.reconcile_failed_prepare(
+            t1,
+            &writes,
+            &write_keys,
+            &OmniError::IoError("cluster write applied but await failed".into()),
+        );
+
+        let after = participant.load_participant_log(t1).unwrap().unwrap();
+        assert_eq!(after.state, "ABORTED");
+        assert_eq!(
+            participant.prepare(t2, &writes).vote,
+            Vote::Commit,
+            "second transaction must prepare cleanly after indeterminate prepare is aborted"
+        );
+        let restarted = TwoPhaseParticipant::new(2, db);
+        assert_eq!(restarted.recover().unwrap(), 1);
     }
 }

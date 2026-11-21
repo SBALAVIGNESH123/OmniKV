@@ -1190,13 +1190,20 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
             .heap_offset
             .store(recovered.heap_offset, Ordering::Release);
 
-        // CRITICAL: Advance global_seq to at least snapshot max_seq.
+        // CRITICAL: Advance global_seq strictly past the snapshot's max_seq,
+        // the rebuilt storage's max_seq, this node's prior sequence, and any
+        // prior SSI eviction floor so every pre-install read_seq sits below
+        // the new floor while post-install snapshots (global_seq - 1) pass.
         let cur_seq = self.db.global_seq.load(Ordering::SeqCst);
-        if envelope.max_seq >= cur_seq {
-            self.db
-                .global_seq
-                .store(envelope.max_seq + 1, Ordering::SeqCst);
-        }
+        let prev_floor = self.db.ssi_history().eviction_floor();
+        let snapshot_floor = envelope
+            .max_seq
+            .max(recovered.max_seq)
+            .max(cur_seq)
+            .max(prev_floor);
+        self.db
+            .global_seq
+            .store(snapshot_floor.saturating_add(1), Ordering::SeqCst);
 
         // The snapshot replaced the data wholesale, so the committed
         // history must be replaced too — otherwise a node promoted after
@@ -1213,6 +1220,7 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
                 .collect(),
             envelope.ssi_eviction_floor,
         );
+        self.db.ssi_history().advance_eviction_floor(snapshot_floor);
         self.db
             .sync_prepared_2pc_reservations()
             .map_err(|e| io_err(&format!("sync 2PC prepared reservations: {e}")))?;
