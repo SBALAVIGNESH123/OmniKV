@@ -269,10 +269,35 @@ const COMMIT_STRIPE_COUNT: usize = 64;
 /// LOCAL batch marker, never carried across the wire.
 type PreparedKeyOwner = (u64, (u64, u64));
 
+#[derive(Default)]
+struct PreparedKeyState {
+    /// Reservations backed by committed/durable `__2PC_PREPARE__/` records.
+    /// Consulted by both pre-proposal admission checks and deterministic Raft
+    /// state-machine apply.
+    durable: HashMap<String, PreparedKeyOwner>,
+    /// Node-local in-flight `prepare_locked` reservations not yet committed to
+    /// storage/Raft. Consulted ONLY by pre-proposal admission checks, never by
+    /// `apply_to_state_machine` (preserving replica determinism).
+    tentative: HashMap<String, PreparedKeyOwner>,
+}
+
+impl PreparedKeyState {
+    fn effective_owner(&self, key: &str) -> Option<PreparedKeyOwner> {
+        self.durable
+            .get(key)
+            .or_else(|| self.tentative.get(key))
+            .copied()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.durable.is_empty() && self.tentative.is_empty()
+    }
+}
+
 pub struct SsiHistory {
     /// Recently committed transactions, kept for conflict detection.
     committed_txns: Mutex<Vec<CommittedTxn>>,
-    prepared_keys: Mutex<HashMap<String, PreparedKeyOwner>>,
+    prepared_keys: Mutex<PreparedKeyState>,
     plain_write_seqs: Mutex<HashMap<String, u64>>,
     evicted_max_seq: AtomicU64,
     plain_evicted_max_seq: AtomicU64,
@@ -345,8 +370,7 @@ impl SsiHistory {
         let mut prepared = self.prepared_keys.lock().unwrap_or_else(|e| e.into_inner());
         if let Some((conflict_key, (_, conflict_txn))) = keys.iter().find_map(|key| {
             prepared
-                .get(key)
-                .copied()
+                .effective_owner(key)
                 .filter(|&owner| owner != (node_id, txn_id))
                 .map(|owner| (key, owner))
         }) {
@@ -356,7 +380,7 @@ impl SsiHistory {
             ));
         }
         for key in keys {
-            prepared.insert(key.clone(), (node_id, txn_id));
+            prepared.tentative.insert(key.clone(), (node_id, txn_id));
         }
         Ok(())
     }
@@ -365,17 +389,23 @@ impl SsiHistory {
         let mut prepared = self.prepared_keys.lock().unwrap_or_else(|e| e.into_inner());
         for key in keys {
             if prepared
+                .tentative
                 .get(key)
                 .is_some_and(|&owner| owner == (node_id, txn_id))
             {
-                prepared.remove(key);
+                prepared.tentative.remove(key);
             }
         }
     }
 
     pub(crate) fn release_prepared_keys_for_txn(&self, node_id: u64, txn_id: (u64, u64)) {
         let mut prepared = self.prepared_keys.lock().unwrap_or_else(|e| e.into_inner());
-        prepared.retain(|_, &mut owner| owner != (node_id, txn_id));
+        prepared
+            .durable
+            .retain(|_, &mut owner| owner != (node_id, txn_id));
+        prepared
+            .tentative
+            .retain(|_, &mut owner| owner != (node_id, txn_id));
     }
 
     pub(crate) fn replace_prepared_keys_for_node(
@@ -385,7 +415,7 @@ impl SsiHistory {
     ) -> Result<(), String> {
         let mut prepared = self.prepared_keys.lock().unwrap_or_else(|e| e.into_inner());
         for key in keys.keys() {
-            if let Some(&(owner_node, owner_txn)) = prepared.get(key)
+            if let Some((owner_node, owner_txn)) = prepared.effective_owner(key)
                 && owner_node != node_id
             {
                 return Err(format!(
@@ -394,28 +424,49 @@ impl SsiHistory {
                 ));
             }
         }
-        prepared.retain(|_, (owner_node, _)| *owner_node != node_id);
+        prepared
+            .durable
+            .retain(|_, (owner_node, _)| *owner_node != node_id);
+        prepared
+            .tentative
+            .retain(|_, (owner_node, _)| *owner_node != node_id);
         for (key, txn_id) in keys {
-            prepared.insert(key.clone(), (node_id, *txn_id));
+            prepared.durable.insert(key.clone(), (node_id, *txn_id));
         }
         Ok(())
     }
 
     pub(crate) fn replace_all_prepared_keys(&self, keys: HashMap<String, PreparedKeyOwner>) {
         let mut prepared = self.prepared_keys.lock().unwrap_or_else(|e| e.into_inner());
-        *prepared = keys;
+        let prev_durable_owners: HashSet<PreparedKeyOwner> =
+            prepared.durable.values().copied().collect();
+        let next_durable_owners: HashSet<PreparedKeyOwner> = keys.values().copied().collect();
+        prepared.tentative.retain(|_, owner| {
+            !prev_durable_owners.contains(owner) || next_durable_owners.contains(owner)
+        });
+        prepared.durable = keys;
     }
 
-    pub(crate) fn merge_prepared_keys(&self, reservations: HashMap<String, PreparedKeyOwner>) {
+    pub(crate) fn merge_durable_prepared_keys(
+        &self,
+        reservations: HashMap<String, PreparedKeyOwner>,
+    ) {
         let mut prepared = self.prepared_keys.lock().unwrap_or_else(|e| e.into_inner());
         for (key, owner) in reservations {
-            prepared.insert(key, owner);
+            if prepared
+                .tentative
+                .get(&key)
+                .is_some_and(|&tentative_owner| tentative_owner == owner)
+            {
+                prepared.tentative.remove(&key);
+            }
+            prepared.durable.insert(key, owner);
         }
     }
 
     pub(crate) fn check_prepared_write_conflict(&self, key: &str) -> Option<String> {
         let prepared = self.prepared_keys.lock().unwrap_or_else(|e| e.into_inner());
-        prepared.get(key).map(|(node_id, txn_id)| {
+        prepared.effective_owner(key).map(|(node_id, txn_id)| {
             format!(
                 "SSI CONFLICT (2PC): prepared key '{}' is reserved by node {} txn {:?}",
                 key, node_id, txn_id
@@ -423,14 +474,14 @@ impl SsiHistory {
         })
     }
 
-    pub(crate) fn prepared_owner(&self, key: &str) -> Option<PreparedKeyOwner> {
+    pub(crate) fn durable_prepared_owner(&self, key: &str) -> Option<PreparedKeyOwner> {
         let prepared = self.prepared_keys.lock().unwrap_or_else(|e| e.into_inner());
-        prepared.get(key).copied()
+        prepared.durable.get(key).copied()
     }
 
-    pub(crate) fn has_prepared_keys(&self) -> bool {
+    pub(crate) fn has_durable_prepared_keys(&self) -> bool {
         let prepared = self.prepared_keys.lock().unwrap_or_else(|e| e.into_inner());
-        !prepared.is_empty()
+        !prepared.durable.is_empty()
     }
 
     pub(crate) fn check_batch_prepared_conflicts(&self, batch: &WriteBatch) -> Option<String> {
@@ -445,7 +496,7 @@ impl SsiHistory {
             .chain(batch.buffered_deletes.iter().map(Vec::as_slice))
             .find_map(|key| {
                 let key_str = std::str::from_utf8(key).ok()?;
-                prepared.get(key_str).map(|(node_id, txn_id)| {
+                prepared.effective_owner(key_str).map(|(node_id, txn_id)| {
                     format!(
                         "SSI CONFLICT (2PC): prepared key '{}' is reserved by node {} txn {:?}",
                         key_str, node_id, txn_id
@@ -457,7 +508,7 @@ impl SsiHistory {
     fn check_prepared_txn_write_conflicts(&self, txn: &Transaction) -> Option<String> {
         let prepared = self.prepared_keys.lock().unwrap_or_else(|e| e.into_inner());
         txn.write_set.keys().find_map(|key| {
-            prepared.get(key).map(|(node_id, txn_id)| {
+            prepared.effective_owner(key).map(|(node_id, txn_id)| {
                 format!(
                     "SSI CONFLICT (2PC): prepared key '{}' is reserved by node {} txn {:?}",
                     key, node_id, txn_id
@@ -776,7 +827,7 @@ impl Default for SsiHistory {
     fn default() -> Self {
         Self {
             committed_txns: Mutex::new(Vec::new()),
-            prepared_keys: Mutex::new(HashMap::new()),
+            prepared_keys: Mutex::new(PreparedKeyState::default()),
             plain_write_seqs: Mutex::new(HashMap::new()),
             evicted_max_seq: AtomicU64::new(0),
             plain_evicted_max_seq: AtomicU64::new(0),

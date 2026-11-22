@@ -28,19 +28,25 @@ pub struct RaftState {
 
 pub const MAX_RAFT_RPC_BODY_BYTES: usize = 64 * 1024 * 1024;
 
-pub fn build_raft_router(state: RaftState) -> axum::Router {
-    axum::Router::new()
-        .route("/raft/append", axum::routing::post(raft_append_handler))
-        .route("/raft/vote", axum::routing::post(raft_vote_handler))
-        .route("/raft/snapshot", axum::routing::post(raft_snapshot_handler))
+fn apply_raft_rpc_layers(router: axum::Router, auth_token: String) -> axum::Router {
+    router
         .layer(axum::extract::DefaultBodyLimit::max(
             MAX_RAFT_RPC_BODY_BYTES,
         ))
         .route_layer(middleware::from_fn_with_state(
-            state.auth_token.clone(),
+            auth_token,
             authenticate_peer,
         ))
-        .with_state(state)
+}
+
+pub fn build_raft_router(state: RaftState) -> axum::Router {
+    let auth_token = state.auth_token.clone();
+    let router = axum::Router::new()
+        .route("/raft/append", axum::routing::post(raft_append_handler))
+        .route("/raft/vote", axum::routing::post(raft_vote_handler))
+        .route("/raft/snapshot", axum::routing::post(raft_snapshot_handler))
+        .with_state(state);
+    apply_raft_rpc_layers(router, auth_token)
 }
 
 async fn authenticate_peer(
@@ -168,21 +174,16 @@ mod tests {
 
     #[tokio::test]
     async fn raft_body_limit_accepts_payloads_above_axum_2mib_default() {
-        let app = axum::Router::new()
-            .route(
+        let app = apply_raft_rpc_layers(
+            axum::Router::new().route(
                 "/raft/append",
                 axum::routing::post(|Json(val): Json<serde_json::Value>| async move {
                     let len = val["blob"].as_str().map_or(0, str::len);
                     (StatusCode::OK, len.to_string())
                 }),
-            )
-            .layer(axum::extract::DefaultBodyLimit::max(
-                MAX_RAFT_RPC_BODY_BYTES,
-            ))
-            .route_layer(middleware::from_fn_with_state(
-                "shared-peer-secret".to_string(),
-                authenticate_peer,
-            ));
+            ),
+            "shared-peer-secret".to_string(),
+        );
         let large_json = serde_json::json!({ "blob": "A".repeat(3 * 1024 * 1024) }).to_string();
         let request = axum::http::Request::builder()
             .uri("/raft/append")

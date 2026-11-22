@@ -1961,8 +1961,6 @@ impl OmniKV {
     pub(crate) fn validate_client_key_bytes(key: &[u8]) -> Result<(), OmniError> {
         if key == b"__COMMIT_MARKER__"
             || key.starts_with(b"__sys__/raft/")
-            || key.starts_with(b"__2PC_LOG__/")
-            || key.starts_with(b"__2PC_PREPARE__/")
             || key.starts_with(b"__2PC_")
         {
             return Err(OmniError::IoError(
@@ -2018,7 +2016,9 @@ impl OmniKV {
             .lock()
             .map_err(|_| OmniError::LockPoisoned("2PC local commit".into()))?;
         crate::dist_txn::validate_2pc_decision_writes(self, None, tx)?;
-        self.commit_batch_local(tx)
+        let seq = self.commit_batch_local(tx)?;
+        self.sync_prepared_2pc_from_batch(tx)?;
+        Ok(seq)
     }
 
     pub(crate) fn ensure_cluster_linearizable(&self) -> Result<(), OmniError> {
@@ -2047,15 +2047,16 @@ impl OmniKV {
             .read()
             .map_err(|_| OmniError::LockPoisoned("transition_guard".into()))?;
         let commit_seq = self.commit_batch_local_locked_skip_prepared(tx)?;
+        self.sync_prepared_2pc_from_batch(tx)?;
         self.ssi_history
             .record_committed(ssi.txn_id, commit_seq, &ssi);
         self.ssi_history.prune(self.min_active_snapshot());
         Ok(commit_seq)
     }
 
-    /// The single-node commit path, also used by the raft state machine
-    /// itself when it applies entries: raft's own bookkeeping must
-    /// never route back through the cluster gateway.
+    /// Fences any in-flight consensus proposals and local sequence reservations
+    /// so a newly registered 2PC prepared-key reservation cannot race past a
+    /// concurrent writer.
     pub(crate) fn fence_write_reservation(&self) -> Result<(), OmniError> {
         if let Some(gateway) = self.cluster_gateway.get() {
             gateway.fence_blocking();
@@ -2075,6 +2076,9 @@ impl OmniKV {
         crate::dist_txn::sync_prepared_reservations_from_batch(self, batch)
     }
 
+    /// The single-node commit path, also used by the raft state machine
+    /// itself when it applies entries: raft's own bookkeeping must
+    /// never route back through the cluster gateway.
     pub(crate) fn commit_batch_local(&self, tx: &WriteBatch) -> Result<u64, OmniError> {
         // Acquire shared topology lock — blocks only during an exclusive
         // snapshot install or a build_snapshot's capture window. Thousands
@@ -2117,11 +2121,15 @@ impl OmniKV {
         let l0_sstables = self.sstable_count();
         metrics_prometheus::record_compaction_backlog(self.compaction_backlog_sstables());
         if l0_sstables >= compaction_policy.l0_write_stall_threshold {
+            // Cap the stall wait budget so an extreme policy cannot overflow
+            // `Instant` or block indefinitely while holding `transition_guard`.
+            const MAX_WRITE_STALL_WAIT: std::time::Duration = std::time::Duration::from_secs(3600);
             let total_wait = std::time::Duration::from_millis(
                 compaction_policy
                     .write_stall_wait_ms
                     .saturating_mul(compaction_policy.write_stall_wait_attempts as u64),
-            );
+            )
+            .min(MAX_WRITE_STALL_WAIT);
             let deadline = std::time::Instant::now().checked_add(total_wait);
             let mut stalled = true;
             let (ref stall_lock, ref cv) = self.compaction_cv;
@@ -2132,11 +2140,7 @@ impl OmniKV {
                     break;
                 }
                 let Some(limit) = deadline else {
-                    if total_wait.is_zero() {
-                        break;
-                    }
-                    guard = cv.wait(guard).unwrap_or_else(|e| e.into_inner());
-                    continue;
+                    break;
                 };
                 let remaining = limit.saturating_duration_since(std::time::Instant::now());
                 if remaining.is_zero() {
@@ -2905,9 +2909,7 @@ impl OmniKV {
             .transition_guard
             .read()
             .map_err(|_| OmniError::LockPoisoned("transition_guard".into()))?;
-        let result = self.compact_sstables_locked();
-        self.notify_compaction_waiters();
-        result
+        self.compact_sstables_locked()
     }
 
     /// Compacts the active memtable while the caller already holds the
@@ -3043,7 +3045,7 @@ impl OmniKV {
             .transition_guard
             .read()
             .map_err(|_| OmniError::LockPoisoned("transition_guard".into()))?;
-        let _guard = self
+        let write_guard = self
             .write_mutex
             .lock()
             .map_err(|_| OmniError::LockPoisoned("compact_l0".into()))?;
@@ -3102,6 +3104,7 @@ impl OmniKV {
             });
 
             stats.record("l0_to_l1", started_at, self.compaction_backlog_sstables());
+            drop(write_guard);
             self.notify_compaction_waiters();
             return Ok(());
         }
@@ -3167,6 +3170,7 @@ impl OmniKV {
         });
 
         stats.record("l0_to_l1", started_at, self.compaction_backlog_sstables());
+        drop(write_guard);
         self.notify_compaction_waiters();
         Ok(())
     }
@@ -4278,13 +4282,20 @@ mod tests {
         })
         .expect("set stall policy");
 
+        let started = std::time::Instant::now();
         let db_bg = db.clone();
+        let writer_ready = Arc::new(std::sync::Barrier::new(2));
+        let bg_ready = writer_ready.clone();
         let bg = std::thread::spawn(move || {
-            // Spurious / no-progress notification while L0 is still stalled.
-            std::thread::sleep(std::time::Duration::from_millis(25));
-            db_bg.notify_compaction_waiters();
+            bg_ready.wait();
+            // Hold `stall_lock` momentarily only after the writer has raced into
+            // `commit_batch`, then fire multiple no-progress wakeups before clearing L0.
+            for _ in 0..3 {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                db_bg.notify_compaction_waiters();
+            }
             // Clear L0 shortly afterwards, well within the 500ms budget.
-            std::thread::sleep(std::time::Duration::from_millis(50));
+            std::thread::sleep(std::time::Duration::from_millis(40));
             db_bg.compact_l0_to_l1().expect("compact L0 to L1");
         });
 
@@ -4292,8 +4303,14 @@ mod tests {
         writer_batch
             .set("after_stall", "ok".into())
             .expect("stage writer key");
+        writer_ready.wait();
         db.commit_batch(&writer_batch)
             .expect("writer must wait through no-progress wakeup until compaction clears L0");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= std::time::Duration::from_millis(80),
+            "writer should wait until compaction clears L0 (elapsed={elapsed:?})"
+        );
         bg.join().expect("background compactor joined");
         assert_eq!(
             db.find("after_stall", db.get_seq()).expect("read key"),

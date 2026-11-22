@@ -191,19 +191,12 @@ pub async fn run_quic_server(
 
     while let Some(incoming) = endpoint.accept().await {
         let db = db.clone();
-        let configured_secret = jwt_secret.clone();
+        let jwt_secret = jwt_secret.clone();
         let rate_limiter = rate_limiter.clone();
         tokio::spawn(async move {
             match incoming.await {
                 Ok(conn) => {
                     tracing::debug!("QUIC connection from {}", conn.remote_address());
-                    let jwt_secret = if configured_secret.is_empty() {
-                        std::env::var("OMNIKV_JWT_SECRET")
-                            .or_else(|_| std::env::var("OMNI_JWT_SECRET"))
-                            .unwrap_or_default()
-                    } else {
-                        configured_secret
-                    };
                     while let Ok((mut send, mut recv)) = conn.accept_bi().await {
                         let db = db.clone();
                         let secret = jwt_secret.clone();
@@ -303,7 +296,7 @@ fn handle_authenticated_request(
     rate_limiter: &RateLimiter,
 ) -> Vec<u8> {
     if jwt_secret.is_empty() {
-        tracing::error!("OMNI_JWT_SECRET not set — rejecting QUIC request");
+        tracing::error!("JWT secret not configured — rejecting QUIC request");
         return b"ERR AUTH_NOT_CONFIGURED\n".to_vec();
     }
 
@@ -550,6 +543,8 @@ mod tests {
         let (db, _dir) = open_temp_db();
         let secret = "0123456789abcdef0123456789abcdef";
         let read_token = crate::auth::generate_token("reader", "read", secret, 60).expect("token");
+        let write_token =
+            crate::auth::generate_token("writer", "write", secret, 60).expect("token");
         let backup_token =
             crate::auth::generate_token("operator", "backup", secret, 60).expect("token");
         let rate_limiter = RateLimiter::new(100.0, 10, 10);
@@ -566,11 +561,43 @@ mod tests {
         );
         assert_eq!(db.find("k", db.get_seq()).expect("find"), None);
 
+        // Positive check: write token succeeds on SET ([0x00, seq: u64 LE]).
+        let write_set_frame = authenticated_frame(&write_token, &set_payload);
+        let write_set_resp =
+            handle_authenticated_request(&db, &write_set_frame, secret, &rate_limiter);
+        assert_eq!(
+            write_set_resp.len(),
+            9,
+            "QUIC SET reply is 1-byte status + u64 seq"
+        );
+        assert_eq!(
+            write_set_resp[0], 0x00,
+            "write token must succeed on QUIC SET"
+        );
+        assert_eq!(
+            db.find("k", db.get_seq()).expect("find"),
+            Some("v".to_string())
+        );
+
+        // Positive check: read token succeeds on GET ([0x00, value...]).
+        let read_get_frame = authenticated_frame(&read_token, &[OpCode::Get as u8, b'k']);
+        assert_eq!(
+            handle_authenticated_request(&db, &read_get_frame, secret, &rate_limiter),
+            b"\x00v",
+            "read token must succeed on QUIC GET"
+        );
+
+        // Read token must not delete an existing key.
         let del_frame = authenticated_frame(&read_token, &[OpCode::Delete as u8, b'k']);
         assert_eq!(
             handle_authenticated_request(&db, &del_frame, secret, &rate_limiter),
             b"ERR FORBIDDEN insufficient role\n",
             "read token must not execute QUIC DELETE"
+        );
+        assert_eq!(
+            db.find("k", db.get_seq()).expect("find"),
+            Some("v".to_string()),
+            "existing key must survive denied QUIC DELETE"
         );
 
         let get_frame = authenticated_frame(&backup_token, &[OpCode::Get as u8, b'k']);
@@ -579,6 +606,15 @@ mod tests {
             b"ERR FORBIDDEN insufficient role\n",
             "backup token must not execute QUIC GET"
         );
+
+        // Positive check: write token succeeds on DELETE ([0x00]).
+        let write_del_frame = authenticated_frame(&write_token, &[OpCode::Delete as u8, b'k']);
+        assert_eq!(
+            handle_authenticated_request(&db, &write_del_frame, secret, &rate_limiter),
+            vec![0x00],
+            "write token must succeed on QUIC DELETE"
+        );
+        assert_eq!(db.find("k", db.get_seq()).expect("find"), None);
     }
 }
 

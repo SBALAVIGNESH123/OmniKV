@@ -573,12 +573,17 @@ impl SqlExecutor {
                     .index_manager()
                     .catalog_snapshot_at(self.statement_read_seq())
                     .map_err(|error| format!("index catalog read failed: {error}"))?;
-                if let Some(overlay) = self.pending_overlay() {
-                    index_catalog.apply_overlay(&overlay);
+                let overlay = self.pending_overlay();
+                let has_staged_rows = overlay
+                    .as_ref()
+                    .is_some_and(|ov| ov.keys().any(|k| k.starts_with("\x00T\x00")));
+                if let Some(overlay) = &overlay {
+                    index_catalog.apply_overlay(overlay);
                 }
+                let plan_indexes = (!has_staged_rows).then_some(&index_catalog);
                 let stats = crate::optimizer::gather_stats_at_checked(
                     &self.catalog,
-                    Some(&index_catalog),
+                    plan_indexes,
                     &self.db,
                     self.statement_read_seq(),
                 )?;
@@ -608,12 +613,17 @@ impl SqlExecutor {
                     .index_manager()
                     .catalog_snapshot_at(self.statement_read_seq())
                     .map_err(|error| format!("index catalog read failed: {error}"))?;
-                if let Some(overlay) = self.pending_overlay() {
-                    index_catalog.apply_overlay(&overlay);
+                let overlay = self.pending_overlay();
+                let has_staged_rows = overlay
+                    .as_ref()
+                    .is_some_and(|ov| ov.keys().any(|k| k.starts_with("\x00T\x00")));
+                if let Some(overlay) = &overlay {
+                    index_catalog.apply_overlay(overlay);
                 }
+                let plan_indexes = (!has_staged_rows).then_some(&index_catalog);
                 let stats = crate::optimizer::gather_stats_at_checked(
                     &self.catalog,
-                    Some(&index_catalog),
+                    plan_indexes,
                     &self.db,
                     self.statement_read_seq(),
                 )?;
@@ -901,10 +911,12 @@ impl SqlExecutor {
             .and_then(|value| serde_json::from_str::<TableDef>(&value).ok()))
     }
 
-    /// Builds the batch that rewrites a legacy table's rows to the typed
-    /// encoding and records the new format in the catalog. The caller merges
-    /// this with its own writes and commits both together, so a statement
-    /// that fails validation leaves the table exactly as it was.
+    /// Rewrites a legacy table's rows to the typed encoding and returns the
+    /// final batch carrying the catalog flip (plus any un-flushed migration
+    /// writes). In explicit transactions all writes remain staged in the
+    /// returned batch so `ROLLBACK` leaves storage untouched; in autocommit
+    /// mode large tables flush bounded intermediate chunks first, so callers
+    /// must finish all statement validation before invoking this helper.
     fn migration_batch(
         &self,
         table: &TableDef,
@@ -1127,6 +1139,43 @@ impl SqlExecutor {
         Ok((batch, effective_seq))
     }
 
+    fn legacy_post_migration_unique_prefixes<'a>(
+        &self,
+        table: &TableDef,
+        index_catalog: &crate::secondary_index::IndexCatalog,
+        rows: impl IntoIterator<Item = &'a Row>,
+    ) -> Result<std::collections::HashSet<String>, String> {
+        let index_manager = self.catalog.index_manager();
+        let mut prefixes = std::collections::HashSet::new();
+        for row in rows {
+            let Some(pk) = row.get(&table.primary_key).cloned().flatten() else {
+                continue;
+            };
+            let canonical_pk = crate::volcano::canonicalize_pk_key(table, &pk);
+            let mut migrated = row.clone();
+            if let Some(slot) = migrated.get_mut(&table.primary_key) {
+                *slot = Some(canonical_pk.clone());
+            }
+            let doc = serde_json::to_value(&migrated)
+                .map_err(|e| format!("Serialize index document: {e}"))?;
+            let entries = index_manager
+                .validate_document_indexes_with_catalog(
+                    index_catalog,
+                    &table.name,
+                    &canonical_pk,
+                    &doc,
+                )
+                .map_err(|e| format!("Index maintenance failed: {e}"))?;
+            for (idx_def, idx_key) in entries {
+                if idx_def.unique {
+                    let prefix = &idx_key[..idx_key.len() - canonical_pk.len()];
+                    prefixes.insert(prefix.to_string());
+                }
+            }
+        }
+        Ok(prefixes)
+    }
+
     fn exec_insert(
         &self,
         table_name: &str,
@@ -1170,8 +1219,9 @@ impl SqlExecutor {
         // aliases such as `7` and `'007'` address the same typed key, and a
         // multi-row INSERT must reject duplicates within the statement as
         // well as conflicts with rows already visible to this executor.
+        let existing_rows = self.load_table_rows_at(&table, read_seq)?;
         let mut occupied_keys = std::collections::HashSet::new();
-        for row in self.load_table_rows_at(&table, read_seq)? {
+        for row in &existing_rows {
             let Some(pk) = row.get(&table.primary_key).cloned().flatten() else {
                 return Err(format!(
                     "table '{}' contains a row without a primary key; refusing to insert",
@@ -1237,23 +1287,51 @@ impl SqlExecutor {
         if table.row_format == crate::catalog::RowFormat::Legacy
             && self.pending_batch.borrow().is_none()
         {
-            let mut dry_batch = WriteBatch::new();
+            // Check unique constraints against the post-migration view of all
+            // existing rows (including unbuilt `!is_ready` unique indexes whose
+            // entries don't exist in storage yet) before migration_batch can
+            // commit any bounded chunk.
+            let mut unique_prefixes = self.legacy_post_migration_unique_prefixes(
+                &table,
+                &index_catalog,
+                existing_rows.iter(),
+            )?;
+            let mut dry_ops: usize = 1; // catalog format flip
             for (key, canonical_pk, value, document) in &planned_inserts {
-                dry_batch
+                let mut probe = WriteBatch::new();
+                probe
                     .set(key, value.clone())
                     .map_err(|e| format!("{:?}", e))?;
-                index_manager
-                    .index_document_with_catalog_and_reads(
+                let entries = index_manager
+                    .validate_document_indexes_with_catalog(
                         &index_catalog,
                         &table.name,
                         canonical_pk,
                         document,
-                        &mut dry_batch,
-                        None,
                     )
                     .map_err(|e| format!("Index maintenance failed: {e}"))?;
+                for (idx_def, idx_key) in &entries {
+                    if idx_def.unique {
+                        let prefix = &idx_key[..idx_key.len() - canonical_pk.len()];
+                        if !unique_prefixes.insert(prefix.to_string()) {
+                            return Err(format!(
+                                "Index maintenance failed: UNIQUE CONSTRAINT VIOLATION: index '{}' on {:?}",
+                                idx_def.name,
+                                idx_def
+                                    .fields
+                                    .iter()
+                                    .map(|(field, _)| field.as_str())
+                                    .collect::<Vec<_>>()
+                            ));
+                        }
+                    }
+                    probe
+                        .set(idx_key, canonical_pk.clone())
+                        .map_err(|e| format!("{:?}", e))?;
+                }
+                dry_ops = dry_ops.saturating_add(1).saturating_add(entries.len());
             }
-            if dry_batch.op_count().saturating_add(1) > WriteBatch::MAX_OPS {
+            if dry_ops > WriteBatch::MAX_OPS {
                 return Err(format!(
                     "{:?}",
                     crate::OmniError::BatchTooLarge(WriteBatch::MAX_OPS)
@@ -2436,9 +2514,18 @@ impl SqlExecutor {
             ));
         }
 
+        let mut untouched_rows = Vec::new();
         if let Some(expr) = where_clause {
             let col_types = column_types_of_table(&table);
-            rows.retain(|(_, row)| eval_where_typed(row, expr, &col_types));
+            let mut matched = Vec::new();
+            for item in rows {
+                if eval_where_typed(&item.1, expr, &col_types) {
+                    matched.push(item);
+                } else {
+                    untouched_rows.push(item.1);
+                }
+            }
+            rows = matched;
         }
 
         // Remove the keys of rows this statement will rewrite. This permits a
@@ -2560,41 +2647,83 @@ impl SqlExecutor {
         if table.row_format == crate::catalog::RowFormat::Legacy
             && self.pending_batch.borrow().is_none()
         {
-            let mut dry_batch = WriteBatch::new();
-            for (raw_stored_pk, old_raw_document, _, _, canonical_pk, key, value, new_document) in
+            // Validate post-migration unique constraints against all untouched
+            // rows (including unbuilt `!is_ready` unique indexes) and count the
+            // exact post-migration op budget before migration_batch flushes any
+            // bounded chunks.
+            let mut unique_prefixes = self.legacy_post_migration_unique_prefixes(
+                &table,
+                &index_catalog,
+                untouched_rows.iter(),
+            )?;
+            let mut dry_ops: usize = 1; // catalog format flip
+            for (_, _, effective_old_pk, old_document, canonical_pk, key, value, new_document) in
                 &planned_updates
             {
-                dry_batch
+                let mut probe = WriteBatch::new();
+                probe
                     .set(key, value.clone())
                     .map_err(|e| format!("{:?}", e))?;
-                index_manager
-                    .replace_document_indexes_with_catalog_and_reads(
+                let old_entries = index_manager
+                    .validate_document_indexes_with_catalog(
                         &index_catalog,
                         &table.name,
-                        raw_stored_pk,
-                        old_raw_document,
-                        canonical_pk,
-                        new_document,
-                        &mut dry_batch,
-                        None,
+                        effective_old_pk,
+                        old_document,
                     )
                     .map_err(|e| format!("Index maintenance failed: {e}"))?;
+                let new_entries = index_manager
+                    .validate_document_indexes_with_catalog(
+                        &index_catalog,
+                        &table.name,
+                        canonical_pk,
+                        new_document,
+                    )
+                    .map_err(|e| format!("Index maintenance failed: {e}"))?;
+                let old_set: std::collections::HashSet<&str> =
+                    old_entries.iter().map(|(_, k)| k.as_str()).collect();
+                let new_set: std::collections::HashSet<&str> =
+                    new_entries.iter().map(|(_, k)| k.as_str()).collect();
+                for (idx_def, idx_key) in &new_entries {
+                    if idx_def.unique {
+                        let prefix = &idx_key[..idx_key.len() - canonical_pk.len()];
+                        if !unique_prefixes.insert(prefix.to_string()) {
+                            return Err(format!(
+                                "Index maintenance failed: UNIQUE CONSTRAINT VIOLATION: index '{}' on {:?}",
+                                idx_def.name,
+                                idx_def
+                                    .fields
+                                    .iter()
+                                    .map(|(field, _)| field.as_str())
+                                    .collect::<Vec<_>>()
+                            ));
+                        }
+                    }
+                    if !old_set.contains(idx_key.as_str()) {
+                        probe
+                            .set(idx_key, canonical_pk.clone())
+                            .map_err(|e| format!("{:?}", e))?;
+                        dry_ops = dry_ops.saturating_add(1);
+                    }
+                }
+                for (_, old_idx_key) in &old_entries {
+                    if !new_set.contains(old_idx_key.as_str()) {
+                        dry_ops = dry_ops.saturating_add(1);
+                    }
+                }
+                dry_ops = dry_ops.saturating_add(1);
             }
             for stale in &stale_keys {
                 if !new_keys.contains(stale) {
-                    dry_batch.delete(stale).map_err(|e| format!("{:?}", e))?;
+                    dry_ops = dry_ops.saturating_add(1);
                 }
             }
-            if dry_batch
-                .op_count()
-                .saturating_add(
-                    2usize
-                        .saturating_mul(update_stage_count)
-                        .saturating_mul(moved_keys.len()),
-                )
-                .saturating_add(1)
-                > WriteBatch::MAX_OPS
-            {
+            dry_ops = dry_ops.saturating_add(
+                2usize
+                    .saturating_mul(update_stage_count)
+                    .saturating_mul(moved_keys.len()),
+            );
+            if dry_ops > WriteBatch::MAX_OPS {
                 return Err(format!(
                     "{:?}",
                     crate::OmniError::BatchTooLarge(WriteBatch::MAX_OPS)
@@ -2746,7 +2875,8 @@ impl SqlExecutor {
             }
         }
 
-        // Deletes commit after the migration's rewrites inside one batch, so
+        // Deletes run after the migration's rewrites (whether chunked in
+        // autocommit mode or staged together in an explicit transaction), so
         // a row the statement removes disappears even if migration moved it.
         let (mut batch, marker_read_seq) = if table.row_format == crate::catalog::RowFormat::Legacy
         {

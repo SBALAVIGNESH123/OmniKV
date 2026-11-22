@@ -482,15 +482,11 @@ fn index_bounds(
                 visit(right, table_name, field, field_type, lower, upper);
             }
             WhereExpr::Comparison { column, op, value } => {
-                let qualifies = column
-                    .split_once('.')
-                    .is_none_or(|(qual, _)| qual.eq_ignore_ascii_case(table_name));
-                if !qualifies
-                    || !column
-                        .rsplit_once('.')
-                        .map_or(column.as_str(), |(_, name)| name)
-                        .eq_ignore_ascii_case(field)
-                {
+                let (qualifies, bare_col) = match column.split_once('.') {
+                    Some((qual, name)) => (qual.eq_ignore_ascii_case(table_name), name),
+                    None => (true, column.as_str()),
+                };
+                if !qualifies || !bare_col.eq_ignore_ascii_case(field) {
                     return;
                 }
                 let Some(value) = crate::secondary_index::sql_index_bound(value, field_type) else {
@@ -1343,9 +1339,11 @@ pub fn compile_plan_with_scan(
             let base: Box<dyn RowIterator> = match access {
                 AccessMethod::PkLookup { key_value } => {
                     let key_value = canonicalize_pk_key(&table_def, key_value);
-                    if legacy_pk_needs_scan(&table_def) {
-                        // A legacy numeric key may be stored as "007", which
-                        // the canonical key range can never reach.
+                    if pk_lookup_needs_scan(&table_def, &key_value) {
+                        // A legacy numeric key may be stored as "007", or a
+                        // cross-format numeric literal like '1.0' on an INTEGER
+                        // PK may still match via `smart_cmp`; scan + filter keeps
+                        // equality semantics identical to SeqScan.
                         let base: Box<dyn RowIterator> = match scan {
                             Some(ctx) => Box::new(SeqScanIter::with_scan(
                                 db,
@@ -1538,6 +1536,26 @@ pub(crate) fn legacy_pk_needs_scan(table: &TableDef) -> bool {
             .iter()
             .find(|c| c.name.eq_ignore_ascii_case(&table.primary_key))
             .is_some_and(|c| c.col_type.is_numeric())
+}
+
+/// Whether an equality lookup on `table`'s primary key must fall back to a
+/// scan-and-filter so typed `smart_cmp` matches identically (legacy numeric
+/// tables, non-`i128` numeric literals like `'1.0'` against an `INTEGER` PK,
+/// or non-finite values against a `FLOAT` PK).
+pub(crate) fn pk_lookup_needs_scan(table: &TableDef, key_value: &str) -> bool {
+    if legacy_pk_needs_scan(table) {
+        return true;
+    }
+    match table
+        .columns
+        .iter()
+        .find(|c| c.name.eq_ignore_ascii_case(&table.primary_key))
+        .map(|c| &c.col_type)
+    {
+        Some(ColumnType::Integer) => key_value.parse::<i128>().is_err(),
+        Some(ColumnType::Float) => !key_value.parse::<f64>().is_ok_and(f64::is_finite),
+        _ => false,
+    }
 }
 
 /// `pk = value` for the scan-and-filter fallback, so the comparison runs

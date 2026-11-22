@@ -1305,6 +1305,53 @@ fn build_differential_oracle_indexes(db: &Arc<OmniKV>) {
     db.commit_batch(&legacy_idx).unwrap();
 }
 
+fn explain_plan(exec: &SqlExecutor, sql: &str) -> String {
+    rows(exec, sql)
+        .into_iter()
+        .filter_map(|r| r.into_iter().next().flatten())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn assert_differential_oracle_plans(indexed_exec: &SqlExecutor) {
+    assert!(
+        explain_plan(indexed_exec, "EXPLAIN SELECT id FROM users WHERE age >= 20")
+            .contains("users_age_int_idx"),
+        "ready INTEGER index must be selected by optimizer"
+    );
+    assert!(
+        explain_plan(
+            indexed_exec,
+            "EXPLAIN SELECT id FROM users WHERE score >= 1.5"
+        )
+        .contains("users_score_float_idx"),
+        "ready FLOAT index must be selected by optimizer"
+    );
+    assert!(
+        explain_plan(
+            indexed_exec,
+            "EXPLAIN SELECT id FROM users WHERE tag >= 'a'"
+        )
+        .contains("users_tag_str_idx"),
+        "ready String index must be selected by optimizer"
+    );
+    let orders_plan = explain_plan(indexed_exec, "EXPLAIN SELECT id FROM orders WHERE age >= 2");
+    assert!(
+        !orders_plan.contains("legacy_wrong_orders_age_idx"),
+        "mismatched String index on INTEGER column must never be selected: {orders_plan}"
+    );
+    assert!(
+        explain_plan(indexed_exec, "EXPLAIN SELECT id FROM USERS WHERE id = 1")
+            .contains("PK Lookup"),
+        "case-insensitive table lookup must still select PK Lookup"
+    );
+    assert!(
+        !explain_plan(indexed_exec, "EXPLAIN SELECT id FROM users WHERE id = NULL")
+            .contains("PK Lookup"),
+        "WHERE pk = NULL must not plan a PK Lookup"
+    );
+}
+
 #[test]
 fn sql_differential_oracle_indexed_vs_unindexed_matches_across_types_bounds_joins_and_pks() {
     let dir_oracle = TempDir::new().unwrap();
@@ -1329,6 +1376,7 @@ fn sql_differential_oracle_indexed_vs_unindexed_matches_across_types_bounds_join
     seed_differential_oracle_tables(&oracle_exec);
     seed_differential_oracle_tables(&indexed_exec);
     build_differential_oracle_indexes(&db_indexed);
+    assert_differential_oracle_plans(&indexed_exec);
 
     for sql in [
         "SELECT id, age FROM users WHERE age >= 2 AND age <= 10 ORDER BY id",
@@ -1348,6 +1396,8 @@ fn sql_differential_oracle_indexed_vs_unindexed_matches_across_types_bounds_join
         "SELECT users.id, orders.id FROM users JOIN orders ON users.id = orders.user_id WHERE users.age >= 2 AND orders.age = 99 ORDER BY users.id",
         "SELECT users.id, orders.id FROM users JOIN orders ON users.id = orders.user_id WHERE users.age >= 20 AND orders.age = 99 ORDER BY users.id",
         "SELECT id, age FROM users WHERE id = 1",
+        "SELECT id, age FROM USERS WHERE id = 1",
+        "SELECT id, age FROM users WHERE id = '1.0'",
         "SELECT id, age FROM users WHERE id = 10",
         "SELECT id, age FROM users WHERE id = 20",
         "SELECT id, age FROM users WHERE id = NULL",
@@ -1361,22 +1411,161 @@ fn sql_differential_oracle_indexed_vs_unindexed_matches_across_types_bounds_join
         );
     }
 
-    // Corrupt a neighbor row whose PK has 'a' as a prefix (`code = 'a1'`).
-    // An exact O(1) PkLookupIter for `code = 'a'` (missing) must NOT scan or decode 'a1'.
+    // FLOAT PRIMARY KEY with -0.0 must match stored 0.0 via PK Lookup.
+    for exec in [&oracle_exec, &indexed_exec] {
+        execute(exec, "CREATE TABLE coords (x FLOAT PRIMARY KEY, v TEXT)");
+        execute(exec, "INSERT INTO coords (x, v) VALUES (0.0, 'origin')");
+    }
+    assert_eq!(
+        rows(&indexed_exec, "SELECT x, v FROM coords WHERE x = -0.0"),
+        vec![vec![Some("0".into()), Some("origin".into())]]
+    );
+
+    // Corrupt neighbor prefix key `codes.a1` and verify BOTH PkLookupIter AND
+    // PlanExecutor (plan_exec.rs) perform exact O(1) lookups without touching `a1`.
     let mut corrupt = WriteBatch::new();
     corrupt
         .set("\u{0}T\u{0}codes\u{0}a1", "{not-valid-json".into())
         .unwrap();
     db_indexed.commit_batch(&corrupt).unwrap();
-    let codes_table = Catalog::new(db_indexed.clone())
-        .get_table("codes")
-        .expect("codes table");
+    let catalog = Arc::new(Catalog::new(db_indexed.clone()));
+    let codes_table = catalog.get_table("codes").expect("codes table");
     let mut pk_iter = omni_engine::volcano::PkLookupIter::new(&db_indexed, &codes_table, "a");
     assert_eq!(
         omni_engine::volcano::RowIterator::try_next_row(&mut pk_iter).unwrap(),
-        None,
-        "exact PkLookupIter for missing key 'a' must not scan or fail on neighbor prefix key 'a1'"
+        None
     );
+    let pk_plan = omni_engine::optimizer::PlanNode::Scan {
+        table: "codes".into(),
+        access: omni_engine::optimizer::AccessMethod::PkLookup {
+            key_value: "a".into(),
+        },
+        filter: None,
+        estimated_rows: 1,
+        estimated_cost: 1.0,
+    };
+    let plan_exec = omni_engine::plan_exec::PlanExecutor::for_plan_at(
+        db_indexed.clone(),
+        catalog,
+        &pk_plan,
+        db_indexed.get_seq(),
+    );
+    assert_eq!(
+        plan_exec.execute_plan(&pk_plan).unwrap().len(),
+        0,
+        "PlanExecutor PkLookup for missing 'a' must not scan or decode neighbor 'a1'"
+    );
+}
+
+#[test]
+fn index_scan_bounds_tighten_conjuncts_and_ignore_foreign_table_qualifiers() {
+    use omni_engine::sql::{CmpOp, SqlValue, WhereExpr};
+    use omni_engine::volcano::{IndexScanIter, RowIterator};
+
+    let dir = TempDir::new().unwrap();
+    let db = OmniKV::open(
+        dir.path().join("manifest.json").to_str().unwrap(),
+        dir.path().join("wal.bin").to_str().unwrap(),
+    )
+    .unwrap();
+    let catalog = Arc::new(Catalog::new(db.clone()));
+    let executor = SqlExecutor::new(db.clone(), catalog.clone());
+    seed_differential_oracle_tables(&executor);
+    build_differential_oracle_indexes(&db);
+
+    // Corrupt rows with age=10 (id=10) and age=30 (id=100) in storage.
+    // Tightened index bounds must skip those out-of-range rows completely!
+    let mut corrupt = WriteBatch::new();
+    corrupt
+        .set("\u{0}T\u{0}users\u{0}10", "{corrupt-age-10".into())
+        .unwrap();
+    corrupt
+        .set("\u{0}T\u{0}users\u{0}100", "{corrupt-age-30".into())
+        .unwrap();
+    db.commit_batch(&corrupt).unwrap();
+
+    let users_table = catalog.get_table("users").expect("users table");
+    let seq = db.get_seq();
+
+    // age = 20 AND age >= 10 must keep lower=20, upper=20 (never touching age=10 or age=30).
+    let pred_eq_and_ge = WhereExpr::And(
+        Box::new(WhereExpr::Comparison {
+            column: "age".into(),
+            op: CmpOp::Eq,
+            value: SqlValue::Integer(20),
+        }),
+        Box::new(WhereExpr::Comparison {
+            column: "age".into(),
+            op: CmpOp::Gte,
+            value: SqlValue::Integer(10),
+        }),
+    );
+    let mut iter = IndexScanIter::with_scan(
+        &db,
+        &catalog,
+        &users_table,
+        "users_age_int_idx",
+        Some(&pred_eq_and_ge),
+        seq,
+        None,
+    );
+    let mut found_ids = Vec::new();
+    while let Some(row) = iter.try_next_row().unwrap() {
+        found_ids.push(row.get("id").cloned().flatten());
+    }
+    assert_eq!(found_ids, vec![Some("11".into())]);
+
+    // age = 20 AND age = 30 must tighten to lower=30 > upper=20 -> 0 rows (never touching age=30).
+    let pred_contradiction = WhereExpr::And(
+        Box::new(WhereExpr::Comparison {
+            column: "age".into(),
+            op: CmpOp::Eq,
+            value: SqlValue::Integer(20),
+        }),
+        Box::new(WhereExpr::Comparison {
+            column: "age".into(),
+            op: CmpOp::Eq,
+            value: SqlValue::Integer(30),
+        }),
+    );
+    let mut empty_iter = IndexScanIter::with_scan(
+        &db,
+        &catalog,
+        &users_table,
+        "users_age_int_idx",
+        Some(&pred_contradiction),
+        seq,
+        None,
+    );
+    assert_eq!(empty_iter.try_next_row().unwrap(), None);
+
+    // Foreign qualifier `orders.age = 99` must NOT overwrite `users.age = 20`.
+    let pred_foreign = WhereExpr::And(
+        Box::new(WhereExpr::Comparison {
+            column: "users.age".into(),
+            op: CmpOp::Eq,
+            value: SqlValue::Integer(20),
+        }),
+        Box::new(WhereExpr::Comparison {
+            column: "orders.age".into(),
+            op: CmpOp::Eq,
+            value: SqlValue::Integer(99),
+        }),
+    );
+    let mut foreign_iter = IndexScanIter::with_scan(
+        &db,
+        &catalog,
+        &users_table,
+        "users_age_int_idx",
+        Some(&pred_foreign),
+        seq,
+        None,
+    );
+    let mut foreign_ids = Vec::new();
+    while let Some(row) = foreign_iter.try_next_row().unwrap() {
+        foreign_ids.push(row.get("id").cloned().flatten());
+    }
+    assert_eq!(foreign_ids, vec![Some("11".into())]);
 }
 
 #[test]
@@ -1414,7 +1603,14 @@ fn stale_partial_index_entries_never_hide_rows_and_are_purged_on_rebuild() {
     seed_stale.set(&stale_key, "999".into()).unwrap();
     db.commit_batch(&seed_stale).unwrap();
 
-    // Unready index must NEVER hide rows from SQL SELECT.
+    assert!(
+        !explain_plan(
+            &executor,
+            "EXPLAIN SELECT id, sku FROM items WHERE sku = 'alpha'"
+        )
+        .contains("items_sku_idx"),
+        "unready index must not be chosen by EXPLAIN"
+    );
     assert_eq!(
         rows(
             &executor,
@@ -1423,8 +1619,6 @@ fn stale_partial_index_entries_never_hide_rows_and_are_purged_on_rebuild() {
         vec![vec![Some("1".into()), Some("alpha".into())]]
     );
 
-    // Rebuilding the unique index must purge the stale entry (otherwise PK '1'
-    // would collide with phantom PK '999' on the unique constraint!) and finish cleanly.
     let rebuilt = idx_mgr
         .rebuild_index("items_sku_idx")
         .expect("rebuild_index must purge stale entries before unique backfill");
@@ -1434,6 +1628,14 @@ fn stale_partial_index_entries_never_hide_rows_and_are_purged_on_rebuild() {
         None,
         "stale partial index entry must be purged by rebuild_index"
     );
+    assert!(
+        explain_plan(
+            &executor,
+            "EXPLAIN SELECT id, sku FROM items WHERE sku = 'alpha'"
+        )
+        .contains("items_sku_idx"),
+        "rebuilt ready index must be chosen by EXPLAIN"
+    );
     assert_eq!(
         rows(
             &executor,
@@ -1441,4 +1643,127 @@ fn stale_partial_index_entries_never_hide_rows_and_are_purged_on_rebuild() {
         ),
         vec![vec![Some("1".into()), Some("alpha".into())]]
     );
+}
+
+#[test]
+fn unbuilt_unique_index_on_large_legacy_table_rejects_duplicates_without_partial_migration() {
+    let dir = TempDir::new().unwrap();
+    let db = OmniKV::open(
+        dir.path().join("manifest.json").to_str().unwrap(),
+        dir.path().join("wal.bin").to_str().unwrap(),
+    )
+    .unwrap();
+
+    let stage_key =
+        seed_large_legacy_table(&db, "big_legacy_unbuilt", WriteBatch::MAX_OPS / 3 + 10);
+
+    // Deliberately create a unique index WITHOUT calling rebuild_index yet.
+    let idx_mgr = IndexManager::new(db.clone());
+    idx_mgr
+        .create_index(
+            "big_legacy_unbuilt_old_col_uq",
+            "big_legacy_unbuilt",
+            vec![("old_col".into(), IndexFieldType::String)],
+            true,
+        )
+        .unwrap();
+
+    let executor = SqlExecutor::new(db.clone(), Arc::new(Catalog::new(db.clone())));
+    for (label, sql) in [
+        (
+            "unbuilt unique index insert violation",
+            "INSERT INTO big_legacy_unbuilt (id, old_col) VALUES (999999, 'v1')",
+        ),
+        (
+            "unbuilt unique index update violation",
+            "UPDATE big_legacy_unbuilt SET old_col = 'v2' WHERE id = 1",
+        ),
+    ] {
+        let stmt = parse_sql(sql).unwrap();
+        assert!(executor.execute(&stmt).is_err(), "{label} must be rejected");
+        assert_legacy_row_untouched(&db, "big_legacy_unbuilt", &stage_key, label);
+    }
+}
+
+#[test]
+fn transactional_drop_table_cleans_stage_markers_retired_indexes_and_updates_explain() {
+    let dir = TempDir::new().unwrap();
+    let db = OmniKV::open(
+        dir.path().join("manifest.json").to_str().unwrap(),
+        dir.path().join("wal.bin").to_str().unwrap(),
+    )
+    .unwrap();
+
+    let stage_key = seed_large_legacy_table(&db, "tx_drop_tbl", 1);
+    let retired_idx_key = "\u{0}IDX_RETIRED\u{0}88";
+    let retired_idx_entry = "\u{0}IDX\u{0}00000088\u{0}v1\u{0}1";
+    let retired_idx_json = "{\"id\":88,\"name\":\"tx_retired_idx\",\"collection\":\"tx_drop_tbl\",\"fields\":[[\"old_col\",\"String\"]],\"unique\":false}";
+    let mut retired_seed = WriteBatch::new();
+    retired_seed
+        .set(retired_idx_key, retired_idx_json.into())
+        .unwrap();
+    retired_seed.set(retired_idx_entry, "1".into()).unwrap();
+    db.commit_batch(&retired_seed).unwrap();
+
+    let tm = TransactionManager::new(db.clone());
+    let mut txn = tm.begin();
+    let mut tx_exec = SqlExecutor::with_transaction(
+        db.clone(),
+        Arc::new(Catalog::at_snapshot(db.clone(), txn.read_seq)),
+        txn.read_seq,
+        &HashMap::new(),
+    );
+    execute(
+        &tx_exec,
+        "UPDATE tx_drop_tbl SET id = 50, old_col = 'moved' WHERE id = 1",
+    );
+    execute(&tx_exec, "DROP TABLE tx_drop_tbl");
+    execute(
+        &tx_exec,
+        "CREATE TABLE tx_drop_tbl (id INTEGER PRIMARY KEY, old_col TEXT)",
+    );
+    let plan_after_recreate = explain_plan(
+        &tx_exec,
+        "EXPLAIN SELECT id FROM tx_drop_tbl WHERE old_col = 'moved'",
+    );
+    assert!(
+        !plan_after_recreate.contains("Index Scan"),
+        "transactional EXPLAIN must not reference dropped indexes: {plan_after_recreate}"
+    );
+    if let Some(reads) = tx_exec.drain_reads() {
+        txn.read_set.extend(reads.keys);
+        txn.read_ranges.extend(reads.ranges);
+    }
+    if let Some(staged) = tx_exec.flush_batch() {
+        for (k, v, ttl) in staged.buffered_writes {
+            txn.write_set
+                .insert(String::from_utf8(k).unwrap(), (Some(v), ttl));
+        }
+        for k in staged.buffered_deletes {
+            txn.write_set
+                .insert(String::from_utf8(k).unwrap(), (None, 0));
+        }
+    }
+    tm.commit(&mut txn).unwrap();
+
+    let seq = db.get_seq();
+    assert_eq!(db.find(&stage_key, seq).unwrap(), None);
+    assert_eq!(
+        db.find(
+            &test_rename_row_stage_key(&stage_key, "\u{0}T\u{0}tx_drop_tbl\u{0}000001"),
+            seq
+        )
+        .unwrap(),
+        None
+    );
+    assert_eq!(
+        db.find(
+            &test_rename_row_stage_key(&stage_key, "\u{0}T\u{0}tx_drop_tbl\u{0}50"),
+            seq
+        )
+        .unwrap(),
+        None
+    );
+    assert_eq!(db.find(retired_idx_key, seq).unwrap(), None);
+    assert_eq!(db.find(retired_idx_entry, seq).unwrap(), None);
 }

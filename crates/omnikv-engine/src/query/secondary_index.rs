@@ -889,6 +889,17 @@ impl IndexManager {
             {
                 let prefix = build_index_scan_prefix(def.id);
                 let end = format!("{}\u{10ffff}", prefix);
+                let staged_keys: Vec<String> = batch
+                    .buffered_writes
+                    .iter()
+                    .filter_map(|(key, _, _)| {
+                        if key.starts_with(prefix.as_bytes()) {
+                            std::str::from_utf8(key).ok().map(str::to_string)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
                 batch.buffered_writes.retain(|(key, _, _)| {
                     key.as_slice() != ret_key.as_bytes() && !key.starts_with(prefix.as_bytes())
                 });
@@ -898,6 +909,15 @@ impl IndexManager {
                     .any(|deleted| deleted.as_slice() == ret_key.as_bytes())
                 {
                     batch.delete(&ret_key)?;
+                }
+                for key in staged_keys {
+                    if !batch
+                        .buffered_deletes
+                        .iter()
+                        .any(|deleted| deleted.as_slice() == key.as_bytes())
+                    {
+                        batch.delete(&key)?;
+                    }
                 }
                 for (key, _) in self.db.scan(&prefix, &end, seq)? {
                     if !batch
@@ -1393,7 +1413,7 @@ impl IndexManager {
                 )?;
                 count += 1;
 
-                if batch.op_count() >= 1000 && !batch.is_empty() {
+                if batch.op_count() >= 1000 {
                     self.db.commit_batch(&batch)?;
                     batch = WriteBatch::new();
                 }

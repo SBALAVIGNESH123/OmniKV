@@ -267,9 +267,9 @@ impl ClusterGateway {
 
     /// The `commit_batch` facade for sync-thread callers when clustered:
     /// serializes the batch into one [`RaftCommand`], proposes, waits for
-    /// local apply. Reached through the [`crate::OmniKV::commit_batch`]
-    /// engine hook — pgwire threads and SQL autocommit land here with no
-    /// code changes of their own.
+    /// local apply. (`crate::OmniKV::commit_batch` calls
+    /// [`Self::commit_batch_checked`] to also enforce 2PC prepared-key checks
+    /// under the flight lock.)
     pub fn commit_batch(&self, batch: &crate::WriteBatch) -> Result<u64, crate::OmniError> {
         let _flight = self.flight_blocking();
         let cmd = RaftCommand::from_batch(batch);

@@ -68,7 +68,10 @@ impl ColumnType {
                 .unwrap_or_else(|_| value.to_string()),
             Self::Float => value
                 .parse::<f64>()
-                .map(|f| f.to_string())
+                .map(|f| {
+                    let normalized = if f == 0.0 { 0.0 } else { f };
+                    normalized.to_string()
+                })
                 .unwrap_or_else(|_| value.to_string()),
             _ => value.to_string(),
         }

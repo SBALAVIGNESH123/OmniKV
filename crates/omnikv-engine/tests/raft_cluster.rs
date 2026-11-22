@@ -4870,16 +4870,8 @@ async fn test_snapshot_install_blocks_pre_install_2pc_prepare_against_plain_writ
         ),
     }
 
-    let fresh_vote = participant.prepare((1, 2), &writes);
-    assert_eq!(
-        fresh_vote.vote,
-        Vote::Commit,
-        "post-install 2PC prepare must still succeed"
-    );
-    participant.abort((1, 2)).unwrap();
-
-    // Reopen the follower from disk immediately after snapshot install and verify
-    // the persisted sequence boundary still rejects the pre-install read_seq.
+    // Drop and reopen IMMEDIATELY after install_snapshot (before any post-install
+    // WAL writes) so WAL replay cannot mask missing `installed_manifest.max_seq`.
     drop(participant);
     drop(installer);
     drop(follower);
@@ -4893,6 +4885,10 @@ async fn test_snapshot_install_blocks_pre_install_2pc_prepare_against_plain_writ
             .unwrap(),
         Some("from_leader_plain".into()),
         "reopened follower must still hold the installed snapshot key"
+    );
+    assert!(
+        reopened_db.ssi_history().eviction_floor() >= pre_install_read_seq,
+        "reopened follower must restore persisted snapshot eviction floor without post-install WAL writes"
     );
     let reopened_participant = TwoPhaseParticipant::new(2, reopened_db);
     let reopened_stale =
@@ -4912,6 +4908,7 @@ async fn test_snapshot_install_blocks_pre_install_2pc_prepare_against_plain_writ
         Vote::Commit,
         "fresh post-restart 2PC prepare must succeed"
     );
+    reopened_participant.abort((1, 4)).unwrap();
 }
 
 #[tokio::test]
@@ -5171,13 +5168,13 @@ fn test_clustered_live_raft_concurrent_2pc_vs_plain_and_ssi_isolation() {
     let (db, _dir) = boot_single_node_live_raft("live_raft_2pc_isolation");
     let participant = Arc::new(TwoPhaseParticipant::new(1, db.clone()));
     let stop = Arc::new(AtomicBool::new(false));
-    let rejected = Arc::new(AtomicUsize::new(0));
+    let plain_2pc_rejected = Arc::new(AtomicUsize::new(0));
 
     let mut handles = Vec::new();
     for worker in 0..4usize {
         let db = db.clone();
         let stop = stop.clone();
-        let rejected = rejected.clone();
+        let plain_2pc_rejected = plain_2pc_rejected.clone();
         handles.push(std::thread::spawn(move || {
             let tm = TransactionManager::new(db.clone());
             let mut iter = 0usize;
@@ -5187,17 +5184,17 @@ fn test_clustered_live_raft_concurrent_2pc_vs_plain_and_ssi_isolation() {
                     let mut b = WriteBatch::new();
                     b.set("hot_2pc_key", format!("plain_{worker}_{iter}"))
                         .unwrap();
-                    if db.commit_batch(&b).is_err() {
-                        rejected.fetch_add(1, Ordering::Relaxed);
+                    if let Err(err) = db.commit_batch(&b)
+                        && err.to_string().contains("SSI CONFLICT (2PC)")
+                    {
+                        plain_2pc_rejected.fetch_add(1, Ordering::Relaxed);
                     }
                 } else {
                     let mut txn = tm.begin();
                     let _ = tm.get(&mut txn, "hot_2pc_key");
                     tm.set(&mut txn, "hot_2pc_key", format!("ssi_{worker}_{iter}"))
                         .unwrap();
-                    if tm.commit(&mut txn).is_err() {
-                        rejected.fetch_add(1, Ordering::Relaxed);
-                    }
+                    let _ = tm.commit(&mut txn);
                 }
             }
         }));
@@ -5213,11 +5210,18 @@ fn test_clustered_live_raft_concurrent_2pc_vs_plain_and_ssi_isolation() {
             ttl: 0,
         }];
         if participant.prepare((1, round), &writes).vote == Vote::Commit {
+            let val_at_prepare = db.find("hot_2pc_key", db.get_seq()).unwrap();
+            let seq_at_prepare = db.get_seq_for_key("hot_2pc_key", u64::MAX);
             std::thread::sleep(Duration::from_millis(15));
-            assert_ne!(
-                db.find("hot_2pc_key", db.get_seq()).unwrap().as_deref(),
-                Some(expected_val.as_str()),
-                "uncommitted 2PC value must not become visible before commit"
+            assert_eq!(
+                db.find("hot_2pc_key", db.get_seq()).unwrap(),
+                val_at_prepare,
+                "competing writers must not mutate hot_2pc_key during a 2PC prepared window"
+            );
+            assert_eq!(
+                db.get_seq_for_key("hot_2pc_key", u64::MAX),
+                seq_at_prepare,
+                "hot_2pc_key sequence must not advance during a 2PC prepared window"
             );
             let commit_seq = participant
                 .commit((1, round))
@@ -5238,8 +5242,8 @@ fn test_clustered_live_raft_concurrent_2pc_vs_plain_and_ssi_isolation() {
 
     assert!(committed_rounds > 0, "expected >= 1 committed 2PC round");
     assert!(
-        rejected.load(Ordering::Relaxed) > 0,
-        "competing clustered writers must observe prepared-key rejections during 2PC windows"
+        plain_2pc_rejected.load(Ordering::Relaxed) > 0,
+        "competing clustered plain writers must observe SSI CONFLICT (2PC) rejections during 2PC windows"
     );
 
     let mut final_batch = WriteBatch::new();
@@ -5252,4 +5256,90 @@ fn test_clustered_live_raft_concurrent_2pc_vs_plain_and_ssi_isolation() {
         db.find("hot_2pc_key", db.get_seq()).unwrap(),
         Some("post_2pc_ok".into())
     );
+}
+
+#[tokio::test]
+async fn test_delete_conflict_logs_since_preserves_index_zero_and_purged_floor() {
+    use openraft::{CommittedLeaderId, Entry, EntryPayload, LogId, RaftStorage};
+
+    let (_db, mut storage, _dir) = create_node("delete_conflict_logs");
+    let leader0 = CommittedLeaderId::new(0, 0);
+    let leader1 = CommittedLeaderId::new(1, 1);
+
+    let entries = vec![
+        Entry {
+            log_id: LogId::new(leader0, 0),
+            payload: EntryPayload::Blank,
+        },
+        Entry {
+            log_id: LogId::new(leader1, 1),
+            payload: EntryPayload::Normal("SET k1 v1".into()),
+        },
+        Entry {
+            log_id: LogId::new(leader1, 2),
+            payload: EntryPayload::Normal("SET k2 v2".into()),
+        },
+        Entry {
+            log_id: LogId::new(leader1, 3),
+            payload: EntryPayload::Normal("SET k3 v3".into()),
+        },
+    ];
+    storage.append_to_log(entries).await.unwrap();
+
+    // Truncating from index 1 must preserve OpenRaft's index-0 membership entry.
+    storage
+        .delete_conflict_logs_since(LogId::new(leader1, 1))
+        .await
+        .unwrap();
+    let state = storage.get_log_state().await.unwrap();
+    assert_eq!(
+        state.last_log_id,
+        Some(LogId::new(leader0, 0)),
+        "truncating at index 1 must keep index 0 as last_log_id"
+    );
+
+    // Re-append 1..=3, purge through index 1, then truncate from index 2:
+    // last_log_id must fall back to last_purged_log_id (index 1).
+    storage
+        .append_to_log(vec![
+            Entry {
+                log_id: LogId::new(leader1, 1),
+                payload: EntryPayload::Normal("SET k1 v1b".into()),
+            },
+            Entry {
+                log_id: LogId::new(leader1, 2),
+                payload: EntryPayload::Normal("SET k2 v2b".into()),
+            },
+        ])
+        .await
+        .unwrap();
+    storage
+        .purge_logs_upto(LogId::new(leader1, 1))
+        .await
+        .unwrap();
+    storage
+        .delete_conflict_logs_since(LogId::new(leader1, 2))
+        .await
+        .unwrap();
+    let state = storage.get_log_state().await.unwrap();
+    assert_eq!(
+        state.last_log_id,
+        Some(LogId::new(leader1, 1)),
+        "truncating immediately after purged floor must set last_log_id = last_purged_log_id"
+    );
+
+    // Truncating from index 0 on a fresh node resets last_log_id to None.
+    let (_db2, mut storage2, _dir2) = create_node("delete_conflict_logs_zero");
+    storage2
+        .append_to_log(vec![Entry {
+            log_id: LogId::new(leader0, 0),
+            payload: EntryPayload::Blank,
+        }])
+        .await
+        .unwrap();
+    storage2
+        .delete_conflict_logs_since(LogId::new(leader0, 0))
+        .await
+        .unwrap();
+    assert_eq!(storage2.get_log_state().await.unwrap().last_log_id, None);
 }

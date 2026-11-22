@@ -422,18 +422,29 @@ fn test_2pc_prepared_reservations_survive_crash_reopen_before_participant_recove
         rogue
             .set("acct:escrow", "clobbered_plain".into())
             .expect("stage plain write");
+        let plain_err = db
+            .commit_batch(&rogue)
+            .expect_err("plain write to a durably PREPARED key must be rejected after reopen");
         assert!(
-            db.commit_batch(&rogue).is_err(),
-            "plain write to a durably PREPARED key must be rejected immediately after reopen"
+            plain_err.to_string().contains("SSI CONFLICT (2PC)"),
+            "expected SSI CONFLICT (2PC) on plain write, got: {plain_err}"
         );
 
         let tm = TransactionManager::new(db.clone());
         let mut ssi = tm.begin();
         tm.set(&mut ssi, "acct:escrow", "clobbered_ssi".into())
             .expect("stage ssi write");
+        let ssi_err = tm
+            .commit(&mut ssi)
+            .expect_err("SSI commit on a durably PREPARED key must be rejected after reopen");
         assert!(
-            tm.commit(&mut ssi).is_err(),
-            "SSI commit on a durably PREPARED key must be rejected immediately after reopen"
+            ssi_err.to_string().contains("SSI CONFLICT (2PC)"),
+            "expected SSI CONFLICT (2PC) on SSI commit, got: {ssi_err}"
+        );
+        assert_eq!(
+            db.find_latest_internal("acct:escrow").expect("find"),
+            None,
+            "rejected writes must not have mutated acct:escrow before 2PC commit"
         );
 
         // Now recover the participant and commit the in-doubt transaction.

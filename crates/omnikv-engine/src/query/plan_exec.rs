@@ -9,7 +9,7 @@ use crate::optimizer::{AccessMethod, PlanNode};
 use crate::sql::{AggFunc, JoinType, SelectColumn, WhereExpr};
 use crate::sql_exec::Row;
 use crate::volcano::{
-    ColumnTypeMap, RowIterator, eval_where_typed, legacy_pk_needs_scan, qualify_row, row_lookup,
+    ColumnTypeMap, RowIterator, eval_where_typed, pk_lookup_needs_scan, qualify_row, row_lookup,
     type_lookup,
 };
 use std::collections::HashMap;
@@ -238,9 +238,15 @@ impl PlanExecutor {
             .ok_or_else(|| format!("Table '{}' does not exist", table_name))?;
 
         let mut rows = match access {
-            AccessMethod::PkLookup { key_value } if legacy_pk_needs_scan(&table) => {
-                // A legacy numeric key may be stored as "007", which the
-                // canonical key range can never reach.
+            AccessMethod::PkLookup { key_value }
+                if pk_lookup_needs_scan(
+                    &table,
+                    &crate::volcano::canonicalize_pk_key(&table, key_value),
+                ) =>
+            {
+                // A legacy numeric key may be stored as "007", or a cross-format
+                // numeric literal like '1.0' on an INTEGER PK may match via
+                // `smart_cmp`; scan and filter identically to SeqScan.
                 let key_value = crate::volcano::canonicalize_pk_key(&table, key_value);
                 let predicate = crate::volcano::pk_equality(&table, &key_value);
                 let mut scanned = self.load_table_rows(&table)?;

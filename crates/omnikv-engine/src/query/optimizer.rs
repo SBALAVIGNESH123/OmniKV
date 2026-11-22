@@ -135,12 +135,10 @@ pub fn gather_stats_at_checked(
                                                 ) | (
                                                     crate::catalog::ColumnType::Float,
                                                     crate::secondary_index::IndexFieldType::Float,
-                                                ) | (
-                                                    crate::catalog::ColumnType::Text
-                                                        | crate::catalog::ColumnType::Boolean,
-                                                    crate::secondary_index::IndexFieldType::String,
                                                 )
-                                            )
+                                            ) || (!col.col_type.is_numeric()
+                                                && *field_type
+                                                    == crate::secondary_index::IndexFieldType::String)
                                         })
                                 })
                     })
@@ -758,13 +756,19 @@ impl Optimizer {
         }
     }
 
+    fn table_stats(&self, table_name: &str) -> Option<&TableStats> {
+        self.stats
+            .get(table_name)
+            .or_else(|| self.stats.get(&table_name.to_lowercase()))
+    }
+
     /// Choose access method for a single table.
     fn plan_table_scan(
         &self,
         table_name: &str,
         where_clause: Option<&WhereExpr>,
     ) -> Result<PlanNode, String> {
-        let stats = self.stats.get(table_name);
+        let stats = self.table_stats(table_name);
         let row_count = stats.map(|s| s.row_count).unwrap_or(1000); // default estimate
 
         // Check for primary key equality lookup
@@ -821,7 +825,7 @@ impl Optimizer {
     ///
     /// Only the declared key qualifies — a column named `id` need not be it.
     fn extract_pk_lookup(&self, table_name: &str, expr: &WhereExpr) -> Option<String> {
-        let pk = self.stats.get(table_name)?.primary_key.clone();
+        let pk = self.table_stats(table_name)?.primary_key.clone();
         match expr {
             WhereExpr::Comparison {
                 column,
@@ -854,7 +858,7 @@ impl Optimizer {
 
     /// Find the best index for a WHERE predicate.
     fn find_best_index(&self, table_name: &str, expr: &WhereExpr) -> Option<IndexDefinition> {
-        let stats = self.stats.get(table_name)?;
+        let stats = self.table_stats(table_name)?;
         let conjuncts = split_conjuncts(expr);
         let mut candidates: Vec<&IndexDefinition> = stats
             .indexes

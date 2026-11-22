@@ -558,7 +558,7 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
                 .expect("RaftStorage meta lock poisoned: fatal invariant");
             if idx > log_id.index {
                 // Determine new last_log_id (log_id.index - 1)
-                if log_id.index <= 1 {
+                if log_id.index == 0 {
                     meta.last_log_id = None;
                 } else {
                     let prev_key = format!("{}{:020}", RAFT_LOG_PREFIX, log_id.index - 1);
@@ -566,10 +566,7 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
                         && let Ok(entry) = serde_json::from_str::<Entry<TypeConfig>>(&val)
                     {
                         meta.last_log_id = Some(entry.log_id);
-                    } else if meta
-                        .last_purged_log_id
-                        .is_some_and(|purged| purged.index == log_id.index - 1)
-                    {
+                    } else {
                         meta.last_log_id = meta.last_purged_log_id;
                     }
                 }
@@ -839,6 +836,7 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
                         if parts.len() == 2
                             && parts[0] != "__COMMIT_MARKER__"
                             && !parts[0].starts_with("__sys__/raft/")
+                            && !parts[0].starts_with("__2PC_")
                             && !crate::dist_txn::key_is_reserved_by_prepared_2pc(
                                 &self.db, &batch, parts[0],
                             )

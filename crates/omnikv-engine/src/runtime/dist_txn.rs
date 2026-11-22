@@ -734,6 +734,16 @@ fn participant_prepare_key(node_id: u64, txn_id: GlobalTxnId) -> String {
     format!("__2PC_PREPARE__/{node_id}/{}_{}", txn_id.0, txn_id.1)
 }
 
+fn parse_participant_prepare_key(key: &str) -> Option<(u64, GlobalTxnId)> {
+    let rest = key.strip_prefix("__2PC_PREPARE__/")?;
+    let (node_str, txn_str) = rest.split_once('/')?;
+    let (coord_str, seq_str) = txn_str.split_once('_')?;
+    Some((
+        node_str.parse().ok()?,
+        (coord_str.parse().ok()?, seq_str.parse().ok()?),
+    ))
+}
+
 fn legacy_participant_prepare_key(txn_id: GlobalTxnId) -> String {
     format!("__2PC_PREPARE__/{}_{}", txn_id.0, txn_id.1)
 }
@@ -1091,7 +1101,7 @@ fn effective_prepared_owner(
             .buffered_deletes
             .iter()
             .any(|k| k.starts_with(b"__2PC_PREPARE__/"));
-    if !db.ssi_history.has_prepared_keys() && !staged_touches_prepare {
+    if !db.ssi_history.has_durable_prepared_keys() && !staged_touches_prepare {
         return Ok(None);
     }
     if staged
@@ -1126,7 +1136,7 @@ fn effective_prepared_owner(
         return Ok(None);
     }
 
-    let mut owner = db.ssi_history.prepared_owner(key);
+    let mut owner = db.ssi_history.durable_prepared_owner(key);
     for (k_bytes, val, _) in &staged.buffered_writes {
         if !k_bytes.starts_with(b"__2PC_PREPARE__/") {
             continue;
@@ -1282,6 +1292,14 @@ pub(crate) fn sync_prepared_reservations_from_batch(
         .iter()
         .any(|key| key.starts_with(b"__2PC_PREPARE__/"))
     {
+        for key_bytes in &batch.buffered_deletes {
+            if let Ok(key) = std::str::from_utf8(key_bytes)
+                && let Some((node_id, txn_id)) = parse_participant_prepare_key(key)
+            {
+                db.ssi_history
+                    .release_prepared_keys_for_txn(node_id, txn_id);
+            }
+        }
         return sync_all_prepared_reservations(db);
     }
     for (key_bytes, value, _) in &batch.buffered_writes {
@@ -1297,7 +1315,7 @@ pub(crate) fn sync_prepared_reservations_from_batch(
                 for write in &entry.writes {
                     reservations.insert(write.key.clone(), (entry.node_id, entry.txn_id));
                 }
-                db.ssi_history.merge_prepared_keys(reservations);
+                db.ssi_history.merge_durable_prepared_keys(reservations);
             }
             "COMMITTED" | "ABORTED" => {
                 db.ssi_history
@@ -2640,6 +2658,22 @@ mod tests {
             "malformed JSON on authoritative participant key must be rejected"
         );
 
+        let bogus_state_entry = ParticipantLogEntry {
+            state: "BOGUS".into(),
+            ..valid_entry
+        };
+        let mut bogus_state = WriteBatch::new();
+        bogus_state
+            .set(
+                &auth_key,
+                serde_json::to_string(&bogus_state_entry).unwrap(),
+            )
+            .unwrap();
+        assert!(
+            db.commit_2pc_batch(&bogus_state).is_err(),
+            "invalid participant state must be rejected"
+        );
+
         let bad_cmd = crate::raft_command::RaftCommand::from_batch(&malformed);
         let mut raft_storage = crate::raft_storage::OmniRaftStorage::new(db.clone());
         let leader = openraft::CommittedLeaderId::new(1, 1);
@@ -2699,6 +2733,28 @@ mod tests {
         assert!(
             !commit_entry_exceeds_storage_limit(2, (1, 2), &fit_writes, &fit_keys, true).unwrap(),
             "clustered Raft COMMIT whose complete encoded entry fits MAX_VALUE_SIZE must still be accepted"
+        );
+
+        // Quotes double-escape inside the Raft Entry<TypeConfig> JSON string
+        // (each `"` expands to `\\\"` across the nested JSON layers), so a 2 MiB
+        // quote-heavy payload fits locally but overflows clustered Raft storage.
+        let quote_payload = "\"".repeat(2 * 1024 * 1024);
+        let quote_writes = vec![DistWrite {
+            node_id: 2,
+            key: "quote_k".into(),
+            value: Some(quote_payload),
+            ttl: 0,
+        }];
+        let quote_keys = vec!["quote_k".to_string()];
+        assert!(
+            !commit_entry_exceeds_storage_limit(2, (1, 3), &quote_writes, &quote_keys, false)
+                .unwrap(),
+            "single-node commit fits a 2 MiB quote-heavy value"
+        );
+        assert!(
+            commit_entry_exceeds_storage_limit(2, (1, 3), &quote_writes, &quote_keys, true)
+                .unwrap(),
+            "clustered Raft COMMIT must account for nested JSON escaping expansion"
         );
     }
 
@@ -2795,5 +2851,40 @@ mod tests {
             db.find("reserved_k", db.get_seq()).unwrap(),
             Some("committed_v".into())
         );
+
+        // Node-local tentative reservations block pre-proposal admission checks,
+        // but Raft state-machine apply MUST ignore them so leader and followers
+        // deterministically apply already-committed entries.
+        db.ssi_history
+            .reserve_prepared_keys(2, (1, 502), &["tentative_k".to_string()])
+            .unwrap();
+        let mut local_plain = WriteBatch::new();
+        local_plain
+            .set("tentative_k", "blocked_locally".into())
+            .unwrap();
+        assert!(
+            db.commit_batch(&local_plain).is_err(),
+            "local admission must block tentative prepared key"
+        );
+        let committed_cmd = crate::raft_command::RaftCommand::from_batch(&local_plain);
+        let apply_res = rt
+            .block_on(openraft::RaftStorage::apply_to_state_machine(
+                &mut raft_storage,
+                &[openraft::Entry {
+                    log_id: openraft::LogId::new(leader, 3),
+                    payload: openraft::EntryPayload::Normal(committed_cmd.encode()),
+                }],
+            ))
+            .unwrap();
+        assert!(
+            apply_res[0].parse::<u64>().is_ok(),
+            "Raft apply must deterministically apply committed entries despite node-local tentative reservations"
+        );
+        assert_eq!(
+            db.find("tentative_k", db.get_seq()).unwrap(),
+            Some("blocked_locally".into())
+        );
+        db.ssi_history
+            .release_prepared_keys(2, (1, 502), &["tentative_k".to_string()]);
     }
 }
