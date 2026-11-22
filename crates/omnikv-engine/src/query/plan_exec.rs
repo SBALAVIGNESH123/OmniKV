@@ -106,7 +106,12 @@ impl PlanExecutor {
                 child, predicate, ..
             } => {
                 let mut rows = self.execute_plan(child)?;
-                rows.retain(|row| eval_where_typed(row, predicate, &self.types));
+                let types = if self.types.is_empty() {
+                    child.output_types(&self.catalog)
+                } else {
+                    self.types.clone()
+                };
+                rows.retain(|row| eval_where_typed(row, predicate, &types));
                 Ok(rows)
             }
             PlanNode::Project { child, columns } => {
@@ -237,6 +242,12 @@ impl PlanExecutor {
             .get_table(table_name)
             .ok_or_else(|| format!("Table '{}' does not exist", table_name))?;
 
+        let table_types: ColumnTypeMap = table
+            .columns
+            .iter()
+            .map(|c| (c.name.clone(), c.col_type.clone()))
+            .collect();
+
         let mut rows = match access {
             AccessMethod::PkLookup { key_value }
                 if pk_lookup_needs_scan(
@@ -250,7 +261,7 @@ impl PlanExecutor {
                 let key_value = crate::volcano::canonicalize_pk_key(&table, key_value);
                 let predicate = crate::volcano::pk_equality(&table, &key_value);
                 let mut scanned = self.load_table_rows(&table)?;
-                scanned.retain(|row| eval_where_typed(row, &predicate, &self.types));
+                scanned.retain(|row| eval_where_typed(row, &predicate, &table_types));
                 scanned
             }
             AccessMethod::PkLookup { key_value } => {
@@ -272,22 +283,35 @@ impl PlanExecutor {
                 }
             }
             AccessMethod::IndexScan { index_name, .. } => {
-                let mut iter = crate::volcano::IndexScanIter::with_scan(
-                    &self.db,
-                    &self.catalog,
-                    &table,
-                    index_name,
-                    filter,
-                    self.read_seq(),
-                    None,
-                );
-                iter.try_collect_all()?
+                let seq = self.read_seq();
+                let idx_catalog = self
+                    .catalog
+                    .index_manager()
+                    .catalog_snapshot_at(seq)
+                    .map_err(|error| format!("index catalog read failed: {error}"))?;
+                if idx_catalog
+                    .get_by_name(index_name)
+                    .is_some_and(|def| idx_catalog.is_ready(def.id))
+                {
+                    let mut iter = crate::volcano::IndexScanIter::with_scan(
+                        &self.db,
+                        &self.catalog,
+                        &table,
+                        index_name,
+                        filter,
+                        seq,
+                        None,
+                    );
+                    iter.try_collect_all()?
+                } else {
+                    self.load_table_rows_at(&table, seq)?
+                }
             }
             AccessMethod::SeqScan => self.load_table_rows(&table)?,
         };
 
         if let Some(expr) = filter {
-            rows.retain(|row| eval_where_typed(row, expr, &self.types));
+            rows.retain(|row| eval_where_typed(row, expr, &table_types));
         }
 
         Ok(rows)
@@ -319,8 +343,11 @@ impl PlanExecutor {
     }
 
     fn load_table_rows(&self, table: &TableDef) -> Result<Vec<Row>, String> {
+        self.load_table_rows_at(table, self.read_seq())
+    }
+
+    fn load_table_rows_at(&self, table: &TableDef, seq: u64) -> Result<Vec<Row>, String> {
         let prefix = table.row_prefix();
-        let seq = self.read_seq();
         let stored = self
             .db
             .scan(&prefix, &format!("{}\u{10ffff}", prefix), seq)

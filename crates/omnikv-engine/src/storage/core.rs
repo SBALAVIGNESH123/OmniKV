@@ -2028,6 +2028,77 @@ impl OmniKV {
         Ok(())
     }
 
+    pub(crate) fn check_2pc_prepare_conflicts(
+        &self,
+        read_seq: u64,
+        write_keys: &[String],
+    ) -> Option<String> {
+        let committed = self.ssi_history.lock_committed();
+        self.check_2pc_prepare_conflicts_locked(&committed, read_seq, write_keys)
+    }
+
+    fn check_2pc_prepare_conflicts_locked(
+        &self,
+        committed: &[crate::transaction::CommittedTxn],
+        read_seq: u64,
+        write_keys: &[String],
+    ) -> Option<String> {
+        self.ssi_history
+            .check_write_conflicts_locked(committed, read_seq, write_keys)
+            .or_else(|| {
+                write_keys.iter().find_map(|key| {
+                    let latest_seq = self.get_seq_for_key(key, u64::MAX);
+                    (latest_seq > read_seq).then(|| {
+                        format!(
+                            "SSI CONFLICT (WW): key '{}' written at seq {}",
+                            key, latest_seq
+                        )
+                    })
+                })
+            })
+    }
+
+    /// Commits a 2PC `PREPARED` batch while atomically re-validating `read_seq`
+    /// against SSI history and current key sequences under the same ordering
+    /// guards as commits and snapshot installs.
+    pub(crate) fn commit_2pc_prepare_checked(
+        &self,
+        tx: &WriteBatch,
+        read_seq: u64,
+        write_keys: &[String],
+    ) -> Result<u64, crate::dist_txn::PrepareCommitError> {
+        use crate::dist_txn::PrepareCommitError;
+        if let Some(gateway) = self.cluster_gateway.get() {
+            return gateway.commit_2pc_prepare_checked(self, tx, read_seq, write_keys);
+        }
+        let lock = self
+            .sql_table_lock("\x002PC_LOCAL_COMMIT")
+            .map_err(PrepareCommitError::PreProposal)?;
+        let _guard = lock.lock().map_err(|_| {
+            PrepareCommitError::PreProposal(OmniError::LockPoisoned("2PC local commit".into()))
+        })?;
+        let _topology_guard = self.transition_guard.read().map_err(|_| {
+            PrepareCommitError::PreProposal(OmniError::LockPoisoned("transition_guard".into()))
+        })?;
+        crate::dist_txn::validate_2pc_decision_writes(self, None, tx)
+            .map_err(PrepareCommitError::PreProposal)?;
+        let committed_guard = self.ssi_history.lock_committed();
+        if let Some(conflict) =
+            self.check_2pc_prepare_conflicts_locked(&committed_guard, read_seq, write_keys)
+        {
+            return Err(PrepareCommitError::PreProposal(OmniError::IoError(
+                conflict,
+            )));
+        }
+        let seq = self
+            .commit_batch_local_locked_skip_prepared(tx)
+            .map_err(PrepareCommitError::PostProposal)?;
+        self.sync_prepared_2pc_from_batch(tx)
+            .map_err(PrepareCommitError::PostProposal)?;
+        drop(committed_guard);
+        Ok(seq)
+    }
+
     pub(crate) fn commit_2pc_batch_with_ssi(
         &self,
         tx: &WriteBatch,
@@ -2041,15 +2112,26 @@ impl OmniKV {
         let _guard = lock
             .lock()
             .map_err(|_| OmniError::LockPoisoned("2PC local commit".into()))?;
-        crate::dist_txn::validate_2pc_decision_writes(self, None, tx)?;
+        // Acquire transition_guard BEFORE committed_txns to preserve the
+        // engine's global lock order (matching TransactionManager::commit),
+        // and hold committed_txns across both batch publication and history
+        // insertion so no concurrent SSI transaction can validate against the
+        // published data before this commit's SSI record is visible.
         let _topology_guard = self
             .transition_guard
             .read()
             .map_err(|_| OmniError::LockPoisoned("transition_guard".into()))?;
+        crate::dist_txn::validate_2pc_decision_writes(self, None, tx)?;
+        let mut committed_guard = self.ssi_history.lock_committed();
         let commit_seq = self.commit_batch_local_locked_skip_prepared(tx)?;
         self.sync_prepared_2pc_from_batch(tx)?;
-        self.ssi_history
-            .record_committed(ssi.txn_id, commit_seq, &ssi);
+        self.ssi_history.record_committed_locked(
+            &mut committed_guard,
+            ssi.txn_id,
+            commit_seq,
+            &ssi,
+        );
+        drop(committed_guard);
         self.ssi_history.prune(self.min_active_snapshot());
         Ok(commit_seq)
     }

@@ -341,7 +341,13 @@ impl IndexScanIter {
             }
         };
         let (field, field_type) = &definition.fields[0];
-        let (lower, upper) = index_bounds(predicate, &table.name, field, field_type);
+        let (lower, upper) = index_bounds(
+            predicate,
+            &table.name,
+            field,
+            field_type,
+            definition.encoding_version,
+        );
         let primary_keys = match manager.range_scan_bounds_at(
             index_name,
             lower.as_ref(),
@@ -400,6 +406,14 @@ impl IndexScanIter {
             error: None,
         }
     }
+
+    pub(crate) fn from_error(error: String) -> Self {
+        Self {
+            rows: Vec::new(),
+            pos: 0,
+            error: Some(error),
+        }
+    }
 }
 
 impl RowIterator for IndexScanIter {
@@ -441,6 +455,7 @@ fn index_bounds(
     table_name: &str,
     field: &str,
     field_type: &crate::secondary_index::IndexFieldType,
+    encoding_version: u8,
 ) -> (Option<serde_json::Value>, Option<serde_json::Value>) {
     let mut lower: Option<(Vec<u8>, serde_json::Value)> = None;
     let mut upper: Option<(Vec<u8>, serde_json::Value)> = None;
@@ -473,13 +488,30 @@ fn index_bounds(
         table_name: &str,
         field: &str,
         field_type: &crate::secondary_index::IndexFieldType,
+        encoding_version: u8,
         lower: &mut Option<(Vec<u8>, serde_json::Value)>,
         upper: &mut Option<(Vec<u8>, serde_json::Value)>,
     ) {
         match expr {
             WhereExpr::And(left, right) => {
-                visit(left, table_name, field, field_type, lower, upper);
-                visit(right, table_name, field, field_type, lower, upper);
+                visit(
+                    left,
+                    table_name,
+                    field,
+                    field_type,
+                    encoding_version,
+                    lower,
+                    upper,
+                );
+                visit(
+                    right,
+                    table_name,
+                    field,
+                    field_type,
+                    encoding_version,
+                    lower,
+                    upper,
+                );
             }
             WhereExpr::Comparison { column, op, value } => {
                 let (qualifies, bare_col) = match column.split_once('.') {
@@ -489,12 +521,18 @@ fn index_bounds(
                 if !qualifies || !bare_col.eq_ignore_ascii_case(field) {
                     return;
                 }
-                let Some(value) = crate::secondary_index::sql_index_bound(value, field_type) else {
+                let Some(value) = crate::secondary_index::sql_index_bound_for_version(
+                    value,
+                    field_type,
+                    encoding_version,
+                ) else {
                     return;
                 };
-                let Some(encoded) =
-                    crate::secondary_index::try_encode_index_value(&value, field_type)
-                else {
+                let Some(encoded) = crate::secondary_index::try_encode_index_value_for_version(
+                    &value,
+                    field_type,
+                    encoding_version,
+                ) else {
                     return;
                 };
                 match op {
@@ -512,7 +550,13 @@ fn index_bounds(
     }
     if let Some(predicate) = predicate {
         visit(
-            predicate, table_name, field, field_type, &mut lower, &mut upper,
+            predicate,
+            table_name,
+            field,
+            field_type,
+            encoding_version,
+            &mut lower,
+            &mut upper,
         );
     }
     (lower.map(|(_, v)| v), upper.map(|(_, v)| v))
@@ -1401,15 +1445,32 @@ pub fn compile_plan_with_scan(
                         ctx.scan_seq,
                         ctx.reads.as_ref(),
                     )),
-                    None => Box::new(IndexScanIter::with_scan(
-                        db,
-                        catalog,
-                        &table_def,
-                        index_name,
-                        filter.as_ref(),
-                        db.get_seq(),
-                        None,
-                    )),
+                    None => {
+                        let seq = db.get_seq();
+                        match catalog.index_manager().catalog_snapshot_at(seq) {
+                            Ok(idx_catalog)
+                                if idx_catalog
+                                    .get_by_name(index_name)
+                                    .is_some_and(|def| idx_catalog.is_ready(def.id)) =>
+                            {
+                                Box::new(IndexScanIter::with_scan(
+                                    db,
+                                    catalog,
+                                    &table_def,
+                                    index_name,
+                                    filter.as_ref(),
+                                    seq,
+                                    None,
+                                ))
+                            }
+                            Ok(_) => {
+                                Box::new(SeqScanIter::with_scan(db, &table_def, seq, None, None))
+                            }
+                            Err(error) => Box::new(IndexScanIter::from_error(format!(
+                                "index catalog read failed: {error}"
+                            ))),
+                        }
+                    }
                 },
             };
             match filter {
@@ -1539,9 +1600,13 @@ pub(crate) fn legacy_pk_needs_scan(table: &TableDef) -> bool {
 }
 
 /// Whether an equality lookup on `table`'s primary key must fall back to a
-/// scan-and-filter so typed `smart_cmp` matches identically (legacy numeric
-/// tables, non-`i128` numeric literals like `'1.0'` against an `INTEGER` PK,
-/// or non-finite values against a `FLOAT` PK).
+/// scan-and-filter so typed `smart_cmp` matches identically:
+/// - legacy numeric tables (may hold non-canonical keys like `"007"`),
+/// - `INTEGER` primary keys (storage permits non-`i128` numeric representations
+///   such as `'1.0'` that still compare equal under `smart_cmp`),
+/// - `FLOAT` primary keys when looking up zero (legacy typed rows persisted
+///   before `-0.0 -> "0"` normalization may live under suffix `"-0"`) or any
+///   non-finite value.
 pub(crate) fn pk_lookup_needs_scan(table: &TableDef, key_value: &str) -> bool {
     if legacy_pk_needs_scan(table) {
         return true;
@@ -1552,8 +1617,10 @@ pub(crate) fn pk_lookup_needs_scan(table: &TableDef, key_value: &str) -> bool {
         .find(|c| c.name.eq_ignore_ascii_case(&table.primary_key))
         .map(|c| &c.col_type)
     {
-        Some(ColumnType::Integer) => key_value.parse::<i128>().is_err(),
-        Some(ColumnType::Float) => !key_value.parse::<f64>().is_ok_and(f64::is_finite),
+        Some(ColumnType::Integer) => true,
+        Some(ColumnType::Float) => !key_value
+            .parse::<f64>()
+            .is_ok_and(|f| f.is_finite() && f != 0.0),
         _ => false,
     }
 }

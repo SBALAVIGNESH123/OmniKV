@@ -475,6 +475,22 @@ impl SchemaManager {
                     .as_deref()
                     .and_then(|v| serde_json::from_str::<crate::catalog::TableDef>(v).ok())
                 {
+                    let done_key = Self::remove_done_key(
+                        version,
+                        direction,
+                        step_index,
+                        &table.name,
+                        field_name,
+                    );
+                    if let Some(receipt) = self.db.find(&done_key, seq)? {
+                        if let Some(canonical_name) = receipt.strip_prefix("cleanup:") {
+                            self.backfill_field(&table.name, canonical_name, None)?;
+                            let mut finish_batch = WriteBatch::new();
+                            finish_batch.set(&done_key, "done".into())?;
+                            self.db.commit_batch(&finish_batch)?;
+                        }
+                        return Ok(());
+                    }
                     if table.primary_key.eq_ignore_ascii_case(field_name) {
                         return Err(crate::OmniError::IoError(format!(
                             "cannot remove primary key field '{}' from SQL table '{}'",
@@ -500,16 +516,21 @@ impl SchemaManager {
                         &canonical_name,
                         "remove",
                     )?;
-                    self.backfill_field(&table.name, &canonical_name, None)?;
+                    let table_name = table.name.clone();
+                    let sql_row_format = table.row_format;
                     table
                         .columns
                         .retain(|c| !c.name.eq_ignore_ascii_case(&canonical_name));
                     let cat_value = serde_json::to_string(&table)
                         .map_err(|e| crate::OmniError::IoError(e.to_string()))?;
-                    let mut cat_batch = WriteBatch::new();
-                    cat_batch.set(&catalog_key, cat_value)?;
-                    self.db.commit_batch(&cat_batch)?;
-                    return Ok(());
+                    return self.remove_sql_field_online(
+                        &table_name,
+                        sql_row_format,
+                        &canonical_name,
+                        &catalog_key,
+                        &cat_value,
+                        &done_key,
+                    );
                 }
                 self.backfill_field(collection, field_name, None)
             }),
@@ -533,7 +554,6 @@ impl SchemaManager {
                             old_name, collection
                         )));
                     }
-                    let stage_key = Self::rename_stage_key(&table.name, old_name, new_name);
                     let done_key = Self::rename_done_key(
                         version,
                         direction,
@@ -542,27 +562,45 @@ impl SchemaManager {
                         old_name,
                         new_name,
                     );
-                    let has_new = table
+                    let canonical_new = table
                         .columns
                         .iter()
-                        .any(|c| c.name.eq_ignore_ascii_case(new_name));
-                    let has_old = table
+                        .find(|c| c.name.eq_ignore_ascii_case(new_name))
+                        .map(|c| c.name.clone());
+                    let has_new = canonical_new.is_some();
+                    let canonical_old_opt = table
                         .columns
                         .iter()
-                        .any(|c| c.name.eq_ignore_ascii_case(old_name));
-                    if let Some(staged_old) = self.db.find(&stage_key, seq)?
-                        && has_new
+                        .find(|c| c.name.eq_ignore_ascii_case(old_name))
+                        .map(|c| c.name.clone());
+                    let has_old = canonical_old_opt.is_some();
+                    if let Some(ref resolved_new) = canonical_new
                         && !has_old
                     {
-                        return self.cleanup_staged_rename(
-                            &table.name,
-                            &staged_old,
-                            &stage_key,
-                            &done_key,
-                        );
-                    }
-                    if has_new && !has_old && self.db.find(&done_key, seq)?.is_some() {
-                        return Ok(());
+                        let stage_prefix = Self::rename_stage_prefix_for_table(&table.name);
+                        let stage_end = format!("{stage_prefix}\u{10ffff}");
+                        for (candidate_stage_key, staged_old) in
+                            self.db.scan(&stage_prefix, &stage_end, seq)?
+                        {
+                            if staged_old.eq_ignore_ascii_case(old_name)
+                                && candidate_stage_key
+                                    == Self::rename_stage_key(
+                                        &table.name,
+                                        &staged_old,
+                                        resolved_new,
+                                    )
+                            {
+                                return self.cleanup_staged_rename(
+                                    &table.name,
+                                    &staged_old,
+                                    &candidate_stage_key,
+                                    &done_key,
+                                );
+                            }
+                        }
+                        if self.db.find(&done_key, seq)?.is_some() {
+                            return Ok(());
+                        }
                     }
                     if has_new {
                         return Err(crate::OmniError::IoError(format!(
@@ -570,12 +608,7 @@ impl SchemaManager {
                             new_name, collection
                         )));
                     }
-                    let canonical_old = table
-                        .columns
-                        .iter()
-                        .find(|c| c.name.eq_ignore_ascii_case(old_name))
-                        .map(|c| c.name.clone())
-                        .unwrap_or_else(|| old_name.clone());
+                    let canonical_old = canonical_old_opt.unwrap_or_else(|| old_name.clone());
                     self.ensure_no_dependent_indexes(
                         seq,
                         &table.name,
@@ -614,15 +647,13 @@ impl SchemaManager {
     }
 
     pub(crate) fn rename_stage_key(collection: &str, old_name: &str, new_name: &str) -> String {
-        let old = old_name.to_lowercase();
-        let new = new_name.to_lowercase();
         format!(
             "{}{}:{}:{}:{}",
             Self::rename_stage_prefix_for_table(collection),
-            old.len(),
-            old,
-            new.len(),
-            new
+            old_name.len(),
+            old_name,
+            new_name.len(),
+            new_name
         )
     }
 
@@ -654,6 +685,103 @@ impl SchemaManager {
             Self::rename_done_prefix(version, direction),
             collection.to_lowercase(),
         )
+    }
+
+    fn remove_done_prefix(version: Version, direction: &str) -> String {
+        format!("\x00SCHEMA\x00remove_done:{version:06}:{direction}:")
+    }
+
+    fn remove_done_key(
+        version: Version,
+        direction: &str,
+        step_index: usize,
+        collection: &str,
+        field_name: &str,
+    ) -> String {
+        let col = collection.to_lowercase();
+        let field = field_name.to_lowercase();
+        format!(
+            "{}{step_index:06}:{}:{}:{}:{}",
+            Self::remove_done_prefix(version, direction),
+            col.len(),
+            col,
+            field.len(),
+            field
+        )
+    }
+
+    fn remove_sql_field_online(
+        &self,
+        collection: &str,
+        sql_row_format: crate::catalog::RowFormat,
+        field_name: &str,
+        catalog_key: &str,
+        cat_value: &str,
+        done_key: &str,
+    ) -> Result<(), OmniError> {
+        self.index_manager.refresh_catalog()?;
+        let seq = self.db.get_seq();
+        let catalog = self.index_manager.catalog_snapshot_at(seq)?;
+        let max_doc_ops = 1 + 2 * catalog.indexes_for_collection(collection).len();
+        // Reserve 2 ops for the catalog update + step receipt so small
+        // removals commit all row rewrites, catalog cutover, and receipt
+        // atomically in one WriteBatch.
+        let single_batch_budget = WriteBatch::MAX_OPS.saturating_sub(2);
+        let mut single_batch = WriteBatch::new();
+        let mut fits_in_one_batch = true;
+
+        'ranges: for (prefix, end) in collection_row_ranges(collection) {
+            let is_sql_rows = prefix.starts_with("\x00T\x00");
+            for (key, value) in self.db.scan(&prefix, &end, seq)? {
+                let Ok(mut doc) = serde_json::from_str::<serde_json::Value>(&value) else {
+                    continue;
+                };
+                let old_doc = doc.clone();
+                let Some(obj) = doc.as_object_mut() else {
+                    continue;
+                };
+                if obj.remove(field_name).is_some() {
+                    if single_batch.op_count().saturating_add(max_doc_ops) > single_batch_budget {
+                        fits_in_one_batch = false;
+                        break 'ranges;
+                    }
+                    self.stage_doc_update(
+                        &catalog,
+                        collection,
+                        &prefix,
+                        is_sql_rows,
+                        sql_row_format,
+                        &key,
+                        &value,
+                        old_doc,
+                        doc,
+                        &mut single_batch,
+                    )?;
+                }
+            }
+        }
+
+        if fits_in_one_batch {
+            single_batch.set(catalog_key, cat_value.to_string())?;
+            single_batch.set(done_key, "done".into())?;
+            self.db.commit_batch(&single_batch)?;
+            return Ok(());
+        }
+
+        // Large removal: commit the catalog cutover and a cleanup receipt
+        // atomically first so the old column stays readable until cutover is
+        // durable, then clean stored row values in safely retryable chunks.
+        let mut cutover_batch = WriteBatch::new();
+        cutover_batch.set(catalog_key, cat_value.to_string())?;
+        cutover_batch.set(done_key, format!("cleanup:{field_name}"))?;
+        self.db.commit_batch(&cutover_batch)?;
+
+        self.backfill_field(collection, field_name, None)?;
+
+        let mut finish_batch = WriteBatch::new();
+        finish_batch.set(done_key, "done".into())?;
+        self.db.commit_batch(&finish_batch)?;
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1099,15 +1227,19 @@ impl SchemaManager {
             MigrationState::RolledBack => "down",
             _ => "up",
         };
-        let done_prefix = Self::rename_done_prefix(record.version, direction);
-        let done_end = format!("{done_prefix}\u{10ffff}");
         let mut batch = WriteBatch::new();
-        for (done_key, _) in self.db.scan(&done_prefix, &done_end, self.db.get_seq())? {
-            if batch.op_count().saturating_add(3) > WriteBatch::MAX_OPS {
-                self.db.commit_batch(&batch)?;
-                batch = WriteBatch::new();
+        for done_prefix in [
+            Self::rename_done_prefix(record.version, direction),
+            Self::remove_done_prefix(record.version, direction),
+        ] {
+            let done_end = format!("{done_prefix}\u{10ffff}");
+            for (done_key, _) in self.db.scan(&done_prefix, &done_end, self.db.get_seq())? {
+                if batch.op_count().saturating_add(3) > WriteBatch::MAX_OPS {
+                    self.db.commit_batch(&batch)?;
+                    batch = WriteBatch::new();
+                }
+                batch.delete(&done_key)?;
             }
-            batch.delete(&done_key)?;
         }
         batch.set(&key, value)?;
         batch.set(VERSION_KEY, version.to_string())?;

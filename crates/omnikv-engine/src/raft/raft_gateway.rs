@@ -317,6 +317,55 @@ impl ClusterGateway {
         Ok(ack.commit_seq)
     }
 
+    pub(crate) fn commit_2pc_prepare_checked(
+        &self,
+        db: &crate::OmniKV,
+        batch: &crate::WriteBatch,
+        read_seq: u64,
+        write_keys: &[String],
+    ) -> Result<u64, crate::dist_txn::PrepareCommitError> {
+        use crate::dist_txn::PrepareCommitError;
+        let _flight = self.flight_blocking();
+        {
+            let _topology_guard = db.transition_guard.read().map_err(|_| {
+                PrepareCommitError::PreProposal(crate::OmniError::LockPoisoned(
+                    "transition_guard".into(),
+                ))
+            })?;
+            crate::dist_txn::validate_2pc_decision_writes(db, None, batch)
+                .map_err(PrepareCommitError::PreProposal)?;
+            if let Some(conflict) = db.check_2pc_prepare_conflicts(read_seq, write_keys) {
+                return Err(PrepareCommitError::PreProposal(crate::OmniError::IoError(
+                    conflict,
+                )));
+            }
+        }
+        let command = RaftCommand::from_batch(batch);
+        command
+            .protects_raft_keys()
+            .map_err(|e| PrepareCommitError::PreProposal(crate::OmniError::IoError(e)))?;
+        let ack = self
+            .block_on_ctx(self.apply_proposal_locked(command))
+            .map_err(|e| PrepareCommitError::PostProposal(e.into_omni_error()))?;
+        // Re-check under transition_guard after local Raft apply (still
+        // holding `flight`) so any snapshot install or earlier-term Raft apply
+        // that invalidated `read_seq` before our PREPARED record landed forces
+        // Vote::Abort (and durable ABORTED cleanup) before voting Commit.
+        {
+            let _topology_guard = db.transition_guard.read().map_err(|_| {
+                PrepareCommitError::PostProposal(crate::OmniError::LockPoisoned(
+                    "transition_guard".into(),
+                ))
+            })?;
+            if let Some(conflict) = db.check_2pc_prepare_conflicts(read_seq, write_keys) {
+                return Err(PrepareCommitError::PostProposal(crate::OmniError::IoError(
+                    conflict,
+                )));
+            }
+        }
+        Ok(ack.commit_seq)
+    }
+
     pub(crate) fn commit_2pc_batch_with_ssi(
         &self,
         batch: &crate::WriteBatch,

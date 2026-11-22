@@ -879,7 +879,12 @@ impl Optimizer {
                                 op,
                                 CmpOp::Eq | CmpOp::Gt | CmpOp::Gte | CmpOp::Lt | CmpOp::Lte
                             )
-                            && crate::secondary_index::sql_index_bound(value, field_type).is_some()
+                            && crate::secondary_index::sql_index_bound_for_version(
+                                value,
+                                field_type,
+                                index.encoding_version,
+                            )
+                            .is_some()
                     })
             })
             .collect();

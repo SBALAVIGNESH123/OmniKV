@@ -41,6 +41,14 @@ const RETIRED_PREFIX: &str = "\x00IDX_RETIRED\x00";
 const NEXT_ID_KEY: &str = "\x00IDX_NEXT_ID\x00";
 const DDL_LOCK_NAME: &str = "\x00IDX_CATALOG\x00ddl";
 
+/// Legacy integer index encoding version (8-byte signed `i64` big-endian).
+/// Persisted definitions written before `encoding_version` existed deserialize as `0`.
+pub const LEGACY_INDEX_ENCODING_VERSION: u8 = 0;
+
+/// Current integer index encoding version (16-byte signed `i128` big-endian,
+/// covering the full SQL `INTEGER` domain).
+pub const CURRENT_INDEX_ENCODING_VERSION: u8 = 1;
+
 /// Unique identifier for an index.
 pub type IndexId = u32;
 
@@ -65,6 +73,9 @@ pub struct IndexDefinition {
     pub fields: Vec<(String, IndexFieldType)>,
     /// If true, duplicate values are rejected.
     pub unique: bool,
+    /// Key encoding format version (`0` = legacy `i64`, `1` = full SQL `i128`).
+    #[serde(default)]
+    pub encoding_version: u8,
 }
 
 /// The Index Catalog — persisted in OmniKV as JSON under `\x00IDX_CATALOG\x00` keys.
@@ -240,6 +251,14 @@ pub(crate) fn try_encode_index_value(
     value: &serde_json::Value,
     field_type: &IndexFieldType,
 ) -> Option<Vec<u8>> {
+    try_encode_index_value_for_version(value, field_type, CURRENT_INDEX_ENCODING_VERSION)
+}
+
+pub(crate) fn try_encode_index_value_for_version(
+    value: &serde_json::Value,
+    field_type: &IndexFieldType,
+    encoding_version: u8,
+) -> Option<Vec<u8>> {
     match field_type {
         IndexFieldType::String => {
             // UTF-8 strings are already lexicographically sortable.
@@ -259,11 +278,21 @@ pub(crate) fn try_encode_index_value(
         IndexFieldType::Integer => {
             // Big-endian encoding with sign bit flip for correct sort order.
             // This ensures -100 < -1 < 0 < 1 < 100 in byte ordering.
-            let n = value
-                .as_i64()
-                .or_else(|| value.as_str()?.parse::<i64>().ok())?;
-            let flipped = (n ^ i64::MIN) as u64; // flip sign bit
-            Some(flipped.to_be_bytes().to_vec())
+            if encoding_version >= CURRENT_INDEX_ENCODING_VERSION {
+                let n = value
+                    .as_i64()
+                    .map(i128::from)
+                    .or_else(|| value.as_u64().map(i128::from))
+                    .or_else(|| value.as_str()?.parse::<i128>().ok())?;
+                let flipped = (n ^ i128::MIN) as u128; // flip sign bit
+                Some(flipped.to_be_bytes().to_vec())
+            } else {
+                let n = value
+                    .as_i64()
+                    .or_else(|| value.as_str()?.parse::<i64>().ok())?;
+                let flipped = (n ^ i64::MIN) as u64; // flip sign bit
+                Some(flipped.to_be_bytes().to_vec())
+            }
         }
         IndexFieldType::Float => {
             // IEEE 754 float encoding with sign handling for sort order.
@@ -355,12 +384,14 @@ fn index_entries(
             else {
                 continue 'indexes;
             };
-            let encoded = try_encode_index_value(value, field_type).ok_or_else(|| {
-                OmniError::IoError(format!(
-                    "invalid value for indexed field '{field}' in index '{}'",
-                    definition.name
-                ))
-            })?;
+            let encoded =
+                try_encode_index_value_for_version(value, field_type, definition.encoding_version)
+                    .ok_or_else(|| {
+                        OmniError::IoError(format!(
+                            "invalid value for indexed field '{field}' in index '{}'",
+                            definition.name
+                        ))
+                    })?;
             values.push(encoded);
         }
         entries.push((
@@ -372,9 +403,10 @@ fn index_entries(
 }
 
 /// Converts a SQL comparison to the stored index representation.
-pub(crate) fn sql_index_bound(
+pub(crate) fn sql_index_bound_for_version(
     value: &crate::sql::SqlValue,
     field_type: &IndexFieldType,
+    encoding_version: u8,
 ) -> Option<serde_json::Value> {
     if matches!(
         value,
@@ -384,7 +416,7 @@ pub(crate) fn sql_index_bound(
     }
     let text = value.as_string();
     let result = serde_json::Value::String(text);
-    try_encode_index_value(&result, field_type)?;
+    try_encode_index_value_for_version(&result, field_type, encoding_version)?;
     Some(result)
 }
 
@@ -564,6 +596,7 @@ impl IndexManager {
             collection: collection.to_string(),
             fields,
             unique,
+            encoding_version: CURRENT_INDEX_ENCODING_VERSION,
         };
 
         let catalog_key = format!("{}{}", CATALOG_PREFIX, id);
@@ -1221,7 +1254,7 @@ impl IndexManager {
             .iter()
             .zip(idx_def.fields.iter())
             .map(|(value, (_, field_type))| {
-                try_encode_index_value(value, field_type)
+                try_encode_index_value_for_version(value, field_type, idx_def.encoding_version)
                     .ok_or_else(|| OmniError::IoError("invalid index lookup value".into()))
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -1276,7 +1309,7 @@ impl IndexManager {
         };
         let index_prefix = build_index_scan_prefix(idx_def.id);
         let encode_bound = |value| {
-            try_encode_index_value(value, ft)
+            try_encode_index_value_for_version(value, ft, idx_def.encoding_version)
                 .map(|encoded| hex_encode(&encoded))
                 .ok_or_else(|| OmniError::IoError("invalid index range bound".into()))
         };
@@ -1335,12 +1368,16 @@ impl IndexManager {
         index_name: &str,
         expected_collection: &str,
     ) -> Result<usize, OmniError> {
-        let idx_def = self.definition(index_name)?;
+        let mut idx_def = self.definition(index_name)?;
         if !idx_def.collection.eq_ignore_ascii_case(expected_collection) {
             return Err(OmniError::IoError(format!(
                 "Index '{}' not found on collection '{}'",
                 index_name, expected_collection
             )));
+        }
+        let upgraded_encoding = idx_def.encoding_version < CURRENT_INDEX_ENCODING_VERSION;
+        if upgraded_encoding {
+            idx_def.encoding_version = CURRENT_INDEX_ENCODING_VERSION;
         }
         let mut invalidate = WriteBatch::new();
         invalidate.delete(&format!("{READY_PREFIX}{}", idx_def.id))?;
@@ -1424,8 +1461,29 @@ impl IndexManager {
             self.db.commit_batch(&batch)?;
         }
         let mut ready = WriteBatch::new();
+        let upgraded_catalog_key = if upgraded_encoding {
+            let catalog_key = format!("{CATALOG_PREFIX}{}", idx_def.id);
+            let catalog_value =
+                serde_json::to_string(&idx_def).map_err(|e| OmniError::IoError(e.to_string()))?;
+            ready.set(&catalog_key, catalog_value)?;
+            Some(catalog_key)
+        } else {
+            None
+        };
         ready.set(&format!("{READY_PREFIX}{}", idx_def.id), "ready".into())?;
-        self.db.commit_batch(&ready)?;
+        let commit_seq = self.db.commit_batch(&ready)?;
+        if let Some(catalog_key) = upgraded_catalog_key {
+            self.db.ssi_history().record_committed(
+                0,
+                commit_seq,
+                &crate::transaction::SsiCommitRecord {
+                    txn_id: 0,
+                    write_keys: vec![catalog_key],
+                    read_keys: Vec::new(),
+                    read_ranges: Vec::new(),
+                },
+            );
+        }
 
         Ok(count)
     }

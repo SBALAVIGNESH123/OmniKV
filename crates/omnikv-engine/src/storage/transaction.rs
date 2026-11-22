@@ -134,7 +134,7 @@ pub struct SsiCommitRecord {
 
 /// Record of a committed transaction, used for conflict detection.
 #[derive(Debug, Clone)]
-struct CommittedTxn {
+pub(crate) struct CommittedTxn {
     /// The transaction ID.
     txn_id: TxnId,
     /// The commit sequence number.
@@ -311,12 +311,25 @@ impl SsiHistory {
     /// closure, AND by every follower's apply path — all three must land
     /// in the same store or histories diverge across a failover.
     pub fn record_committed(&self, txn_id: TxnId, commit_seq: u64, record: &SsiCommitRecord) {
-        let mut committed = self
-            .committed_txns
+        let mut committed = self.lock_committed();
+        self.record_committed_locked(&mut committed, txn_id, commit_seq, record);
+    }
+
+    pub(crate) fn lock_committed(&self) -> std::sync::MutexGuard<'_, Vec<CommittedTxn>> {
+        self.committed_txns
             .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub(crate) fn record_committed_locked(
+        &self,
+        committed: &mut Vec<CommittedTxn>,
+        txn_id: TxnId,
+        commit_seq: u64,
+        record: &SsiCommitRecord,
+    ) {
         self.push_committed_locked(
-            &mut committed,
+            committed,
             CommittedTxn {
                 txn_id,
                 commit_seq,
@@ -408,32 +421,11 @@ impl SsiHistory {
             .retain(|_, &mut owner| owner != (node_id, txn_id));
     }
 
-    pub(crate) fn replace_prepared_keys_for_node(
-        &self,
-        node_id: u64,
-        keys: &HashMap<String, (u64, u64)>,
-    ) -> Result<(), String> {
+    pub(crate) fn clear_tentative_prepared_keys_for_node(&self, node_id: u64) {
         let mut prepared = self.prepared_keys.lock().unwrap_or_else(|e| e.into_inner());
-        for key in keys.keys() {
-            if let Some((owner_node, owner_txn)) = prepared.effective_owner(key)
-                && owner_node != node_id
-            {
-                return Err(format!(
-                    "prepared key '{}' is reserved by transaction {:?}",
-                    key, owner_txn
-                ));
-            }
-        }
-        prepared
-            .durable
-            .retain(|_, (owner_node, _)| *owner_node != node_id);
         prepared
             .tentative
             .retain(|_, (owner_node, _)| *owner_node != node_id);
-        for (key, txn_id) in keys {
-            prepared.durable.insert(key.clone(), (node_id, *txn_id));
-        }
-        Ok(())
     }
 
     pub(crate) fn replace_all_prepared_keys(&self, keys: HashMap<String, PreparedKeyOwner>) {
@@ -561,10 +553,16 @@ impl SsiHistory {
         read_seq: u64,
         write_keys: &[String],
     ) -> Option<String> {
-        let committed = self
-            .committed_txns
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let committed = self.lock_committed();
+        self.check_write_conflicts_locked(&committed, read_seq, write_keys)
+    }
+
+    pub(crate) fn check_write_conflicts_locked(
+        &self,
+        committed: &[CommittedTxn],
+        read_seq: u64,
+        write_keys: &[String],
+    ) -> Option<String> {
         let plain = self
             .plain_write_seqs
             .lock()

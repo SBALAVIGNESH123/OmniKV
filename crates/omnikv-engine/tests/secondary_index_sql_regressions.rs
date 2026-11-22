@@ -1,4 +1,5 @@
 use omni_engine::catalog::Catalog;
+use omni_engine::schema::{Migration, SchemaManager, SchemaOp};
 use omni_engine::secondary_index::{IndexFieldType, IndexManager};
 use omni_engine::sql::parse_sql;
 use omni_engine::sql_exec::{ExecResult, SqlExecutor};
@@ -41,6 +42,17 @@ fn rows(executor: &SqlExecutor, sql: &str) -> Vec<Vec<Option<String>>> {
         panic!("expected rows for {sql}");
     };
     rows
+}
+
+fn select_rows(executor: &SqlExecutor, sql: &str) -> Vec<Vec<String>> {
+    rows(executor, sql)
+        .into_iter()
+        .map(|row| {
+            row.into_iter()
+                .map(|cell| cell.unwrap_or_else(|| "NULL".into()))
+                .collect()
+        })
+        .collect()
 }
 
 fn create_index(manager: &IndexManager, field: &str, field_type: IndexFieldType, unique: bool) {
@@ -715,6 +727,7 @@ fn failed_unique_index_rebuild_over_batch_limit_cleans_up_and_allows_retry() {
                 collection: "other_tbl".into(),
                 fields: vec![("code".into(), IndexFieldType::String)],
                 unique: false,
+                encoding_version: omni_engine::secondary_index::CURRENT_INDEX_ENCODING_VERSION,
             })
             .unwrap(),
         )
@@ -729,16 +742,14 @@ fn failed_unique_index_rebuild_over_batch_limit_cleans_up_and_allows_retry() {
 
 fn test_rename_stage_key(collection: &str, old_name: &str, new_name: &str) -> String {
     let col = collection.to_lowercase();
-    let old = old_name.to_lowercase();
-    let new = new_name.to_lowercase();
     format!(
         "\u{0}SCHEMA\u{0}rename_stage:{}:{}:{}:{}:{}:{}",
         col.len(),
         col,
-        old.len(),
-        old,
-        new.len(),
-        new
+        old_name.len(),
+        old_name,
+        new_name.len(),
+        new_name
     )
 }
 
@@ -1766,4 +1777,786 @@ fn transactional_drop_table_cleans_stage_markers_retired_indexes_and_updates_exp
     );
     assert_eq!(db.find(retired_idx_key, seq).unwrap(), None);
     assert_eq!(db.find(retired_idx_entry, seq).unwrap(), None);
+}
+
+#[test]
+fn transactional_drop_empty_typed_table_updates_explain_for_active_index() {
+    let dir = TempDir::new().unwrap();
+    let db = OmniKV::open(
+        dir.path().join("manifest.json").to_str().unwrap(),
+        dir.path().join("wal.bin").to_str().unwrap(),
+    )
+    .unwrap();
+    let setup_exec = SqlExecutor::new(db.clone(), Arc::new(Catalog::new(db.clone())));
+    execute(
+        &setup_exec,
+        "CREATE TABLE tx_drop_active (id INTEGER PRIMARY KEY, email TEXT)",
+    );
+    let idx_mgr = IndexManager::new(db.clone());
+    idx_mgr
+        .create_index(
+            "tx_drop_active_email_idx",
+            "tx_drop_active",
+            vec![("email".into(), IndexFieldType::String)],
+            false,
+        )
+        .unwrap();
+    idx_mgr.rebuild_index("tx_drop_active_email_idx").unwrap();
+
+    let tm = TransactionManager::new(db.clone());
+    let mut txn = tm.begin();
+    let tx_exec = SqlExecutor::with_transaction(
+        db.clone(),
+        Arc::new(Catalog::at_snapshot(db, txn.read_seq)),
+        txn.read_seq,
+        &HashMap::new(),
+    );
+    let plan_before_drop = explain_plan(
+        &tx_exec,
+        "EXPLAIN SELECT id FROM tx_drop_active WHERE email = 'alice@example.com'",
+    );
+    assert!(
+        plan_before_drop.contains("Index Scan"),
+        "EXPLAIN on empty typed table with ready active index must select Index Scan before DROP: {plan_before_drop}"
+    );
+    execute(&tx_exec, "DROP TABLE tx_drop_active");
+    execute(
+        &tx_exec,
+        "CREATE TABLE tx_drop_active (id INTEGER PRIMARY KEY, email TEXT)",
+    );
+    let plan_after_active_recreate = explain_plan(
+        &tx_exec,
+        "EXPLAIN SELECT id FROM tx_drop_active WHERE email = 'alice@example.com'",
+    );
+    assert!(
+        !plan_after_active_recreate.contains("Index Scan"),
+        "EXPLAIN after transactional DROP + CREATE must not select dropped active index: {plan_after_active_recreate}"
+    );
+    tm.abort(&mut txn);
+}
+
+#[test]
+fn legacy_typed_negative_zero_float_pk_is_addressable_and_updatable() {
+    let dir = TempDir::new().unwrap();
+    let db = OmniKV::open(
+        dir.path().join("manifest.json").to_str().unwrap(),
+        dir.path().join("wal.bin").to_str().unwrap(),
+    )
+    .unwrap();
+    let catalog = Arc::new(Catalog::new(db.clone()));
+    let executor = SqlExecutor::new(db.clone(), catalog.clone());
+    execute(
+        &executor,
+        "CREATE TABLE coords (x FLOAT PRIMARY KEY, label TEXT)",
+    );
+
+    let idx_mgr = IndexManager::new(db.clone());
+    idx_mgr
+        .create_index(
+            "coords_label_idx",
+            "coords",
+            vec![("label".into(), IndexFieldType::String)],
+            false,
+        )
+        .unwrap();
+    idx_mgr
+        .create_index(
+            "coords_x_uq",
+            "coords",
+            vec![("x".into(), IndexFieldType::Float)],
+            true,
+        )
+        .unwrap();
+
+    let mut seed = WriteBatch::new();
+    seed.set(
+        "\u{0}T\u{0}coords\u{0}-0",
+        "{\"x\":\"-0\",\"label\":\"origin\"}".into(),
+    )
+    .unwrap();
+    db.commit_batch(&seed).unwrap();
+    idx_mgr.rebuild_index("coords_label_idx").unwrap();
+    idx_mgr.rebuild_index("coords_x_uq").unwrap();
+
+    for query in [
+        "SELECT label FROM coords WHERE x = 0",
+        "SELECT label FROM coords WHERE x = -0.0",
+    ] {
+        assert_eq!(select_rows(&executor, query), vec![vec!["origin"]]);
+        let stmt = parse_sql(query).unwrap();
+        let idx_cat = idx_mgr.catalog_snapshot().unwrap();
+        let stats = omni_engine::optimizer::gather_stats(&catalog, Some(&idx_cat), &db);
+        let plan = omni_engine::optimizer::Optimizer::new(stats)
+            .optimize(&stmt)
+            .unwrap();
+        let plan_exec = omni_engine::plan_exec::PlanExecutor::new(db.clone(), catalog.clone());
+        let plan_rows = plan_exec.execute_plan(&plan).unwrap();
+        assert_eq!(plan_rows.len(), 1);
+        assert_eq!(
+            plan_rows[0].get("label").and_then(|v| v.as_deref()),
+            Some("origin")
+        );
+    }
+
+    let dup_stmt = parse_sql("INSERT INTO coords (x, label) VALUES (0.0, 'dup')").unwrap();
+    assert!(executor.execute(&dup_stmt).is_err());
+
+    execute(
+        &executor,
+        "UPDATE coords SET label = 'migrated' WHERE x = -0.0",
+    );
+    let seq = db.get_seq();
+    assert_eq!(db.find("\u{0}T\u{0}coords\u{0}-0", seq).unwrap(), None);
+    assert!(db.find("\u{0}T\u{0}coords\u{0}0", seq).unwrap().is_some());
+    assert_eq!(
+        select_rows(&executor, "SELECT label FROM coords WHERE x = 0"),
+        vec![vec!["migrated"]]
+    );
+    assert_eq!(
+        select_rows(
+            &executor,
+            "SELECT label FROM coords WHERE label = 'migrated'"
+        ),
+        vec![vec!["migrated"]]
+    );
+    assert_eq!(
+        select_rows(&executor, "SELECT label FROM coords WHERE label = 'origin'").len(),
+        0
+    );
+}
+
+#[test]
+fn legacy_typed_negative_zero_float_pk_is_deletable_with_indexes() {
+    let dir = TempDir::new().unwrap();
+    let db = OmniKV::open(
+        dir.path().join("manifest.json").to_str().unwrap(),
+        dir.path().join("wal.bin").to_str().unwrap(),
+    )
+    .unwrap();
+    let executor = SqlExecutor::new(db.clone(), Arc::new(Catalog::new(db.clone())));
+    execute(
+        &executor,
+        "CREATE TABLE coords_del (x FLOAT PRIMARY KEY, label TEXT)",
+    );
+    let idx_mgr = IndexManager::new(db.clone());
+    idx_mgr
+        .create_index(
+            "coords_del_label_idx",
+            "coords_del",
+            vec![("label".into(), IndexFieldType::String)],
+            false,
+        )
+        .unwrap();
+    let mut seed = WriteBatch::new();
+    seed.set(
+        "\u{0}T\u{0}coords_del\u{0}-0",
+        "{\"x\":\"-0\",\"label\":\"remove_me\"}".into(),
+    )
+    .unwrap();
+    db.commit_batch(&seed).unwrap();
+    idx_mgr.rebuild_index("coords_del_label_idx").unwrap();
+
+    execute(&executor, "DELETE FROM coords_del WHERE x = 0");
+    assert_eq!(
+        db.find("\u{0}T\u{0}coords_del\u{0}-0", db.get_seq())
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        idx_mgr
+            .lookup(
+                "coords_del_label_idx",
+                &[serde_json::Value::String("remove_me".into())]
+            )
+            .unwrap()
+            .len(),
+        0
+    );
+}
+
+#[test]
+fn integer_pk_non_i128_literal_matches_eq_in_both_executors() {
+    let dir = TempDir::new().unwrap();
+    let db = OmniKV::open(
+        dir.path().join("manifest.json").to_str().unwrap(),
+        dir.path().join("wal.bin").to_str().unwrap(),
+    )
+    .unwrap();
+    let catalog = Arc::new(Catalog::new(db.clone()));
+    let executor = SqlExecutor::new(db.clone(), catalog.clone());
+    execute(
+        &executor,
+        "CREATE TABLE int_pk_tbl (id INTEGER PRIMARY KEY, v TEXT)",
+    );
+    execute(
+        &executor,
+        "INSERT INTO int_pk_tbl (id, v) VALUES ('1.0', 'float_like')",
+    );
+
+    assert_eq!(
+        select_rows(&executor, "SELECT v FROM int_pk_tbl WHERE id = 1"),
+        vec![vec!["float_like"]]
+    );
+    let stmt = parse_sql("SELECT v FROM int_pk_tbl WHERE id = 1").unwrap();
+    let stats = omni_engine::optimizer::gather_stats(&catalog, None, &db);
+    let plan = omni_engine::optimizer::Optimizer::new(stats)
+        .optimize(&stmt)
+        .unwrap();
+    let plan_exec = omni_engine::plan_exec::PlanExecutor::new(db, catalog);
+    let rows = plan_exec.execute_plan(&plan).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].get("v").and_then(|v| v.as_deref()),
+        Some("float_like")
+    );
+}
+
+#[test]
+fn staged_document_rename_preserves_case() {
+    let dir = TempDir::new().unwrap();
+    let db = OmniKV::open(
+        dir.path().join("manifest.json").to_str().unwrap(),
+        dir.path().join("wal.bin").to_str().unwrap(),
+    )
+    .unwrap();
+    let schema = SchemaManager::new(db.clone(), Arc::new(IndexManager::new(db.clone())));
+
+    let doc_key = "docs:1";
+    let stage_upper = test_rename_stage_key("docs", "A", "X");
+    let stage_lower = test_rename_stage_key("docs", "a", "x");
+    assert_ne!(stage_upper, stage_lower);
+    let row_marker_upper = test_rename_row_stage_key(&stage_upper, doc_key);
+    let mut seed = WriteBatch::new();
+    seed.set(
+        doc_key,
+        "{\"A\":\"from_A\",\"X\":\"from_A\",\"a\":\"from_a\",\"x\":\"keep_x\"}".into(),
+    )
+    .unwrap();
+    seed.set(&stage_upper, "A".into()).unwrap();
+    seed.set(&row_marker_upper, "1".into()).unwrap();
+    db.commit_batch(&seed).unwrap();
+
+    let colliding_lower = Migration {
+        version: 1,
+        description: "lower a -> x must not reuse A -> X stage".into(),
+        up: vec![SchemaOp::RenameField {
+            collection: "docs".into(),
+            old_name: "a".into(),
+            new_name: "x".into(),
+        }],
+        down: vec![],
+    };
+    let err = schema.migrate_up(&colliding_lower).unwrap_err();
+    assert!(
+        err.to_string().contains("destination exists"),
+        "a -> x must fail because x already exists: {err}"
+    );
+    let seq = db.get_seq();
+    let stored: serde_json::Value =
+        serde_json::from_str(&db.find(doc_key, seq).unwrap().unwrap()).unwrap();
+    assert_eq!(stored["x"], "keep_x");
+    assert_eq!(db.find(&stage_upper, seq).unwrap(), Some("A".into()));
+    assert_eq!(db.find(&row_marker_upper, seq).unwrap(), Some("1".into()));
+}
+
+#[test]
+fn staged_sql_rename_resolves_canonical_column_on_retry() {
+    let dir = TempDir::new().unwrap();
+    let db = OmniKV::open(
+        dir.path().join("manifest.json").to_str().unwrap(),
+        dir.path().join("wal.bin").to_str().unwrap(),
+    )
+    .unwrap();
+    let schema = SchemaManager::new(db.clone(), Arc::new(IndexManager::new(db.clone())));
+    let executor = SqlExecutor::new(db.clone(), Arc::new(Catalog::new(db.clone())));
+    execute(
+        &executor,
+        "CREATE TABLE mixed_cols (id INTEGER PRIMARY KEY, DisplayName TEXT)",
+    );
+    execute(
+        &executor,
+        "INSERT INTO mixed_cols (id, DisplayName) VALUES (1, 'Alice')",
+    );
+    let sql_stage = test_rename_stage_key("mixed_cols", "DisplayName", "FullName");
+    let sql_row_key = "\u{0}T\u{0}mixed_cols\u{0}1";
+    let mut table_def: omni_engine::catalog::TableDef = serde_json::from_str(
+        &db.find("\u{0}CATALOG\u{0}mixed_cols", db.get_seq())
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    for col in &mut table_def.columns {
+        if col.name == "DisplayName" {
+            col.name = "FullName".into();
+        }
+    }
+    let mut sim_crash = WriteBatch::new();
+    sim_crash
+        .set(
+            sql_row_key,
+            "{\"id\":\"1\",\"DisplayName\":\"Alice\",\"FullName\":\"Alice\"}".into(),
+        )
+        .unwrap();
+    sim_crash.set(&sql_stage, "DisplayName".into()).unwrap();
+    sim_crash
+        .set(
+            &test_rename_row_stage_key(&sql_stage, sql_row_key),
+            "1".into(),
+        )
+        .unwrap();
+    sim_crash
+        .set(
+            "\u{0}CATALOG\u{0}mixed_cols",
+            serde_json::to_string(&table_def).unwrap(),
+        )
+        .unwrap();
+    db.commit_batch(&sim_crash).unwrap();
+
+    let sql_rename = Migration {
+        version: 1,
+        description: "retry case-insensitive SQL column rename".into(),
+        up: vec![SchemaOp::RenameField {
+            collection: "mixed_cols".into(),
+            old_name: "displayname".into(),
+            new_name: "FullName".into(),
+        }],
+        down: vec![],
+    };
+    schema
+        .migrate_up(&sql_rename)
+        .expect("retrying SQL rename after catalog cutover must find staged canonical column");
+    let seq = db.get_seq();
+    assert_eq!(db.find(&sql_stage, seq).unwrap(), None);
+    let cleaned_row: serde_json::Value =
+        serde_json::from_str(&db.find(sql_row_key, seq).unwrap().unwrap()).unwrap();
+    assert_eq!(cleaned_row.get("DisplayName"), None);
+    assert_eq!(cleaned_row["FullName"], "Alice");
+}
+
+#[test]
+fn legacy_update_preflight_counts_unchanged_index_writes_before_migration_commit() {
+    let dir = TempDir::new().unwrap();
+    let db = OmniKV::open(
+        dir.path().join("manifest.json").to_str().unwrap(),
+        dir.path().join("wal.bin").to_str().unwrap(),
+    )
+    .unwrap();
+
+    let row_count = WriteBatch::MAX_OPS / 2; // 5,000 rows + 5,000 unchanged index writes + 1 catalog flip = 10,001 > MAX_OPS
+    let stage_key = seed_large_legacy_table(&db, "big_legacy_idx_cap", row_count);
+    let idx_mgr = IndexManager::new(db.clone());
+    idx_mgr
+        .create_index(
+            "big_legacy_idx_cap_old_col_idx",
+            "big_legacy_idx_cap",
+            vec![("old_col".into(), IndexFieldType::String)],
+            false,
+        )
+        .unwrap();
+    idx_mgr
+        .rebuild_index("big_legacy_idx_cap_old_col_idx")
+        .unwrap();
+
+    let executor = SqlExecutor::new(db.clone(), Arc::new(Catalog::new(db.clone())));
+    // Update an unindexed column (actually old_col is indexed, wait: add/update a non-indexed column?
+    // Even updating old_col to the SAME value or adding a non-indexed column leaves the index key unchanged).
+    // Here old_col is indexed with values v1..v5000; updating `id = id` or updating via no-op value keeps
+    // every index key unchanged while rewriting all 5,000 rows + 5,000 index sets + 1 catalog flip.
+    // Let's seed a 3-column legacy table or update old_col on row 1? No, update `old_col = 'same'` changes old_col.
+    // Instead, re-seed table schema with an extra unindexed `note` column so old_col stays identical!
+    let mut table_def: omni_engine::catalog::TableDef = serde_json::from_str(
+        &db.find("\u{0}CATALOG\u{0}big_legacy_idx_cap", db.get_seq())
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    table_def.columns.push(omni_engine::catalog::Column {
+        name: "note".into(),
+        col_type: omni_engine::catalog::ColumnType::Text,
+        nullable: true,
+        primary_key: false,
+        default: None,
+    });
+    let mut cat_wb = WriteBatch::new();
+    cat_wb
+        .set(
+            "\u{0}CATALOG\u{0}big_legacy_idx_cap",
+            serde_json::to_string(&table_def).unwrap(),
+        )
+        .unwrap();
+    db.commit_batch(&cat_wb).unwrap();
+
+    let stmt = parse_sql("UPDATE big_legacy_idx_cap SET note = 'touched'").unwrap();
+    let Err(err) = executor.execute(&stmt) else {
+        panic!(
+            "5,000 rows + 5,000 unchanged index writes + 1 catalog flip must fail BatchTooLarge"
+        );
+    };
+    assert!(
+        err.contains("BatchTooLarge"),
+        "expected BatchTooLarge before any migration chunk commits, got: {err}"
+    );
+    assert_legacy_row_untouched(
+        &db,
+        "big_legacy_idx_cap",
+        &stage_key,
+        "oversized legacy UPDATE with unchanged index writes",
+    );
+}
+
+#[test]
+fn sql_remove_field_small_atomic_and_replayable_via_step_receipt() {
+    let dir = TempDir::new().unwrap();
+    let db = OmniKV::open(
+        dir.path().join("manifest.json").to_str().unwrap(),
+        dir.path().join("wal.bin").to_str().unwrap(),
+    )
+    .unwrap();
+    let executor = SqlExecutor::new(db.clone(), Arc::new(Catalog::new(db.clone())));
+    let schema = SchemaManager::new(db.clone(), Arc::new(IndexManager::new(db.clone())));
+
+    execute(
+        &executor,
+        "CREATE TABLE drop_col_tbl (id INTEGER PRIMARY KEY, obsolete TEXT, keep_col TEXT)",
+    );
+    execute(
+        &executor,
+        "INSERT INTO drop_col_tbl (id, obsolete, keep_col) VALUES (1, 'old_val', 'kept')",
+    );
+
+    let failing_migration = Migration {
+        version: 1,
+        description: "remove obsolete then fail".into(),
+        up: vec![
+            SchemaOp::RemoveField {
+                collection: "drop_col_tbl".into(),
+                field_name: "obsolete".into(),
+            },
+            SchemaOp::RemoveField {
+                collection: "drop_col_tbl".into(),
+                field_name: "does_not_exist".into(),
+            },
+        ],
+        down: vec![],
+    };
+    let err = schema.migrate_up(&failing_migration).unwrap_err();
+    assert!(err.to_string().contains("does not exist"));
+    assert_eq!(schema.current_version().unwrap(), 0);
+    let row_json: serde_json::Value = serde_json::from_str(
+        &db.find("\u{0}T\u{0}drop_col_tbl\u{0}1", db.get_seq())
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(row_json.get("obsolete"), None);
+    assert_eq!(row_json["keep_col"], "kept");
+
+    let fixed_migration = Migration {
+        version: 1,
+        description: "remove obsolete then add extra".into(),
+        up: vec![
+            SchemaOp::RemoveField {
+                collection: "drop_col_tbl".into(),
+                field_name: "obsolete".into(),
+            },
+            SchemaOp::AddField {
+                collection: "drop_col_tbl".into(),
+                field_name: "extra".into(),
+                default_value: serde_json::Value::String("ok".into()),
+            },
+        ],
+        down: vec![],
+    };
+    schema.migrate_up(&fixed_migration).expect(
+        "replaying migration after step 0 RemoveField succeeded must skip step 0 via receipt",
+    );
+    assert_eq!(schema.current_version().unwrap(), 1);
+
+    let missing_col = Migration {
+        version: 2,
+        description: "remove absent column without receipt".into(),
+        up: vec![SchemaOp::RemoveField {
+            collection: "drop_col_tbl".into(),
+            field_name: "obsolete".into(),
+        }],
+        down: vec![],
+    };
+    let missing_err = schema.migrate_up(&missing_col).unwrap_err();
+    assert!(missing_err.to_string().contains("does not exist"));
+}
+
+#[test]
+fn sql_remove_field_large_cutover_and_chunked_cleanup() {
+    let dir = TempDir::new().unwrap();
+    let db = OmniKV::open(
+        dir.path().join("manifest.json").to_str().unwrap(),
+        dir.path().join("wal.bin").to_str().unwrap(),
+    )
+    .unwrap();
+    let executor = SqlExecutor::new(db.clone(), Arc::new(Catalog::new(db.clone())));
+    let schema = SchemaManager::new(db.clone(), Arc::new(IndexManager::new(db.clone())));
+
+    execute(
+        &executor,
+        "CREATE TABLE big_remove_tbl (id INTEGER PRIMARY KEY, drop_me TEXT)",
+    );
+    let total_rows = WriteBatch::MAX_OPS + 50;
+    let mut seed = WriteBatch::new();
+    for i in 1..=total_rows {
+        seed.set(
+            &format!("\u{0}T\u{0}big_remove_tbl\u{0}{i}"),
+            format!("{{\"id\":\"{i}\",\"drop_me\":\"val_{i}\"}}"),
+        )
+        .unwrap();
+        if seed.op_count() >= WriteBatch::MAX_OPS / 2 {
+            db.commit_batch(&seed).unwrap();
+            seed = WriteBatch::new();
+        }
+    }
+    if !seed.is_empty() {
+        db.commit_batch(&seed).unwrap();
+    }
+    let big_remove = Migration {
+        version: 1,
+        description: "large column removal".into(),
+        up: vec![SchemaOp::RemoveField {
+            collection: "big_remove_tbl".into(),
+            field_name: "drop_me".into(),
+        }],
+        down: vec![],
+    };
+    schema
+        .migrate_up(&big_remove)
+        .expect("large SQL RemoveField must succeed via durable cutover + chunked cleanup");
+    assert_eq!(schema.current_version().unwrap(), 1);
+    let check_row: serde_json::Value = serde_json::from_str(
+        &db.find(
+            &format!("\u{0}T\u{0}big_remove_tbl\u{0}{total_rows}"),
+            db.get_seq(),
+        )
+        .unwrap()
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(check_row.get("drop_me"), None);
+}
+
+#[test]
+fn integer_secondary_index_supports_full_sql_i128_domain() {
+    let dir = TempDir::new().unwrap();
+    let db = OmniKV::open(
+        dir.path().join("manifest.json").to_str().unwrap(),
+        dir.path().join("wal.bin").to_str().unwrap(),
+    )
+    .unwrap();
+    let executor = SqlExecutor::new(db.clone(), Arc::new(Catalog::new(db.clone())));
+    let idx_mgr = IndexManager::new(db);
+
+    execute(
+        &executor,
+        "CREATE TABLE bigints (id INTEGER PRIMARY KEY, n INTEGER)",
+    );
+    execute(
+        &executor,
+        "INSERT INTO bigints (id, n) VALUES (1, '-9223372036854775809')",
+    );
+    execute(&executor, "INSERT INTO bigints (id, n) VALUES (2, '42')");
+    execute(
+        &executor,
+        "INSERT INTO bigints (id, n) VALUES (3, '9223372036854775808')",
+    );
+
+    idx_mgr
+        .create_index(
+            "bigints_n_idx",
+            "bigints",
+            vec![("n".into(), IndexFieldType::Integer)],
+            false,
+        )
+        .unwrap();
+    assert_eq!(idx_mgr.rebuild_index("bigints_n_idx").unwrap(), 3);
+
+    let plan = explain_plan(
+        &executor,
+        "EXPLAIN SELECT id FROM bigints WHERE n = '9223372036854775808'",
+    );
+    assert!(plan.contains("Index Scan"), "plan: {plan}");
+    assert_eq!(
+        select_rows(
+            &executor,
+            "SELECT id FROM bigints WHERE n = '9223372036854775808'"
+        ),
+        vec![vec!["3"]]
+    );
+    assert_eq!(
+        select_rows(
+            &executor,
+            "SELECT id FROM bigints WHERE n >= '42' ORDER BY id ASC"
+        ),
+        vec![vec!["2"], vec!["3"]]
+    );
+    assert_eq!(
+        select_rows(&executor, "SELECT id FROM bigints WHERE n < '42'"),
+        vec![vec!["1"]]
+    );
+    execute(
+        &executor,
+        "DELETE FROM bigints WHERE n = '9223372036854775808'",
+    );
+    assert_eq!(
+        select_rows(
+            &executor,
+            "SELECT id FROM bigints WHERE n = '9223372036854775808'"
+        )
+        .len(),
+        0
+    );
+}
+
+#[test]
+fn integer_secondary_index_upgrades_legacy_v0_on_rebuild() {
+    let dir = TempDir::new().unwrap();
+    let db = OmniKV::open(
+        dir.path().join("manifest.json").to_str().unwrap(),
+        dir.path().join("wal.bin").to_str().unwrap(),
+    )
+    .unwrap();
+    let executor = SqlExecutor::new(db.clone(), Arc::new(Catalog::new(db.clone())));
+    let idx_mgr = IndexManager::new(db.clone());
+
+    execute(
+        &executor,
+        "CREATE TABLE legacy_int_idx_tbl (id INTEGER PRIMARY KEY, n INTEGER)",
+    );
+    execute(
+        &executor,
+        "INSERT INTO legacy_int_idx_tbl (id, n) VALUES (1, '7')",
+    );
+    let mut seed_v0 = WriteBatch::new();
+    let legacy_def_json = "{\"id\":77,\"name\":\"legacy_v0_n_idx\",\"collection\":\"legacy_int_idx_tbl\",\"fields\":[[\"n\",\"Integer\"]],\"unique\":false}";
+    let encoded_7_i64 = format!("{:016x}", (7i64 ^ i64::MIN).cast_unsigned());
+    seed_v0
+        .set("\u{0}IDX_CATALOG\u{0}77", legacy_def_json.into())
+        .unwrap();
+    seed_v0
+        .set("\u{0}IDX_READY\u{0}77", "ready".into())
+        .unwrap();
+    seed_v0.set("\u{0}IDX_NEXT_ID\u{0}", "78".into()).unwrap();
+    seed_v0
+        .set(
+            &format!("\u{0}IDX\u{0}00000077\u{0}{encoded_7_i64}\u{0}1"),
+            "1".into(),
+        )
+        .unwrap();
+    db.commit_batch(&seed_v0).unwrap();
+
+    assert_eq!(
+        idx_mgr
+            .definition("legacy_v0_n_idx")
+            .unwrap()
+            .encoding_version,
+        0
+    );
+    assert_eq!(
+        select_rows(&executor, "SELECT id FROM legacy_int_idx_tbl WHERE n = 7"),
+        vec![vec!["1"]]
+    );
+    idx_mgr.rebuild_index("legacy_v0_n_idx").unwrap();
+    assert_eq!(
+        idx_mgr
+            .definition("legacy_v0_n_idx")
+            .unwrap()
+            .encoding_version,
+        omni_engine::secondary_index::CURRENT_INDEX_ENCODING_VERSION
+    );
+    execute(
+        &executor,
+        "INSERT INTO legacy_int_idx_tbl (id, n) VALUES (2, '9223372036854775808')",
+    );
+    assert_eq!(
+        select_rows(
+            &executor,
+            "SELECT id FROM legacy_int_idx_tbl WHERE n = '9223372036854775808'"
+        ),
+        vec![vec!["2"]]
+    );
+}
+
+#[test]
+fn unpinned_compile_plan_and_plan_executor_do_not_omit_rows_when_index_not_ready() {
+    let dir = TempDir::new().unwrap();
+    let db = OmniKV::open(
+        dir.path().join("manifest.json").to_str().unwrap(),
+        dir.path().join("wal.bin").to_str().unwrap(),
+    )
+    .unwrap();
+    let catalog = Arc::new(Catalog::new(db.clone()));
+    let executor = SqlExecutor::new(db.clone(), catalog.clone());
+    let idx_mgr = IndexManager::new(db.clone());
+
+    execute(
+        &executor,
+        "CREATE TABLE rebuild_scan_tbl (id INTEGER PRIMARY KEY, tag TEXT)",
+    );
+    execute(
+        &executor,
+        "INSERT INTO rebuild_scan_tbl (id, tag) VALUES (1, 'hit'), (2, 'miss'), (3, 'hit')",
+    );
+    let idx_id = idx_mgr
+        .create_index(
+            "rebuild_scan_tag_idx",
+            "rebuild_scan_tbl",
+            vec![("tag".into(), IndexFieldType::String)],
+            false,
+        )
+        .unwrap();
+    idx_mgr.rebuild_index("rebuild_scan_tag_idx").unwrap();
+
+    // Plan the IndexScan while the index is ready, then simulate rebuild_index_locked's
+    // invalidation + clear window (ready marker removed and index entries cleared).
+    let stmt = parse_sql("SELECT id FROM rebuild_scan_tbl WHERE tag = 'hit'").unwrap();
+    let idx_cat = idx_mgr.catalog_snapshot().unwrap();
+    let stats = omni_engine::optimizer::gather_stats(&catalog, Some(&idx_cat), &db);
+    let plan = omni_engine::optimizer::Optimizer::new(stats)
+        .optimize(&stmt)
+        .unwrap();
+    assert!(
+        plan.to_string().contains("Index Scan"),
+        "precondition: plan must contain Index Scan: {plan}"
+    );
+
+    let mut clear_wb = WriteBatch::new();
+    clear_wb
+        .delete(&format!("\u{0}IDX_READY\u{0}{idx_id}"))
+        .unwrap();
+    let idx_prefix = format!("\u{0}IDX\u{0}{idx_id:08}\u{0}");
+    for (k, _) in db
+        .scan(
+            &idx_prefix,
+            &format!("{idx_prefix}\u{10ffff}"),
+            db.get_seq(),
+        )
+        .unwrap()
+    {
+        clear_wb.delete(&k).unwrap();
+    }
+    db.commit_batch(&clear_wb).unwrap();
+
+    // Unpinned compile_plan must detect the unready index at the same seq and fall back
+    // to SeqScan rather than returning zero rows.
+    let mut volcano_iter = omni_engine::volcano::compile_plan(&plan, &db, &catalog);
+    let volcano_rows = volcano_iter.try_collect_all().unwrap();
+    assert_eq!(
+        volcano_rows.len(),
+        2,
+        "unpinned compile_plan must not omit matching rows while index is not ready"
+    );
+
+    let plan_exec = omni_engine::plan_exec::PlanExecutor::new(db, catalog);
+    let exec_rows = plan_exec.execute_plan(&plan).unwrap();
+    assert_eq!(
+        exec_rows.len(),
+        2,
+        "PlanExecutor must not omit matching rows while index is not ready"
+    );
 }

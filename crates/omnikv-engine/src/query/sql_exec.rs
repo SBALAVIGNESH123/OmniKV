@@ -2532,18 +2532,27 @@ impl SqlExecutor {
         // no-op update of a row's existing key while still detecting a move
         // onto a key owned by an untouched row or another updated row.
         let mut old_keys = Vec::with_capacity(rows.len());
-        for (_, row) in &rows {
+        for (raw_stored_pk, row) in &rows {
             let pk = row
                 .get(&table.primary_key)
                 .cloned()
                 .flatten()
                 .ok_or_else(|| format!("primary key is NULL in table '{}'", table.name))?;
-            let old_key = format!(
+            let canonical_old_key = format!(
                 "{}{}",
                 table.row_prefix(),
                 crate::volcano::canonicalize_pk_key(&table, &pk)
             );
-            available_keys.remove(&old_key);
+            available_keys.remove(&canonical_old_key);
+            // For Legacy tables, migration_batch rekeys rows to canonical_old_key
+            // before this statement's writes run. For Typed tables, keep the
+            // actual stored suffix (e.g. a pre-existing "-0" FLOAT key) so
+            // updates delete the old key and replace its exact index entries.
+            let old_key = if table.row_format == crate::catalog::RowFormat::Legacy {
+                canonical_old_key
+            } else {
+                format!("{}{}", table.row_prefix(), raw_stored_pk)
+            };
             old_keys.push(old_key);
         }
 
@@ -2589,10 +2598,12 @@ impl SqlExecutor {
                 .cloned()
                 .flatten()
                 .ok_or_else(|| format!("primary key cannot be NULL in table '{}'", table.name))?;
-            // A legacy row may be stored under a non-canonical key ("007");
-            // the typed path addresses it as "7".
+            // A legacy row (or a pre-existing typed row like "-0" under FLOAT)
+            // may be stored under a non-canonical key; write under the canonical
+            // key and keep the stored PK column consistent with it.
             let canonical_pk = crate::volcano::canonicalize_pk_key(&table, &pk);
-            if table.row_format == crate::catalog::RowFormat::Legacy
+            if (table.row_format == crate::catalog::RowFormat::Legacy
+                || raw_stored_pk != canonical_pk)
                 && let Some(slot) = row.get_mut(&table.primary_key)
             {
                 *slot = Some(canonical_pk.clone());
@@ -2680,8 +2691,6 @@ impl SqlExecutor {
                         new_document,
                     )
                     .map_err(|e| format!("Index maintenance failed: {e}"))?;
-                let old_set: std::collections::HashSet<&str> =
-                    old_entries.iter().map(|(_, k)| k.as_str()).collect();
                 let new_set: std::collections::HashSet<&str> =
                     new_entries.iter().map(|(_, k)| k.as_str()).collect();
                 for (idx_def, idx_key) in &new_entries {
@@ -2699,12 +2708,12 @@ impl SqlExecutor {
                             ));
                         }
                     }
-                    if !old_set.contains(idx_key.as_str()) {
-                        probe
-                            .set(idx_key, canonical_pk.clone())
-                            .map_err(|e| format!("{:?}", e))?;
-                        dry_ops = dry_ops.saturating_add(1);
-                    }
+                    // Execution (`replace_document_indexes_with_catalog_and_reads`)
+                    // writes every entry in `new_entries`, including unchanged keys.
+                    probe
+                        .set(idx_key, canonical_pk.clone())
+                        .map_err(|e| format!("{:?}", e))?;
+                    dry_ops = dry_ops.saturating_add(1);
                 }
                 for (_, old_idx_key) in &old_entries {
                     if !new_set.contains(old_idx_key.as_str()) {
@@ -2885,19 +2894,27 @@ impl SqlExecutor {
             (WriteBatch::new(), read_seq)
         };
         self.seed_pending_indexes(&mut batch)?;
-        for (_, canonical_pk, key, _, document) in planned_deletes {
+        for (raw_stored_pk, canonical_pk, key, old_raw_document, document) in planned_deletes {
+            let (target_pk, target_key, target_doc) =
+                if table.row_format == crate::catalog::RowFormat::Legacy {
+                    (canonical_pk, key, document)
+                } else {
+                    let stored_key = format!("{}{}", table.row_prefix(), raw_stored_pk);
+                    (raw_stored_pk, stored_key, old_raw_document)
+                };
             index_manager
                 .remove_document_indexes_with_catalog(
                     &index_catalog,
                     &table.name,
-                    &canonical_pk,
-                    &document,
+                    &target_pk,
+                    &target_doc,
                     &mut batch,
                 )
                 .map_err(|e| format!("Index maintenance failed: {e}"))?;
-            Self::stage_batch_delete(&mut batch, &key)?;
+            Self::stage_batch_delete(&mut batch, &target_key)?;
             for stage_key in &active_stages {
-                let marker = crate::schema::SchemaManager::rename_row_stage_key(stage_key, &key);
+                let marker =
+                    crate::schema::SchemaManager::rename_row_stage_key(stage_key, &target_key);
                 if self
                     .find_row_stage_marker_with_batch(Some(&batch), &marker, marker_read_seq)?
                     .is_some()

@@ -112,6 +112,49 @@ pub struct PrepareResult {
     pub prepare_seq: u64,
 }
 
+/// Outcome of committing a 2PC transaction on a participant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommitOutcome {
+    /// Committed locally (or idempotently retried on the original storage
+    /// history) at this exact local MVCC commit sequence.
+    CommittedAt(u64),
+    /// Already committed prior to a Raft snapshot install; the committed state
+    /// is durable locally, but the source node's historical MVCC commit marker
+    /// cannot be mapped onto this replica's rebuilt sequence history.
+    AlreadyCommittedViaSnapshot,
+}
+
+/// An in-doubt transaction that could not be marked `COMPLETE` because one or
+/// more participants failed to acknowledge its decision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingRecovery {
+    pub txn_id: GlobalTxnId,
+    pub decision: String,
+    pub failures: Vec<(u64, String)>,
+}
+
+/// Summary produced by [`TwoPhaseCoordinator::recover_with`] and
+/// [`TwoPhaseCoordinator::recover_participants`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecoveryReport {
+    /// `(txn_id, decision)` pairs acknowledged by every participant and marked
+    /// `COMPLETE` in the coordinator's recovery log.
+    pub completed: Vec<(GlobalTxnId, String)>,
+    /// Transactions where at least one participant did not acknowledge, so
+    /// `COMPLETE` was NOT logged.
+    pub pending: Vec<PendingRecovery>,
+}
+
+pub(crate) enum PrepareCommitError {
+    /// Validation failed before any durable `PREPARED` record was proposed or
+    /// committed; releasing in-memory/tentative locks is sufficient.
+    PreProposal(OmniError),
+    /// Failure occurred during or after proposing/committing `PREPARED`;
+    /// participant reconciliation must write `ABORTED` to clear any durable
+    /// reservation before releasing locks.
+    PostProposal(OmniError),
+}
+
 /// Recovery log entry for 2PC coordinator.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TwoPhaseLogEntry {
@@ -616,6 +659,96 @@ impl TwoPhaseCoordinator {
         Ok(in_doubt)
     }
 
+    /// Drives recovery for every in-doubt transaction returned by [`Self::recover`].
+    ///
+    /// Dispatches `"COMMIT"` and `"ABORT"` decisions (applying presumed-abort
+    /// by durably logging `"ABORT"` first for `"PREPARE"`-only records) to each
+    /// participant via `dispatch(participant_id, txn_id, decision)`. Writes
+    /// `"COMPLETE"` ONLY after every participant acknowledges the decision.
+    pub fn recover_with<F>(&self, mut dispatch: F) -> Result<RecoveryReport, OmniError>
+    where
+        F: FnMut(u64, GlobalTxnId, &str) -> Result<(), OmniError>,
+    {
+        let mut in_doubt = self.recover()?;
+        in_doubt.sort_by_key(|(txn_id, _, _)| *txn_id);
+
+        let mut report = RecoveryReport {
+            completed: Vec::new(),
+            pending: Vec::new(),
+        };
+
+        for (txn_id, state, participants) in in_doubt {
+            let decision = match state.as_str() {
+                "COMMIT" => "COMMIT",
+                "ABORT" => "ABORT",
+                "PREPARE" => {
+                    // Presumed abort: persist ABORT before notifying participants
+                    // so a subsequent crash cannot flip the decision.
+                    self.log_state(txn_id, "ABORT", &participants)?;
+                    "ABORT"
+                }
+                other => {
+                    report.pending.push(PendingRecovery {
+                        txn_id,
+                        decision: other.to_string(),
+                        failures: vec![(
+                            self.node_id,
+                            format!("unrecognized coordinator log state '{other}'"),
+                        )],
+                    });
+                    continue;
+                }
+            };
+
+            let mut failures = Vec::new();
+            for &participant_id in &participants {
+                if let Err(err) = dispatch(participant_id, txn_id, decision) {
+                    failures.push((participant_id, err.to_string()));
+                }
+            }
+
+            if failures.is_empty() {
+                self.log_state(txn_id, "COMPLETE", &participants)?;
+                if let Ok(mut active) = self.active_txns.lock() {
+                    active.remove(&txn_id);
+                }
+                report.completed.push((txn_id, decision.to_string()));
+            } else {
+                report.pending.push(PendingRecovery {
+                    txn_id,
+                    decision: decision.to_string(),
+                    failures,
+                });
+            }
+        }
+
+        Ok(report)
+    }
+
+    /// Convenience recovery driver that dispatches every in-doubt coordinator
+    /// decision directly to the provided in-process [`TwoPhaseParticipant`]s.
+    pub fn recover_participants(
+        &self,
+        participants: &[&TwoPhaseParticipant],
+    ) -> Result<RecoveryReport, OmniError> {
+        let by_node: HashMap<u64, &TwoPhaseParticipant> =
+            participants.iter().map(|p| (p.node_id(), *p)).collect();
+        self.recover_with(|node_id, txn_id, decision| {
+            let participant = by_node.get(&node_id).ok_or_else(|| {
+                OmniError::IoError(format!(
+                    "2PC recovery participant node {node_id} unavailable"
+                ))
+            })?;
+            match decision {
+                "COMMIT" => participant.commit_outcome(txn_id).map(|_| ()),
+                "ABORT" => participant.abort(txn_id),
+                other => Err(OmniError::IoError(format!(
+                    "unsupported 2PC recovery decision '{other}'"
+                ))),
+            }
+        })
+    }
+
     /// Write a 2PC state change to the coordinator's recovery log.
     fn log_state(
         &self,
@@ -728,6 +861,8 @@ struct ParticipantLogEntry {
     writes: Vec<DistWrite>,
     prepare_seq: u64,
     commit_seq: Option<u64>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    snapshot_imported: bool,
 }
 
 fn participant_prepare_key(node_id: u64, txn_id: GlobalTxnId) -> String {
@@ -809,6 +944,7 @@ fn commit_entry_exceeds_storage_limit(
         writes: writes.to_vec(),
         prepare_seq: u64::MAX,
         commit_seq: Some(u64::MAX),
+        snapshot_imported: false,
     };
     let committed_encoded = serde_json::to_string(&worst_committed)
         .map_err(|error| OmniError::IoError(format!("commit log serialization failed: {error}")))?;
@@ -1258,10 +1394,25 @@ pub(crate) fn stamp_2pc_commit_seq(
         return None;
     }
     let mut entry: ParticipantLogEntry = serde_json::from_str(value).ok()?;
-    if entry.state != "COMMITTED" || entry.commit_seq.is_some() {
+    if entry.state != "COMMITTED" || entry.commit_seq.is_some() || entry.snapshot_imported {
         return None;
     }
     entry.commit_seq = Some(commit_seq);
+    serde_json::to_string(&entry).ok()
+}
+
+/// Clears a source node's local `commit_seq` when importing a `COMMITTED` 2PC
+/// participant record during Raft snapshot installation. Snapshot installation
+/// assigns new storage sequences on the destination node, so reusing the
+/// source's `commit_seq` could return a marker at which the installed value is
+/// not visible locally.
+pub(crate) fn sanitize_2pc_entry_for_snapshot_install(key: &str, value: &str) -> Option<String> {
+    let mut entry = parse_participant_entry(key, value)?;
+    if entry.state != "COMMITTED" {
+        return None;
+    }
+    entry.commit_seq = None;
+    entry.snapshot_imported = true;
     serde_json::to_string(&entry).ok()
 }
 
@@ -1340,6 +1491,11 @@ impl TwoPhaseParticipant {
             tracing::error!(node_id, ?error, "2PC participant recovery failed");
         }
         participant
+    }
+
+    /// Returns this participant's node ID.
+    pub fn node_id(&self) -> u64 {
+        self.node_id
     }
 
     /// PREPARE — validate writes and vote.
@@ -1549,6 +1705,7 @@ impl TwoPhaseParticipant {
             writes: writes.to_vec(),
             prepare_seq: 0,
             commit_seq: None,
+            snapshot_imported: false,
         };
         let mut prepare_batch = WriteBatch::new();
         let encoded = match serde_json::to_string(&log_entry) {
@@ -1605,7 +1762,10 @@ impl TwoPhaseParticipant {
             &legacy_participant_prepare_key(txn_id),
             format!("PREPARED:{}", self.node_id),
         );
-        match self.db.commit_2pc_batch(&prepare_batch) {
+        match self
+            .db
+            .commit_2pc_prepare_checked(&prepare_batch, read_seq, &write_keys)
+        {
             Ok(prepare_seq) => {
                 let persisted = ParticipantLogEntry {
                     txn_id,
@@ -1614,6 +1774,7 @@ impl TwoPhaseParticipant {
                     writes: writes.to_vec(),
                     prepare_seq,
                     commit_seq: None,
+                    snapshot_imported: false,
                 };
                 let mut update = WriteBatch::new();
                 if let Ok(encoded) = serde_json::to_string(&persisted)
@@ -1640,7 +1801,16 @@ impl TwoPhaseParticipant {
                     prepare_seq,
                 }
             }
-            Err(e) => {
+            Err(PrepareCommitError::PreProposal(e)) => {
+                self.release_key_locks(txn_id, &write_keys);
+                PrepareResult {
+                    node_id: self.node_id,
+                    txn_id,
+                    vote: Vote::Abort(e.to_string()),
+                    prepare_seq: 0,
+                }
+            }
+            Err(PrepareCommitError::PostProposal(e)) => {
                 self.reconcile_failed_prepare(txn_id, writes, &write_keys, &e);
                 PrepareResult {
                     node_id: self.node_id,
@@ -1674,6 +1844,7 @@ impl TwoPhaseParticipant {
             writes: writes.to_vec(),
             prepare_seq: 0,
             commit_seq: None,
+            snapshot_imported: false,
         };
         let mut abort_batch = WriteBatch::new();
         let abort_committed = serde_json::to_string(&abort_entry)
@@ -1799,18 +1970,42 @@ impl TwoPhaseParticipant {
             );
             recovered += 1;
         }
+        // Leave the durable ownership map exclusively owned by OmniKV::open,
+        // Raft apply, snapshot installation, and local 2PC commits so a stale
+        // recovery scan can never reinstate an ABORTED or COMMITTED owner.
+        // Recovery clears only stale tentative reservations for this node and
+        // rebuilds the participant's local prepared/key_locks caches.
         self.db
             .ssi_history
-            .replace_prepared_keys_for_node(self.node_id, &recovered_locks)
-            .map_err(OmniError::IoError)?;
+            .clear_tentative_prepared_keys_for_node(self.node_id);
         *prepared = recovered_prepared;
         *key_locks = recovered_locks;
         self.needs_recovery.store(false, Ordering::SeqCst);
         Ok(recovered)
     }
 
-    /// COMMIT — apply the previously prepared writes.
+    /// COMMIT — apply the previously prepared writes and return the exact local
+    /// storage commit sequence.
+    ///
+    /// Retries on the original storage history return the exact persisted
+    /// marker. If the transaction was already committed before a Raft snapshot
+    /// install replaced this replica's storage history, returns an error rather
+    /// than a source-node sequence that cannot address the installed value
+    /// locally; callers that only need idempotent commit acknowledgement should
+    /// use [`Self::commit_outcome`].
     pub fn commit(&self, txn_id: GlobalTxnId) -> Result<u64, OmniError> {
+        match self.commit_outcome(txn_id)? {
+            CommitOutcome::CommittedAt(seq) => Ok(seq),
+            CommitOutcome::AlreadyCommittedViaSnapshot => Err(OmniError::IoError(format!(
+                "Transaction {txn_id:?} already committed before snapshot install; \
+                 historical local commit sequence is unavailable"
+            ))),
+        }
+    }
+
+    /// COMMIT with explicit distinction between a local commit marker and an
+    /// already-committed transaction imported via Raft snapshot installation.
+    pub fn commit_outcome(&self, txn_id: GlobalTxnId) -> Result<CommitOutcome, OmniError> {
         let lock = self
             .db
             .sql_table_lock(&format!("\x002PC\x00{}", self.node_id))?;
@@ -1827,6 +2022,10 @@ impl TwoPhaseParticipant {
         let write_keys: Vec<String> = state.writes.iter().map(|w| w.key.clone()).collect();
         match state.state.as_str() {
             "COMMITTED" => {
+                if state.snapshot_imported {
+                    self.cleanup_terminal_state(txn_id)?;
+                    return Ok(CommitOutcome::AlreadyCommittedViaSnapshot);
+                }
                 let ssi_txn_id = txn_id.0.wrapping_mul(1_000_000).wrapping_add(txn_id.1);
                 let commit_seq = match state.commit_seq {
                     Some(seq) => seq,
@@ -1857,7 +2056,7 @@ impl TwoPhaseParticipant {
                     }
                 };
                 self.cleanup_terminal_state(txn_id)?;
-                return Ok(commit_seq);
+                return Ok(CommitOutcome::CommittedAt(commit_seq));
             }
             "PREPARED" => {}
             _ => {
@@ -1876,6 +2075,7 @@ impl TwoPhaseParticipant {
             writes: state.writes.clone(),
             prepare_seq: state.prepare_seq,
             commit_seq: None,
+            snapshot_imported: false,
         };
         commit_batch.set(
             &participant_prepare_key(self.node_id, txn_id),
@@ -1898,7 +2098,7 @@ impl TwoPhaseParticipant {
         )?;
         self.cleanup_terminal_state(txn_id)?;
 
-        Ok(commit_seq)
+        Ok(CommitOutcome::CommittedAt(commit_seq))
     }
 
     /// ABORT — discard the prepared writes.
@@ -1936,6 +2136,7 @@ impl TwoPhaseParticipant {
             writes: writes.clone(),
             prepare_seq: 0,
             commit_seq: None,
+            snapshot_imported: false,
         };
         let mut log_batch = WriteBatch::new();
         log_batch.set(
@@ -2130,6 +2331,7 @@ mod tests {
             writes: writes.clone(),
             prepare_seq: 1,
             commit_seq: None,
+            snapshot_imported: false,
         };
         commit_batch
             .set(
@@ -2281,6 +2483,7 @@ mod tests {
                 }],
                 prepare_seq: 1,
                 commit_seq: None,
+                snapshot_imported: false,
             };
             let mut batch = WriteBatch::new();
             batch
@@ -2407,6 +2610,7 @@ mod tests {
             writes: writes.clone(),
             prepare_seq: 0,
             commit_seq: None,
+            snapshot_imported: false,
         };
         let mut prepare_batch = WriteBatch::new();
         prepare_batch
@@ -2451,6 +2655,7 @@ mod tests {
                 }],
                 prepare_seq: 1,
                 commit_seq: None,
+                snapshot_imported: false,
             })
             .unwrap()
         };
@@ -2574,6 +2779,7 @@ mod tests {
             writes: Vec::new(),
             prepare_seq: 0,
             commit_seq: None,
+            snapshot_imported: false,
         };
         let mut pa_abort = WriteBatch::new();
         pa_abort
@@ -2643,6 +2849,7 @@ mod tests {
             }],
             prepare_seq: 1,
             commit_seq: None,
+            snapshot_imported: false,
         };
         let mut init = WriteBatch::new();
         init.set(&auth_key, serde_json::to_string(&valid_entry).unwrap())
@@ -2886,5 +3093,234 @@ mod tests {
         );
         db.ssi_history
             .release_prepared_keys(2, (1, 502), &["tentative_k".to_string()]);
+    }
+
+    #[test]
+    fn participant_recover_does_not_reinstall_aborted_durable_owner() {
+        let (db, _dir) = test_db();
+        let participant = TwoPhaseParticipant::new(2, db.clone());
+        let tid = (1, 601);
+        let writes = vec![DistWrite {
+            node_id: 2,
+            key: "recover_race_k".into(),
+            value: Some("v".into()),
+            ttl: 0,
+        }];
+        assert_eq!(participant.prepare(tid, &writes).vote, Vote::Commit);
+
+        // Apply ABORTED directly through Raft state machine (releasing prepared.durable).
+        let abort_entry = ParticipantLogEntry {
+            txn_id: tid,
+            node_id: 2,
+            state: "ABORTED".into(),
+            writes,
+            prepare_seq: 0,
+            commit_seq: None,
+            snapshot_imported: false,
+        };
+        let mut abort_batch = WriteBatch::new();
+        abort_batch
+            .set(
+                &participant_prepare_key(2, tid),
+                serde_json::to_string(&abort_entry).unwrap(),
+            )
+            .unwrap();
+        let cmd = crate::raft_command::RaftCommand::from_batch(&abort_batch);
+        let mut raft_storage = crate::raft_storage::OmniRaftStorage::new(db.clone());
+        let leader = openraft::CommittedLeaderId::new(1, 1);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let resp = rt
+            .block_on(openraft::RaftStorage::apply_to_state_machine(
+                &mut raft_storage,
+                &[openraft::Entry {
+                    log_id: openraft::LogId::new(leader, 1),
+                    payload: openraft::EntryPayload::Normal(cmd.encode()),
+                }],
+            ))
+            .unwrap();
+        assert!(resp[0].parse::<u64>().is_ok());
+
+        // Calling participant.recover() must rebuild local cache to 0 and must NOT
+        // reinstate the aborted owner in prepared.durable.
+        assert_eq!(participant.recover().unwrap(), 0);
+        assert_eq!(
+            db.ssi_history.durable_prepared_owner("recover_race_k"),
+            None
+        );
+        let mut plain = WriteBatch::new();
+        plain.set("recover_race_k", "post_abort".into()).unwrap();
+        assert!(db.commit_batch(&plain).is_ok());
+    }
+
+    #[test]
+    fn local_2pc_commit_ssi_visibility_rejects_concurrent_rw_conflict() {
+        let (db, _dir) = test_db();
+        let mut seed = WriteBatch::new();
+        seed.set("k_read", "v0".into()).unwrap();
+        seed.set("j_write", "v0".into()).unwrap();
+        db.commit_batch(&seed).unwrap();
+
+        let participant = TwoPhaseParticipant::new(1, db.clone());
+        let tm = crate::transaction::TransactionManager::new(db.clone());
+
+        // Start an SSI transaction that reads `k_read` and buffers a write to `j_write`.
+        let mut ssi_txn = tm.begin();
+        assert_eq!(tm.get(&mut ssi_txn, "k_read").unwrap(), Some("v0".into()));
+        tm.set(&mut ssi_txn, "j_write", "from_ssi".into()).unwrap();
+
+        // Prepare and commit a local 2PC write to `k_read`. Because commit_2pc_batch_with_ssi
+        // holds the committed-history guard across publication and history insertion,
+        // `ssi_txn` must observe the RW anti-dependency and abort.
+        let tid = (1, 701);
+        let writes = vec![DistWrite {
+            node_id: 1,
+            key: "k_read".into(),
+            value: Some("from_2pc".into()),
+            ttl: 0,
+        }];
+        assert_eq!(participant.prepare(tid, &writes).vote, Vote::Commit);
+        participant.commit(tid).unwrap();
+
+        let err = tm
+            .commit(&mut ssi_txn)
+            .expect_err("SSI txn reading k_read must abort after local 2PC commit wrote k_read");
+        assert!(
+            err.to_string().contains("SSI CONFLICT (RW)"),
+            "expected RW conflict, got: {err}"
+        );
+    }
+
+    #[test]
+    fn coordinator_recovery_driver_dispatches_missed_abort_commit_and_presumed_abort() {
+        let (coord_db, _cdir) = test_db();
+        let (p1_db, _p1dir) = test_db();
+        let (p2_db, _p2dir) = test_db();
+        let coord = TwoPhaseCoordinator::new(1, coord_db.clone(), 5_000);
+        let p1 = TwoPhaseParticipant::new(10, p1_db.clone());
+        let p2 = TwoPhaseParticipant::new(20, p2_db.clone());
+
+        // Case 1: Missed ABORT — p1 voted Commit (holding reservation on "blocked_k"),
+        // p2 voted Abort, coordinator logged ABORT and crashed before notifying p1.
+        let abort_txn = coord.begin().unwrap();
+        coord
+            .add_write(
+                abort_txn,
+                10,
+                "blocked_k".into(),
+                Some("never_committed".into()),
+                0,
+            )
+            .unwrap();
+        coord
+            .add_write(abort_txn, 20, "other_k".into(), Some("v".into()), 0)
+            .unwrap();
+        coord.prepare(abort_txn).unwrap();
+        let p1_vote = p1.prepare(
+            abort_txn,
+            &coord.get_participant_writes(abort_txn, 10).unwrap(),
+        );
+        assert_eq!(p1_vote.vote, Vote::Commit);
+        assert_eq!(
+            coord.receive_vote(abort_txn, p1_vote).unwrap(),
+            DistTxnState::WaitingForVotes
+        );
+        assert!(
+            coord
+                .receive_vote(
+                    abort_txn,
+                    PrepareResult {
+                        node_id: 20,
+                        txn_id: abort_txn,
+                        vote: Vote::Abort("simulated conflict".into()),
+                        prepare_seq: 0,
+                    },
+                )
+                .is_err()
+        );
+
+        // Plain write on p1 is blocked while p1 holds its missed-ABORT reservation.
+        let mut blocked_write = WriteBatch::new();
+        blocked_write.set("blocked_k", "plain".into()).unwrap();
+        assert!(
+            p1_db.commit_batch(&blocked_write).is_err(),
+            "participant holding missed-ABORT PREPARED record must still block plain writes"
+        );
+
+        // First recovery attempt fails to reach node 10 -> COMPLETE must NOT be written.
+        let restarted = TwoPhaseCoordinator::new(1, coord_db.clone(), 5_000);
+        let partial = restarted
+            .recover_with(|node_id, txn_id, decision| {
+                if node_id == 10 {
+                    return Err(OmniError::IoError("participant 10 unreachable".into()));
+                }
+                assert_eq!(decision, "ABORT");
+                p2.abort(txn_id)
+            })
+            .unwrap();
+        assert_eq!(partial.completed.len(), 0);
+        assert_eq!(partial.pending.len(), 1);
+        assert_eq!(partial.pending[0].txn_id, abort_txn);
+        assert_eq!(restarted.recover().unwrap().len(), 1);
+        assert!(p1_db.commit_batch(&blocked_write).is_err());
+
+        // Case 2: Missed COMMIT — prepared, coordinator logged COMMIT and crashed.
+        let commit_txn = restarted.begin().unwrap();
+        restarted
+            .add_write(
+                commit_txn,
+                10,
+                "commit_recovery_k".into(),
+                Some("committed_via_recovery".into()),
+                0,
+            )
+            .unwrap();
+        restarted.prepare(commit_txn).unwrap();
+        let commit_vote = p1.prepare(
+            commit_txn,
+            &restarted.get_participant_writes(commit_txn, 10).unwrap(),
+        );
+        assert_eq!(commit_vote.vote, Vote::Commit);
+        assert_eq!(
+            restarted.receive_vote(commit_txn, commit_vote).unwrap(),
+            DistTxnState::Committing
+        );
+
+        // Case 3: Presumed abort — coordinator crashed after logging PREPARE only.
+        let prepare_only_txn = (1, 999);
+        let p1_pa_vote = p1.prepare(
+            prepare_only_txn,
+            &[DistWrite {
+                node_id: 10,
+                key: "presumed_abort_k".into(),
+                value: Some("never".into()),
+                ttl: 0,
+            }],
+        );
+        assert_eq!(p1_pa_vote.vote, Vote::Commit);
+        restarted
+            .log_state(prepare_only_txn, "PREPARE", &[10])
+            .unwrap();
+
+        // Full recovery dispatches all three decisions and writes COMPLETE for each.
+        let report = restarted.recover_participants(&[&p1, &p2]).unwrap();
+        assert_eq!(report.pending.len(), 0);
+        assert_eq!(report.completed.len(), 3);
+        assert_eq!(restarted.recover().unwrap().len(), 0);
+
+        // Missed ABORT and presumed-abort reservations are cleared; missed COMMIT landed.
+        p1_db
+            .commit_batch(&blocked_write)
+            .expect("plain write to blocked_k must succeed once recovery delivered ABORT");
+        let mut pa_plain = WriteBatch::new();
+        pa_plain.set("presumed_abort_k", "freed".into()).unwrap();
+        p1_db.commit_batch(&pa_plain).expect(
+            "plain write to presumed_abort_k must succeed once presumed-abort delivered ABORT",
+        );
+        assert_eq!(
+            p1_db.find("commit_recovery_k", p1_db.get_seq()).unwrap(),
+            Some("committed_via_recovery".into())
+        );
     }
 }
