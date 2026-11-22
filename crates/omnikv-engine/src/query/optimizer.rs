@@ -118,6 +118,31 @@ pub fn gather_stats_at_checked(
                     .filter(|definition| {
                         ic.is_ready(definition.id)
                             && table.row_format == crate::catalog::RowFormat::Typed
+                            && definition
+                                .fields
+                                .first()
+                                .is_some_and(|(field, field_type)| {
+                                    table
+                                        .columns
+                                        .iter()
+                                        .find(|col| col.name.eq_ignore_ascii_case(field))
+                                        .is_some_and(|col| {
+                                            matches!(
+                                                (&col.col_type, field_type),
+                                                (
+                                                    crate::catalog::ColumnType::Integer,
+                                                    crate::secondary_index::IndexFieldType::Integer,
+                                                ) | (
+                                                    crate::catalog::ColumnType::Float,
+                                                    crate::secondary_index::IndexFieldType::Float,
+                                                ) | (
+                                                    crate::catalog::ColumnType::Text
+                                                        | crate::catalog::ColumnType::Boolean,
+                                                    crate::secondary_index::IndexFieldType::String,
+                                                )
+                                            )
+                                        })
+                                })
                     })
                     .cloned()
                     .collect()
@@ -808,7 +833,13 @@ impl Optimizer {
                     Some((qual, _)) => qual.eq_ignore_ascii_case(table_name),
                     None => true,
                 };
-                if qualifies && bare_name(column).eq_ignore_ascii_case(&pk) {
+                if qualifies
+                    && bare_name(column).eq_ignore_ascii_case(&pk)
+                    && !matches!(
+                        value,
+                        crate::sql::SqlValue::Null | crate::sql::SqlValue::Placeholder(_)
+                    )
+                {
                     Some(value.as_string())
                 } else {
                     None

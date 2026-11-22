@@ -250,23 +250,20 @@ impl PlanExecutor {
             AccessMethod::PkLookup { key_value } => {
                 let key_value = crate::volcano::canonicalize_pk_key(&table, key_value);
                 let key = format!("{}{}", table.row_prefix(), key_value);
-                let end = format!("{}{}\u{10ffff}", table.row_prefix(), key_value);
                 let seq = self.read_seq();
-                self.db
-                    .scan(&key, &end, seq)
-                    .map_err(|error| {
-                        format!(
-                            "storage PK lookup failed for table '{}': {error}",
-                            table.name
-                        )
-                    })?
-                    .into_iter()
-                    .map(|(_, value)| {
-                        Self::deserialize_row_checked(&value, table.row_format).map_err(|error| {
-                            format!("table '{}' row decode failed: {error}", table.name)
-                        })
-                    })
-                    .collect::<Result<Vec<_>, _>>()?
+                match self.db.find(&key, seq).map_err(|error| {
+                    format!(
+                        "storage PK lookup failed for table '{}': {error}",
+                        table.name
+                    )
+                })? {
+                    Some(value) => vec![
+                        Self::deserialize_row_checked(&value, table.row_format).map_err(
+                            |error| format!("table '{}' row decode failed: {error}", table.name),
+                        )?,
+                    ],
+                    None => Vec::new(),
+                }
             }
             AccessMethod::IndexScan { index_name, .. } => {
                 let mut iter = crate::volcano::IndexScanIter::with_scan(

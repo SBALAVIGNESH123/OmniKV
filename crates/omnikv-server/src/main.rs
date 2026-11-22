@@ -294,9 +294,11 @@ async fn spawn_protocol_servers(
     let quic_endpoint =
         quic_server::create_server_endpoint(&quic_addr_str, quic_tls.certs, quic_tls.key)?;
     let quic_db = db.clone();
+    let quic_jwt_secret = cfg.jwt_secret.clone();
     let quic_rate_limiter = rate_limiter.clone();
     let quic_handle = tokio::spawn(async move {
-        quic_server::run_quic_server(quic_endpoint, quic_db, quic_rate_limiter).await;
+        quic_server::run_quic_server(quic_endpoint, quic_db, quic_jwt_secret, quic_rate_limiter)
+            .await;
     });
 
     // ─── 3. PostgreSQL Wire Protocol ───────────────────────────

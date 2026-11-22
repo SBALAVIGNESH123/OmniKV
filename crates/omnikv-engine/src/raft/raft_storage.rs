@@ -558,7 +558,7 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
                 .expect("RaftStorage meta lock poisoned: fatal invariant");
             if idx > log_id.index {
                 // Determine new last_log_id (log_id.index - 1)
-                if log_id.index == 1 {
+                if log_id.index <= 1 {
                     meta.last_log_id = None;
                 } else {
                     let prev_key = format!("{}{:020}", RAFT_LOG_PREFIX, log_id.index - 1);
@@ -566,6 +566,11 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
                         && let Ok(entry) = serde_json::from_str::<Entry<TypeConfig>>(&val)
                     {
                         meta.last_log_id = Some(entry.log_id);
+                    } else if meta
+                        .last_purged_log_id
+                        .is_some_and(|purged| purged.index == log_id.index - 1)
+                    {
+                        meta.last_log_id = meta.last_purged_log_id;
                     }
                 }
                 self.save_meta(&meta, &mut batch);
@@ -683,8 +688,7 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
         // batch flushes, and the record — if any — is entered into this
         // node's committed history at that same marker.
         let mut staged_slots: Vec<(usize, Option<SsiCommitRecord>)> = Vec::new();
-        let mut staged_deletes: std::collections::HashSet<Vec<u8>> =
-            std::collections::HashSet::new();
+        let mut staged_keys: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
         // Flushes the staged batch (if non-empty) and stamps every entry
         // staged in it with the batch's COMMIT MARKER, which the proposer
         // reads back through client_write's response as the sequence its
@@ -705,7 +709,7 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
         // has every pre-failover commit in its history when it first leads.
         let flush_staged = |batch: &mut WriteBatch,
                             slots: &mut Vec<(usize, Option<SsiCommitRecord>)>,
-                            deletes: &mut std::collections::HashSet<Vec<u8>>,
+                            keys: &mut std::collections::HashSet<Vec<u8>>,
                             res: &mut Vec<String>|
          -> Result<(), crate::OmniError> {
             if batch.is_empty() {
@@ -757,7 +761,7 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
             // (never runs a local COMMIT) does not grow without bound.
             history.prune(self.db.min_active_snapshot());
             slots.clear();
-            deletes.clear();
+            keys.clear();
             batch.clear();
             Ok(())
         };
@@ -772,11 +776,12 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
                     // so pre-cluster log entries and the storage tests
                     // keep their meaning.
                     if let Some(mut cmd) = crate::raft_command::RaftCommand::decode(req) {
-                        let system_key = cmd
-                            .sets
+                        let system_key = cmd.sets.iter().any(|op| {
+                            op.key == "__COMMIT_MARKER__" || op.key.starts_with("__sys__/raft/")
+                        }) || cmd
+                            .dels
                             .iter()
-                            .any(|op| op.key.starts_with("__sys__/raft/"))
-                            || cmd.dels.iter().any(|k| k.starts_with("__sys__/raft/"));
+                            .any(|k| k == "__COMMIT_MARKER__" || k.starts_with("__sys__/raft/"));
                         let conflicting_2pc =
                             crate::dist_txn::conflicts_with_2pc_decision(&self.db, &batch, &cmd)
                                 .map_err(io_err)?;
@@ -793,26 +798,22 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
                         // Flush at the ENTRY boundary (never mid-command):
                         // a reader or crash between commits must never see
                         // part of this entry's writes. Also flush whenever
-                        // this entry sets a key deleted by an earlier staged
-                        // entry, because WriteBatch applies all sets before
-                        // all deletes and grouping them would invert order.
-                        let sets_staged_delete = !staged_deletes.is_empty()
-                            && cmd
+                        // this entry touches any key already staged in the
+                        // current batch so conflicting sets/deletes across
+                        // entries never reorder or share a commit marker.
+                        let touches_staged_key = !staged_keys.is_empty()
+                            && (cmd
                                 .sets
                                 .iter()
-                                .any(|op| staged_deletes.contains(op.key.as_bytes()));
+                                .any(|op| staged_keys.contains(op.key.as_bytes()))
+                                || cmd.dels.iter().any(|k| staged_keys.contains(k.as_bytes())));
                         if !batch.is_empty()
-                            && (sets_staged_delete
+                            && (touches_staged_key
                                 || batch.op_count() + cmd.sets.len() + cmd.dels.len()
                                     >= WriteBatch::MAX_OPS)
                         {
-                            flush_staged(
-                                &mut batch,
-                                &mut staged_slots,
-                                &mut staged_deletes,
-                                &mut res,
-                            )
-                            .map_err(io_err)?;
+                            flush_staged(&mut batch, &mut staged_slots, &mut staged_keys, &mut res)
+                                .map_err(io_err)?;
                         }
                         for op in cmd.sets {
                             // The entry carries the ABSOLUTE expiry the
@@ -820,13 +821,14 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
                             // Re-deriving `now + ttl` here would drift the
                             // expiry forward by the replication delay on
                             // every follower hop.
+                            staged_keys.insert(op.key.as_bytes().to_vec());
                             batch
                                 .set_with_expiry(&op.key, op.value, op.ttl)
                                 .map_err(|e| storage_write_err(&e))?;
                         }
                         for key in &cmd.dels {
                             batch.delete(key).map_err(|e| storage_write_err(&e))?;
-                            staged_deletes.insert(key.as_bytes().to_vec());
+                            staged_keys.insert(key.as_bytes().to_vec());
                         }
                         // Placeholder: stamped with the batch's commit
                         // marker when it flushes. Empty until then.
@@ -834,20 +836,28 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
                         staged_slots.push((res.len() - 1, cmd.ssi.take()));
                     } else if let Some(rest) = req.strip_prefix("SET ") {
                         let parts: Vec<&str> = rest.splitn(2, ' ').collect();
-                        if parts.len() == 2 && !parts[0].starts_with("__sys__/raft/") {
-                            let sets_staged_delete = staged_deletes.contains(parts[0].as_bytes());
+                        if parts.len() == 2
+                            && parts[0] != "__COMMIT_MARKER__"
+                            && !parts[0].starts_with("__sys__/raft/")
+                            && !crate::dist_txn::key_is_reserved_by_prepared_2pc(
+                                &self.db, &batch, parts[0],
+                            )
+                            .map_err(io_err)?
+                        {
+                            let touches_staged_key = staged_keys.contains(parts[0].as_bytes());
                             if !batch.is_empty()
-                                && (sets_staged_delete
+                                && (touches_staged_key
                                     || batch.op_count() + 1 >= WriteBatch::MAX_OPS)
                             {
                                 flush_staged(
                                     &mut batch,
                                     &mut staged_slots,
-                                    &mut staged_deletes,
+                                    &mut staged_keys,
                                     &mut res,
                                 )
                                 .map_err(io_err)?;
                             }
+                            staged_keys.insert(parts[0].as_bytes().to_vec());
                             batch
                                 .set(parts[0], parts[1].to_string())
                                 .map_err(|e| storage_write_err(&e))?;
@@ -875,8 +885,7 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
         // the pre-crash last_applied. Flushing here (rather than letting
         // data ride along with the meta op) removes the exact-cap special
         // case: the batch is empty when the single meta op is appended.
-        flush_staged(&mut batch, &mut staged_slots, &mut staged_deletes, &mut res)
-            .map_err(io_err)?;
+        flush_staged(&mut batch, &mut staged_slots, &mut staged_keys, &mut res).map_err(io_err)?;
 
         if last_applied.is_some() || new_membership.is_some() {
             // Scoped: the guard must be released before the final commit

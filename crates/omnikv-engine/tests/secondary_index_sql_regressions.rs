@@ -1107,3 +1107,338 @@ fn failed_insert_and_update_on_large_legacy_table_leave_storage_untouched() {
         Some("1".into())
     );
 }
+
+#[test]
+fn legacy_update_canonicalizes_stored_pk_and_drop_table_cleans_stage_markers_and_retired_indexes() {
+    let dir = TempDir::new().unwrap();
+    let db = OmniKV::open(
+        dir.path().join("manifest.json").to_str().unwrap(),
+        dir.path().join("wal.bin").to_str().unwrap(),
+    )
+    .unwrap();
+
+    let stage_key = seed_large_legacy_table(&db, "legacy_pk_canon", 1);
+    let retired_idx_key = "\u{0}IDX_RETIRED\u{0}99";
+    let retired_idx_entry = "\u{0}IDX\u{0}00000099\u{0}v1\u{0}1";
+    let retired_idx_json = "{\"id\":99,\"name\":\"old_retired_idx\",\"collection\":\"legacy_pk_canon\",\"fields\":[[\"old_col\",\"String\"]],\"unique\":false}";
+    let mut retired_seed = WriteBatch::new();
+    retired_seed
+        .set(retired_idx_key, retired_idx_json.into())
+        .unwrap();
+    retired_seed.set(retired_idx_entry, "1".into()).unwrap();
+    db.commit_batch(&retired_seed).unwrap();
+
+    let executor = SqlExecutor::new(db.clone(), Arc::new(Catalog::new(db.clone())));
+    execute(
+        &executor,
+        "UPDATE legacy_pk_canon SET old_col = 'updated' WHERE id = 1",
+    );
+
+    assert_eq!(
+        rows(
+            &executor,
+            "SELECT id, old_col FROM legacy_pk_canon WHERE id = 1"
+        ),
+        vec![vec![Some("1".into()), Some("updated".into())]],
+        "UPDATE on a legacy non-canonical PK row must canonicalize stored row[primary_key]"
+    );
+
+    let canonical_marker =
+        test_rename_row_stage_key(&stage_key, "\u{0}T\u{0}legacy_pk_canon\u{0}1");
+    assert_eq!(
+        db.find(&canonical_marker, db.get_seq()).unwrap(),
+        Some("1".into())
+    );
+
+    execute(&executor, "DROP TABLE legacy_pk_canon");
+    assert_eq!(
+        db.find(&stage_key, db.get_seq()).unwrap(),
+        None,
+        "DROP TABLE must clean up rename_stage markers for the table"
+    );
+    assert_eq!(
+        db.find(&canonical_marker, db.get_seq()).unwrap(),
+        None,
+        "DROP TABLE must clean up rename_row markers for the table"
+    );
+    assert_eq!(
+        db.find(retired_idx_key, db.get_seq()).unwrap(),
+        None,
+        "DROP TABLE must clean up retired index metadata for the table"
+    );
+    assert_eq!(
+        db.find(retired_idx_entry, db.get_seq()).unwrap(),
+        None,
+        "DROP TABLE must clean up retired index entries for the table"
+    );
+}
+
+#[test]
+fn schema_add_field_stores_unquoted_string_and_none_for_null_sql_column_defaults() {
+    use omni_engine::schema::{Migration, SchemaManager, SchemaOp};
+
+    let dir = TempDir::new().unwrap();
+    let db = OmniKV::open(
+        dir.path().join("manifest.json").to_str().unwrap(),
+        dir.path().join("wal.bin").to_str().unwrap(),
+    )
+    .unwrap();
+    let catalog = Arc::new(Catalog::new(db.clone()));
+    let executor = SqlExecutor::new(db.clone(), catalog);
+    execute(
+        &executor,
+        "CREATE TABLE add_field_defaults (id INTEGER PRIMARY KEY)",
+    );
+    execute(&executor, "INSERT INTO add_field_defaults (id) VALUES (1)");
+
+    let schema = SchemaManager::new(db.clone(), Arc::new(IndexManager::new(db.clone())));
+    schema
+        .migrate_up(&Migration {
+            version: 1,
+            description: "add string and null defaults".into(),
+            up: vec![
+                SchemaOp::AddField {
+                    collection: "add_field_defaults".into(),
+                    field_name: "label".into(),
+                    default_value: serde_json::Value::String("hello".into()),
+                },
+                SchemaOp::AddField {
+                    collection: "add_field_defaults".into(),
+                    field_name: "note".into(),
+                    default_value: serde_json::Value::Null,
+                },
+            ],
+            down: vec![],
+        })
+        .unwrap();
+
+    let refreshed_catalog = Arc::new(Catalog::new(db.clone()));
+    let table_def = refreshed_catalog
+        .get_table("add_field_defaults")
+        .expect("table metadata must exist after AddField");
+    let label_col = table_def
+        .columns
+        .iter()
+        .find(|c| c.name == "label")
+        .expect("label column must exist");
+    let note_col = table_def
+        .columns
+        .iter()
+        .find(|c| c.name == "note")
+        .expect("note column must exist");
+    assert_eq!(
+        label_col.default.as_deref(),
+        Some("hello"),
+        "AddField must store unquoted string default in SQL catalog"
+    );
+    assert_eq!(
+        note_col.default, None,
+        "AddField must store None (not \"null\") for JSON null default in SQL catalog"
+    );
+
+    let refreshed = SqlExecutor::new(db, refreshed_catalog);
+    assert_eq!(
+        rows(
+            &refreshed,
+            "SELECT label, note FROM add_field_defaults WHERE id = 1"
+        ),
+        vec![vec![Some("hello".into()), None]]
+    );
+}
+
+fn seed_differential_oracle_tables(exec: &SqlExecutor) {
+    for sql in [
+        "CREATE TABLE users (id INTEGER PRIMARY KEY, age INTEGER, score FLOAT, tag TEXT)",
+        "CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER, age INTEGER, label TEXT)",
+        "CREATE TABLE codes (code TEXT PRIMARY KEY, priority INTEGER)",
+        "INSERT INTO users (id, age, score, tag) VALUES (1, 2, 1.5, 'a'), (2, 9, 2.5, 'ab'), (10, 10, 10.0, 'b'), (11, 20, 20.5, 'ba'), (100, 30, 30.0, 'c'), (101, NULL, NULL, NULL), (200, -5, -1.25, '')",
+        "INSERT INTO orders (id, user_id, age, label) VALUES (1, 1, 99, 'x'), (2, 10, 99, 'y'), (3, 11, 99, 'z'), (4, 100, 5, 'w')",
+        "INSERT INTO codes (code, priority) VALUES ('a1', 1), ('ab', 2), ('b', 3)",
+    ] {
+        execute(exec, sql);
+    }
+}
+
+fn build_differential_oracle_indexes(db: &Arc<OmniKV>) {
+    let idx_mgr = IndexManager::new(db.clone());
+    for (name, table, col, field_type) in [
+        ("users_age_int_idx", "users", "age", IndexFieldType::Integer),
+        (
+            "users_score_float_idx",
+            "users",
+            "score",
+            IndexFieldType::Float,
+        ),
+        ("users_tag_str_idx", "users", "tag", IndexFieldType::String),
+    ] {
+        idx_mgr
+            .create_index(name, table, vec![(col.into(), field_type)], false)
+            .unwrap();
+        idx_mgr.rebuild_index(name).unwrap();
+    }
+
+    // Creating a mismatched String index on INTEGER column orders.age must be rejected.
+    assert!(
+        idx_mgr
+            .create_index(
+                "orders_age_wrong_str_idx",
+                "orders",
+                vec![("age".into(), IndexFieldType::String)],
+                false,
+            )
+            .is_err(),
+        "create_index must reject mismatched IndexFieldType::String on SQL INTEGER column"
+    );
+
+    // Even if a pre-existing mismatched catalog entry is present on disk, the SQL
+    // optimizer must refuse to use it for range/equality scans.
+    let mut legacy_idx = WriteBatch::new();
+    legacy_idx
+        .set(
+            "\u{0}IDX_CATALOG\u{0}900",
+            "{\"id\":900,\"name\":\"legacy_wrong_orders_age_idx\",\"collection\":\"orders\",\"fields\":[[\"age\",\"String\"]],\"unique\":false}".into(),
+        )
+        .unwrap();
+    legacy_idx
+        .set("\u{0}IDX_READY\u{0}900", "ready".into())
+        .unwrap();
+    db.commit_batch(&legacy_idx).unwrap();
+}
+
+#[test]
+fn sql_differential_oracle_indexed_vs_unindexed_matches_across_types_bounds_joins_and_pks() {
+    let dir_oracle = TempDir::new().unwrap();
+    let db_oracle = OmniKV::open(
+        dir_oracle.path().join("manifest.json").to_str().unwrap(),
+        dir_oracle.path().join("wal.bin").to_str().unwrap(),
+    )
+    .unwrap();
+    let oracle_exec = SqlExecutor::new(db_oracle.clone(), Arc::new(Catalog::new(db_oracle)));
+
+    let dir_indexed = TempDir::new().unwrap();
+    let db_indexed = OmniKV::open(
+        dir_indexed.path().join("manifest.json").to_str().unwrap(),
+        dir_indexed.path().join("wal.bin").to_str().unwrap(),
+    )
+    .unwrap();
+    let indexed_exec = SqlExecutor::new(
+        db_indexed.clone(),
+        Arc::new(Catalog::new(db_indexed.clone())),
+    );
+
+    seed_differential_oracle_tables(&oracle_exec);
+    seed_differential_oracle_tables(&indexed_exec);
+    build_differential_oracle_indexes(&db_indexed);
+
+    for sql in [
+        "SELECT id, age FROM users WHERE age >= 2 AND age <= 10 ORDER BY id",
+        "SELECT id, age FROM users WHERE age >= 30 AND age >= 10 ORDER BY id",
+        "SELECT id, age FROM users WHERE age >= 10 AND age >= 30 ORDER BY id",
+        "SELECT id, age FROM users WHERE age = 20 AND age >= 10 ORDER BY id",
+        "SELECT id, age FROM users WHERE age >= 10 AND age = 20 ORDER BY id",
+        "SELECT id, age FROM users WHERE age <= 20 AND age <= 50 ORDER BY id",
+        "SELECT id, age FROM users WHERE age = 20 AND age = 30 ORDER BY id",
+        "SELECT id, age FROM users WHERE age > 25 AND age < 15 ORDER BY id",
+        "SELECT id, age FROM users WHERE age < 0 ORDER BY id",
+        "SELECT id, score FROM users WHERE score >= -2.0 AND score <= 10.0 ORDER BY id",
+        "SELECT id, tag FROM users WHERE tag >= 'a' AND tag <= 'ab' ORDER BY id",
+        "SELECT id, tag FROM users WHERE tag >= '' AND tag <= 'b' ORDER BY id",
+        "SELECT id, age FROM orders WHERE age >= 2 AND age <= 10 ORDER BY id",
+        "SELECT id, age FROM orders WHERE age >= 10 ORDER BY id",
+        "SELECT users.id, orders.id FROM users JOIN orders ON users.id = orders.user_id WHERE users.age >= 2 AND orders.age = 99 ORDER BY users.id",
+        "SELECT users.id, orders.id FROM users JOIN orders ON users.id = orders.user_id WHERE users.age >= 20 AND orders.age = 99 ORDER BY users.id",
+        "SELECT id, age FROM users WHERE id = 1",
+        "SELECT id, age FROM users WHERE id = 10",
+        "SELECT id, age FROM users WHERE id = 20",
+        "SELECT id, age FROM users WHERE id = NULL",
+        "SELECT code, priority FROM codes WHERE code = 'a'",
+        "SELECT code, priority FROM codes WHERE code = 'a1'",
+    ] {
+        assert_eq!(
+            rows(&indexed_exec, sql),
+            rows(&oracle_exec, sql),
+            "indexed SQL result diverged from sequential oracle for query: {sql}"
+        );
+    }
+
+    // Corrupt a neighbor row whose PK has 'a' as a prefix (`code = 'a1'`).
+    // An exact O(1) PkLookupIter for `code = 'a'` (missing) must NOT scan or decode 'a1'.
+    let mut corrupt = WriteBatch::new();
+    corrupt
+        .set("\u{0}T\u{0}codes\u{0}a1", "{not-valid-json".into())
+        .unwrap();
+    db_indexed.commit_batch(&corrupt).unwrap();
+    let codes_table = Catalog::new(db_indexed.clone())
+        .get_table("codes")
+        .expect("codes table");
+    let mut pk_iter = omni_engine::volcano::PkLookupIter::new(&db_indexed, &codes_table, "a");
+    assert_eq!(
+        omni_engine::volcano::RowIterator::try_next_row(&mut pk_iter).unwrap(),
+        None,
+        "exact PkLookupIter for missing key 'a' must not scan or fail on neighbor prefix key 'a1'"
+    );
+}
+
+#[test]
+fn stale_partial_index_entries_never_hide_rows_and_are_purged_on_rebuild() {
+    let dir = TempDir::new().unwrap();
+    let db = OmniKV::open(
+        dir.path().join("manifest.json").to_str().unwrap(),
+        dir.path().join("wal.bin").to_str().unwrap(),
+    )
+    .unwrap();
+    let executor = SqlExecutor::new(db.clone(), Arc::new(Catalog::new(db.clone())));
+    execute(
+        &executor,
+        "CREATE TABLE items (id INTEGER PRIMARY KEY, sku TEXT)",
+    );
+    execute(
+        &executor,
+        "INSERT INTO items (id, sku) VALUES (1, 'alpha'), (2, 'beta'), (3, 'gamma')",
+    );
+
+    let idx_mgr = IndexManager::new(db.clone());
+    let index_id = idx_mgr
+        .create_index(
+            "items_sku_idx",
+            "items",
+            vec![("sku".into(), IndexFieldType::String)],
+            true,
+        )
+        .unwrap();
+
+    // Simulate stale/partial index entries left behind by an earlier crashed build
+    // (pointing to a non-existent phantom PK '999' for sku = 'alpha', while index is NOT ready).
+    let stale_key = format!("\u{0}IDX\u{0}{index_id:08}\u{0}616c706861\u{0}999");
+    let mut seed_stale = WriteBatch::new();
+    seed_stale.set(&stale_key, "999".into()).unwrap();
+    db.commit_batch(&seed_stale).unwrap();
+
+    // Unready index must NEVER hide rows from SQL SELECT.
+    assert_eq!(
+        rows(
+            &executor,
+            "SELECT id, sku FROM items WHERE sku = 'alpha' ORDER BY id"
+        ),
+        vec![vec![Some("1".into()), Some("alpha".into())]]
+    );
+
+    // Rebuilding the unique index must purge the stale entry (otherwise PK '1'
+    // would collide with phantom PK '999' on the unique constraint!) and finish cleanly.
+    let rebuilt = idx_mgr
+        .rebuild_index("items_sku_idx")
+        .expect("rebuild_index must purge stale entries before unique backfill");
+    assert_eq!(rebuilt, 3);
+    assert_eq!(
+        db.find(&stale_key, db.get_seq()).unwrap(),
+        None,
+        "stale partial index entry must be purged by rebuild_index"
+    );
+    assert_eq!(
+        rows(
+            &executor,
+            "SELECT id, sku FROM items WHERE sku = 'alpha' ORDER BY id"
+        ),
+        vec![vec![Some("1".into()), Some("alpha".into())]]
+    );
+}

@@ -1078,15 +1078,107 @@ pub(crate) fn validate_2pc_decision_writes(
     Ok(())
 }
 
+fn effective_prepared_owner(
+    db: &OmniKV,
+    staged: &WriteBatch,
+    key: &str,
+) -> Result<Option<(u64, GlobalTxnId)>, OmniError> {
+    let staged_touches_prepare = staged
+        .buffered_writes
+        .iter()
+        .any(|(k, _, _)| k.starts_with(b"__2PC_PREPARE__/"))
+        || staged
+            .buffered_deletes
+            .iter()
+            .any(|k| k.starts_with(b"__2PC_PREPARE__/"));
+    if !db.ssi_history.has_prepared_keys() && !staged_touches_prepare {
+        return Ok(None);
+    }
+    if staged
+        .buffered_deletes
+        .iter()
+        .any(|k| k.starts_with(b"__2PC_PREPARE__/"))
+    {
+        let mut active_records: HashMap<String, String> = db
+            .scan("__2PC_PREPARE__/", "__2PC_PREPARE__/~", u64::MAX)?
+            .into_iter()
+            .collect();
+        for (k_bytes, val, _) in &staged.buffered_writes {
+            if let Ok(k_str) = std::str::from_utf8(k_bytes)
+                && k_str.starts_with("__2PC_PREPARE__/")
+            {
+                active_records.insert(k_str.to_string(), val.clone());
+            }
+        }
+        for del in &staged.buffered_deletes {
+            if let Ok(k_str) = std::str::from_utf8(del) {
+                active_records.remove(k_str);
+            }
+        }
+        for (rec_key, rec_val) in active_records {
+            let Some(entry) = parse_participant_entry(&rec_key, &rec_val) else {
+                continue;
+            };
+            if entry.state == "PREPARED" && entry.writes.iter().any(|w| w.key == key) {
+                return Ok(Some((entry.node_id, entry.txn_id)));
+            }
+        }
+        return Ok(None);
+    }
+
+    let mut owner = db.ssi_history.prepared_owner(key);
+    for (k_bytes, val, _) in &staged.buffered_writes {
+        if !k_bytes.starts_with(b"__2PC_PREPARE__/") {
+            continue;
+        }
+        let Ok(k_str) = std::str::from_utf8(k_bytes) else {
+            continue;
+        };
+        let Some(entry) = parse_participant_entry(k_str, val) else {
+            continue;
+        };
+        match entry.state.as_str() {
+            "PREPARED" if entry.writes.iter().any(|w| w.key == key) => {
+                owner = Some((entry.node_id, entry.txn_id));
+            }
+            "COMMITTED" | "ABORTED" if owner == Some((entry.node_id, entry.txn_id)) => {
+                owner = None;
+            }
+            _ => {}
+        }
+    }
+    Ok(owner)
+}
+
+pub(crate) fn key_is_reserved_by_prepared_2pc(
+    db: &OmniKV,
+    staged: &WriteBatch,
+    key: &str,
+) -> Result<bool, OmniError> {
+    Ok(effective_prepared_owner(db, staged, key)?.is_some())
+}
+
 pub(crate) fn conflicts_with_2pc_decision(
     db: &OmniKV,
     staged: &WriteBatch,
     cmd: &crate::raft_command::RaftCommand,
 ) -> Result<bool, OmniError> {
     let mut touches_prepare = false;
+    let mut cmd_commit_owners: HashMap<(u64, GlobalTxnId), HashSet<String>> = HashMap::new();
     for op in &cmd.sets {
         if op.key.starts_with("__2PC_PREPARE__/") {
             touches_prepare = true;
+            if !cmd.dels.iter().any(|k| k == &op.key)
+                && let Some(entry) = parse_participant_entry(&op.key, &op.value)
+                && entry.state == "COMMITTED"
+            {
+                let entry_keys = cmd_commit_owners
+                    .entry((entry.node_id, entry.txn_id))
+                    .or_default();
+                for write in entry.writes {
+                    entry_keys.insert(write.key);
+                }
+            }
         }
         let Some(opposite_key) = opposite_2pc_decision_key(&op.key) else {
             continue;
@@ -1122,6 +1214,23 @@ pub(crate) fn conflicts_with_2pc_decision(
         let incoming_deletes: Vec<&str> = cmd.dels.iter().map(String::as_str).collect();
         if check_2pc_participant_writes(db, Some(staged), &incoming_writes, &incoming_deletes)?
             .is_some()
+        {
+            return Ok(true);
+        }
+    }
+    for key in cmd
+        .sets
+        .iter()
+        .map(|op| op.key.as_str())
+        .chain(cmd.dels.iter().map(String::as_str))
+    {
+        if key.starts_with("__2PC_") {
+            continue;
+        }
+        if let Some(active_owner) = effective_prepared_owner(db, staged, key)?
+            && !cmd_commit_owners
+                .get(&active_owner)
+                .is_some_and(|keys| keys.contains(key))
         {
             return Ok(true);
         }
@@ -2628,5 +2737,63 @@ mod tests {
         participant
             .commit((1, 402))
             .expect("MAX_OPS - 2 writes + 2 participant records must commit cleanly");
+    }
+
+    #[test]
+    fn raft_apply_rejects_non_owner_writes_and_legacy_sets_against_prepared_2pc_key() {
+        let (db, _dir) = test_db();
+        let participant = TwoPhaseParticipant::new(2, db.clone());
+        let tid = (1, 501);
+        let res = participant.prepare(
+            tid,
+            &[DistWrite {
+                node_id: 2,
+                key: "reserved_k".into(),
+                value: Some("committed_v".into()),
+                ttl: 0,
+            }],
+        );
+        assert_eq!(res.vote, Vote::Commit);
+
+        let mut rogue_batch = WriteBatch::new();
+        rogue_batch.set("reserved_k", "rogue_v".into()).unwrap();
+        let rogue_cmd = crate::raft_command::RaftCommand::from_batch(&rogue_batch);
+
+        let mut raft_storage = crate::raft_storage::OmniRaftStorage::new(db.clone());
+        let leader = openraft::CommittedLeaderId::new(1, 1);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let responses = rt
+            .block_on(openraft::RaftStorage::apply_to_state_machine(
+                &mut raft_storage,
+                &[
+                    openraft::Entry {
+                        log_id: openraft::LogId::new(leader, 1),
+                        payload: openraft::EntryPayload::Normal(rogue_cmd.encode()),
+                    },
+                    openraft::Entry {
+                        log_id: openraft::LogId::new(leader, 2),
+                        payload: openraft::EntryPayload::Normal(
+                            "SET reserved_k rogue_legacy".into(),
+                        ),
+                    },
+                ],
+            ))
+            .unwrap();
+        assert_eq!(
+            responses,
+            vec!["ERR", "ERR"],
+            "Raft state machine apply must reject non-owner structured and legacy writes to a PREPARED key"
+        );
+        assert_eq!(db.find("reserved_k", db.get_seq()).unwrap(), None);
+
+        participant
+            .commit(tid)
+            .expect("owner 2PC commit must still succeed");
+        assert_eq!(
+            db.find("reserved_k", db.get_seq()).unwrap(),
+            Some("committed_v".into())
+        );
     }
 }

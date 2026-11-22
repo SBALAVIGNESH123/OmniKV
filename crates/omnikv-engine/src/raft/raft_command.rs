@@ -107,11 +107,16 @@ impl RaftCommand {
     /// rejected up front with a clear error instead of an "ERR" apply
     /// result the client can't distinguish from success.
     pub fn protects_system_keys(&self) -> Result<(), String> {
-        self.reject_prefixes(&["__sys__/raft/", "__2PC_LOG__/", "__2PC_PREPARE__/"])
+        self.reject_prefixes(&[
+            "__COMMIT_MARKER__",
+            "__sys__/raft/",
+            "__2PC_LOG__/",
+            "__2PC_PREPARE__/",
+        ])
     }
 
     pub(crate) fn protects_raft_keys(&self) -> Result<(), String> {
-        self.reject_prefixes(&["__sys__/raft/"])
+        self.reject_prefixes(&["__COMMIT_MARKER__", "__sys__/raft/"])
     }
 
     fn reject_prefixes(&self, reserved: &[&str]) -> Result<(), String> {

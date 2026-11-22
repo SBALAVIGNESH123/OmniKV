@@ -178,7 +178,12 @@ pub fn create_client_endpoint(insecure_skip_verify: bool) -> Result<Endpoint, St
 }
 
 /// Run the QUIC server loop, handling binary protocol requests.
-pub async fn run_quic_server(endpoint: Endpoint, db: Arc<OmniKV>, rate_limiter: Arc<RateLimiter>) {
+pub async fn run_quic_server(
+    endpoint: Endpoint,
+    db: Arc<OmniKV>,
+    jwt_secret: String,
+    rate_limiter: Arc<RateLimiter>,
+) {
     tracing::info!(
         "QUIC/HTTP3 server listening on {}",
         endpoint.local_addr().unwrap()
@@ -186,12 +191,19 @@ pub async fn run_quic_server(endpoint: Endpoint, db: Arc<OmniKV>, rate_limiter: 
 
     while let Some(incoming) = endpoint.accept().await {
         let db = db.clone();
+        let configured_secret = jwt_secret.clone();
         let rate_limiter = rate_limiter.clone();
         tokio::spawn(async move {
             match incoming.await {
                 Ok(conn) => {
                     tracing::debug!("QUIC connection from {}", conn.remote_address());
-                    let jwt_secret = std::env::var("OMNI_JWT_SECRET").unwrap_or_default();
+                    let jwt_secret = if configured_secret.is_empty() {
+                        std::env::var("OMNIKV_JWT_SECRET")
+                            .or_else(|_| std::env::var("OMNI_JWT_SECRET"))
+                            .unwrap_or_default()
+                    } else {
+                        configured_secret
+                    };
                     while let Ok((mut send, mut recv)) = conn.accept_bi().await {
                         let db = db.clone();
                         let secret = jwt_secret.clone();
@@ -329,7 +341,7 @@ fn handle_authenticated_request(
         return format!("ERR RATE_LIMITED retry_after_ms={retry_after_ms}\n").into_bytes();
     }
 
-    handle_binary_request(db, &frame[payload_start..])
+    handle_binary_request(db, &claims.role, &frame[payload_start..])
 }
 
 fn invalid_utf8_response() -> Vec<u8> {
@@ -340,11 +352,15 @@ fn invalid_frame_response() -> Vec<u8> {
     b"ERR INVALID_FRAME\n".to_vec()
 }
 
+fn forbidden_role_response() -> Vec<u8> {
+    b"ERR FORBIDDEN insufficient role\n".to_vec()
+}
+
 fn decode_utf8_payload(payload: &[u8]) -> Result<&str, Vec<u8>> {
     std::str::from_utf8(payload).map_err(|_| invalid_utf8_response())
 }
 
-fn handle_binary_request(db: &Arc<OmniKV>, data: &[u8]) -> Vec<u8> {
+fn handle_binary_request(db: &Arc<OmniKV>, role: &str, data: &[u8]) -> Vec<u8> {
     if data.is_empty() {
         return invalid_frame_response();
     }
@@ -356,6 +372,9 @@ fn handle_binary_request(db: &Arc<OmniKV>, data: &[u8]) -> Vec<u8> {
         Some(OpCode::Ping) => vec![OpCode::Pong as u8],
 
         Some(OpCode::Get) => {
+            if !crate::auth::RequiredRole::Read.allows(role) {
+                return forbidden_role_response();
+            }
             let key = match decode_utf8_payload(payload) {
                 Ok(key) => key,
                 Err(response) => return response,
@@ -373,6 +392,9 @@ fn handle_binary_request(db: &Arc<OmniKV>, data: &[u8]) -> Vec<u8> {
         }
 
         Some(OpCode::Set) => {
+            if !crate::auth::RequiredRole::Write.allows(role) {
+                return forbidden_role_response();
+            }
             // Payload format: [key_len: u16][key][value]
             if payload.len() < 2 {
                 return invalid_frame_response();
@@ -407,6 +429,9 @@ fn handle_binary_request(db: &Arc<OmniKV>, data: &[u8]) -> Vec<u8> {
         }
 
         Some(OpCode::Delete) => {
+            if !crate::auth::RequiredRole::Write.allows(role) {
+                return forbidden_role_response();
+            }
             let key = match decode_utf8_payload(payload) {
                 Ok(key) => key,
                 Err(response) => return response,
@@ -518,6 +543,42 @@ mod tests {
             Err("FRAME_TOO_LARGE".to_string())
         );
         assert!(validate_quic_frame_length(3).is_ok());
+    }
+
+    #[test]
+    fn quic_enforces_rbac_roles_for_read_and_write_opcodes() {
+        let (db, _dir) = open_temp_db();
+        let secret = "0123456789abcdef0123456789abcdef";
+        let read_token = crate::auth::generate_token("reader", "read", secret, 60).expect("token");
+        let backup_token =
+            crate::auth::generate_token("operator", "backup", secret, 60).expect("token");
+        let rate_limiter = RateLimiter::new(100.0, 10, 10);
+
+        let mut set_payload = vec![OpCode::Set as u8];
+        set_payload.extend_from_slice(&1u16.to_le_bytes());
+        set_payload.extend_from_slice(b"k");
+        set_payload.extend_from_slice(b"v");
+        let set_frame = authenticated_frame(&read_token, &set_payload);
+        assert_eq!(
+            handle_authenticated_request(&db, &set_frame, secret, &rate_limiter),
+            b"ERR FORBIDDEN insufficient role\n",
+            "read token must not execute QUIC SET"
+        );
+        assert_eq!(db.find("k", db.get_seq()).expect("find"), None);
+
+        let del_frame = authenticated_frame(&read_token, &[OpCode::Delete as u8, b'k']);
+        assert_eq!(
+            handle_authenticated_request(&db, &del_frame, secret, &rate_limiter),
+            b"ERR FORBIDDEN insufficient role\n",
+            "read token must not execute QUIC DELETE"
+        );
+
+        let get_frame = authenticated_frame(&backup_token, &[OpCode::Get as u8, b'k']);
+        assert_eq!(
+            handle_authenticated_request(&db, &get_frame, secret, &rate_limiter),
+            b"ERR FORBIDDEN insufficient role\n",
+            "backup token must not execute QUIC GET"
+        );
     }
 }
 

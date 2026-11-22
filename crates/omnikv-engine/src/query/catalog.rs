@@ -226,10 +226,32 @@ impl Catalog {
             .db
             .scan(&prefix, &format!("{}\u{10ffff}", prefix), seq)
             .map_err(|e| format!("{:?}", e))?;
-        let (index_entry_keys, index_meta_keys) = self
+        let (index_entry_keys, mut index_meta_keys) = self
             .index_manager
             .collect_drop_index_keys_for_collection_at(&table.name, seq)
             .map_err(|e| format!("{e:?}"))?;
+        let stage_prefix = crate::schema::SchemaManager::rename_stage_prefix_for_table(&table.name);
+        let stage_entries = self
+            .db
+            .scan(&stage_prefix, &format!("{stage_prefix}\u{10ffff}"), seq)
+            .map_err(|e| format!("{e:?}"))?;
+        let mut rename_row_marker_keys = Vec::new();
+        for (stage_key, _) in stage_entries {
+            let row_marker_prefix =
+                crate::schema::SchemaManager::rename_row_stage_prefix(&stage_key);
+            for (marker_key, _) in self
+                .db
+                .scan(
+                    &row_marker_prefix,
+                    &format!("{row_marker_prefix}\u{10ffff}"),
+                    seq,
+                )
+                .map_err(|e| format!("{e:?}"))?
+            {
+                rename_row_marker_keys.push(marker_key);
+            }
+            index_meta_keys.push(stage_key);
+        }
 
         let chunk_cap = WriteBatch::MAX_OPS.saturating_sub(4);
         let mut batch = WriteBatch::new();
@@ -237,6 +259,7 @@ impl Catalog {
             .iter()
             .map(|(k, _)| k.as_str())
             .chain(index_entry_keys.iter().map(String::as_str))
+            .chain(rename_row_marker_keys.iter().map(String::as_str))
         {
             batch.delete(key).map_err(|e| format!("{:?}", e))?;
             if batch.op_count() >= chunk_cap {

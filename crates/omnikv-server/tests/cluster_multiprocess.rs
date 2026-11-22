@@ -87,7 +87,7 @@ fn tcp_cmd_raw_lines(port: u16, request: &str, expect_lines: usize) -> Result<St
 
     let mut out = Vec::new();
     let mut lines = Vec::new();
-    let mut buf = [0u8; 4096];
+    let mut buf = vec![0u8; 64 * 1024];
     while lines.len() < expect_lines {
         let n = stream.read(&mut buf).map_err(|e| format!("read: {e}"))?;
         if n == 0 {
@@ -167,6 +167,16 @@ fn fresh_node_dir(id: u64) -> std::path::PathBuf {
 }
 
 fn spawn_node(id: u64, ports: &[(u16, u16, u16, u16, u16)], tcp_tls: bool) -> Node {
+    spawn_node_with_timers(id, ports, tcp_tls, (50, 150, 300))
+}
+
+fn spawn_node_with_timers(
+    id: u64,
+    ports: &[(u16, u16, u16, u16, u16)],
+    tcp_tls: bool,
+    timers: (u64, u64, u64),
+) -> Node {
+    let (heartbeat_ms, election_min_ms, election_max_ms) = timers;
     let idx = usize::try_from(id - 1).expect("node id fits usize");
     let (tcp, http, quic, pgwire, raft) = ports[idx];
     let dir = fresh_node_dir(id);
@@ -206,9 +216,9 @@ fn spawn_node(id: u64, ports: &[(u16, u16, u16, u16, u16)], tcp_tls: bool) -> No
             "test-bootstrap-key-0123456789",
         )
         .env("OMNIKV_TLS_INSECURE_SKIP", "true")
-        .env("OMNIKV_RAFT_HEARTBEAT_MS", "50")
-        .env("OMNIKV_RAFT_ELECTION_MIN_MS", "150")
-        .env("OMNIKV_RAFT_ELECTION_MAX_MS", "300")
+        .env("OMNIKV_RAFT_HEARTBEAT_MS", heartbeat_ms.to_string())
+        .env("OMNIKV_RAFT_ELECTION_MIN_MS", election_min_ms.to_string())
+        .env("OMNIKV_RAFT_ELECTION_MAX_MS", election_max_ms.to_string())
         .env("RUST_LOG", "warn")
         .stdout(Stdio::null())
         .stderr(std::process::Stdio::from(
@@ -249,12 +259,16 @@ fn stderr_excerpt(dir: &std::path::Path) -> String {
 }
 
 fn boot_cluster() -> Vec<Node> {
+    boot_cluster_with_timers((50, 150, 300))
+}
+
+fn boot_cluster_with_timers(timers: (u64, u64, u64)) -> Vec<Node> {
     let mut attempt_failures = Vec::new();
     for attempt in 1..=3 {
         let ports = allocate_port_set(3);
-        let n2 = spawn_node(2, &ports, false);
-        let n3 = spawn_node(3, &ports, false);
-        let n1 = spawn_node(1, &ports, false);
+        let n2 = spawn_node_with_timers(2, &ports, false, timers);
+        let n3 = spawn_node_with_timers(3, &ports, false, timers);
+        let n1 = spawn_node_with_timers(1, &ports, false, timers);
         let mut nodes = vec![n1, n2, n3];
 
         let mut failed_reason = None;
@@ -323,7 +337,7 @@ fn find_leader(nodes: &[&Node]) -> Option<usize> {
     None
 }
 
-fn retry_until<T>(deadline: Instant, f: impl Fn() -> Option<T>) -> Option<T> {
+fn retry_until<T>(deadline: Instant, mut f: impl FnMut() -> Option<T>) -> Option<T> {
     while Instant::now() < deadline {
         if let Some(v) = f() {
             return Some(v);
@@ -571,4 +585,93 @@ fn tls_enabled_port_refuses_plaintext_commands() {
             );
         }
     }
+}
+
+#[test]
+fn large_value_replicates_over_raft_peer_http_and_survives_leader_failover() {
+    // Use production-default Raft timers (500/1500/3000 ms) so unoptimized debug
+    // builds have headroom to serialize, transmit, and fsync a 3 MiB entry
+    // without tripping an artificial 150 ms election timeout mid-RPC.
+    let nodes = boot_cluster_with_timers((500, 1500, 3000));
+    let refs: Vec<&Node> = nodes.iter().collect();
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let leader_idx =
+        retry_until(deadline, || find_leader(&refs)).expect("no leader elected within 30s");
+    // 3 MiB exceeds Axum's 2 MiB DefaultBodyLimit and exercises the full
+    // multi-process Raft peer HTTP replication path end-to-end.
+    let payload_len = 3 * 1024 * 1024;
+    let payload = "L".repeat(payload_len);
+    let expected = format!("OK: {payload}");
+    let write_cmd = format!("SET large:payload {payload}");
+    let mut leader_id = refs[leader_idx].id;
+    let mut last_resp = String::new();
+    let write_ok = retry_until(Instant::now() + Duration::from_secs(30), || {
+        let cur_idx = find_leader(&refs)?;
+        leader_id = refs[cur_idx].id;
+        match tcp_cmd(refs[cur_idx].tcp_port(), &write_cmd) {
+            Ok(resp) if resp.starts_with("OK") => Some(()),
+            Ok(resp) => {
+                last_resp = resp;
+                None
+            }
+            Err(err) => {
+                last_resp = err;
+                None
+            }
+        }
+    });
+    assert!(
+        write_ok.is_some(),
+        "3 MiB write failed across retries (last_resp={last_resp}, stderrs={:?})",
+        nodes
+            .iter()
+            .map(|n| (n.id, stderr_excerpt(&n.dir)))
+            .collect::<Vec<_>>()
+    );
+
+    for node in &nodes {
+        let seen = retry_until(Instant::now() + Duration::from_secs(15), || {
+            matches!(tcp_cmd(node.tcp_port(), "GET large:payload"), Ok(r) if r == expected)
+                .then_some(())
+        });
+        assert!(
+            seen.is_some(),
+            "node {} failed to replicate 3 MiB payload over Raft HTTP peer RPC",
+            node.id
+        );
+    }
+
+    let survivors: Vec<(u16, u64)> = nodes
+        .iter()
+        .filter(|n| n.id != leader_id)
+        .map(|n| (n.tcp_port(), n.id))
+        .collect();
+    drop(refs);
+
+    let mut nodes = nodes;
+    let leader_pos = nodes
+        .iter()
+        .position(|n| n.id == leader_id)
+        .expect("leader in nodes");
+    let mut killed = nodes.swap_remove(leader_pos);
+    killed.child.kill().expect("kill leader");
+    killed.child.wait().expect("reap leader");
+    drop(killed);
+
+    let new_leader = retry_until(Instant::now() + Duration::from_secs(30), || {
+        find_leader_among(&survivors)
+    })
+    .expect("no new leader elected after killing leader");
+
+    let got = tcp_cmd(new_leader.0, "GET large:payload").expect("GET on new leader");
+    assert_eq!(
+        got.len(),
+        expected.len(),
+        "3 MiB payload length mismatch after leader failover"
+    );
+    assert_eq!(
+        got, expected,
+        "3 MiB payload corrupted or lost after leader failover"
+    );
 }

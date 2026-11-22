@@ -449,7 +449,11 @@ impl SchemaManager {
                         col_type,
                         nullable: true,
                         primary_key: false,
-                        default: Some(default_value.to_string()),
+                        default: match default_value {
+                            serde_json::Value::Null => None,
+                            serde_json::Value::String(s) => Some(s.clone()),
+                            other => Some(other.to_string()),
+                        },
                     });
                     let cat_value = serde_json::to_string(&table)
                         .map_err(|e| crate::OmniError::IoError(e.to_string()))?;

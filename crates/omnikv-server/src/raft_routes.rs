@@ -26,11 +26,16 @@ pub struct RaftState {
     pub auth_token: String,
 }
 
+pub const MAX_RAFT_RPC_BODY_BYTES: usize = 64 * 1024 * 1024;
+
 pub fn build_raft_router(state: RaftState) -> axum::Router {
     axum::Router::new()
         .route("/raft/append", axum::routing::post(raft_append_handler))
         .route("/raft/vote", axum::routing::post(raft_vote_handler))
         .route("/raft/snapshot", axum::routing::post(raft_snapshot_handler))
+        .layer(axum::extract::DefaultBodyLimit::max(
+            MAX_RAFT_RPC_BODY_BYTES,
+        ))
         .route_layer(middleware::from_fn_with_state(
             state.auth_token.clone(),
             authenticate_peer,
@@ -159,5 +164,34 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("x-omnikv-raft-auth", "shared-peer-secret".parse().unwrap());
         assert!(authorize_peer(&headers, "shared-peer-secret").is_ok());
+    }
+
+    #[tokio::test]
+    async fn raft_body_limit_accepts_payloads_above_axum_2mib_default() {
+        let app = axum::Router::new()
+            .route(
+                "/raft/append",
+                axum::routing::post(|Json(val): Json<serde_json::Value>| async move {
+                    let len = val["blob"].as_str().map_or(0, str::len);
+                    (StatusCode::OK, len.to_string())
+                }),
+            )
+            .layer(axum::extract::DefaultBodyLimit::max(
+                MAX_RAFT_RPC_BODY_BYTES,
+            ))
+            .route_layer(middleware::from_fn_with_state(
+                "shared-peer-secret".to_string(),
+                authenticate_peer,
+            ));
+        let large_json = serde_json::json!({ "blob": "A".repeat(3 * 1024 * 1024) }).to_string();
+        let request = axum::http::Request::builder()
+            .uri("/raft/append")
+            .method("POST")
+            .header("content-type", "application/json")
+            .header("x-omnikv-raft-auth", "shared-peer-secret")
+            .body(axum::body::Body::from(large_json))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 }

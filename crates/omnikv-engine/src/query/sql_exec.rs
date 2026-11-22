@@ -568,11 +568,14 @@ impl SqlExecutor {
             }
             SqlStatement::Explain(inner) => {
                 self.refresh_statement_catalog_for(inner, self.statement_read_seq())?;
-                let index_catalog = self
+                let mut index_catalog = self
                     .catalog
                     .index_manager()
                     .catalog_snapshot_at(self.statement_read_seq())
                     .map_err(|error| format!("index catalog read failed: {error}"))?;
+                if let Some(overlay) = self.pending_overlay() {
+                    index_catalog.apply_overlay(&overlay);
+                }
                 let stats = crate::optimizer::gather_stats_at_checked(
                     &self.catalog,
                     Some(&index_catalog),
@@ -600,11 +603,14 @@ impl SqlExecutor {
             }
             SqlStatement::ExplainAnalyze(inner) => {
                 self.refresh_statement_catalog_for(inner, self.statement_read_seq())?;
-                let index_catalog = self
+                let mut index_catalog = self
                     .catalog
                     .index_manager()
                     .catalog_snapshot_at(self.statement_read_seq())
                     .map_err(|error| format!("index catalog read failed: {error}"))?;
+                if let Some(overlay) = self.pending_overlay() {
+                    index_catalog.apply_overlay(&overlay);
+                }
                 let stats = crate::optimizer::gather_stats_at_checked(
                     &self.catalog,
                     Some(&index_catalog),
@@ -812,16 +818,37 @@ impl SqlExecutor {
             // The table's own rows go through the normal DML staging: the
             // row reads use this statement's snapshot+overlay, so only
             // rows that exist for this transaction are deleted.
-            let rows = self.load_table_rows(&table)?;
+            let rows = self.load_table_rows_with_keys_at(&table, read_seq)?;
             let mut batch = WriteBatch::new();
-            for row in &rows {
-                let pk = row
-                    .get(&table.primary_key)
-                    .cloned()
-                    .flatten()
-                    .unwrap_or_default();
-                let key = format!("{}{}", table.row_prefix(), pk);
+            for (raw_stored_pk, _) in &rows {
+                let key = format!("{}{}", table.row_prefix(), raw_stored_pk);
                 batch.delete(&key).map_err(|e| format!("{:?}", e))?;
+            }
+            let overlay = self.pending_overlay();
+            for stage_key in self.active_rename_stages(&table.name, read_seq)? {
+                let row_marker_prefix =
+                    crate::schema::SchemaManager::rename_row_stage_prefix(&stage_key);
+                for (marker_key, _) in self
+                    .db
+                    .scan(
+                        &row_marker_prefix,
+                        &format!("{row_marker_prefix}\u{10ffff}"),
+                        read_seq,
+                    )
+                    .map_err(|e| format!("{e:?}"))?
+                {
+                    Self::stage_batch_delete(&mut batch, &marker_key)?;
+                }
+                if let Some(ov) = &overlay {
+                    for (staged_key, staged_val) in ov {
+                        if staged_val.is_some()
+                            && staged_key.starts_with(row_marker_prefix.as_str())
+                        {
+                            Self::stage_batch_delete(&mut batch, staged_key)?;
+                        }
+                    }
+                }
+                Self::stage_batch_delete(&mut batch, &stage_key)?;
             }
             self.seed_pending_indexes(&mut batch)?;
             let (idx_start, idx_end) = crate::secondary_index::IndexCatalog::catalog_scan_range();
@@ -920,10 +947,14 @@ impl SqlExecutor {
             }
         }
 
-        // Validate every legacy row and check canonical PK uniqueness before
-        // committing any bounded chunk, so an invalid table is never partially
-        // mutated.
+        // Validate every legacy row, canonical PK uniqueness, and secondary
+        // index value encoding before committing any bounded chunk, so an
+        // invalid table is never partially mutated.
+        let index_manager = self.catalog.index_manager();
+        let index_catalog = self.dml_index_catalog(seq)?;
         let mut canonical_keys: HashMap<String, String> = HashMap::new();
+        let mut unique_index_prefixes: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
         let mut planned_rows = Vec::with_capacity(stored.len());
         for (key, serialized) in &stored {
             let mut row =
@@ -960,6 +991,38 @@ impl SqlExecutor {
             let canonical_key = format!("{prefix}{canonical_suffix}");
             let new_document = serde_json::to_value(&row)
                 .map_err(|e| format!("Serialize new index document: {e}"))?;
+            index_manager
+                .validate_document_indexes_with_catalog(
+                    &index_catalog,
+                    &table.name,
+                    &stored_suffix,
+                    &old_document,
+                )
+                .map_err(|e| format!("Index maintenance failed: {e}"))?;
+            let new_entries = index_manager
+                .validate_document_indexes_with_catalog(
+                    &index_catalog,
+                    &table.name,
+                    &canonical_suffix,
+                    &new_document,
+                )
+                .map_err(|e| format!("Index maintenance failed: {e}"))?;
+            for (idx_def, idx_key) in new_entries {
+                if idx_def.unique {
+                    let prefix_key = &idx_key[..idx_key.len() - canonical_suffix.len()];
+                    if !unique_index_prefixes.insert(prefix_key.to_string()) {
+                        return Err(format!(
+                            "Index maintenance failed: UNIQUE CONSTRAINT VIOLATION: index '{}' on {:?}",
+                            idx_def.name,
+                            idx_def
+                                .fields
+                                .iter()
+                                .map(|(field, _)| field.as_str())
+                                .collect::<Vec<_>>()
+                        ));
+                    }
+                }
+            }
             planned_rows.push((
                 key.clone(),
                 serialized.clone(),
@@ -974,8 +1037,6 @@ impl SqlExecutor {
 
         let mut batch = WriteBatch::new();
         self.seed_pending_indexes(&mut batch)?;
-        let index_manager = self.catalog.index_manager();
-        let index_catalog = self.dml_index_catalog(seq)?;
         let active_stages = self.active_rename_stages(&table.name, seq)?;
         let index_count = index_catalog.indexes_for_collection(&table.name).len();
         let per_row_budget = 2 + 2 * index_count + 2 * active_stages.len();
@@ -2444,6 +2505,11 @@ impl SqlExecutor {
             // A legacy row may be stored under a non-canonical key ("007");
             // the typed path addresses it as "7".
             let canonical_pk = crate::volcano::canonicalize_pk_key(&table, &pk);
+            if table.row_format == crate::catalog::RowFormat::Legacy
+                && let Some(slot) = row.get_mut(&table.primary_key)
+            {
+                *slot = Some(canonical_pk.clone());
+            }
             let key = format!("{}{}", table.row_prefix(), canonical_pk);
             if !available_keys.insert(key.clone()) {
                 return Err(format!(
@@ -2519,7 +2585,16 @@ impl SqlExecutor {
                     dry_batch.delete(stale).map_err(|e| format!("{:?}", e))?;
                 }
             }
-            if dry_batch.op_count().saturating_add(1) > WriteBatch::MAX_OPS {
+            if dry_batch
+                .op_count()
+                .saturating_add(
+                    2usize
+                        .saturating_mul(update_stage_count)
+                        .saturating_mul(moved_keys.len()),
+                )
+                .saturating_add(1)
+                > WriteBatch::MAX_OPS
+            {
                 return Err(format!(
                     "{:?}",
                     crate::OmniError::BatchTooLarge(WriteBatch::MAX_OPS)
@@ -2658,7 +2733,12 @@ impl SqlExecutor {
                     .map_err(|e| format!("Index maintenance failed: {e}"))?;
                 dry_batch.delete(key).map_err(|e| format!("{:?}", e))?;
             }
-            if dry_batch.op_count().saturating_add(1) > WriteBatch::MAX_OPS {
+            if dry_batch
+                .op_count()
+                .saturating_add(active_stages.len().saturating_mul(planned_deletes.len()))
+                .saturating_add(1)
+                > WriteBatch::MAX_OPS
+            {
                 return Err(format!(
                     "{:?}",
                     crate::OmniError::BatchTooLarge(WriteBatch::MAX_OPS)

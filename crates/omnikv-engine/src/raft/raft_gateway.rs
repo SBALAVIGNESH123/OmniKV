@@ -259,6 +259,12 @@ impl ClusterGateway {
         self.block_on_ctx(async { self.probe().await })
     }
 
+    /// Blocking fence that waits for any in-flight consensus proposal to
+    /// complete and apply locally.
+    pub(crate) fn fence_blocking(&self) {
+        let _flight = self.flight_blocking();
+    }
+
     /// The `commit_batch` facade for sync-thread callers when clustered:
     /// serializes the batch into one [`RaftCommand`], proposes, waits for
     /// local apply. Reached through the [`crate::OmniKV::commit_batch`]
@@ -266,6 +272,25 @@ impl ClusterGateway {
     /// code changes of their own.
     pub fn commit_batch(&self, batch: &crate::WriteBatch) -> Result<u64, crate::OmniError> {
         let _flight = self.flight_blocking();
+        let cmd = RaftCommand::from_batch(batch);
+        if cmd.is_empty() {
+            return Ok(0);
+        }
+        let ack = self
+            .block_on_ctx(async { self.propose_locked(cmd).await })
+            .map_err(RaftWriteError::into_omni_error)?;
+        Ok(ack.index)
+    }
+
+    pub(crate) fn commit_batch_checked(
+        &self,
+        batch: &crate::WriteBatch,
+        ssi_history: &crate::transaction::SsiHistory,
+    ) -> Result<u64, crate::OmniError> {
+        let _flight = self.flight_blocking();
+        if let Some(conflict) = ssi_history.check_batch_prepared_conflicts(batch) {
+            return Err(crate::OmniError::IoError(conflict));
+        }
         let cmd = RaftCommand::from_batch(batch);
         if cmd.is_empty() {
             return Ok(0);

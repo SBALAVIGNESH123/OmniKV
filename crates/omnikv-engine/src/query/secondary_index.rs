@@ -113,7 +113,7 @@ impl IndexCatalog {
                 .map_err(|error| OmniError::IoError(format!("invalid index catalog: {error}")))?;
             if def.fields.is_empty()
                 || key != format!("{CATALOG_PREFIX}{}", def.id)
-                || !names.insert(def.name.to_lowercase())
+                || !names.insert(def.name.to_ascii_lowercase())
             {
                 return Err(OmniError::IoError(
                     "invalid or duplicate index definition".into(),
@@ -236,7 +236,7 @@ pub fn encode_index_value(value: &serde_json::Value, field_type: &IndexFieldType
     try_encode_index_value(value, field_type).unwrap_or_default()
 }
 
-fn try_encode_index_value(
+pub(crate) fn try_encode_index_value(
     value: &serde_json::Value,
     field_type: &IndexFieldType,
 ) -> Option<Vec<u8>> {
@@ -879,6 +879,37 @@ impl IndexManager {
                 }
             }
         }
+        for (ret_key, value) in self.db.scan(
+            RETIRED_PREFIX,
+            &format!("{}\u{10ffff}", RETIRED_PREFIX),
+            seq,
+        )? {
+            if let Ok(def) = serde_json::from_str::<IndexDefinition>(&value)
+                && def.collection.eq_ignore_ascii_case(collection)
+            {
+                let prefix = build_index_scan_prefix(def.id);
+                let end = format!("{}\u{10ffff}", prefix);
+                batch.buffered_writes.retain(|(key, _, _)| {
+                    key.as_slice() != ret_key.as_bytes() && !key.starts_with(prefix.as_bytes())
+                });
+                if !batch
+                    .buffered_deletes
+                    .iter()
+                    .any(|deleted| deleted.as_slice() == ret_key.as_bytes())
+                {
+                    batch.delete(&ret_key)?;
+                }
+                for (key, _) in self.db.scan(&prefix, &end, seq)? {
+                    if !batch
+                        .buffered_deletes
+                        .iter()
+                        .any(|deleted| deleted.as_slice() == key.as_bytes())
+                    {
+                        batch.delete(&key)?;
+                    }
+                }
+            }
+        }
         Ok(())
     }
 
@@ -952,6 +983,16 @@ impl IndexManager {
     ) -> Result<(), OmniError> {
         let entries = index_entries(catalog, collection, primary_key, document)?;
         self.write_new_index_entries(&entries, primary_key, batch, read_collector)
+    }
+
+    pub(crate) fn validate_document_indexes_with_catalog(
+        &self,
+        catalog: &IndexCatalog,
+        collection: &str,
+        primary_key: &str,
+        document: &serde_json::Value,
+    ) -> Result<Vec<(IndexDefinition, String)>, OmniError> {
+        index_entries(catalog, collection, primary_key, document)
     }
 
     /// Replaces index entries for one row. Skips unchanged values to avoid delete-after-write.
@@ -1285,8 +1326,31 @@ impl IndexManager {
         invalidate.delete(&format!("{READY_PREFIX}{}", idx_def.id))?;
         self.db.commit_batch(&invalidate)?;
 
+        // Clear any pre-existing or partially built entries for this index ID
+        // before scanning the collection at a fresh snapshot.
+        let index_prefix = build_index_scan_prefix(idx_def.id);
+        let index_end = format!("{}\u{10ffff}", index_prefix);
+        loop {
+            let clear_seq = self.db.get_seq();
+            let stale = self.db.scan_limit(
+                &index_prefix,
+                &index_end,
+                clear_seq,
+                WriteBatch::MAX_OPS / 2,
+            )?;
+            if stale.is_empty() {
+                break;
+            }
+            let mut clear_batch = WriteBatch::new();
+            for (stale_key, _) in stale {
+                clear_batch.delete(&stale_key)?;
+            }
+            self.db.commit_batch(&clear_batch)?;
+        }
+
         let seq = self.db.get_seq();
-        let catalog = self.catalog_snapshot_at(seq)?;
+        let mut single_catalog = IndexCatalog::empty();
+        single_catalog.register_in_memory(idx_def.clone());
         let table_row_format = self
             .db
             .find(
@@ -1321,7 +1385,7 @@ impl IndexManager {
                 };
                 let pk = key.strip_prefix(&collection_prefix).unwrap_or(&key);
                 self.index_document_with_catalog(
-                    &catalog,
+                    &single_catalog,
                     &idx_def.collection,
                     pk,
                     &doc,
@@ -1329,7 +1393,7 @@ impl IndexManager {
                 )?;
                 count += 1;
 
-                if count % 1000 == 0 && !batch.is_empty() {
+                if batch.op_count() >= 1000 && !batch.is_empty() {
                     self.db.commit_batch(&batch)?;
                     batch = WriteBatch::new();
                 }

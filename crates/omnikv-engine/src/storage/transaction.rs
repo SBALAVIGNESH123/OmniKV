@@ -423,6 +423,16 @@ impl SsiHistory {
         })
     }
 
+    pub(crate) fn prepared_owner(&self, key: &str) -> Option<PreparedKeyOwner> {
+        let prepared = self.prepared_keys.lock().unwrap_or_else(|e| e.into_inner());
+        prepared.get(key).copied()
+    }
+
+    pub(crate) fn has_prepared_keys(&self) -> bool {
+        let prepared = self.prepared_keys.lock().unwrap_or_else(|e| e.into_inner());
+        !prepared.is_empty()
+    }
+
     pub(crate) fn check_batch_prepared_conflicts(&self, batch: &WriteBatch) -> Option<String> {
         let prepared = self.prepared_keys.lock().unwrap_or_else(|e| e.into_inner());
         if prepared.is_empty() {

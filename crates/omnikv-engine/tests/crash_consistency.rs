@@ -381,3 +381,86 @@ fn test_overwrite_survives_restart() {
         "overwritten value must survive restart"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Test 11 — 2PC PREPARED key reservations survive crash/reopen before
+//           TwoPhaseParticipant::new() is even instantiated
+// ---------------------------------------------------------------------------
+#[test]
+fn test_2pc_prepared_reservations_survive_crash_reopen_before_participant_recovery() {
+    use omni_engine::dist_txn::{DistWrite, TwoPhaseParticipant, Vote};
+    use omni_engine::transaction::TransactionManager;
+
+    let _lock = TEST_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let dir = TempDir::new().unwrap();
+    let (manifest, wal) = fresh_db_paths(&dir);
+
+    {
+        let db = OmniKV::open(&manifest, &wal).expect("open before prepare");
+        let participant = TwoPhaseParticipant::new(2, db.clone());
+        let prep = participant.prepare(
+            (1, 901),
+            &[DistWrite {
+                node_id: 2,
+                key: "acct:escrow".into(),
+                value: Some("1000".into()),
+                ttl: 0,
+            }],
+        );
+        assert_eq!(prep.vote, Vote::Commit);
+        db.sync_all().expect("sync prepared record");
+        // Drop without committing or aborting: simulates crash during 2PC in-doubt window.
+    }
+
+    // Reopen ONLY OmniKV (do NOT instantiate TwoPhaseParticipant yet).
+    {
+        let db = OmniKV::open(&manifest, &wal).expect("reopen after crash");
+
+        let mut rogue = WriteBatch::new();
+        rogue
+            .set("acct:escrow", "clobbered_plain".into())
+            .expect("stage plain write");
+        assert!(
+            db.commit_batch(&rogue).is_err(),
+            "plain write to a durably PREPARED key must be rejected immediately after reopen"
+        );
+
+        let tm = TransactionManager::new(db.clone());
+        let mut ssi = tm.begin();
+        tm.set(&mut ssi, "acct:escrow", "clobbered_ssi".into())
+            .expect("stage ssi write");
+        assert!(
+            tm.commit(&mut ssi).is_err(),
+            "SSI commit on a durably PREPARED key must be rejected immediately after reopen"
+        );
+
+        // Now recover the participant and commit the in-doubt transaction.
+        let participant = TwoPhaseParticipant::new(2, db.clone());
+        participant
+            .commit((1, 901))
+            .expect("recovered participant must commit prepared txn");
+        assert_eq!(
+            db.find_latest_internal("acct:escrow").expect("find"),
+            Some("1000".into())
+        );
+
+        // Once committed, reservations are released and normal writes succeed.
+        let mut after = WriteBatch::new();
+        after
+            .set("acct:escrow", "2000".into())
+            .expect("stage post-commit write");
+        db.commit_batch(&after)
+            .expect("plain write must succeed after 2PC commit releases reservation");
+        db.sync_all().expect("sync post-commit write");
+    }
+
+    let db_final = OmniKV::open(&manifest, &wal).expect("final reopen");
+    assert_eq!(
+        db_final
+            .find_latest_internal("acct:escrow")
+            .expect("find final"),
+        Some("2000".into())
+    );
+}

@@ -341,7 +341,7 @@ impl IndexScanIter {
             }
         };
         let (field, field_type) = &definition.fields[0];
-        let (lower, upper) = index_bounds(predicate, field, field_type);
+        let (lower, upper) = index_bounds(predicate, &table.name, field, field_type);
         let primary_keys = match manager.range_scan_bounds_at(
             index_name,
             lower.as_ref(),
@@ -438,39 +438,76 @@ impl RowIterator for IndexScanIter {
 
 fn index_bounds(
     predicate: Option<&WhereExpr>,
+    table_name: &str,
     field: &str,
     field_type: &crate::secondary_index::IndexFieldType,
 ) -> (Option<serde_json::Value>, Option<serde_json::Value>) {
-    let mut lower = None;
-    let mut upper = None;
+    let mut lower: Option<(Vec<u8>, serde_json::Value)> = None;
+    let mut upper: Option<(Vec<u8>, serde_json::Value)> = None;
+    fn tighten_lower(
+        lower: &mut Option<(Vec<u8>, serde_json::Value)>,
+        encoded: Vec<u8>,
+        value: serde_json::Value,
+    ) {
+        if lower
+            .as_ref()
+            .is_none_or(|(existing, _)| encoded > *existing)
+        {
+            *lower = Some((encoded, value));
+        }
+    }
+    fn tighten_upper(
+        upper: &mut Option<(Vec<u8>, serde_json::Value)>,
+        encoded: Vec<u8>,
+        value: serde_json::Value,
+    ) {
+        if upper
+            .as_ref()
+            .is_none_or(|(existing, _)| encoded < *existing)
+        {
+            *upper = Some((encoded, value));
+        }
+    }
     fn visit(
         expr: &WhereExpr,
+        table_name: &str,
         field: &str,
         field_type: &crate::secondary_index::IndexFieldType,
-        lower: &mut Option<serde_json::Value>,
-        upper: &mut Option<serde_json::Value>,
+        lower: &mut Option<(Vec<u8>, serde_json::Value)>,
+        upper: &mut Option<(Vec<u8>, serde_json::Value)>,
     ) {
         match expr {
             WhereExpr::And(left, right) => {
-                visit(left, field, field_type, lower, upper);
-                visit(right, field, field_type, lower, upper);
+                visit(left, table_name, field, field_type, lower, upper);
+                visit(right, table_name, field, field_type, lower, upper);
             }
-            WhereExpr::Comparison { column, op, value }
-                if column
-                    .rsplit_once('.')
-                    .map_or(column.as_str(), |(_, name)| name)
-                    .eq_ignore_ascii_case(field) =>
-            {
+            WhereExpr::Comparison { column, op, value } => {
+                let qualifies = column
+                    .split_once('.')
+                    .is_none_or(|(qual, _)| qual.eq_ignore_ascii_case(table_name));
+                if !qualifies
+                    || !column
+                        .rsplit_once('.')
+                        .map_or(column.as_str(), |(_, name)| name)
+                        .eq_ignore_ascii_case(field)
+                {
+                    return;
+                }
                 let Some(value) = crate::secondary_index::sql_index_bound(value, field_type) else {
+                    return;
+                };
+                let Some(encoded) =
+                    crate::secondary_index::try_encode_index_value(&value, field_type)
+                else {
                     return;
                 };
                 match op {
                     CmpOp::Eq => {
-                        *lower = Some(value.clone());
-                        *upper = Some(value);
+                        tighten_lower(lower, encoded.clone(), value.clone());
+                        tighten_upper(upper, encoded, value);
                     }
-                    CmpOp::Gt | CmpOp::Gte => *lower = Some(value),
-                    CmpOp::Lt | CmpOp::Lte => *upper = Some(value),
+                    CmpOp::Gt | CmpOp::Gte => tighten_lower(lower, encoded, value),
+                    CmpOp::Lt | CmpOp::Lte => tighten_upper(upper, encoded, value),
                     _ => {}
                 }
             }
@@ -478,9 +515,11 @@ fn index_bounds(
         }
     }
     if let Some(predicate) = predicate {
-        visit(predicate, field, field_type, &mut lower, &mut upper);
+        visit(
+            predicate, table_name, field, field_type, &mut lower, &mut upper,
+        );
     }
-    (lower, upper)
+    (lower.map(|(_, v)| v), upper.map(|(_, v)| v))
 }
 
 // ─── PK Lookup Iterator ────────────────────────────────────────────────────
@@ -509,7 +548,6 @@ impl PkLookupIter {
         reads: Option<&std::sync::Arc<std::sync::Mutex<ReadCollector>>>,
     ) -> Self {
         let key = format!("{}{}", table.row_prefix(), key_value);
-        let end = format!("{}{}\u{10ffff}", table.row_prefix(), key_value);
         if let Some(ov) = overlay {
             match ov.get(key.as_str()) {
                 // Buffered write: read our own uncommitted row.
@@ -543,20 +581,18 @@ impl PkLookupIter {
         {
             collector.record_point(&key);
         }
-        let (row, error) = match db.scan(&key, &end, scan_seq) {
-            Ok(rows) => match rows.into_iter().next() {
-                Some((_, value)) => match crate::plan_exec::PlanExecutor::deserialize_row_checked(
-                    &value,
-                    table.row_format,
-                ) {
-                    Ok(row) => (Some(row), None),
-                    Err(error) => (
-                        None,
-                        Some(format!("table '{}' row decode failed: {error}", table.name)),
-                    ),
-                },
-                None => (None, None),
+        let (row, error) = match db.find(&key, scan_seq) {
+            Ok(Some(value)) => match crate::plan_exec::PlanExecutor::deserialize_row_checked(
+                &value,
+                table.row_format,
+            ) {
+                Ok(row) => (Some(row), None),
+                Err(error) => (
+                    None,
+                    Some(format!("table '{}' row decode failed: {error}", table.name)),
+                ),
             },
+            Ok(None) => (None, None),
             Err(error) => (
                 None,
                 Some(format!(

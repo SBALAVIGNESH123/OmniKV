@@ -1865,8 +1865,8 @@ impl OmniKV {
         read_seq: u64,
         limit: usize,
     ) -> Result<Vec<(String, String)>, OmniError> {
-        let mut results = Vec::with_capacity(limit);
         let mut iter = self.scan_iter_inner(start_key, end_key, read_seq)?;
+        let mut results = Vec::with_capacity(limit.min(iter.candidates.len()));
         while results.len() < limit {
             let Some(entry) = iter.try_next()? else {
                 break;
@@ -1959,7 +1959,8 @@ impl OmniKV {
     }
 
     pub(crate) fn validate_client_key_bytes(key: &[u8]) -> Result<(), OmniError> {
-        if key.starts_with(b"__sys__/raft/")
+        if key == b"__COMMIT_MARKER__"
+            || key.starts_with(b"__sys__/raft/")
             || key.starts_with(b"__2PC_LOG__/")
             || key.starts_with(b"__2PC_PREPARE__/")
             || key.starts_with(b"__2PC_")
@@ -2001,7 +2002,7 @@ impl OmniKV {
         // is the raft log index the write was applied at — on followers
         // too, since only the leader accepts client writes.
         if let Some(gateway) = self.cluster_gateway.get() {
-            return gateway.commit_batch(tx);
+            return gateway.commit_batch_checked(tx, &self.ssi_history);
         }
         self.commit_batch_local(tx)
     }
@@ -2056,6 +2057,9 @@ impl OmniKV {
     /// itself when it applies entries: raft's own bookkeeping must
     /// never route back through the cluster gateway.
     pub(crate) fn fence_write_reservation(&self) -> Result<(), OmniError> {
+        if let Some(gateway) = self.cluster_gateway.get() {
+            gateway.fence_blocking();
+        }
         let _guard = self
             .write_mutex
             .lock()
@@ -2127,10 +2131,14 @@ impl OmniKV {
                     stalled = false;
                     break;
                 }
-                let remaining = match deadline {
-                    Some(limit) => limit.saturating_duration_since(std::time::Instant::now()),
-                    None => total_wait,
+                let Some(limit) = deadline else {
+                    if total_wait.is_zero() {
+                        break;
+                    }
+                    guard = cv.wait(guard).unwrap_or_else(|e| e.into_inner());
+                    continue;
                 };
+                let remaining = limit.saturating_duration_since(std::time::Instant::now());
                 if remaining.is_zero() {
                     break;
                 }

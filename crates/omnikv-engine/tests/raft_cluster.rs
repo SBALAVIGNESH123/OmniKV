@@ -5000,3 +5000,256 @@ async fn test_grouped_raft_apply_preserves_delete_before_2pc_commit_order() {
         "grouped and separate Raft applies must converge to identical state"
     );
 }
+
+fn build_2pc_isolation_raft_entries() -> Vec<openraft::Entry<omni_engine::raft_impl::TypeConfig>> {
+    use omni_engine::WriteBatch;
+    use omni_engine::raft_command::RaftCommand;
+    use openraft::{CommittedLeaderId, Entry, EntryPayload, LogId};
+
+    let prepare_key = "__2PC_PREPARE__/2/1_77";
+    let make_record = |state: &str| {
+        serde_json::json!({
+            "txn_id": [1, 77],
+            "node_id": 2,
+            "state": state,
+            "writes": [{"node_id": 2, "key": "k_iso", "value": "v_2pc", "ttl": 0}],
+            "prepare_seq": 1,
+            "commit_seq": null
+        })
+        .to_string()
+    };
+
+    let mut prep = WriteBatch::new();
+    prep.set(prepare_key, make_record("PREPARED")).unwrap();
+
+    let mut smuggle_abort = WriteBatch::new();
+    smuggle_abort
+        .set("k_iso", "smuggled_on_abort".into())
+        .unwrap();
+    smuggle_abort
+        .set(prepare_key, make_record("ABORTED"))
+        .unwrap();
+
+    let mut rogue = WriteBatch::new();
+    rogue.set("k_iso", "rogue_overwrite".into()).unwrap();
+
+    let mut commit = WriteBatch::new();
+    commit.set("k_iso", "v_2pc".into()).unwrap();
+    commit.set(prepare_key, make_record("COMMITTED")).unwrap();
+
+    let mut del = WriteBatch::new();
+    del.delete("k_iso").unwrap();
+
+    let mut after = WriteBatch::new();
+    after.set("k_iso", "after_del".into()).unwrap();
+
+    let leader = CommittedLeaderId::new(1, 1);
+    [prep, smuggle_abort, rogue, commit, del, after]
+        .into_iter()
+        .enumerate()
+        .map(|(i, b)| Entry {
+            log_id: LogId::new(leader, (i + 1) as u64),
+            payload: EntryPayload::Normal(RaftCommand::from_batch(&b).encode()),
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn test_grouped_raft_apply_2pc_commit_seq_isolation_and_abort_smuggle_rejection() {
+    let (grouped_db, mut grouped_storage, _g_dir) = create_node("grouped_2pc_isolation");
+    let (separate_db, mut separate_storage, _s_dir) = create_node("separate_2pc_isolation");
+    let entries = build_2pc_isolation_raft_entries();
+
+    let grouped_res = grouped_storage
+        .apply_to_state_machine(&entries)
+        .await
+        .unwrap();
+    let mut separate_res = Vec::new();
+    for entry in &entries {
+        separate_res.extend(
+            separate_storage
+                .apply_to_state_machine(std::slice::from_ref(entry))
+                .await
+                .unwrap(),
+        );
+    }
+
+    for (label, res, db) in [
+        ("grouped", &grouped_res, &grouped_db),
+        ("separate", &separate_res, &separate_db),
+    ] {
+        assert_eq!(
+            res[1], "ERR",
+            "{label}: ABORT entry smuggling user write must be rejected"
+        );
+        assert_eq!(
+            res[2], "ERR",
+            "{label}: non-owner write to PREPARED key must be rejected"
+        );
+        let commit_seq: u64 = res[3].parse().expect("2PC COMMIT must return commit_seq");
+        let del_seq: u64 = res[4].parse().expect("DELETE must return seq");
+        let after_seq: u64 = res[5].parse().expect("final SET must return seq");
+        assert!(
+            commit_seq < del_seq && del_seq < after_seq,
+            "{label}: 2PC COMMIT, DELETE, and final SET must land at distinct ordered sequences ({commit_seq}, {del_seq}, {after_seq})"
+        );
+        assert_eq!(
+            db.find("k_iso", commit_seq).unwrap(),
+            Some("v_2pc".into()),
+            "{label}: k_iso must equal v_2pc at the 2PC transaction's own commit_seq"
+        );
+        assert_eq!(
+            db.find("k_iso", del_seq).unwrap(),
+            None,
+            "{label}: k_iso must be deleted at del_seq"
+        );
+        assert_eq!(
+            db.find("k_iso", after_seq).unwrap(),
+            Some("after_del".into()),
+            "{label}: k_iso must hold final value after_del"
+        );
+    }
+}
+
+fn boot_single_node_live_raft(name: &str) -> (Arc<OmniKV>, tempfile::TempDir) {
+    use omni_engine::raft_gateway::ClusterGateway;
+    use omni_engine::raft_impl::OmniRaft;
+    use omni_engine::raft_network::OmniNetwork;
+    use std::collections::BTreeMap;
+    use std::time::{Duration, Instant};
+
+    let (db, storage, dir) = create_node(name);
+    let rt = ClusterGateway::consensus_runtime();
+    let config = Arc::new(
+        openraft::Config {
+            heartbeat_interval: 50,
+            election_timeout_min: 150,
+            election_timeout_max: 300,
+            ..Default::default()
+        }
+        .validate()
+        .unwrap(),
+    );
+    let (log_store, state_machine) = openraft::storage::Adaptor::new(storage);
+    let raft = rt
+        .block_on(OmniRaft::new(
+            1,
+            config,
+            OmniNetwork::default(),
+            log_store,
+            state_machine,
+        ))
+        .unwrap();
+    let mut members = BTreeMap::new();
+    members.insert(
+        1u64,
+        openraft::BasicNode {
+            addr: "127.0.0.1:0".into(),
+        },
+    );
+    rt.block_on(raft.initialize(members)).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while rt.block_on(raft.current_leader()) != Some(1) {
+        assert!(
+            Instant::now() < deadline,
+            "single-node Raft failed to elect leader"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    db.set_cluster_gateway(Arc::new(ClusterGateway::with_runtime(rt, raft)));
+    (db, dir)
+}
+
+#[test]
+fn test_clustered_live_raft_concurrent_2pc_vs_plain_and_ssi_isolation() {
+    use omni_engine::WriteBatch;
+    use omni_engine::dist_txn::{DistWrite, TwoPhaseParticipant, Vote};
+    use omni_engine::transaction::TransactionManager;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    let (db, _dir) = boot_single_node_live_raft("live_raft_2pc_isolation");
+    let participant = Arc::new(TwoPhaseParticipant::new(1, db.clone()));
+    let stop = Arc::new(AtomicBool::new(false));
+    let rejected = Arc::new(AtomicUsize::new(0));
+
+    let mut handles = Vec::new();
+    for worker in 0..4usize {
+        let db = db.clone();
+        let stop = stop.clone();
+        let rejected = rejected.clone();
+        handles.push(std::thread::spawn(move || {
+            let tm = TransactionManager::new(db.clone());
+            let mut iter = 0usize;
+            while !stop.load(Ordering::Relaxed) {
+                iter = iter.wrapping_add(1);
+                if (worker + iter).is_multiple_of(2) {
+                    let mut b = WriteBatch::new();
+                    b.set("hot_2pc_key", format!("plain_{worker}_{iter}"))
+                        .unwrap();
+                    if db.commit_batch(&b).is_err() {
+                        rejected.fetch_add(1, Ordering::Relaxed);
+                    }
+                } else {
+                    let mut txn = tm.begin();
+                    let _ = tm.get(&mut txn, "hot_2pc_key");
+                    tm.set(&mut txn, "hot_2pc_key", format!("ssi_{worker}_{iter}"))
+                        .unwrap();
+                    if tm.commit(&mut txn).is_err() {
+                        rejected.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
+        }));
+    }
+
+    let mut committed_rounds = 0u64;
+    for round in 1..=12u64 {
+        let expected_val = format!("2pc_round_{round}");
+        let writes = vec![DistWrite {
+            node_id: 1,
+            key: "hot_2pc_key".into(),
+            value: Some(expected_val.clone()),
+            ttl: 0,
+        }];
+        if participant.prepare((1, round), &writes).vote == Vote::Commit {
+            std::thread::sleep(Duration::from_millis(15));
+            assert_ne!(
+                db.find("hot_2pc_key", db.get_seq()).unwrap().as_deref(),
+                Some(expected_val.as_str()),
+                "uncommitted 2PC value must not become visible before commit"
+            );
+            let commit_seq = participant
+                .commit((1, round))
+                .expect("prepared 2PC txn must commit through live Raft");
+            assert_eq!(
+                db.find("hot_2pc_key", commit_seq).unwrap(),
+                Some(expected_val),
+                "2PC committed value must be intact at its exact commit_seq"
+            );
+            committed_rounds += 1;
+        }
+    }
+
+    stop.store(true, Ordering::Relaxed);
+    for h in handles {
+        h.join().unwrap();
+    }
+
+    assert!(committed_rounds > 0, "expected >= 1 committed 2PC round");
+    assert!(
+        rejected.load(Ordering::Relaxed) > 0,
+        "competing clustered writers must observe prepared-key rejections during 2PC windows"
+    );
+
+    let mut final_batch = WriteBatch::new();
+    final_batch
+        .set("hot_2pc_key", "post_2pc_ok".into())
+        .unwrap();
+    db.commit_batch(&final_batch)
+        .expect("clustered plain write must succeed once 2PC commits");
+    assert_eq!(
+        db.find("hot_2pc_key", db.get_seq()).unwrap(),
+        Some("post_2pc_ok".into())
+    );
+}
