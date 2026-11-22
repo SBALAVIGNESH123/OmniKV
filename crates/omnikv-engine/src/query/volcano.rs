@@ -1436,15 +1436,33 @@ pub fn compile_plan_with_scan(
                         Some(&ctx.overlay),
                         ctx.reads.as_ref(),
                     )),
-                    Some(ctx) => Box::new(IndexScanIter::with_scan(
-                        db,
-                        catalog,
-                        &table_def,
-                        index_name,
-                        filter.as_ref(),
-                        ctx.scan_seq,
-                        ctx.reads.as_ref(),
-                    )),
+                    Some(ctx) => match catalog.index_manager().catalog_snapshot_at(ctx.scan_seq) {
+                        Ok(idx_catalog)
+                            if idx_catalog
+                                .get_by_name(index_name)
+                                .is_some_and(|def| idx_catalog.is_ready(def.id)) =>
+                        {
+                            Box::new(IndexScanIter::with_scan(
+                                db,
+                                catalog,
+                                &table_def,
+                                index_name,
+                                filter.as_ref(),
+                                ctx.scan_seq,
+                                ctx.reads.as_ref(),
+                            ))
+                        }
+                        Ok(_) => Box::new(SeqScanIter::with_scan(
+                            db,
+                            &table_def,
+                            ctx.scan_seq,
+                            Some(&ctx.overlay),
+                            ctx.reads.as_ref(),
+                        )),
+                        Err(error) => Box::new(IndexScanIter::from_error(format!(
+                            "index catalog read failed: {error}"
+                        ))),
+                    },
                     None => {
                         let seq = db.get_seq();
                         match catalog.index_manager().catalog_snapshot_at(seq) {

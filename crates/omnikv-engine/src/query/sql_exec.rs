@@ -2858,25 +2858,27 @@ impl SqlExecutor {
         if table.row_format == crate::catalog::RowFormat::Legacy
             && self.pending_batch.borrow().is_none()
         {
-            let mut dry_batch = WriteBatch::new();
-            for (raw_stored_pk, _, key, old_raw_document, _) in &planned_deletes {
-                index_manager
-                    .remove_document_indexes_with_catalog(
+            let mut dry_ops: usize = 1; // catalog format flip
+            for (_, canonical_pk, key, _, document) in &planned_deletes {
+                let mut probe = WriteBatch::new();
+                probe.delete(key).map_err(|e| format!("{:?}", e))?;
+                let entries = index_manager
+                    .validate_document_indexes_with_catalog(
                         &index_catalog,
                         &table.name,
-                        raw_stored_pk,
-                        old_raw_document,
-                        &mut dry_batch,
+                        canonical_pk,
+                        document,
                     )
                     .map_err(|e| format!("Index maintenance failed: {e}"))?;
-                dry_batch.delete(key).map_err(|e| format!("{:?}", e))?;
+                for (_, idx_key) in &entries {
+                    probe.delete(idx_key).map_err(|e| format!("{:?}", e))?;
+                }
+                dry_ops = dry_ops
+                    .saturating_add(1)
+                    .saturating_add(entries.len())
+                    .saturating_add(active_stages.len());
             }
-            if dry_batch
-                .op_count()
-                .saturating_add(active_stages.len().saturating_mul(planned_deletes.len()))
-                .saturating_add(1)
-                > WriteBatch::MAX_OPS
-            {
+            if dry_ops > WriteBatch::MAX_OPS {
                 return Err(format!(
                     "{:?}",
                     crate::OmniError::BatchTooLarge(WriteBatch::MAX_OPS)

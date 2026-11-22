@@ -608,7 +608,12 @@ impl SchemaManager {
                             new_name, collection
                         )));
                     }
-                    let canonical_old = canonical_old_opt.unwrap_or_else(|| old_name.clone());
+                    let Some(canonical_old) = canonical_old_opt else {
+                        return Err(crate::OmniError::IoError(format!(
+                            "column '{}' does not exist in SQL table '{}'",
+                            old_name, collection
+                        )));
+                    };
                     self.ensure_no_dependent_indexes(
                         seq,
                         &table.name,
@@ -680,10 +685,16 @@ impl SchemaManager {
         old_name: &str,
         new_name: &str,
     ) -> String {
+        let col = collection.to_lowercase();
         format!(
-            "{}{step_index:06}:{}:{old_name}:{new_name}",
+            "{}{step_index:06}:{}:{}:{}:{}:{}:{}",
             Self::rename_done_prefix(version, direction),
-            collection.to_lowercase(),
+            col.len(),
+            col,
+            old_name.len(),
+            old_name,
+            new_name.len(),
+            new_name
         )
     }
 

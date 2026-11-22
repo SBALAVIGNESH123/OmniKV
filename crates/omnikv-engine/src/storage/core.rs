@@ -2015,8 +2015,12 @@ impl OmniKV {
         let _guard = lock
             .lock()
             .map_err(|_| OmniError::LockPoisoned("2PC local commit".into()))?;
+        let _topology_guard = self
+            .transition_guard
+            .read()
+            .map_err(|_| OmniError::LockPoisoned("transition_guard".into()))?;
         crate::dist_txn::validate_2pc_decision_writes(self, None, tx)?;
-        let seq = self.commit_batch_local(tx)?;
+        let seq = self.commit_batch_local_locked(tx)?;
         self.sync_prepared_2pc_from_batch(tx)?;
         Ok(seq)
     }

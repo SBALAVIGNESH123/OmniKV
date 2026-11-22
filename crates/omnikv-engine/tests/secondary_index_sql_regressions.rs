@@ -2552,11 +2552,182 @@ fn unpinned_compile_plan_and_plan_executor_do_not_omit_rows_when_index_not_ready
         "unpinned compile_plan must not omit matching rows while index is not ready"
     );
 
+    // Pinned compile_plan_with_scan (empty overlay) must also detect an unready index
+    // at ctx.scan_seq and fall back to SeqScan instead of reading empty index entries.
+    let scan_ctx = omni_engine::volcano::ScanContext {
+        scan_seq: db.get_seq(),
+        overlay: omni_engine::volcano::TxnOverlay::new(),
+        reads: None,
+    };
+    let mut pinned_iter =
+        omni_engine::volcano::compile_plan_with_scan(&plan, &db, &catalog, Some(&scan_ctx));
+    let pinned_rows = pinned_iter.try_collect_all().unwrap();
+    assert_eq!(
+        pinned_rows.len(),
+        2,
+        "compile_plan_with_scan must fall back to SeqScan when index is unready at ctx.scan_seq"
+    );
+
     let plan_exec = omni_engine::plan_exec::PlanExecutor::new(db, catalog);
     let exec_rows = plan_exec.execute_plan(&plan).unwrap();
     assert_eq!(
         exec_rows.len(),
         2,
         "PlanExecutor must not omit matching rows while index is not ready"
+    );
+}
+
+#[test]
+fn legacy_v0_integer_index_rebuild_publishes_v1_catalog_before_entries() {
+    let (db, _dir, executor) = setup();
+    let idx_mgr = IndexManager::new(db.clone());
+    execute(
+        &executor,
+        "CREATE TABLE v0_upgrade_tbl (id INTEGER PRIMARY KEY, code INTEGER)",
+    );
+    execute(
+        &executor,
+        "INSERT INTO v0_upgrade_tbl (id, code) VALUES (1, 100), (2, 200), (3, 100)",
+    );
+    let idx_id = idx_mgr
+        .create_index(
+            "v0_upgrade_code_idx",
+            "v0_upgrade_tbl",
+            vec![("code".into(), IndexFieldType::Integer)],
+            true,
+        )
+        .unwrap();
+    // Rewrite catalog entry to legacy v0 (`encoding_version: 0`) and seed a stale v0 key.
+    let mut legacy_def = idx_mgr.definition("v0_upgrade_code_idx").unwrap();
+    legacy_def.encoding_version = 0;
+    let mut seed_v0 = WriteBatch::new();
+    seed_v0
+        .set(
+            &format!("\u{0}IDX_CATALOG\u{0}{idx_id}"),
+            serde_json::to_string(&legacy_def).unwrap(),
+        )
+        .unwrap();
+    seed_v0
+        .set(
+            &format!("\u{0}IDX\u{0}{idx_id:08}\u{0}8000000000000064\u{0}1"),
+            "1".into(),
+        )
+        .unwrap();
+    db.commit_batch(&seed_v0).unwrap();
+
+    // Rebuild clears legacy v0 entries, writes v1 entries for rows 1 & 2, then fails
+    // with UNIQUE CONSTRAINT VIOLATION on duplicate row 3 (code = 100).
+    let err = idx_mgr.rebuild_index("v0_upgrade_code_idx").unwrap_err();
+    assert!(
+        err.to_string().contains("UNIQUE CONSTRAINT VIOLATION"),
+        "expected unique violation mid-rebuild, got: {err}"
+    );
+
+    // Catalog must ALREADY be upgraded to v1 once v0 entries were cleared so
+    // no v0/v1 mixed-format index entries can ever exist.
+    let def_after = idx_mgr.definition("v0_upgrade_code_idx").unwrap();
+    assert_eq!(
+        def_after.encoding_version,
+        omni_engine::secondary_index::CURRENT_INDEX_ENCODING_VERSION
+    );
+    // Resolve duplicate on row 3, verify subsequent DML uses v1 consistently
+    // (including values beyond i64::MAX), and complete rebuild cleanly.
+    execute(
+        &executor,
+        "UPDATE v0_upgrade_tbl SET code = 170141183460469231731687303715884105720 WHERE id = 3",
+    );
+    let dup = executor.execute(
+        &parse_sql(
+            "INSERT INTO v0_upgrade_tbl (id, code) VALUES (4, 170141183460469231731687303715884105720)",
+        )
+        .unwrap(),
+    );
+    assert!(
+        dup.is_err(),
+        "unique index after interrupted v0->v1 rebuild must reject duplicate v1 keys"
+    );
+    idx_mgr.rebuild_index("v0_upgrade_code_idx").unwrap();
+    assert_eq!(
+        rows(
+            &executor,
+            "SELECT id, code FROM v0_upgrade_tbl WHERE code = 170141183460469231731687303715884105720"
+        ),
+        vec![vec![
+            Some("3".into()),
+            Some("170141183460469231731687303715884105720".into()),
+        ]]
+    );
+}
+
+#[test]
+fn sql_rename_missing_column_fails_instead_of_noop() {
+    use omni_engine::schema::{Migration, SchemaManager, SchemaOp};
+
+    let (db, _dir, executor) = setup();
+    let schema = SchemaManager::new(db.clone(), Arc::new(IndexManager::new(db)));
+    execute(
+        &executor,
+        "CREATE TABLE rename_missing_tbl (id INTEGER PRIMARY KEY, name TEXT)",
+    );
+    let err = schema
+        .migrate_up(&Migration {
+            version: 1,
+            description: "rename nonexistent SQL column".into(),
+            up: vec![SchemaOp::RenameField {
+                collection: "rename_missing_tbl".into(),
+                old_name: "no_such_col".into(),
+                new_name: "renamed_col".into(),
+            }],
+            down: vec![],
+        })
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("does not exist"),
+        "renaming a missing SQL column must fail explicitly, got: {err}"
+    );
+}
+
+#[test]
+fn legacy_delete_preflight_validates_canonical_pk_and_batch_cap() {
+    let dir = TempDir::new().unwrap();
+    let db = OmniKV::open(
+        dir.path().join("manifest.json").to_str().unwrap(),
+        dir.path().join("wal.bin").to_str().unwrap(),
+    )
+    .unwrap();
+    let _stage_key = seed_large_legacy_table(&db, "big_legacy_del_cap", WriteBatch::MAX_OPS / 2);
+    let idx_mgr = IndexManager::new(db.clone());
+    idx_mgr
+        .create_index(
+            "big_legacy_del_cap_old_col_idx",
+            "big_legacy_del_cap",
+            vec![("old_col".into(), IndexFieldType::String)],
+            false,
+        )
+        .unwrap();
+    idx_mgr
+        .rebuild_index("big_legacy_del_cap_old_col_idx")
+        .unwrap();
+
+    let executor = SqlExecutor::new(db.clone(), Arc::new(Catalog::new(db.clone())));
+    // 5,000 rows + 5,000 index deletes + 5,000 stage marker checks + 1 catalog flip > MAX_OPS:
+    // must fail cleanly with BatchTooLarge BEFORE migration flips catalog format.
+    let err = executor
+        .execute(&parse_sql("DELETE FROM big_legacy_del_cap").unwrap())
+        .err()
+        .expect("oversized legacy DELETE must fail preflight with BatchTooLarge");
+    assert!(
+        err.contains("BatchTooLarge"),
+        "expected BatchTooLarge from legacy DELETE preflight, got: {err}"
+    );
+    let cat_raw = db
+        .find("\u{0}CATALOG\u{0}big_legacy_del_cap", db.get_seq())
+        .unwrap()
+        .unwrap();
+    let table_def: omni_engine::catalog::TableDef = serde_json::from_str(&cat_raw).unwrap();
+    assert_eq!(
+        table_def.row_format,
+        omni_engine::catalog::RowFormat::Legacy,
+        "failed legacy DELETE preflight must leave table in Legacy format"
     );
 }

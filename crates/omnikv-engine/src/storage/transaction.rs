@@ -680,11 +680,15 @@ impl SsiHistory {
         &self,
         txn: &Transaction,
     ) -> (Option<String>, std::sync::MutexGuard<'_, Vec<CommittedTxn>>) {
-        let prepared_conflict = self.check_prepared_txn_write_conflicts(txn);
+        // Lock committed_txns BEFORE checking prepared_keys (matching the
+        // global lock hierarchy `transition_guard -> committed_txns ->
+        // write_mutex -> prepared_keys`) so no 2PC prepare/commit can slip
+        // between the prepared-key check and the committed-history scan.
         let committed = self
             .committed_txns
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        let prepared_conflict = self.check_prepared_txn_write_conflicts(txn);
         let evicted_max = self.evicted_max_seq.load(Ordering::SeqCst);
 
         let found =
@@ -786,13 +790,13 @@ impl SsiHistory {
     /// stall every concurrent commit on the node for each consensus
     /// round trip.
     fn detect_conflicts(&self, txn: &Transaction) -> Option<String> {
-        if let Some(conflict) = self.check_prepared_txn_write_conflicts(txn) {
-            return Some(conflict);
-        }
         let committed = self
             .committed_txns
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        if let Some(conflict) = self.check_prepared_txn_write_conflicts(txn) {
+            return Some(conflict);
+        }
         let evicted_max = self.evicted_max_seq.load(Ordering::SeqCst);
         Self::scan_conflicts(txn, &committed, evicted_max)
     }

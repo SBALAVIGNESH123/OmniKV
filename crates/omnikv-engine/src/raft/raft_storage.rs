@@ -153,24 +153,30 @@ impl OmniRaftStorage {
     /// Record the given index as the last applied log index.
     pub fn mark_applied(&self, index: u64) -> Result<(), crate::OmniError> {
         let mut batch = WriteBatch::new();
-        {
-            let mut meta = self
+        let next_meta = {
+            let meta = self
                 .meta
                 .lock()
                 .expect("RaftStorage meta lock poisoned: fatal invariant");
+            let mut next = meta.clone();
             // For the test helper, the exact leader_id is not critical — only the index matters.
-            let leader_id = meta
+            let leader_id = next
                 .last_applied
                 .map(|existing| existing.leader_id)
                 .unwrap_or_else(|| openraft::CommittedLeaderId::new(0, 0));
-            meta.last_applied = Some(LogId::new(leader_id, index));
-            self.save_meta(&meta, &mut batch);
-        }
+            next.last_applied = Some(LogId::new(leader_id, index));
+            self.save_meta(&next, &mut batch);
+            next
+        };
         // The meta guard is dropped BEFORE the commit: commit_batch_local
         // takes the transition lock, and holding meta across it would
         // invert the lock order against build_snapshot/install_snapshot
         // (transition -> meta) and deadlock.
         self.db.commit_batch_local(&batch)?;
+        *self
+            .meta
+            .lock()
+            .expect("RaftStorage meta lock poisoned: fatal invariant") = next_meta;
         Ok(())
     }
 
@@ -233,14 +239,19 @@ impl RaftLogReader<TypeConfig> for OmniRaftStorage {
 
         for idx in start..end {
             let key = format!("{}{:020}", RAFT_LOG_PREFIX, idx);
-            if let Ok(Some(val)) = self.db.find_latest_internal(&key) {
-                if let Ok(entry) = serde_json::from_str::<Entry<TypeConfig>>(&val) {
+            match self.db.find_latest_internal(&key) {
+                Ok(Some(val)) => {
+                    let entry = serde_json::from_str::<Entry<TypeConfig>>(&val).map_err(|e| {
+                        storage_read_err(format!("corrupt raft log at index {idx}: {e}"))
+                    })?;
                     entries.push(entry);
-                } else {
-                    break;
                 }
-            } else {
-                break;
+                Ok(None) => break,
+                Err(e) => {
+                    return Err(storage_read_err(format!(
+                        "failed to read raft log at index {idx}: {e}"
+                    )));
+                }
             }
         }
         Ok(entries)
@@ -327,13 +338,15 @@ impl RaftSnapshotBuilder<TypeConfig> for OmniRaftStorage {
             (meta, self.db.get_seq())
         };
 
-        if let Ok(iter) = self.db.scan_all_latest_internal() {
-            for (k, v) in iter {
-                if k.starts_with("__sys__/raft/") {
-                    continue;
-                }
-                entries.push((k, v));
+        let iter = self
+            .db
+            .scan_all_latest_internal()
+            .map_err(|e| storage_read_err(format!("snapshot storage scan failed: {e}")))?;
+        for (k, v) in iter {
+            if k.starts_with("__sys__/raft/") {
+                continue;
             }
+            entries.push((k, v));
         }
 
         let envelope = SnapshotEnvelope {
@@ -426,14 +439,16 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
 
     async fn save_vote(&mut self, vote: &Vote<u64>) -> Result<(), StorageError<u64>> {
         let mut batch = WriteBatch::new();
-        {
-            let mut meta = self
+        let next_meta = {
+            let meta = self
                 .meta
                 .lock()
                 .expect("RaftStorage meta lock poisoned: fatal invariant");
-            meta.vote = Some(*vote);
-            self.save_meta(&meta, &mut batch);
-        }
+            let mut next = meta.clone();
+            next.vote = Some(*vote);
+            self.save_meta(&next, &mut batch);
+            next
+        };
         self.db
             .commit_batch_local(&batch)
             .map_err(|e| StorageError::IO {
@@ -443,6 +458,10 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
                     AnyError::error(e.to_string()),
                 ),
             })?;
+        *self
+            .meta
+            .lock()
+            .expect("RaftStorage meta lock poisoned: fatal invariant") = next_meta;
         Ok(())
     }
 
@@ -496,18 +515,20 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
             last_log_id = Some(entry.log_id);
         }
 
-        if last_log_id.is_some() {
+        let next_meta = if last_log_id.is_some() {
             // Scoped: the guard must be released before commit_chunked
             // takes the transition lock (lock order is transition -> meta).
-            {
-                let mut meta = self
-                    .meta
-                    .lock()
-                    .expect("RaftStorage meta lock poisoned: fatal invariant");
-                meta.last_log_id = last_log_id;
-                self.save_meta(&meta, &mut batch);
-            }
-        }
+            let meta = self
+                .meta
+                .lock()
+                .expect("RaftStorage meta lock poisoned: fatal invariant");
+            let mut next = meta.clone();
+            next.last_log_id = last_log_id;
+            self.save_meta(&next, &mut batch);
+            Some(next)
+        } else {
+            None
+        };
 
         // Tail chunk (never larger than MAX_OPS thanks to the flushes
         // above; commit_chunked is belt-and-braces for the meta op).
@@ -518,6 +539,12 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
                 AnyError::error(e.to_string()),
             ),
         })?;
+        if let Some(next_meta) = next_meta {
+            *self
+                .meta
+                .lock()
+                .expect("RaftStorage meta lock poisoned: fatal invariant") = next_meta;
+        }
         Ok(())
     }
 
@@ -545,69 +572,51 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
         // only fall back to the purge floor when truncation starts immediately
         // after it. If an expected predecessor above the purge floor is
         // missing, unreadable, or invalid, fail closed with a storage error.
+        let last_purged = {
+            let meta = self
+                .meta
+                .lock()
+                .expect("RaftStorage meta lock poisoned: fatal invariant");
+            meta.last_purged_log_id
+        };
+        let resolve_predecessor = |prev_idx: u64| -> Result<Option<LogId<u64>>, String> {
+            if last_purged.is_some_and(|purged| purged.index == prev_idx) {
+                return Ok(last_purged);
+            }
+            let prev_key = format!("{}{:020}", RAFT_LOG_PREFIX, prev_idx);
+            match self.db.find_latest_internal(&prev_key) {
+                Ok(Some(val)) => {
+                    let entry = serde_json::from_str::<Entry<TypeConfig>>(&val).map_err(|e| {
+                        format!("corrupt predecessor raft log at index {prev_idx}: {e}")
+                    })?;
+                    Ok(Some(entry.log_id))
+                }
+                Ok(None) if prev_idx == 0 && last_purged.is_none() => Ok(None),
+                Ok(None) => Err(format!(
+                    "missing predecessor raft log at index {prev_idx} above purge floor {:?}",
+                    last_purged
+                )),
+                Err(e) => Err(format!(
+                    "failed to read predecessor raft log at index {prev_idx}: {e}"
+                )),
+            }
+        };
+        let log_read_err = |msg: String| StorageError::IO {
+            source: StorageIOError::new(
+                openraft::ErrorSubject::Logs,
+                openraft::ErrorVerb::Read,
+                AnyError::error(msg),
+            ),
+        };
         let new_last_log_id = if log_id.index == 0 {
             None
         } else {
-            let prev_idx = log_id.index - 1;
-            let last_purged = {
-                let meta = self
-                    .meta
-                    .lock()
-                    .expect("RaftStorage meta lock poisoned: fatal invariant");
-                meta.last_purged_log_id
-            };
-            if last_purged.is_some_and(|purged| purged.index == prev_idx) {
-                last_purged
-            } else {
-                let prev_key = format!("{}{:020}", RAFT_LOG_PREFIX, prev_idx);
-                match self.db.find_latest_internal(&prev_key) {
-                    Ok(Some(val)) => {
-                        let entry =
-                            serde_json::from_str::<Entry<TypeConfig>>(&val).map_err(|e| {
-                                StorageError::IO {
-                                    source: StorageIOError::new(
-                                        openraft::ErrorSubject::Logs,
-                                        openraft::ErrorVerb::Read,
-                                        AnyError::error(format!(
-                                            "corrupt predecessor raft log at index {prev_idx}: {e}"
-                                        )),
-                                    ),
-                                }
-                            })?;
-                        Some(entry.log_id)
-                    }
-                    Ok(None) if prev_idx == 0 && last_purged.is_none() => None,
-                    Ok(None) => {
-                        return Err(StorageError::IO {
-                            source: StorageIOError::new(
-                                openraft::ErrorSubject::Logs,
-                                openraft::ErrorVerb::Read,
-                                AnyError::error(format!(
-                                    "missing predecessor raft log at index {prev_idx} above purge floor {:?}",
-                                    last_purged
-                                )),
-                            ),
-                        });
-                    }
-                    Err(e) => {
-                        return Err(StorageError::IO {
-                            source: StorageIOError::new(
-                                openraft::ErrorSubject::Logs,
-                                openraft::ErrorVerb::Read,
-                                AnyError::error(format!(
-                                    "failed to read predecessor raft log at index {prev_idx}: {e}"
-                                )),
-                            ),
-                        });
-                    }
-                }
-            }
+            resolve_predecessor(log_id.index - 1).map_err(log_read_err)?
         };
 
-        let mut batch = WriteBatch::new();
-        let mut idx = log_id.index;
+        let mut end_idx = log_id.index;
         loop {
-            let key = format!("{}{:020}", RAFT_LOG_PREFIX, idx);
+            let key = format!("{}{:020}", RAFT_LOG_PREFIX, end_idx);
             let exists = self
                 .db
                 .find_latest_internal(&key)
@@ -620,57 +629,54 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
                 })?
                 .is_some();
             if exists {
-                batch.delete(&key).map_err(|e| storage_write_err(&e))?;
-                // Conflict truncation is normally small, but a long
-                // divergent tail can exceed one batch; flush chunks.
-                if batch.op_count() >= WriteBatch::MAX_OPS {
-                    self.db
-                        .commit_batch_local(&batch)
-                        .map_err(|e| StorageError::IO {
-                            source: StorageIOError::new(
-                                openraft::ErrorSubject::Store,
-                                openraft::ErrorVerb::Write,
-                                AnyError::error(e.to_string()),
-                            ),
-                        })?;
-                    batch.clear();
-                }
-                idx += 1;
+                end_idx += 1;
             } else {
                 break;
             }
         }
 
-        if idx > log_id.index {
-            if batch.op_count() >= WriteBatch::MAX_OPS {
-                self.db
-                    .commit_batch_local(&batch)
-                    .map_err(|e| StorageError::IO {
-                        source: StorageIOError::new(
-                            openraft::ErrorSubject::Store,
-                            openraft::ErrorVerb::Write,
-                            AnyError::error(e.to_string()),
-                        ),
-                    })?;
-                batch.clear();
+        // Delete the conflict tail HIGH-TO-LOW in bounded chunks, updating
+        // `meta.last_log_id` atomically with each chunk so a crash mid-truncate
+        // never leaves a hole at `log_id.index` or orphaned upper entries.
+        let chunk_cap = WriteBatch::MAX_OPS.saturating_sub(1).max(1) as u64;
+        let mut cursor = end_idx;
+        while cursor > log_id.index {
+            let chunk_start = cursor.saturating_sub(chunk_cap).max(log_id.index);
+            let chunk_last_log_id = if chunk_start == log_id.index {
+                new_last_log_id
+            } else {
+                resolve_predecessor(chunk_start - 1).map_err(log_read_err)?
+            };
+            let mut batch = WriteBatch::new();
+            for idx in chunk_start..cursor {
+                let key = format!("{}{:020}", RAFT_LOG_PREFIX, idx);
+                batch.delete(&key).map_err(|e| storage_write_err(&e))?;
             }
-            let mut meta = self
+            let next_meta = {
+                let meta = self
+                    .meta
+                    .lock()
+                    .expect("RaftStorage meta lock poisoned: fatal invariant");
+                let mut next = meta.clone();
+                next.last_log_id = chunk_last_log_id;
+                self.save_meta(&next, &mut batch);
+                next
+            };
+            self.db
+                .commit_batch_local(&batch)
+                .map_err(|e| StorageError::IO {
+                    source: StorageIOError::new(
+                        openraft::ErrorSubject::Store,
+                        openraft::ErrorVerb::Write,
+                        AnyError::error(e.to_string()),
+                    ),
+                })?;
+            *self
                 .meta
                 .lock()
-                .expect("RaftStorage meta lock poisoned: fatal invariant");
-            meta.last_log_id = new_last_log_id;
-            self.save_meta(&meta, &mut batch);
+                .expect("RaftStorage meta lock poisoned: fatal invariant") = next_meta;
+            cursor = chunk_start;
         }
-
-        self.db
-            .commit_batch_local(&batch)
-            .map_err(|e| StorageError::IO {
-                source: StorageIOError::new(
-                    openraft::ErrorSubject::Store,
-                    openraft::ErrorVerb::Write,
-                    AnyError::error(e.to_string()),
-                ),
-            })?;
         Ok(())
     }
 
@@ -692,7 +698,7 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
             // indexes than one batch holds; flush chunks as we go. The
             // meta update (last_purged_log_id) rides the FINAL chunk
             // only — a crash mid-purge just re-purges idempotently.
-            if batch.op_count() >= WriteBatch::MAX_OPS {
+            if batch.op_count() >= WriteBatch::MAX_OPS.saturating_sub(1) {
                 self.db
                     .commit_batch_local(&batch)
                     .map_err(|e| StorageError::IO {
@@ -706,14 +712,16 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
             }
         }
 
-        {
-            let mut meta = self
+        let next_meta = {
+            let meta = self
                 .meta
                 .lock()
                 .expect("RaftStorage meta lock poisoned: fatal invariant");
-            meta.last_purged_log_id = Some(log_id);
-            self.save_meta(&meta, &mut batch);
-        }
+            let mut next = meta.clone();
+            next.last_purged_log_id = Some(log_id);
+            self.save_meta(&next, &mut batch);
+            next
+        };
 
         self.db
             .commit_batch_local(&batch)
@@ -724,6 +732,10 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
                     AnyError::error(e.to_string()),
                 ),
             })?;
+        *self
+            .meta
+            .lock()
+            .expect("RaftStorage meta lock poisoned: fatal invariant") = next_meta;
         Ok(())
     }
 
@@ -822,11 +834,17 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
                     .buffered_deletes
                     .iter()
                     .any(|key| key.starts_with(b"__2PC_PREPARE__/"));
+            let history = self.db.ssi_history();
+            // Hold `committed_txns` across data commit, 2PC reservation sync,
+            // and SSI history insertion (preserving global lock order
+            // `transition_guard -> committed_txns -> write_mutex -> prepared_keys`)
+            // so concurrent validators cannot observe published data or
+            // released 2PC reservations before the SSI commit record is visible.
+            let mut committed_guard = history.lock_committed();
             let marker = self.db.commit_batch_local_locked_skip_prepared(batch)?;
             if touches_2pc {
                 self.db.sync_prepared_2pc_from_batch(batch)?;
             }
-            let history = self.db.ssi_history();
             // Entries sharing a batch committed atomically at one marker —
             // a transaction whose read_seq equals it sees all of them.
             for &(slot, ref ssi) in slots.iter() {
@@ -838,9 +856,15 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
                 // the COMMIT stamps the same value through the same path —
                 // its own apply — so no record is made twice.
                 if let Some(record) = ssi {
-                    history.record_committed(record.txn_id, marker, record);
+                    history.record_committed_locked(
+                        &mut committed_guard,
+                        record.txn_id,
+                        marker,
+                        record,
+                    );
                 }
             }
+            drop(committed_guard);
             // Records below the oldest in-play snapshot can never again
             // be a conflict; drop them so a node that only ever APPLIES
             // (never runs a local COMMIT) does not grow without bound.
@@ -973,27 +997,35 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
         // case: the batch is empty when the single meta op is appended.
         flush_staged(&mut batch, &mut staged_slots, &mut staged_keys, &mut res).map_err(io_err)?;
 
-        if last_applied.is_some() || new_membership.is_some() {
+        let next_meta = if last_applied.is_some() || new_membership.is_some() {
             // Scoped: the guard must be released before the final commit
             // takes the transition lock (lock order is transition -> meta).
-            {
-                let mut meta = self
-                    .meta
-                    .lock()
-                    .expect("RaftStorage meta lock poisoned: fatal invariant");
-                if let Some(la) = last_applied {
-                    meta.last_applied = Some(la);
-                }
-                if let Some(m) = new_membership {
-                    meta.membership = m;
-                }
-                self.save_meta(&meta, &mut batch);
+            let meta = self
+                .meta
+                .lock()
+                .expect("RaftStorage meta lock poisoned: fatal invariant");
+            let mut next = meta.clone();
+            if let Some(la) = last_applied {
+                next.last_applied = Some(la);
             }
-        }
+            if let Some(m) = new_membership {
+                next.membership = m;
+            }
+            self.save_meta(&next, &mut batch);
+            Some(next)
+        } else {
+            None
+        };
 
         // Final chunk: the meta record only (user data flushed above).
         // commit_chunked is belt-and-braces for that single op.
         commit_chunked(&self.db, &mut batch).map_err(io_err)?;
+        if let Some(next_meta) = next_meta {
+            *self
+                .meta
+                .lock()
+                .expect("RaftStorage meta lock poisoned: fatal invariant") = next_meta;
+        }
 
         Ok(res)
     }
@@ -1082,6 +1114,13 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
             fs::remove_dir_all(&tmp_dir).map_err(|e| io_err(&format!("rm tmp dir: {}", e)))?;
         }
         fs::create_dir_all(&tmp_dir).map_err(|e| io_err(&format!("mkdir tmp: {}", e)))?;
+        struct TempDirGuard(std::path::PathBuf);
+        impl Drop for TempDirGuard {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _tmp_cleanup = TempDirGuard(tmp_dir.clone());
 
         // ── Phase C: Write snapshot entries into a fresh WriteBatch in tmp engine ──
         let manifest_file_name = std::path::Path::new(&manifest_path)
@@ -1142,19 +1181,22 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
                 .map_err(|e| io_err(&format!("commit snapshot batch: {}", e)))?;
             batch = crate::WriteBatch::new();
         }
-        let mut meta = self
-            .meta
-            .lock()
-            .expect("RaftStorage meta lock poisoned: fatal invariant");
-        meta.last_applied = snap_meta.last_log_id;
-        meta.last_log_id = snap_meta.last_log_id;
-        meta.membership = snap_meta.last_membership.clone();
-        meta.last_purged_log_id = snap_meta.last_log_id;
-        let json = serde_json::to_string(&*meta).map_err(|e| storage_write_err(&e))?;
-        batch
-            .set(RAFT_META_KEY, json)
-            .map_err(|e| io_err(&format!("meta set: {}", e)))?;
-        drop(meta);
+        let next_meta = {
+            let meta = self
+                .meta
+                .lock()
+                .expect("RaftStorage meta lock poisoned: fatal invariant");
+            let mut next = meta.clone();
+            next.last_applied = snap_meta.last_log_id;
+            next.last_log_id = snap_meta.last_log_id;
+            next.membership = snap_meta.last_membership.clone();
+            next.last_purged_log_id = snap_meta.last_log_id;
+            let json = serde_json::to_string(&next).map_err(|e| storage_write_err(&e))?;
+            batch
+                .set(RAFT_META_KEY, json)
+                .map_err(|e| io_err(&format!("meta set: {}", e)))?;
+            next
+        };
 
         if !batch.is_empty() {
             tmp_db
@@ -1286,11 +1328,14 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
             }
         }
 
-        let _ = fs::remove_dir_all(&tmp_dir);
-
         // ── Phase E: Recover fresh storage from installed snapshot ──
-        let recovered = OmniKV::recover_storage_roots(&manifest_path, &wal_path)
-            .map_err(|e| io_err(&format!("recover snapshot storage: {}", e)))?;
+        let recovered = match OmniKV::recover_storage_roots(&manifest_path, &wal_path) {
+            Ok(recovered) => recovered,
+            Err(e) => {
+                restore_active_files();
+                return Err(io_err(&format!("recover snapshot storage: {}", e)));
+            }
+        };
 
         // ── Phase F: Single atomic StorageRoots publish ──
         let new_roots = crate::StorageRoots {
@@ -1348,6 +1393,14 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
         self.db
             .sync_prepared_2pc_reservations()
             .map_err(|e| io_err(&format!("sync 2PC prepared reservations: {e}")))?;
+
+        // Publish in-memory Raft metadata only after disk promotion and
+        // storage recovery succeeded so a failed install cannot diverge
+        // in-memory metadata from on-disk state.
+        *self
+            .meta
+            .lock()
+            .expect("RaftStorage meta lock poisoned: fatal invariant") = next_meta;
 
         // ── Phase I: Release exclusive lock (writers resume on new topology) ──
         drop(_exclusive);
@@ -1429,6 +1482,105 @@ mod tests {
                 .last_log_id,
             Some(LogId::new(leader1, 4)),
             "failed truncation must not report purge floor as last_log_id"
+        );
+    }
+
+    #[tokio::test]
+    async fn try_get_log_entries_fails_closed_on_corrupt_entry() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let manifest = dir.path().join("manifest.json");
+        let wal = dir.path().join("wal.bin");
+        let db = OmniKV::open(
+            manifest.to_str().expect("manifest path"),
+            wal.to_str().expect("wal path"),
+        )
+        .expect("open db");
+        let mut storage = OmniRaftStorage::new(db.clone());
+        let leader1 = CommittedLeaderId::new(1, 1);
+
+        storage
+            .append_to_log(vec![
+                Entry {
+                    log_id: LogId::new(leader1, 1),
+                    payload: EntryPayload::Normal("SET k1 v1".into()),
+                },
+                Entry {
+                    log_id: LogId::new(leader1, 2),
+                    payload: EntryPayload::Normal("SET k2 v2".into()),
+                },
+            ])
+            .await
+            .expect("append logs");
+
+        let mut corrupt_wb = WriteBatch::new();
+        corrupt_wb
+            .set(
+                &format!("{RAFT_LOG_PREFIX}{:020}", 2u64),
+                "{corrupt_log".into(),
+            )
+            .expect("stage corrupt log");
+        db.commit_batch_local(&corrupt_wb)
+            .expect("commit corrupt log");
+
+        let err = storage
+            .try_get_log_entries(1..=2)
+            .await
+            .expect_err("corrupt raft log entry must fail closed instead of silently truncating");
+        assert!(
+            err.to_string().contains("corrupt raft log at index 2"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_conflict_logs_since_truncates_multi_chunk_tail_cleanly() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let manifest = dir.path().join("manifest.json");
+        let wal = dir.path().join("wal.bin");
+        let db = OmniKV::open(
+            manifest.to_str().expect("manifest path"),
+            wal.to_str().expect("wal path"),
+        )
+        .expect("open db");
+        let mut storage = OmniRaftStorage::new(db.clone());
+        let leader1 = CommittedLeaderId::new(1, 1);
+
+        let total = WriteBatch::MAX_OPS as u64 + 25;
+        let entries: Vec<Entry<TypeConfig>> = (1..=total)
+            .map(|idx| Entry {
+                log_id: LogId::new(leader1, idx),
+                payload: EntryPayload::Blank,
+            })
+            .collect();
+        storage.append_to_log(entries).await.expect("append tail");
+
+        storage
+            .delete_conflict_logs_since(LogId::new(leader1, 3))
+            .await
+            .expect("high-to-low chunked conflict truncation must succeed");
+
+        assert_eq!(
+            storage
+                .get_log_state()
+                .await
+                .expect("log state")
+                .last_log_id,
+            Some(LogId::new(leader1, 2))
+        );
+        let reloaded = OmniRaftStorage::new(db);
+        assert!(
+            reloaded.read_log(2).is_some(),
+            "surviving entry 2 must remain on disk"
+        );
+        assert_eq!(
+            reloaded.read_log(3),
+            None,
+            "conflict start entry 3 must be deleted"
+        );
+        assert_eq!(
+            reloaded.read_log(total),
+            None,
+            "conflict tail end entry must be deleted"
         );
     }
 }

@@ -1405,6 +1405,28 @@ impl IndexManager {
             self.db.commit_batch(&clear_batch)?;
         }
 
+        if upgraded_encoding {
+            // Publish the upgraded encoding version after clearing all legacy
+            // entries and BEFORE writing any v1 entries so a crash mid-rebuild
+            // can never leave v0 catalog metadata pointing at v1 index keys.
+            let catalog_key = format!("{CATALOG_PREFIX}{}", idx_def.id);
+            let catalog_value =
+                serde_json::to_string(&idx_def).map_err(|e| OmniError::IoError(e.to_string()))?;
+            let mut upgrade = WriteBatch::new();
+            upgrade.set(&catalog_key, catalog_value)?;
+            let upgrade_seq = self.db.commit_batch(&upgrade)?;
+            self.db.ssi_history().record_committed(
+                0,
+                upgrade_seq,
+                &crate::transaction::SsiCommitRecord {
+                    txn_id: 0,
+                    write_keys: vec![catalog_key],
+                    read_keys: Vec::new(),
+                    read_ranges: Vec::new(),
+                },
+            );
+        }
+
         let seq = self.db.get_seq();
         let mut single_catalog = IndexCatalog::empty();
         single_catalog.register_in_memory(idx_def.clone());
@@ -1461,29 +1483,8 @@ impl IndexManager {
             self.db.commit_batch(&batch)?;
         }
         let mut ready = WriteBatch::new();
-        let upgraded_catalog_key = if upgraded_encoding {
-            let catalog_key = format!("{CATALOG_PREFIX}{}", idx_def.id);
-            let catalog_value =
-                serde_json::to_string(&idx_def).map_err(|e| OmniError::IoError(e.to_string()))?;
-            ready.set(&catalog_key, catalog_value)?;
-            Some(catalog_key)
-        } else {
-            None
-        };
         ready.set(&format!("{READY_PREFIX}{}", idx_def.id), "ready".into())?;
-        let commit_seq = self.db.commit_batch(&ready)?;
-        if let Some(catalog_key) = upgraded_catalog_key {
-            self.db.ssi_history().record_committed(
-                0,
-                commit_seq,
-                &crate::transaction::SsiCommitRecord {
-                    txn_id: 0,
-                    write_keys: vec![catalog_key],
-                    read_keys: Vec::new(),
-                    read_ranges: Vec::new(),
-                },
-            );
-        }
+        self.db.commit_batch(&ready)?;
 
         Ok(count)
     }

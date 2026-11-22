@@ -669,6 +669,7 @@ impl TwoPhaseCoordinator {
     where
         F: FnMut(u64, GlobalTxnId, &str) -> Result<(), OmniError>,
     {
+        self.db.ensure_cluster_linearizable()?;
         let mut in_doubt = self.recover()?;
         in_doubt.sort_by_key(|(txn_id, _, _)| *txn_id);
 
@@ -682,10 +683,36 @@ impl TwoPhaseCoordinator {
                 "COMMIT" => "COMMIT",
                 "ABORT" => "ABORT",
                 "PREPARE" => {
-                    // Presumed abort: persist ABORT before notifying participants
-                    // so a subsequent crash cannot flip the decision.
-                    self.log_state(txn_id, "ABORT", &participants)?;
-                    "ABORT"
+                    // Never presumed-abort a transaction currently in flight on
+                    // this live coordinator while votes are still being collected.
+                    let in_flight = self
+                        .active_txns
+                        .lock()
+                        .map_err(|_| OmniError::LockPoisoned("coordinator".into()))?
+                        .get(&txn_id)
+                        .is_some_and(|txn| {
+                            matches!(
+                                txn.state,
+                                DistTxnState::Preparing | DistTxnState::WaitingForVotes
+                            )
+                        });
+                    if in_flight {
+                        continue;
+                    }
+                    // Presumed abort: check whether COMMIT landed concurrently
+                    // before persisting ABORT so a durable COMMIT is never lost.
+                    if self.has_durable_state(txn_id, "COMMIT")? {
+                        "COMMIT"
+                    } else if let Err(err) = self.log_state(txn_id, "ABORT", &participants) {
+                        let _ = self.db.ensure_cluster_linearizable();
+                        if self.has_durable_state(txn_id, "COMMIT")? {
+                            "COMMIT"
+                        } else {
+                            return Err(err);
+                        }
+                    } else {
+                        "ABORT"
+                    }
                 }
                 other => {
                     report.pending.push(PendingRecovery {
@@ -714,6 +741,15 @@ impl TwoPhaseCoordinator {
                 }
                 report.completed.push((txn_id, decision.to_string()));
             } else {
+                if let Ok(mut active) = self.active_txns.lock()
+                    && let Some(txn) = active.get_mut(&txn_id)
+                {
+                    txn.state = if decision == "COMMIT" {
+                        DistTxnState::Committing
+                    } else {
+                        DistTxnState::Aborted
+                    };
+                }
                 report.pending.push(PendingRecovery {
                     txn_id,
                     decision: decision.to_string(),
@@ -1526,9 +1562,7 @@ impl TwoPhaseParticipant {
             let _guard = lock
                 .lock()
                 .map_err(|_| OmniError::LockPoisoned("2PC participant".into()))?;
-            if self.needs_recovery.load(Ordering::SeqCst) {
-                self.db.ensure_cluster_linearizable()?;
-            }
+            self.db.ensure_cluster_linearizable()?;
             self.recover_locked()?;
             if let Some(existing) = self.load_participant_log(txn_id)? {
                 if existing.writes != writes && existing.state != "ABORTED" {
@@ -2012,8 +2046,8 @@ impl TwoPhaseParticipant {
         let _guard = lock
             .lock()
             .map_err(|_| OmniError::LockPoisoned("2PC participant".into()))?;
+        self.db.ensure_cluster_linearizable()?;
         if self.needs_recovery.load(Ordering::SeqCst) {
-            self.db.ensure_cluster_linearizable()?;
             self.recover_locked()?;
         }
         let state = self
@@ -2109,8 +2143,8 @@ impl TwoPhaseParticipant {
         let _guard = lock
             .lock()
             .map_err(|_| OmniError::LockPoisoned("2PC participant".into()))?;
+        self.db.ensure_cluster_linearizable()?;
         if self.needs_recovery.load(Ordering::SeqCst) {
-            self.db.ensure_cluster_linearizable()?;
             self.recover_locked()?;
         }
         let writes = match self.load_participant_log(txn_id)? {
@@ -3321,6 +3355,47 @@ mod tests {
         assert_eq!(
             p1_db.find("commit_recovery_k", p1_db.get_seq()).unwrap(),
             Some("committed_via_recovery".into())
+        );
+    }
+
+    #[test]
+    fn recover_with_skips_in_flight_prepare_on_live_coordinator() {
+        let (coord_db, _coord_dir) = test_db();
+        let (p1_db, _p1_dir) = test_db();
+        let coord = TwoPhaseCoordinator::new(1, coord_db, 5_000);
+        let p1 = TwoPhaseParticipant::new(10, p1_db.clone());
+
+        // Start a live transaction in WaitingForVotes (logged PREPARE).
+        let live_txn = coord.begin().unwrap();
+        coord
+            .add_write(live_txn, 10, "live_key".into(), Some("live_val".into()), 0)
+            .unwrap();
+        coord.prepare(live_txn).unwrap();
+        let vote = p1.prepare(
+            live_txn,
+            &coord.get_participant_writes(live_txn, 10).unwrap(),
+        );
+        assert_eq!(vote.vote, Vote::Commit);
+
+        // Running recover_with on the live coordinator must NOT abort live_txn.
+        let report = coord.recover_participants(&[&p1]).unwrap();
+        assert_eq!(report.completed.len(), 0);
+        assert_eq!(report.pending.len(), 0);
+        assert_eq!(
+            coord.get_state(live_txn),
+            Some(DistTxnState::WaitingForVotes)
+        );
+
+        // The live transaction can still collect its vote and commit cleanly.
+        assert_eq!(
+            coord.receive_vote(live_txn, vote).unwrap(),
+            DistTxnState::Committing
+        );
+        p1.commit(live_txn).unwrap();
+        coord.finalize_commit(live_txn).unwrap();
+        assert_eq!(
+            p1_db.find("live_key", p1_db.get_seq()).unwrap(),
+            Some("live_val".into())
         );
     }
 }
