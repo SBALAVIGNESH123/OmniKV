@@ -1019,8 +1019,12 @@ impl SqlExecutor {
                 .map_err(|e| format!("Index maintenance failed: {e}"))?;
             for (idx_def, idx_key) in new_entries {
                 if idx_def.unique {
-                    let prefix_key = &idx_key[..idx_key.len() - canonical_suffix.len()];
-                    if !unique_index_prefixes.insert(prefix_key.to_string()) {
+                    let prefix_key = crate::secondary_index::IndexManager::canonical_unique_prefix(
+                        &idx_def,
+                        &idx_key,
+                        &canonical_suffix,
+                    );
+                    if !unique_index_prefixes.insert(prefix_key) {
                         return Err(format!(
                             "Index maintenance failed: UNIQUE CONSTRAINT VIOLATION: index '{}' on {:?}",
                             idx_def.name,
@@ -1166,8 +1170,12 @@ impl SqlExecutor {
                 .map_err(|e| format!("Index maintenance failed: {e}"))?;
             for (idx_def, idx_key) in entries {
                 if idx_def.unique {
-                    let prefix = &idx_key[..idx_key.len() - canonical_pk.len()];
-                    prefixes.insert(prefix.to_string());
+                    let prefix = crate::secondary_index::IndexManager::canonical_unique_prefix(
+                        &idx_def,
+                        &idx_key,
+                        &canonical_pk,
+                    );
+                    prefixes.insert(prefix);
                 }
             }
         }
@@ -1310,8 +1318,12 @@ impl SqlExecutor {
                     .map_err(|e| format!("Index maintenance failed: {e}"))?;
                 for (idx_def, idx_key) in &entries {
                     if idx_def.unique {
-                        let prefix = &idx_key[..idx_key.len() - canonical_pk.len()];
-                        if !unique_prefixes.insert(prefix.to_string()) {
+                        let prefix = crate::secondary_index::IndexManager::canonical_unique_prefix(
+                            idx_def,
+                            idx_key,
+                            canonical_pk,
+                        );
+                        if !unique_prefixes.insert(prefix) {
                             return Err(format!(
                                 "Index maintenance failed: UNIQUE CONSTRAINT VIOLATION: index '{}' on {:?}",
                                 idx_def.name,
@@ -2708,8 +2720,12 @@ impl SqlExecutor {
                     new_entries.iter().map(|(_, k)| k.as_str()).collect();
                 for (idx_def, idx_key) in &new_entries {
                     if idx_def.unique {
-                        let prefix = &idx_key[..idx_key.len() - canonical_pk.len()];
-                        if !unique_prefixes.insert(prefix.to_string()) {
+                        let prefix = crate::secondary_index::IndexManager::canonical_unique_prefix(
+                            idx_def,
+                            idx_key,
+                            canonical_pk,
+                        );
+                        if !unique_prefixes.insert(prefix) {
                             return Err(format!(
                                 "Index maintenance failed: UNIQUE CONSTRAINT VIOLATION: index '{}' on {:?}",
                                 idx_def.name,

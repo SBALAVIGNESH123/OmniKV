@@ -2947,10 +2947,36 @@ fn v0_float_index_preserves_signed_zero_lookup_delete_and_unique_until_rebuild()
     seed.set(&v0_neg_zero_key, "1".into()).unwrap();
     db.commit_batch(&seed).unwrap();
 
-    // Lookup for -0.0 reproduces the v0 key and finds pk "1".
+    // Both -0.0 and +0.0 lookups/range scans on a v0 float index must find pk "1".
     assert_eq!(
         idx_mgr
             .lookup("v0_float_idx", &[serde_json::json!(-0.0)])
+            .unwrap(),
+        vec!["1".to_string()]
+    );
+    assert_eq!(
+        idx_mgr
+            .lookup("v0_float_idx", &[serde_json::json!(0.0)])
+            .unwrap(),
+        vec!["1".to_string()]
+    );
+    assert_eq!(
+        idx_mgr
+            .range_scan(
+                "v0_float_idx",
+                &serde_json::json!(0.0),
+                &serde_json::json!(1.0),
+            )
+            .unwrap(),
+        vec!["1".to_string()]
+    );
+    assert_eq!(
+        idx_mgr
+            .range_scan(
+                "v0_float_idx",
+                &serde_json::json!(-1.0),
+                &serde_json::json!(-0.0),
+            )
             .unwrap(),
         vec!["1".to_string()]
     );
@@ -3310,4 +3336,129 @@ fn schema_drop_and_recreate_ignores_stale_cleanup_receipt() {
     )
     .unwrap();
     assert!(!after_table.columns.iter().any(|c| c.name == "bio"));
+}
+
+#[test]
+fn document_index_stays_rebuildable_and_droppable_when_case_differing_sql_table_exists() {
+    let (db, _dir, executor) = setup();
+    let idx_mgr = IndexManager::new(db.clone());
+    let mut seed = WriteBatch::new();
+    seed.set("DOCS:1", "{\"code\":\"alpha\"}".into()).unwrap();
+    db.commit_batch(&seed).unwrap();
+
+    idx_mgr
+        .create_index(
+            "docs_upper_idx",
+            "DOCS",
+            vec![("code".into(), IndexFieldType::String)],
+            true,
+        )
+        .unwrap();
+    idx_mgr.rebuild_index("docs_upper_idx").unwrap();
+
+    // Creating a SQL table with a different casing (`docs`) must not orphan
+    // the pre-existing `DOCS` document index or break its rebuild/drop lifecycle.
+    execute(
+        &executor,
+        "CREATE TABLE docs (id INTEGER PRIMARY KEY, code TEXT)",
+    );
+    execute(&executor, "INSERT INTO docs VALUES (1, 'sql_only')");
+
+    assert_eq!(idx_mgr.rebuild_index("docs_upper_idx").unwrap(), 1);
+    assert_eq!(
+        idx_mgr
+            .lookup("docs_upper_idx", &[serde_json::json!("alpha")])
+            .unwrap(),
+        vec!["1".to_string()]
+    );
+    idx_mgr
+        .drop_index("docs_upper_idx")
+        .expect("document index on DOCS must remain droppable when SQL table docs exists");
+    assert!(idx_mgr.definition("docs_upper_idx").is_err());
+}
+
+#[test]
+fn legacy_v0_unique_float_preflight_blocks_pos_zero_collision_before_migration_chunks() {
+    let (db, _dir, executor) = setup();
+    let idx_mgr = IndexManager::new(db.clone());
+    execute(
+        &executor,
+        "CREATE TABLE leg_v0f (id INTEGER PRIMARY KEY, score FLOAT)",
+    );
+    let idx_id = idx_mgr
+        .create_index(
+            "leg_v0f_score_u",
+            "leg_v0f",
+            vec![("score".into(), IndexFieldType::Float)],
+            true,
+        )
+        .unwrap();
+    let mut def = idx_mgr.definition("leg_v0f_score_u").unwrap();
+    def.encoding_version = 0;
+
+    let leg_meta = db
+        .find("\u{0}CATALOG\u{0}leg_v0f", db.get_seq())
+        .unwrap()
+        .unwrap()
+        .replace("\"Typed\"", "\"Legacy\"");
+    let mut seed = WriteBatch::new();
+    seed.set("\u{0}CATALOG\u{0}leg_v0f", leg_meta).unwrap();
+    seed.set(
+        &format!("\u{0}IDX_CATALOG\u{0}{idx_id}"),
+        serde_json::to_string(&def).unwrap(),
+    )
+    .unwrap();
+    seed.set(&format!("\u{0}IDX_READY\u{0}{idx_id}"), "ready".into())
+        .unwrap();
+    seed.set(
+        "\u{0}T\u{0}leg_v0f\u{0}01",
+        "{\"id\":\"01\",\"score\":\"-0.0\"}".into(),
+    )
+    .unwrap();
+    seed.set(
+        &format!("\u{0}IDX\u{0}{idx_id:08}\u{0}7fffffffffffffff\u{0}01"),
+        "01".into(),
+    )
+    .unwrap();
+    db.commit_batch(&seed).unwrap();
+
+    let mut extra = WriteBatch::new();
+    for i in 2..=3_501u64 {
+        let raw_pk = format!("{i:05}");
+        extra
+            .set(
+                &format!("\u{0}T\u{0}leg_v0f\u{0}{raw_pk}"),
+                format!("{{\"id\":\"{raw_pk}\",\"score\":\"{i}.5\"}}"),
+            )
+            .unwrap();
+        if extra.op_count() >= 5_000 {
+            db.commit_batch(&extra).unwrap();
+            extra = WriteBatch::new();
+        }
+    }
+    if !extra.is_empty() {
+        db.commit_batch(&extra).unwrap();
+    }
+
+    let exec_leg = SqlExecutor::new(db.clone(), Arc::new(Catalog::new(db.clone())));
+    let err = exec_leg
+        .execute(&parse_sql("INSERT INTO leg_v0f VALUES (99999, 0.0)").unwrap())
+        .err()
+        .expect("inserting 0.0 colliding with legacy v0 -0.0 must fail preflight");
+    assert!(
+        err.contains("UNIQUE CONSTRAINT VIOLATION"),
+        "expected UNIQUE CONSTRAINT VIOLATION, got: {err}"
+    );
+    assert!(
+        db.find("\u{0}T\u{0}leg_v0f\u{0}01", db.get_seq())
+            .unwrap()
+            .is_some(),
+        "failed legacy INSERT must not commit partial migration chunks"
+    );
+    assert!(
+        db.find("\u{0}T\u{0}leg_v0f\u{0}1", db.get_seq())
+            .unwrap()
+            .is_none(),
+        "canonical key 1 must not be written on failed legacy INSERT"
+    );
 }

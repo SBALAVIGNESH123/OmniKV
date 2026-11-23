@@ -686,15 +686,25 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
     async fn purge_logs_upto(&mut self, log_id: LogId<u64>) -> Result<(), StorageError<u64>> {
         let mut batch = WriteBatch::new();
 
-        let start_idx = {
+        let (start_idx, mut last_seen_leader_id) = {
             let meta = self
                 .meta
                 .lock()
                 .expect("RaftStorage meta lock poisoned: fatal invariant");
-            meta.last_purged_log_id.map(|id| id.index + 1).unwrap_or(1)
+            if meta.last_purged_log_id.is_some_and(|cur| log_id <= cur) {
+                return Ok(());
+            }
+            (
+                meta.last_purged_log_id.map(|id| id.index + 1).unwrap_or(1),
+                meta.last_purged_log_id
+                    .map(|id| id.leader_id)
+                    .unwrap_or_default(),
+            )
         };
 
-        let resolve_purge_boundary_id = |idx: u64| -> Result<LogId<u64>, String> {
+        let resolve_purge_boundary_id = |idx: u64,
+                                         fallback_leader_id: openraft::CommittedLeaderId<u64>|
+         -> Result<LogId<u64>, String> {
             let key = format!("{}{:020}", RAFT_LOG_PREFIX, idx);
             match self
                 .db
@@ -703,8 +713,8 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
             {
                 Some(val) => Ok(serde_json::from_str::<Entry<TypeConfig>>(&val)
                     .map(|entry| entry.log_id)
-                    .unwrap_or_else(|_| LogId::new(log_id.leader_id, idx))),
-                None => Ok(LogId::new(log_id.leader_id, idx)),
+                    .unwrap_or_else(|_| LogId::new(fallback_leader_id, idx))),
+                None => Ok(LogId::new(fallback_leader_id, idx)),
             }
         };
 
@@ -717,7 +727,9 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
             // last index that chunk deletes) so a crash or failed commit
             // never leaves deleted entries below a stale purge floor.
             if idx < log_id.index && batch.op_count() >= WriteBatch::MAX_OPS.saturating_sub(1) {
-                let chunk_floor = resolve_purge_boundary_id(idx).map_err(storage_read_err)?;
+                let chunk_floor = resolve_purge_boundary_id(idx, last_seen_leader_id)
+                    .map_err(storage_read_err)?;
+                last_seen_leader_id = chunk_floor.leader_id;
                 let next_meta = {
                     let meta = self
                         .meta
@@ -1715,11 +1727,19 @@ mod tests {
             .await
             .expect("multi-chunk purge must succeed");
 
-        let reloaded = OmniRaftStorage::new(db);
+        let mut reloaded = OmniRaftStorage::new(db);
         let state = reloaded.meta.lock().expect("meta lock").last_purged_log_id;
         assert_eq!(state, Some(LogId::new(leader1, more_end - 2)));
         assert_eq!(reloaded.read_log(more_end - 2), None);
         assert!(reloaded.read_log(more_end - 1).is_some());
+
+        // Purging an older LogId must be a no-op and never regress `last_purged_log_id`.
+        reloaded
+            .purge_logs_upto(LogId::new(leader1, 500))
+            .await
+            .expect("older purge must succeed as no-op");
+        let after_older = reloaded.meta.lock().expect("meta lock").last_purged_log_id;
+        assert_eq!(after_older, Some(LogId::new(leader1, more_end - 2)));
     }
 
     #[tokio::test]

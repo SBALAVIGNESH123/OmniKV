@@ -336,7 +336,6 @@ impl TwoPhaseCoordinator {
         };
 
         active.insert(txn_id, txn);
-        self.mark_live_in_flight(txn_id);
         Ok(txn_id)
     }
 
@@ -471,18 +470,17 @@ impl TwoPhaseCoordinator {
 
             if all_commit {
                 txn.state = DistTxnState::InDoubt;
+                self.unmark_live_in_flight(txn_id);
                 let participants: Vec<u64> = all_participants.into_iter().collect();
                 if let Err(err) = self.log_state(txn_id, "COMMIT", &participants) {
                     let _ = self.db.ensure_cluster_linearizable();
                     if matches!(self.has_durable_state(txn_id, "COMMIT"), Ok(true)) {
                         txn.state = DistTxnState::Committing;
-                        self.unmark_live_in_flight(txn_id);
                         return Ok(DistTxnState::Committing);
                     }
                     return Err(err);
                 }
                 txn.state = DistTxnState::Committing;
-                self.unmark_live_in_flight(txn_id);
                 return Ok(DistTxnState::Committing);
             }
 
@@ -495,9 +493,10 @@ impl TwoPhaseCoordinator {
                 })
                 .collect();
             let participants: Vec<u64> = all_participants.into_iter().collect();
+            txn.state = DistTxnState::InDoubt;
+            self.unmark_live_in_flight(txn_id);
             self.log_state(txn_id, "ABORT", &participants)?;
             txn.state = DistTxnState::Aborted;
-            self.unmark_live_in_flight(txn_id);
             return Err(OmniError::IoError(format!(
                 "Distributed transaction aborted: {}",
                 abort_reasons.join("; ")
@@ -3607,10 +3606,15 @@ mod tests {
         let p1 = TwoPhaseParticipant::new(10, p1_db.clone());
 
         let txn_a = primary_coord.begin().unwrap();
+        assert!(
+            !primary_coord.has_live_in_flight(txn_a),
+            "begin() must not mark live-in-flight before PREPARE is durable"
+        );
         primary_coord
             .add_write(txn_a, 10, "shared_live_k".into(), Some("v1".into()), 0)
             .unwrap();
         primary_coord.prepare(txn_a).unwrap();
+        assert!(primary_coord.has_live_in_flight(txn_a));
         let vote = p1.prepare(
             txn_a,
             &primary_coord.get_participant_writes(txn_a, 10).unwrap(),

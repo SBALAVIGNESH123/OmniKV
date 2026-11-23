@@ -36,6 +36,9 @@ use crate::{OmniError, OmniKV, WriteBatch};
 
 const INDEX_PREFIX: &[u8] = b"\x00IDX\x00";
 const CATALOG_PREFIX: &str = "\x00IDX_CATALOG\x00";
+const V0_NEG_ZERO_HEX: &str = "7fffffffffffffff";
+const V0_POS_ZERO_HEX: &str = "8000000000000000";
+
 const READY_PREFIX: &str = "\x00IDX_READY\x00";
 const RETIRED_PREFIX: &str = "\x00IDX_RETIRED\x00";
 const NEXT_ID_KEY: &str = "\x00IDX_NEXT_ID\x00";
@@ -347,25 +350,6 @@ fn build_index_scan_prefix(index_id: IndexId) -> String {
     format!("\x00IDX\x00{:08}\x00", index_id)
 }
 
-/// Builds a scan range for a specific value prefix on an index.
-fn build_index_value_prefix(index_id: IndexId, encoded_values: &[Vec<u8>]) -> String {
-    let mut key = format!("\x00IDX\x00{:08}\x00", index_id);
-    for (i, val) in encoded_values.iter().enumerate() {
-        let hex = hex_encode(val);
-        key.push_str(&hex);
-        if i < encoded_values.len() - 1 {
-            key.push('\x00');
-        }
-    }
-    key
-}
-
-fn build_exact_index_value_prefix(index_id: IndexId, encoded_values: &[Vec<u8>]) -> String {
-    let mut key = build_index_value_prefix(index_id, encoded_values);
-    key.push('\x00');
-    key
-}
-
 /// Hex encoding for binary index values — preserves lexicographic sort order.
 fn hex_encode(data: &[u8]) -> String {
     data.iter().map(|b| format!("{:02x}", b)).collect()
@@ -670,9 +654,8 @@ impl IndexManager {
         let retired = self.find_retired_indexes_at(name, None, seq)?;
         let mut collections: Vec<String> = Vec::new();
         for def in active.iter().chain(retired.iter()) {
-            let canonical = self.resolve_collection_name_at(&def.collection, seq)?;
-            if !collections.iter().any(|c| c == &canonical) {
-                collections.push(canonical);
+            if !collections.iter().any(|c| c == &def.collection) {
+                collections.push(def.collection.clone());
             }
         }
         match collections.as_slice() {
@@ -724,26 +707,36 @@ impl IndexManager {
             .lock()
             .map_err(|_| OmniError::LockPoisoned("index DDL".into()))?;
         let seq = self.db.get_seq();
-        let canonical_expected = self.resolve_collection_name_at(expected_collection, seq)?;
+        let catalog = IndexCatalog::load_checked_at(&self.db, seq)?;
+        let exact_match = catalog
+            .get_by_name(name)
+            .is_some_and(|d| d.collection == expected_collection)
+            || !self
+                .find_retired_indexes_at(name, Some(expected_collection), seq)?
+                .is_empty();
+        let target_collection = if revalidate_unambiguous || exact_match {
+            expected_collection.to_string()
+        } else {
+            self.resolve_collection_name_at(expected_collection, seq)?
+        };
         if revalidate_unambiguous {
             let current_target = self.resolve_drop_target_at(name, seq)?;
-            if current_target != canonical_expected {
+            if current_target != target_collection {
                 return Err(OmniError::IoError(format!(
                     "Index '{}' target collection changed concurrently; retry drop_index",
                     name
                 )));
             }
         }
-        let catalog = IndexCatalog::load_checked_at(&self.db, seq)?;
         let mut ids_to_purge: Vec<IndexId> = self
-            .find_retired_indexes_at(name, Some(&canonical_expected), seq)?
+            .find_retired_indexes_at(name, Some(&target_collection), seq)?
             .into_iter()
             .map(|d| d.id)
             .collect();
 
         if let Some(def) = catalog
             .get_by_name(name)
-            .filter(|d| d.collection == canonical_expected)
+            .filter(|d| d.collection == target_collection)
         {
             let id = def.id;
             let catalog_key = format!("{CATALOG_PREFIX}{id}");
@@ -1009,6 +1002,18 @@ impl IndexManager {
     /// `primary_key` — the document's primary key
     /// `document` — the JSON document being stored
     /// `batch` — the WriteBatch to append index writes to (atomic with data write)
+    fn resolve_maintenance_collection_at(
+        &self,
+        catalog: &IndexCatalog,
+        collection: &str,
+        seq: u64,
+    ) -> Result<String, OmniError> {
+        if !catalog.indexes_for_collection(collection).is_empty() {
+            return Ok(collection.to_string());
+        }
+        self.resolve_collection_name_at(collection, seq)
+    }
+
     pub fn index_document(
         &self,
         collection: &str,
@@ -1017,8 +1022,8 @@ impl IndexManager {
         batch: &mut WriteBatch,
     ) -> Result<(), OmniError> {
         let seq = self.db.get_seq();
-        let canonical = self.resolve_collection_name_at(collection, seq)?;
         let catalog = self.catalog_snapshot_at(seq)?;
+        let canonical = self.resolve_maintenance_collection_at(&catalog, collection, seq)?;
         self.index_document_with_catalog(&catalog, &canonical, primary_key, document, batch)
     }
 
@@ -1074,8 +1079,8 @@ impl IndexManager {
         batch: &mut WriteBatch,
     ) -> Result<(), OmniError> {
         let seq = self.db.get_seq();
-        let canonical = self.resolve_collection_name_at(collection, seq)?;
         let catalog = self.catalog_snapshot_at(seq)?;
+        let canonical = self.resolve_maintenance_collection_at(&catalog, collection, seq)?;
         self.replace_document_indexes_with_catalog(
             &catalog,
             &canonical,
@@ -1144,8 +1149,8 @@ impl IndexManager {
         batch: &mut WriteBatch,
     ) -> Result<(), OmniError> {
         let seq = self.db.get_seq();
-        let canonical = self.resolve_collection_name_at(collection, seq)?;
         let catalog = self.catalog_snapshot_at(seq)?;
+        let canonical = self.resolve_maintenance_collection_at(&catalog, collection, seq)?;
         self.remove_document_indexes_with_catalog(
             &catalog,
             &canonical,
@@ -1192,14 +1197,76 @@ impl IndexManager {
         Ok(())
     }
 
+    fn v0_equivalent_prefixes_from_parts(idx_def: &IndexDefinition, parts: &[&str]) -> Vec<String> {
+        let scan_prefix = build_index_scan_prefix(idx_def.id);
+        let mut prefixes = vec![scan_prefix];
+        for (segment, (_, field_type)) in parts.iter().zip(idx_def.fields.iter()) {
+            let choices: &[&str] = if idx_def.encoding_version < CURRENT_INDEX_ENCODING_VERSION
+                && *field_type == IndexFieldType::Float
+                && (*segment == V0_NEG_ZERO_HEX || *segment == V0_POS_ZERO_HEX)
+            {
+                &[V0_NEG_ZERO_HEX, V0_POS_ZERO_HEX]
+            } else {
+                std::slice::from_ref(segment)
+            };
+            let mut next = Vec::with_capacity(prefixes.len() * choices.len());
+            for prefix in &prefixes {
+                for choice in choices {
+                    next.push(format!("{prefix}{choice}\x00"));
+                }
+            }
+            prefixes = next;
+        }
+        prefixes
+    }
+
+    /// Canonicalizes a unique-index value prefix for preflight duplicate sets so
+    /// legacy v0 float `-0.0` (`7fffffffffffffff`) and `+0.0` (`8000000000000000`)
+    /// collide identically to `check_unique`.
+    pub(crate) fn canonical_unique_prefix(
+        idx_def: &IndexDefinition,
+        idx_key: &str,
+        primary_key: &str,
+    ) -> String {
+        let base_prefix = &idx_key[..idx_key.len() - primary_key.len()];
+        if idx_def.encoding_version >= CURRENT_INDEX_ENCODING_VERSION
+            || !idx_def
+                .fields
+                .iter()
+                .any(|(_, ft)| *ft == IndexFieldType::Float)
+        {
+            return base_prefix.to_string();
+        }
+        let scan_prefix = build_index_scan_prefix(idx_def.id);
+        let Some(rest) = base_prefix
+            .strip_prefix(&scan_prefix)
+            .and_then(|s| s.strip_suffix('\x00'))
+        else {
+            return base_prefix.to_string();
+        };
+        let parts: Vec<&str> = rest.split('\x00').collect();
+        if parts.len() != idx_def.fields.len() {
+            return base_prefix.to_string();
+        }
+        let mut out = scan_prefix;
+        for (segment, (_, field_type)) in parts.iter().zip(idx_def.fields.iter()) {
+            let canonical_seg =
+                if *field_type == IndexFieldType::Float && *segment == V0_NEG_ZERO_HEX {
+                    V0_POS_ZERO_HEX
+                } else {
+                    *segment
+                };
+            out.push_str(canonical_seg);
+            out.push('\x00');
+        }
+        out
+    }
+
     fn v0_equivalent_unique_prefixes(
         idx_def: &IndexDefinition,
         idx_key: &str,
         primary_key: &str,
     ) -> Vec<String> {
-        const V0_NEG_ZERO_HEX: &str = "7fffffffffffffff";
-        const V0_POS_ZERO_HEX: &str = "8000000000000000";
-
         let base_prefix = &idx_key[..idx_key.len() - primary_key.len()];
         if idx_def.encoding_version >= CURRENT_INDEX_ENCODING_VERSION
             || !idx_def
@@ -1220,24 +1287,7 @@ impl IndexManager {
         if parts.len() != idx_def.fields.len() {
             return vec![base_prefix.to_string()];
         }
-        let mut prefixes = vec![scan_prefix];
-        for (segment, (_, field_type)) in parts.iter().zip(idx_def.fields.iter()) {
-            let choices: &[&str] = if *field_type == IndexFieldType::Float
-                && (*segment == V0_NEG_ZERO_HEX || *segment == V0_POS_ZERO_HEX)
-            {
-                &[V0_NEG_ZERO_HEX, V0_POS_ZERO_HEX]
-            } else {
-                std::slice::from_ref(segment)
-            };
-            let mut next = Vec::with_capacity(prefixes.len() * choices.len());
-            for prefix in &prefixes {
-                for choice in choices {
-                    next.push(format!("{prefix}{choice}\x00"));
-                }
-            }
-            prefixes = next;
-        }
-        prefixes
+        Self::v0_equivalent_prefixes_from_parts(idx_def, &parts)
     }
 
     fn check_unique(
@@ -1328,11 +1378,15 @@ impl IndexManager {
             })
             .collect::<Result<Vec<_>, _>>()?;
 
-        let prefix = build_exact_index_value_prefix(idx_def.id, &encoded);
+        let hex_parts: Vec<String> = encoded.iter().map(|part| hex_encode(part)).collect();
+        let part_refs: Vec<&str> = hex_parts.iter().map(String::as_str).collect();
+        let prefixes = Self::v0_equivalent_prefixes_from_parts(idx_def, &part_refs);
 
         let mut results = Vec::new();
-        for (_, pk) in self.db.scan_prefix(&prefix, seq)? {
-            results.push(pk);
+        for prefix in prefixes {
+            for (_, pk) in self.db.scan_prefix(&prefix, seq)? {
+                results.push(pk);
+            }
         }
 
         Ok(results)
@@ -1381,8 +1435,20 @@ impl IndexManager {
                 .map(|encoded| hex_encode(&encoded))
                 .ok_or_else(|| OmniError::IoError("invalid index range bound".into()))
         };
-        let start_hex = start_value.map(encode_bound).transpose()?;
-        let end_hex = end_value.map(encode_bound).transpose()?;
+        let mut start_hex = start_value.map(encode_bound).transpose()?;
+        let mut end_hex = end_value.map(encode_bound).transpose()?;
+        if idx_def.encoding_version < CURRENT_INDEX_ENCODING_VERSION && *ft == IndexFieldType::Float
+        {
+            // Legacy v0 float indexes stored `-0.0` at `7fffffffffffffff` and
+            // `+0.0` at `8000000000000000`. Widen inclusive zero bounds so
+            // range scans never drop the opposite-signed zero.
+            if start_hex.as_deref() == Some(V0_POS_ZERO_HEX) {
+                start_hex = Some(V0_NEG_ZERO_HEX.to_string());
+            }
+            if end_hex.as_deref() == Some(V0_NEG_ZERO_HEX) {
+                end_hex = Some(V0_POS_ZERO_HEX.to_string());
+            }
+        }
         if start_hex
             .as_ref()
             .zip(end_hex.as_ref())
@@ -1437,9 +1503,10 @@ impl IndexManager {
         expected_collection: &str,
     ) -> Result<usize, OmniError> {
         let mut idx_def = self.definition(index_name)?;
-        let canonical_expected =
-            self.resolve_collection_name_at(expected_collection, self.db.get_seq())?;
-        if idx_def.collection != canonical_expected {
+        let target_matches = idx_def.collection == expected_collection
+            || self.resolve_collection_name_at(expected_collection, self.db.get_seq())?
+                == idx_def.collection;
+        if !target_matches {
             return Err(OmniError::IoError(format!(
                 "Index '{}' not found on collection '{}'",
                 index_name, expected_collection
@@ -1503,6 +1570,7 @@ impl IndexManager {
                 seq,
             )?
             .and_then(|raw| serde_json::from_str::<crate::catalog::TableDef>(&raw).ok())
+            .filter(|table| table.name == idx_def.collection)
             .map(|table| table.row_format)
             .unwrap_or_default();
 

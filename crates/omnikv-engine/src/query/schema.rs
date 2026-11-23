@@ -1053,6 +1053,7 @@ impl SchemaManager {
                 seq,
             )?
             .and_then(|raw| serde_json::from_str::<crate::catalog::TableDef>(&raw).ok())
+            .filter(|table| table.name == collection)
             .map(|table| table.row_format)
             .unwrap_or_default();
 
@@ -1221,6 +1222,7 @@ impl SchemaManager {
                 seq,
             )?
             .and_then(|raw| serde_json::from_str::<crate::catalog::TableDef>(&raw).ok())
+            .filter(|table| table.name == collection)
             .map(|table| table.row_format)
             .unwrap_or_default();
 

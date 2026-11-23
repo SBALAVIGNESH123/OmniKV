@@ -475,3 +475,59 @@ fn test_2pc_prepared_reservations_survive_crash_reopen_before_participant_recove
         Some("2000".into())
     );
 }
+
+#[cfg(feature = "failpoints")]
+#[test]
+fn coordinator_indoubt_txn_unmarks_live_in_flight_for_recovery() {
+    use omni_engine::dist_txn::{TwoPhaseCoordinator, TwoPhaseParticipant, Vote};
+
+    let _lock = TEST_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let registry = FailRegistry::new();
+    registry.reset();
+
+    let coord_dir = TempDir::new().expect("coord tempdir");
+    let (coord_manifest, coord_wal) = fresh_db_paths(&coord_dir);
+    let coord_db = OmniKV::open(&coord_manifest, &coord_wal).expect("open coord db");
+
+    let part_dir = TempDir::new().expect("participant tempdir");
+    let (part_manifest, part_wal) = fresh_db_paths(&part_dir);
+    let part_db = OmniKV::open(&part_manifest, &part_wal).expect("open part db");
+
+    let primary = TwoPhaseCoordinator::new(1, coord_db.clone(), 5_000);
+    let peer = TwoPhaseCoordinator::new(1, coord_db, 5_000);
+    let participant = TwoPhaseParticipant::new(10, part_db);
+
+    let txn = primary.begin().expect("begin");
+    primary
+        .add_write(txn, 10, "indoubt_k".into(), Some("v".into()), 0)
+        .expect("add_write");
+    primary.prepare(txn).expect("prepare");
+    let writes = primary
+        .get_participant_writes(txn, 10)
+        .expect("participant writes");
+    let vote = participant.prepare(txn, &writes);
+    assert_eq!(vote.vote, Vote::Commit);
+
+    // Fail the coordinator's COMMIT log sync so `txn` transitions to InDoubt.
+    registry.arm("wal::sync");
+    let vote_res = primary.receive_vote(txn, vote);
+    registry.reset();
+    assert!(
+        vote_res.is_err(),
+        "receive_vote must return Err when COMMIT WAL sync fails"
+    );
+
+    // Neither handle may skip the InDoubt transaction as still collecting votes:
+    // both must attempt durable ABORT recovery (hitting the poisoned WAL error
+    // instead of returning `Ok(0 completed)`).
+    assert!(
+        primary.recover_participants(&[&participant]).is_err(),
+        "primary coordinator must attempt recovery for InDoubt txn instead of skipping it"
+    );
+    assert!(
+        peer.recover_participants(&[&participant]).is_err(),
+        "peer coordinator must attempt recovery for InDoubt txn instead of skipping it"
+    );
+}
