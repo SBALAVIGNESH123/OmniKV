@@ -9,7 +9,7 @@
 //!
 //! The optimizer produces a `QueryPlan` tree that the executor walks.
 
-use crate::catalog::{Catalog, ColumnType};
+use crate::catalog::{Catalog, ColumnType, RowFormat};
 use crate::secondary_index::{IndexCatalog, IndexDefinition};
 use crate::sql::{
     AggFunc, CmpOp, FromClause, JoinType, OrderByItem, SelectColumn, SqlStatement, SqlValue,
@@ -41,6 +41,10 @@ pub struct TableStats {
     /// Declared primary key; decides whether an equality predicate can be
     /// answered by a single-row key lookup.
     pub primary_key: String,
+    /// Declared primary key column type (when known from catalog).
+    pub pk_type: Option<ColumnType>,
+    /// Table NULL/key row format (when known from catalog).
+    pub row_format: RowFormat,
 }
 
 impl TableStats {
@@ -94,14 +98,12 @@ pub fn gather_stats_at_checked(
     for table_name in catalog.list_tables() {
         if let Some(table) = catalog.get_table(&table_name) {
             let prefix = table.row_prefix();
-            let sample = db
-                .scan(&prefix, &format!("{}\u{10ffff}", prefix), seq)
-                .map_err(|error| {
-                    format!(
-                        "storage statistics scan failed for table '{}': {error}",
-                        table.name
-                    )
-                })?;
+            let sample = db.scan_prefix(&prefix, seq).map_err(|error| {
+                format!(
+                    "storage statistics scan failed for table '{}': {error}",
+                    table.name
+                )
+            })?;
             let row_count = sample.len() as u64;
 
             let avg_row_bytes = if row_count > 0 {
@@ -113,7 +115,7 @@ pub fn gather_stats_at_checked(
             };
 
             let indexes: Vec<IndexDefinition> = if let Some(ic) = index_catalog {
-                ic.indexes_for_collection(&table_name)
+                ic.indexes_for_collection(&table.name)
                     .into_iter()
                     .filter(|definition| {
                         ic.is_ready(definition.id)
@@ -195,6 +197,11 @@ pub fn gather_stats_at_checked(
                 }
             }
 
+            let pk_type = table
+                .columns
+                .iter()
+                .find(|col| col.name.eq_ignore_ascii_case(&table.primary_key))
+                .map(|col| col.col_type.clone());
             stats.insert(
                 table_name.clone(),
                 TableStats {
@@ -204,6 +211,8 @@ pub fn gather_stats_at_checked(
                     indexes,
                     histograms,
                     primary_key: table.primary_key.clone(),
+                    pk_type,
+                    row_format: table.row_format,
                 },
             );
         }
@@ -774,15 +783,28 @@ impl Optimizer {
         // Check for primary key equality lookup
         if let Some(expr) = where_clause {
             if let Some(pk_val) = self.extract_pk_lookup(table_name, expr) {
-                // The fetched row still has to satisfy the rest of the
-                // predicate.
-                return Ok(PlanNode::Scan {
-                    table: table_name.to_string(),
-                    access: AccessMethod::PkLookup { key_value: pk_val },
-                    filter: Some(expr.clone()),
-                    estimated_rows: 1,
-                    estimated_cost: PK_LOOKUP_COST,
+                let canonical_pk = match stats.and_then(|s| s.pk_type.as_ref()) {
+                    Some(pk_type) => pk_type.canonicalize(&pk_val),
+                    None => pk_val.clone(),
+                };
+                let needs_scan = stats.is_some_and(|s| {
+                    crate::volcano::pk_lookup_needs_scan_parts(
+                        s.row_format,
+                        s.pk_type.as_ref(),
+                        &canonical_pk,
+                    )
                 });
+                if !needs_scan {
+                    // The fetched row still has to satisfy the rest of the
+                    // predicate.
+                    return Ok(PlanNode::Scan {
+                        table: table_name.to_string(),
+                        access: AccessMethod::PkLookup { key_value: pk_val },
+                        filter: Some(expr.clone()),
+                        estimated_rows: 1,
+                        estimated_cost: PK_LOOKUP_COST,
+                    });
+                }
             }
 
             // Check for index scan opportunity
@@ -1058,6 +1080,8 @@ mod tests {
                 indexes: vec![],
                 histograms: vec![],
                 primary_key: "id".into(),
+                pk_type: None,
+                row_format: RowFormat::Typed,
             },
         );
         m.insert(
@@ -1069,6 +1093,8 @@ mod tests {
                 indexes: vec![],
                 histograms: vec![],
                 primary_key: "id".into(),
+                pk_type: None,
+                row_format: RowFormat::Typed,
             },
         );
         m
@@ -1121,6 +1147,8 @@ mod tests {
                 indexes: vec![],
                 histograms: vec![],
                 primary_key: "order_no".into(),
+                pk_type: None,
+                row_format: RowFormat::Typed,
             },
         );
         let opt = Optimizer::new(stats);

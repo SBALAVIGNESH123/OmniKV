@@ -115,11 +115,7 @@ impl IndexCatalog {
     pub fn load_checked_at(db: &Arc<OmniKV>, seq: u64) -> Result<Self, OmniError> {
         let mut catalog = Self::empty();
         let mut names = HashSet::new();
-        for (key, value) in db.scan(
-            CATALOG_PREFIX,
-            &format!("{}\u{10ffff}", CATALOG_PREFIX),
-            seq,
-        )? {
+        for (key, value) in db.scan_prefix(CATALOG_PREFIX, seq)? {
             let def: IndexDefinition = serde_json::from_str(&value)
                 .map_err(|error| OmniError::IoError(format!("invalid index catalog: {error}")))?;
             if def.fields.is_empty()
@@ -144,11 +140,7 @@ impl IndexCatalog {
             }
             catalog.register_in_memory(def);
         }
-        for (key, _) in db.scan(
-            RETIRED_PREFIX,
-            &format!("{}\u{10ffff}", RETIRED_PREFIX),
-            seq,
-        )? {
+        for (key, _) in db.scan_prefix(RETIRED_PREFIX, seq)? {
             if let Some(id_str) = key.strip_prefix(RETIRED_PREFIX)
                 && let Ok(id) = id_str.parse::<IndexId>()
             {
@@ -181,10 +173,14 @@ impl IndexCatalog {
     }
 
     /// Returns all indexes that cover the given collection.
+    ///
+    /// Matches collection names exactly so differently-cased document
+    /// collections (e.g., `docs` vs `DOCS`) remain isolated; SQL callers
+    /// resolve the canonical `TableDef.name` first.
     pub fn indexes_for_collection(&self, collection: &str) -> Vec<&IndexDefinition> {
         self.indexes
             .values()
-            .filter(|idx| idx.collection.eq_ignore_ascii_case(collection))
+            .filter(|idx| idx.collection == collection)
             .collect()
     }
 
@@ -204,8 +200,18 @@ impl IndexCatalog {
         self.ready.contains(&id)
     }
 
+    /// Verifies that the planned index ID is still ready at this catalog
+    /// snapshot and still refers to the planned index name and SQL table.
+    pub fn is_ready_for_plan(&self, index_id: IndexId, index_name: &str, table_name: &str) -> bool {
+        self.is_ready(index_id)
+            && self.get(index_id).is_some_and(|def| {
+                def.name.eq_ignore_ascii_case(index_name)
+                    && def.collection.eq_ignore_ascii_case(table_name)
+            })
+    }
+
     pub(crate) fn catalog_scan_range() -> (&'static str, &'static str) {
-        (CATALOG_PREFIX, "\x00IDX_CATALOG\x00\u{10ffff}")
+        (CATALOG_PREFIX, "\x00IDX_CATALOG\x01")
     }
 
     pub(crate) fn apply_overlay(&mut self, overlay: &HashMap<String, Option<String>>) {
@@ -296,13 +302,20 @@ pub(crate) fn try_encode_index_value_for_version(
         }
         IndexFieldType::Float => {
             // IEEE 754 float encoding with sign handling for sort order.
+            // Pre-rebuild v0 indexes preserved IEEE-754 signed zero (-0.0 vs
+            // +0.0); keep v0 encoding until rebuild publishes v1 so lookup,
+            // deletion, and replacement match existing v0 entries cleanly.
             let f = value
                 .as_f64()
                 .or_else(|| value.as_str()?.parse::<f64>().ok())?;
             if !f.is_finite() {
                 return None;
             }
-            let f = if f == 0.0 { 0.0 } else { f };
+            let f = if encoding_version >= CURRENT_INDEX_ENCODING_VERSION && f == 0.0 {
+                0.0
+            } else {
+                f
+            };
             let bits = f.to_bits();
             let sortable = if f.is_sign_negative() {
                 !bits // negative: flip all bits
@@ -455,18 +468,17 @@ fn append_index_delete(batch: &mut WriteBatch, key: &str) -> Result<(), OmniErro
     batch.delete(key)
 }
 
-/// Row ranges for both collection/doc keys and SQL table keys.
+/// Half-open `[prefix, successor)` row ranges for both document collection
+/// keys (`<collection>:`) and SQL table keys (`\x00T\x00<collection>\x00`).
+///
+/// Callers must treat the second element as an EXCLUSIVE upper bound (or scan
+/// with `OmniKV::scan_prefix` / `OmniKV::scan_exclusive`).
 pub(crate) fn collection_row_ranges(collection: &str) -> [(String, String); 2] {
-    [
-        (
-            format!("{}:", collection),
-            format!("{}:\u{10ffff}", collection),
-        ),
-        (
-            format!("\x00T\x00{}\x00", collection),
-            format!("\x00T\x00{}\x00\u{10ffff}", collection),
-        ),
-    ]
+    let doc_prefix = format!("{collection}:");
+    let doc_end = format!("{collection};");
+    let sql_prefix = format!("\x00T\x00{collection}\x00");
+    let sql_end = format!("\x00T\x00{collection}\x01");
+    [(doc_prefix, doc_end), (sql_prefix, sql_end)]
 }
 
 /// The Index Manager — the main public interface for index operations.
@@ -481,6 +493,27 @@ impl IndexManager {
     /// Creates a new IndexManager, loading existing index definitions from OmniKV.
     pub fn new(db: Arc<OmniKV>) -> Self {
         Self { db }
+    }
+
+    /// Resolves `collection` to its canonical SQL `TableDef.name` when a SQL
+    /// table exists for it (preserving case-insensitive SQL semantics), or
+    /// returns `collection` verbatim for document collections so differently
+    /// cased prefixes (e.g., `docs` vs `DOCS`) stay distinct.
+    pub(crate) fn resolve_collection_name_at(
+        &self,
+        collection: &str,
+        seq: u64,
+    ) -> Result<String, OmniError> {
+        let table = self
+            .db
+            .find(&crate::catalog::Catalog::catalog_key(collection), seq)?
+            .map(|value| {
+                serde_json::from_str::<crate::catalog::TableDef>(&value).map_err(|error| {
+                    OmniError::IoError(format!("invalid SQL table definition: {error}"))
+                })
+            })
+            .transpose()?;
+        Ok(table.map_or_else(|| collection.to_string(), |t| t.name))
     }
 
     /// Refreshes definitions from durable storage for the latest sequence.
@@ -637,11 +670,9 @@ impl IndexManager {
         let retired = self.find_retired_indexes_at(name, None, seq)?;
         let mut collections: Vec<String> = Vec::new();
         for def in active.iter().chain(retired.iter()) {
-            if !collections
-                .iter()
-                .any(|c| c.eq_ignore_ascii_case(&def.collection))
-            {
-                collections.push(def.collection.clone());
+            let canonical = self.resolve_collection_name_at(&def.collection, seq)?;
+            if !collections.iter().any(|c| c == &canonical) {
+                collections.push(canonical);
             }
         }
         match collections.as_slice() {
@@ -693,9 +724,10 @@ impl IndexManager {
             .lock()
             .map_err(|_| OmniError::LockPoisoned("index DDL".into()))?;
         let seq = self.db.get_seq();
+        let canonical_expected = self.resolve_collection_name_at(expected_collection, seq)?;
         if revalidate_unambiguous {
             let current_target = self.resolve_drop_target_at(name, seq)?;
-            if !current_target.eq_ignore_ascii_case(expected_collection) {
+            if current_target != canonical_expected {
                 return Err(OmniError::IoError(format!(
                     "Index '{}' target collection changed concurrently; retry drop_index",
                     name
@@ -704,14 +736,14 @@ impl IndexManager {
         }
         let catalog = IndexCatalog::load_checked_at(&self.db, seq)?;
         let mut ids_to_purge: Vec<IndexId> = self
-            .find_retired_indexes_at(name, Some(expected_collection), seq)?
+            .find_retired_indexes_at(name, Some(&canonical_expected), seq)?
             .into_iter()
             .map(|d| d.id)
             .collect();
 
         if let Some(def) = catalog
             .get_by_name(name)
-            .filter(|d| d.collection.eq_ignore_ascii_case(expected_collection))
+            .filter(|d| d.collection == canonical_expected)
         {
             let id = def.id;
             let catalog_key = format!("{CATALOG_PREFIX}{id}");
@@ -754,17 +786,12 @@ impl IndexManager {
         seq: u64,
     ) -> Result<Vec<IndexDefinition>, OmniError> {
         let mut matches = Vec::new();
-        for (_, value) in self.db.scan(
-            RETIRED_PREFIX,
-            &format!("{}\u{10ffff}", RETIRED_PREFIX),
-            seq,
-        )? {
+        for (_, value) in self.db.scan_prefix(RETIRED_PREFIX, seq)? {
             let Ok(def) = serde_json::from_str::<IndexDefinition>(&value) else {
                 continue;
             };
             if def.name.eq_ignore_ascii_case(name)
-                && expected_collection
-                    .is_none_or(|expected| def.collection.eq_ignore_ascii_case(expected))
+                && expected_collection.is_none_or(|expected| def.collection == expected)
             {
                 matches.push(def);
             }
@@ -774,13 +801,10 @@ impl IndexManager {
 
     fn cleanup_retired_indexes_for_collection(&self, collection: &str) -> Result<(), OmniError> {
         let seq = self.db.get_seq();
-        for (_, value) in self.db.scan(
-            RETIRED_PREFIX,
-            &format!("{}\u{10ffff}", RETIRED_PREFIX),
-            seq,
-        )? {
+        let canonical = self.resolve_collection_name_at(collection, seq)?;
+        for (_, value) in self.db.scan_prefix(RETIRED_PREFIX, seq)? {
             if let Ok(def) = serde_json::from_str::<IndexDefinition>(&value)
-                && def.collection.eq_ignore_ascii_case(collection)
+                && def.collection == canonical
             {
                 self.purge_retired_index_entries(def.id)?;
             }
@@ -791,13 +815,12 @@ impl IndexManager {
     fn purge_retired_index_entries(&self, id: IndexId) -> Result<(), OmniError> {
         const DELETE_BATCH_LIMIT: usize = WriteBatch::MAX_OPS / 2;
         let prefix = build_index_scan_prefix(id);
-        let end = format!("{}\u{10ffff}", prefix);
         let retired_key = format!("{RETIRED_PREFIX}{id}");
         loop {
             let seq = self.db.get_seq();
             let entries =
                 self.db
-                    .scan_limit(&prefix, &end, seq, DELETE_BATCH_LIMIT.saturating_add(1))?;
+                    .scan_prefix_limit(&prefix, seq, DELETE_BATCH_LIMIT.saturating_add(1))?;
             if entries.is_empty() {
                 let mut clear_batch = WriteBatch::new();
                 clear_batch.delete(&retired_key)?;
@@ -830,30 +853,25 @@ impl IndexManager {
         collection: &str,
         seq: u64,
     ) -> Result<(Vec<String>, Vec<String>), OmniError> {
+        let canonical = self.resolve_collection_name_at(collection, seq)?;
         let catalog = IndexCatalog::load_checked_at(&self.db, seq)?;
         let mut entry_keys = Vec::new();
         let mut meta_keys = Vec::new();
-        for def in catalog.indexes_for_collection(collection) {
+        for def in catalog.indexes_for_collection(&canonical) {
             meta_keys.push(format!("{}{}", CATALOG_PREFIX, def.id));
             meta_keys.push(format!("{READY_PREFIX}{}", def.id));
             let prefix = build_index_scan_prefix(def.id);
-            let end = format!("{}\u{10ffff}", prefix);
-            for (key, _) in self.db.scan(&prefix, &end, seq)? {
+            for (key, _) in self.db.scan_prefix(&prefix, seq)? {
                 entry_keys.push(key);
             }
         }
-        for (ret_key, value) in self.db.scan(
-            RETIRED_PREFIX,
-            &format!("{}\u{10ffff}", RETIRED_PREFIX),
-            seq,
-        )? {
+        for (ret_key, value) in self.db.scan_prefix(RETIRED_PREFIX, seq)? {
             if let Ok(def) = serde_json::from_str::<IndexDefinition>(&value)
-                && def.collection.eq_ignore_ascii_case(collection)
+                && def.collection == canonical
             {
                 meta_keys.push(ret_key);
                 let prefix = build_index_scan_prefix(def.id);
-                let end = format!("{}\u{10ffff}", prefix);
-                for (key, _) in self.db.scan(&prefix, &end, seq)? {
+                for (key, _) in self.db.scan_prefix(&prefix, seq)? {
                     entry_keys.push(key);
                 }
             }
@@ -875,12 +893,12 @@ impl IndexManager {
         seq: u64,
         batch: &mut WriteBatch,
     ) -> Result<(), OmniError> {
+        let canonical = self.resolve_collection_name_at(collection, seq)?;
         let catalog = IndexCatalog::load_checked_at(&self.db, seq)?;
-        for def in catalog.indexes_for_collection(collection) {
+        for def in catalog.indexes_for_collection(&canonical) {
             let cat_key = format!("{}{}", CATALOG_PREFIX, def.id);
             let ready_key = format!("{READY_PREFIX}{}", def.id);
             let prefix = build_index_scan_prefix(def.id);
-            let end = format!("{}\u{10ffff}", prefix);
             let staged_keys: Vec<String> = batch
                 .buffered_writes
                 .iter()
@@ -902,7 +920,7 @@ impl IndexManager {
             for key in staged_keys {
                 batch.delete(&key)?;
             }
-            for (key, _) in self.db.scan(&prefix, &end, seq)? {
+            for (key, _) in self.db.scan_prefix(&prefix, seq)? {
                 if !batch
                     .buffered_deletes
                     .iter()
@@ -912,16 +930,11 @@ impl IndexManager {
                 }
             }
         }
-        for (ret_key, value) in self.db.scan(
-            RETIRED_PREFIX,
-            &format!("{}\u{10ffff}", RETIRED_PREFIX),
-            seq,
-        )? {
+        for (ret_key, value) in self.db.scan_prefix(RETIRED_PREFIX, seq)? {
             if let Ok(def) = serde_json::from_str::<IndexDefinition>(&value)
-                && def.collection.eq_ignore_ascii_case(collection)
+                && def.collection == canonical
             {
                 let prefix = build_index_scan_prefix(def.id);
-                let end = format!("{}\u{10ffff}", prefix);
                 let staged_keys: Vec<String> = batch
                     .buffered_writes
                     .iter()
@@ -952,7 +965,7 @@ impl IndexManager {
                         batch.delete(&key)?;
                     }
                 }
-                for (key, _) in self.db.scan(&prefix, &end, seq)? {
+                for (key, _) in self.db.scan_prefix(&prefix, seq)? {
                     if !batch
                         .buffered_deletes
                         .iter()
@@ -1003,8 +1016,10 @@ impl IndexManager {
         document: &serde_json::Value,
         batch: &mut WriteBatch,
     ) -> Result<(), OmniError> {
-        let catalog = self.catalog_snapshot()?;
-        self.index_document_with_catalog(&catalog, collection, primary_key, document, batch)
+        let seq = self.db.get_seq();
+        let canonical = self.resolve_collection_name_at(collection, seq)?;
+        let catalog = self.catalog_snapshot_at(seq)?;
+        self.index_document_with_catalog(&catalog, &canonical, primary_key, document, batch)
     }
 
     pub fn index_document_with_catalog(
@@ -1058,10 +1073,12 @@ impl IndexManager {
         new_document: &serde_json::Value,
         batch: &mut WriteBatch,
     ) -> Result<(), OmniError> {
-        let catalog = self.catalog_snapshot()?;
+        let seq = self.db.get_seq();
+        let canonical = self.resolve_collection_name_at(collection, seq)?;
+        let catalog = self.catalog_snapshot_at(seq)?;
         self.replace_document_indexes_with_catalog(
             &catalog,
-            collection,
+            &canonical,
             old_primary_key,
             old_document,
             new_primary_key,
@@ -1126,10 +1143,12 @@ impl IndexManager {
         old_document: &serde_json::Value,
         batch: &mut WriteBatch,
     ) -> Result<(), OmniError> {
-        let catalog = self.catalog_snapshot()?;
+        let seq = self.db.get_seq();
+        let canonical = self.resolve_collection_name_at(collection, seq)?;
+        let catalog = self.catalog_snapshot_at(seq)?;
         self.remove_document_indexes_with_catalog(
             &catalog,
-            collection,
+            &canonical,
             primary_key,
             old_document,
             batch,
@@ -1173,46 +1192,96 @@ impl IndexManager {
         Ok(())
     }
 
+    fn v0_equivalent_unique_prefixes(
+        idx_def: &IndexDefinition,
+        idx_key: &str,
+        primary_key: &str,
+    ) -> Vec<String> {
+        const V0_NEG_ZERO_HEX: &str = "7fffffffffffffff";
+        const V0_POS_ZERO_HEX: &str = "8000000000000000";
+
+        let base_prefix = &idx_key[..idx_key.len() - primary_key.len()];
+        if idx_def.encoding_version >= CURRENT_INDEX_ENCODING_VERSION
+            || !idx_def
+                .fields
+                .iter()
+                .any(|(_, ft)| *ft == IndexFieldType::Float)
+        {
+            return vec![base_prefix.to_string()];
+        }
+        let scan_prefix = build_index_scan_prefix(idx_def.id);
+        let Some(rest) = base_prefix
+            .strip_prefix(&scan_prefix)
+            .and_then(|s| s.strip_suffix('\x00'))
+        else {
+            return vec![base_prefix.to_string()];
+        };
+        let parts: Vec<&str> = rest.split('\x00').collect();
+        if parts.len() != idx_def.fields.len() {
+            return vec![base_prefix.to_string()];
+        }
+        let mut prefixes = vec![scan_prefix];
+        for (segment, (_, field_type)) in parts.iter().zip(idx_def.fields.iter()) {
+            let choices: &[&str] = if *field_type == IndexFieldType::Float
+                && (*segment == V0_NEG_ZERO_HEX || *segment == V0_POS_ZERO_HEX)
+            {
+                &[V0_NEG_ZERO_HEX, V0_POS_ZERO_HEX]
+            } else {
+                std::slice::from_ref(segment)
+            };
+            let mut next = Vec::with_capacity(prefixes.len() * choices.len());
+            for prefix in &prefixes {
+                for choice in choices {
+                    next.push(format!("{prefix}{choice}\x00"));
+                }
+            }
+            prefixes = next;
+        }
+        prefixes
+    }
+
     fn check_unique(
         &self,
         idx_def: &IndexDefinition,
         idx_key: &str,
         primary_key: &str,
         batch: &WriteBatch,
-        read_collector: Option<&mut crate::volcano::ReadCollector>,
+        mut read_collector: Option<&mut crate::volcano::ReadCollector>,
     ) -> Result<(), OmniError> {
-        let prefix = &idx_key[..idx_key.len() - primary_key.len()];
-        let end = format!("{}\x01", &prefix[..prefix.len() - 1]);
-        if let Some(collector) = read_collector {
-            collector.ranges.push((prefix.to_string(), end.clone()));
-        }
+        let prefixes = Self::v0_equivalent_unique_prefixes(idx_def, idx_key, primary_key);
         let seq = self.db.get_seq();
-        for (existing_key, existing_pk) in self.db.scan(prefix, &end, seq)? {
-            if batch
-                .buffered_deletes
-                .iter()
-                .any(|deleted| deleted.as_slice() == existing_key.as_bytes())
-            {
-                continue;
+        for prefix in prefixes {
+            let end = format!("{}\x01", &prefix[..prefix.len() - 1]);
+            if let Some(collector) = read_collector.as_deref_mut() {
+                collector.ranges.push((prefix.clone(), end.clone()));
             }
-            if existing_pk != primary_key {
-                return Err(unique_violation(idx_def));
-            }
-        }
-        // Dedup against conflicting staged deletes in the same batch.
-        for (pending_key, pending_pk, _) in &batch.buffered_writes {
-            let Ok(pending_key) = std::str::from_utf8(pending_key) else {
-                continue;
-            };
-            if pending_key >= prefix
-                && pending_key < end.as_str()
-                && !batch
+            for (existing_key, existing_pk) in self.db.scan_prefix(&prefix, seq)? {
+                if batch
                     .buffered_deletes
                     .iter()
-                    .any(|deleted| deleted.as_slice() == pending_key.as_bytes())
-                && pending_pk != primary_key
-            {
-                return Err(unique_violation(idx_def));
+                    .any(|deleted| deleted.as_slice() == existing_key.as_bytes())
+                {
+                    continue;
+                }
+                if existing_pk != primary_key {
+                    return Err(unique_violation(idx_def));
+                }
+            }
+            // Dedup against conflicting staged deletes in the same batch.
+            for (pending_key, pending_pk, _) in &batch.buffered_writes {
+                let Ok(pending_key) = std::str::from_utf8(pending_key) else {
+                    continue;
+                };
+                if pending_key >= prefix.as_str()
+                    && pending_key < end.as_str()
+                    && !batch
+                        .buffered_deletes
+                        .iter()
+                        .any(|deleted| deleted.as_slice() == pending_key.as_bytes())
+                    && pending_pk != primary_key
+                {
+                    return Err(unique_violation(idx_def));
+                }
             }
         }
         Ok(())
@@ -1260,10 +1329,9 @@ impl IndexManager {
             .collect::<Result<Vec<_>, _>>()?;
 
         let prefix = build_exact_index_value_prefix(idx_def.id, &encoded);
-        let end = format!("{}\x01", &prefix[..prefix.len() - 1]);
 
         let mut results = Vec::new();
-        for (_, pk) in self.db.scan(&prefix, &end, seq)? {
+        for (_, pk) in self.db.scan_prefix(&prefix, seq)? {
             results.push(pk);
         }
 
@@ -1332,7 +1400,7 @@ impl IndexManager {
         );
 
         let mut results = Vec::new();
-        for (key, pk) in self.db.scan(&start_key, &end_key, seq)? {
+        for (key, pk) in self.db.scan_exclusive(&start_key, Some(&end_key), seq)? {
             let Some(value_hex) = key
                 .strip_prefix(&index_prefix)
                 .and_then(|suffix| suffix.split('\x00').next())
@@ -1369,7 +1437,9 @@ impl IndexManager {
         expected_collection: &str,
     ) -> Result<usize, OmniError> {
         let mut idx_def = self.definition(index_name)?;
-        if !idx_def.collection.eq_ignore_ascii_case(expected_collection) {
+        let canonical_expected =
+            self.resolve_collection_name_at(expected_collection, self.db.get_seq())?;
+        if idx_def.collection != canonical_expected {
             return Err(OmniError::IoError(format!(
                 "Index '{}' not found on collection '{}'",
                 index_name, expected_collection
@@ -1386,15 +1456,11 @@ impl IndexManager {
         // Clear any pre-existing or partially built entries for this index ID
         // before scanning the collection at a fresh snapshot.
         let index_prefix = build_index_scan_prefix(idx_def.id);
-        let index_end = format!("{}\u{10ffff}", index_prefix);
         loop {
             let clear_seq = self.db.get_seq();
-            let stale = self.db.scan_limit(
-                &index_prefix,
-                &index_end,
-                clear_seq,
-                WriteBatch::MAX_OPS / 2,
-            )?;
+            let stale =
+                self.db
+                    .scan_prefix_limit(&index_prefix, clear_seq, WriteBatch::MAX_OPS / 2)?;
             if stale.is_empty() {
                 break;
             }
@@ -1445,7 +1511,10 @@ impl IndexManager {
 
         for (collection_prefix, collection_end) in collection_row_ranges(&idx_def.collection) {
             let is_sql_rows = collection_prefix.starts_with("\x00T\x00");
-            for (key, value) in self.db.scan(&collection_prefix, &collection_end, seq)? {
+            for (key, value) in
+                self.db
+                    .scan_exclusive(&collection_prefix, Some(&collection_end), seq)?
+            {
                 let doc = if is_sql_rows {
                     let row = crate::plan_exec::PlanExecutor::deserialize_row_checked(
                         &value,
@@ -1491,9 +1560,11 @@ impl IndexManager {
 
     /// Returns all index definitions for a collection.
     pub fn list_indexes(&self, collection: &str) -> Result<Vec<IndexDefinition>, OmniError> {
-        let catalog = self.catalog_snapshot()?;
+        let seq = self.db.get_seq();
+        let canonical = self.resolve_collection_name_at(collection, seq)?;
+        let catalog = self.catalog_snapshot_at(seq)?;
         Ok(catalog
-            .indexes_for_collection(collection)
+            .indexes_for_collection(&canonical)
             .into_iter()
             .cloned()
             .collect())

@@ -741,11 +741,10 @@ fn failed_unique_index_rebuild_over_batch_limit_cleans_up_and_allows_retry() {
 }
 
 fn test_rename_stage_key(collection: &str, old_name: &str, new_name: &str) -> String {
-    let col = collection.to_lowercase();
     format!(
         "\u{0}SCHEMA\u{0}rename_stage:{}:{}:{}:{}:{}:{}",
-        col.len(),
-        col,
+        collection.len(),
+        collection,
         old_name.len(),
         old_name,
         new_name.len(),
@@ -1352,13 +1351,24 @@ fn assert_differential_oracle_plans(indexed_exec: &SqlExecutor) {
         "mismatched String index on INTEGER column must never be selected: {orders_plan}"
     );
     assert!(
-        explain_plan(indexed_exec, "EXPLAIN SELECT id FROM USERS WHERE id = 1")
-            .contains("PK Lookup"),
-        "case-insensitive table lookup must still select PK Lookup"
+        explain_plan(
+            indexed_exec,
+            "EXPLAIN SELECT code FROM CODES WHERE code = 'a1'"
+        )
+        .contains("PK Lookup"),
+        "case-insensitive TEXT PK table lookup must still select PK Lookup"
+    );
+    let int_pk_plan = explain_plan(indexed_exec, "EXPLAIN SELECT id FROM USERS WHERE id = 1");
+    assert!(
+        int_pk_plan.contains("Seq Scan") && !int_pk_plan.contains("PK Lookup"),
+        "INTEGER PK equality compatibility fallback must be planned and costed as Seq Scan: {int_pk_plan}"
     );
     assert!(
-        !explain_plan(indexed_exec, "EXPLAIN SELECT id FROM users WHERE id = NULL")
-            .contains("PK Lookup"),
+        !explain_plan(
+            indexed_exec,
+            "EXPLAIN SELECT code FROM codes WHERE code = NULL"
+        )
+        .contains("PK Lookup"),
         "WHERE pk = NULL must not plan a PK Lookup"
     );
 }
@@ -2585,10 +2595,25 @@ fn legacy_v0_integer_index_rebuild_publishes_v1_catalog_before_entries() {
         &executor,
         "CREATE TABLE v0_upgrade_tbl (id INTEGER PRIMARY KEY, code INTEGER)",
     );
-    execute(
-        &executor,
-        "INSERT INTO v0_upgrade_tbl (id, code) VALUES (1, 100), (2, 200), (3, 100)",
-    );
+    // Seed 1,001 unique rows plus one lexicographically-last duplicate (`id = 999999`)
+    // so rebuild commits its first 1,000-entry v1 chunk BEFORE failing on the duplicate.
+    let mut seed_rows = WriteBatch::new();
+    for id in 1..=1001u64 {
+        seed_rows
+            .set(
+                &format!("\u{0}T\u{0}v0_upgrade_tbl\u{0}{id}"),
+                format!("{{\"id\":\"{id}\",\"code\":\"{id}\"}}"),
+            )
+            .unwrap();
+    }
+    seed_rows
+        .set(
+            "\u{0}T\u{0}v0_upgrade_tbl\u{0}999999",
+            "{\"id\":\"999999\",\"code\":\"1\"}".into(),
+        )
+        .unwrap();
+    db.commit_batch(&seed_rows).unwrap();
+
     let idx_id = idx_mgr
         .create_index(
             "v0_upgrade_code_idx",
@@ -2600,6 +2625,7 @@ fn legacy_v0_integer_index_rebuild_publishes_v1_catalog_before_entries() {
     // Rewrite catalog entry to legacy v0 (`encoding_version: 0`) and seed a stale v0 key.
     let mut legacy_def = idx_mgr.definition("v0_upgrade_code_idx").unwrap();
     legacy_def.encoding_version = 0;
+    let stale_v0_key = format!("\u{0}IDX\u{0}{idx_id:08}\u{0}8000000000000001\u{0}1");
     let mut seed_v0 = WriteBatch::new();
     seed_v0
         .set(
@@ -2607,55 +2633,55 @@ fn legacy_v0_integer_index_rebuild_publishes_v1_catalog_before_entries() {
             serde_json::to_string(&legacy_def).unwrap(),
         )
         .unwrap();
-    seed_v0
-        .set(
-            &format!("\u{0}IDX\u{0}{idx_id:08}\u{0}8000000000000064\u{0}1"),
-            "1".into(),
-        )
-        .unwrap();
+    seed_v0.set(&stale_v0_key, "1".into()).unwrap();
     db.commit_batch(&seed_v0).unwrap();
 
-    // Rebuild clears legacy v0 entries, writes v1 entries for rows 1 & 2, then fails
-    // with UNIQUE CONSTRAINT VIOLATION on duplicate row 3 (code = 100).
+    // Rebuild clears legacy v0 entries, commits the first 1,000-entry v1 chunk,
+    // then fails with UNIQUE CONSTRAINT VIOLATION on duplicate row 999999 (code = 1).
     let err = idx_mgr.rebuild_index("v0_upgrade_code_idx").unwrap_err();
     assert!(
         err.to_string().contains("UNIQUE CONSTRAINT VIOLATION"),
-        "expected unique violation mid-rebuild, got: {err}"
+        "{err}"
     );
 
-    // Catalog must ALREADY be upgraded to v1 once v0 entries were cleared so
-    // no v0/v1 mixed-format index entries can ever exist.
-    let def_after = idx_mgr.definition("v0_upgrade_code_idx").unwrap();
+    let mid_seq = db.get_seq();
+    assert_eq!(db.find(&stale_v0_key, mid_seq).unwrap(), None);
+    let idx_prefix = format!("\u{0}IDX\u{0}{idx_id:08}\u{0}");
+    let idx_entries = db
+        .scan(&idx_prefix, &format!("{idx_prefix}\u{10ffff}"), mid_seq)
+        .unwrap();
+    let has_v1_key = idx_entries.iter().any(|(k, _)| {
+        k.strip_prefix(&idx_prefix)
+            .and_then(|rest| rest.split('\x00').next())
+            .is_some_and(|hex| hex.len() == 32)
+    });
+    assert!(idx_entries.len() >= 1000 && has_v1_key);
     assert_eq!(
-        def_after.encoding_version,
+        db.find(&format!("\u{0}IDX_READY\u{0}{idx_id}"), mid_seq)
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        idx_mgr
+            .definition("v0_upgrade_code_idx")
+            .unwrap()
+            .encoding_version,
         omni_engine::secondary_index::CURRENT_INDEX_ENCODING_VERSION
     );
-    // Resolve duplicate on row 3, verify subsequent DML uses v1 consistently
-    // (including values beyond i64::MAX), and complete rebuild cleanly.
     execute(
         &executor,
-        "UPDATE v0_upgrade_tbl SET code = 170141183460469231731687303715884105720 WHERE id = 3",
+        "UPDATE v0_upgrade_tbl SET code = 170141183460469231731687303715884105720 WHERE id = 999999",
     );
-    let dup = executor.execute(
-        &parse_sql(
-            "INSERT INTO v0_upgrade_tbl (id, code) VALUES (4, 170141183460469231731687303715884105720)",
-        )
-        .unwrap(),
-    );
-    assert!(
-        dup.is_err(),
-        "unique index after interrupted v0->v1 rebuild must reject duplicate v1 keys"
-    );
+    let dup_sql = "INSERT INTO v0_upgrade_tbl (id, code) VALUES (1000000, 170141183460469231731687303715884105720)";
+    assert!(executor.execute(&parse_sql(dup_sql).unwrap()).is_err());
     idx_mgr.rebuild_index("v0_upgrade_code_idx").unwrap();
+    let big = "170141183460469231731687303715884105720";
     assert_eq!(
         rows(
             &executor,
-            "SELECT id, code FROM v0_upgrade_tbl WHERE code = 170141183460469231731687303715884105720"
+            &format!("SELECT id, code FROM v0_upgrade_tbl WHERE code = {big}")
         ),
-        vec![vec![
-            Some("3".into()),
-            Some("170141183460469231731687303715884105720".into()),
-        ]]
+        vec![vec![Some("999999".into()), Some(big.into())]]
     );
 }
 
@@ -2695,7 +2721,7 @@ fn legacy_delete_preflight_validates_canonical_pk_and_batch_cap() {
         dir.path().join("wal.bin").to_str().unwrap(),
     )
     .unwrap();
-    let _stage_key = seed_large_legacy_table(&db, "big_legacy_del_cap", WriteBatch::MAX_OPS / 2);
+    let stage_key = seed_large_legacy_table(&db, "big_legacy_del_cap", WriteBatch::MAX_OPS / 2);
     let idx_mgr = IndexManager::new(db.clone());
     idx_mgr
         .create_index(
@@ -2710,8 +2736,8 @@ fn legacy_delete_preflight_validates_canonical_pk_and_batch_cap() {
         .unwrap();
 
     let executor = SqlExecutor::new(db.clone(), Arc::new(Catalog::new(db.clone())));
-    // 5,000 rows + 5,000 index deletes + 5,000 stage marker checks + 1 catalog flip > MAX_OPS:
-    // must fail cleanly with BatchTooLarge BEFORE migration flips catalog format.
+    // 5,000 rows + 5,000 index deletes + 1 catalog flip > MAX_OPS:
+    // must fail cleanly with BatchTooLarge BEFORE migration mutates rows/markers or catalog.
     let err = executor
         .execute(&parse_sql("DELETE FROM big_legacy_del_cap").unwrap())
         .err()
@@ -2719,6 +2745,12 @@ fn legacy_delete_preflight_validates_canonical_pk_and_batch_cap() {
     assert!(
         err.contains("BatchTooLarge"),
         "expected BatchTooLarge from legacy DELETE preflight, got: {err}"
+    );
+    assert_legacy_row_untouched(
+        &db,
+        "big_legacy_del_cap",
+        &stage_key,
+        "failed legacy DELETE preflight",
     );
     let cat_raw = db
         .find("\u{0}CATALOG\u{0}big_legacy_del_cap", db.get_seq())
@@ -2730,4 +2762,552 @@ fn legacy_delete_preflight_validates_canonical_pk_and_batch_cap() {
         omni_engine::catalog::RowFormat::Legacy,
         "failed legacy DELETE preflight must leave table in Legacy format"
     );
+}
+
+#[test]
+fn sql_prefix_scan_includes_u10ffff_primary_keys_and_excludes_successor() {
+    let (db, _dir, executor) = setup();
+    execute(
+        &executor,
+        "CREATE TABLE max_pk_tbl (id TEXT PRIMARY KEY, tag TEXT)",
+    );
+    let max_pk = "\u{10ffff}x";
+    execute(
+        &executor,
+        &format!("INSERT INTO max_pk_tbl (id, tag) VALUES ('a', 't1'), ('{max_pk}', 't2')"),
+    );
+    // Also plant a neighbor key right at the bytewise prefix successor to ensure exclusion.
+    let mut neighbor = WriteBatch::new();
+    neighbor
+        .set(
+            "\u{0}T\u{0}max_pk_tbl\u{1}stray",
+            "{\"id\":\"stray\",\"tag\":\"bad\"}".into(),
+        )
+        .unwrap();
+    db.commit_batch(&neighbor).unwrap();
+
+    let got = rows(&executor, "SELECT id, tag FROM max_pk_tbl ORDER BY id");
+    assert_eq!(
+        got,
+        vec![
+            vec![Some("a".into()), Some("t1".into())],
+            vec![Some(max_pk.into()), Some("t2".into())],
+        ]
+    );
+
+    let idx_mgr = IndexManager::new(db);
+    idx_mgr
+        .create_index(
+            "max_pk_tag_idx",
+            "max_pk_tbl",
+            vec![("tag".into(), IndexFieldType::String)],
+            false,
+        )
+        .unwrap();
+    assert_eq!(idx_mgr.rebuild_index("max_pk_tag_idx").unwrap(), 2);
+    assert_eq!(
+        rows(&executor, "SELECT id FROM max_pk_tbl WHERE tag = 't2'"),
+        vec![vec![Some(max_pk.into())]]
+    );
+}
+
+#[test]
+fn document_collections_with_different_case_keep_indexes_and_rename_stages_isolated() {
+    use omni_engine::schema::{Migration, SchemaManager, SchemaOp};
+
+    let (db, _dir, _executor) = setup();
+    let idx_mgr = Arc::new(IndexManager::new(db.clone()));
+    let schema = SchemaManager::new(db.clone(), idx_mgr.clone());
+
+    idx_mgr
+        .create_index(
+            "docs_email_idx",
+            "docs",
+            vec![("email".into(), IndexFieldType::String)],
+            true,
+        )
+        .unwrap();
+
+    // Writing the same email to distinct document collections `docs:1` and `DOCS:2`
+    // must NOT collide under `docs_email_idx`.
+    let mut wb = WriteBatch::new();
+    let doc1 = serde_json::json!({"email": "same@example.com", "old_f": "v1"});
+    let doc2 = serde_json::json!({"email": "same@example.com", "old_f": "v2"});
+    wb.set("docs:1", doc1.to_string()).unwrap();
+    idx_mgr.index_document("docs", "1", &doc1, &mut wb).unwrap();
+    wb.set("DOCS:2", doc2.to_string()).unwrap();
+    idx_mgr.index_document("DOCS", "2", &doc2, &mut wb).unwrap();
+    db.commit_batch(&wb).unwrap();
+
+    assert_eq!(
+        idx_mgr
+            .lookup("docs_email_idx", &[serde_json::json!("same@example.com")])
+            .unwrap(),
+        vec!["1".to_string()]
+    );
+    assert_eq!(idx_mgr.rebuild_index("docs_email_idx").unwrap(), 1);
+    assert_eq!(
+        idx_mgr
+            .lookup("docs_email_idx", &[serde_json::json!("same@example.com")])
+            .unwrap(),
+        vec!["1".to_string()]
+    );
+
+    // Seed an interrupted rename stage for lowercase `docs` and run the same
+    // rename on uppercase `DOCS`; `docs`'s stage and row marker must stay intact.
+    let docs_stage = test_rename_stage_key("docs", "old_f", "new_f");
+    let docs_marker = format!(
+        "\u{0}SCHEMA\u{0}rename_row:{}:{}\u{0}docs:1",
+        docs_stage
+            .strip_prefix("\u{0}SCHEMA\u{0}rename_stage:")
+            .unwrap()
+            .len(),
+        docs_stage
+            .strip_prefix("\u{0}SCHEMA\u{0}rename_stage:")
+            .unwrap()
+    );
+    let mut stage_seed = WriteBatch::new();
+    stage_seed.set(&docs_stage, "old_f".into()).unwrap();
+    stage_seed.set(&docs_marker, "1".into()).unwrap();
+    stage_seed
+        .set(
+            "docs:1",
+            serde_json::json!({"email": "same@example.com", "old_f": "v1", "new_f": "v1"})
+                .to_string(),
+        )
+        .unwrap();
+    db.commit_batch(&stage_seed).unwrap();
+
+    schema
+        .migrate_up(&Migration {
+            version: 1,
+            description: "rename DOCS only".into(),
+            up: vec![SchemaOp::RenameField {
+                collection: "DOCS".into(),
+                old_name: "old_f".into(),
+                new_name: "new_f".into(),
+            }],
+            down: vec![],
+        })
+        .unwrap();
+
+    let seq = db.get_seq();
+    assert!(
+        db.find(&docs_stage, seq).unwrap().is_some(),
+        "renaming DOCS must not delete lowercase docs's rename stage"
+    );
+    assert!(
+        db.find(&docs_marker, seq).unwrap().is_some(),
+        "renaming DOCS must not delete lowercase docs's row stage marker"
+    );
+    // Retrying lowercase `docs` finishes cleanly without destination conflict.
+    schema
+        .migrate_up(&Migration {
+            version: 2,
+            description: "finish docs rename".into(),
+            up: vec![SchemaOp::RenameField {
+                collection: "docs".into(),
+                old_name: "old_f".into(),
+                new_name: "new_f".into(),
+            }],
+            down: vec![],
+        })
+        .unwrap();
+    let final_doc1: serde_json::Value =
+        serde_json::from_str(&db.find("docs:1", db.get_seq()).unwrap().unwrap()).unwrap();
+    assert_eq!(final_doc1.get("new_f").and_then(|v| v.as_str()), Some("v1"));
+    assert_eq!(final_doc1.get("old_f"), None);
+}
+
+#[test]
+fn v0_float_index_preserves_signed_zero_lookup_delete_and_unique_until_rebuild() {
+    let (db, _dir, _executor) = setup();
+    let idx_mgr = IndexManager::new(db.clone());
+    let idx_id = idx_mgr
+        .create_index(
+            "v0_float_idx",
+            "metrics",
+            vec![("val".into(), IndexFieldType::Float)],
+            true,
+        )
+        .unwrap();
+    // Downgrade catalog metadata to legacy v0 (`encoding_version: 0`) and seed
+    // a pre-upgrade `-0.0` document + v0 index key (`7fffffffffffffff`).
+    let mut legacy_def = idx_mgr.definition("v0_float_idx").unwrap();
+    legacy_def.encoding_version = 0;
+    let v0_neg_zero_key = format!("\u{0}IDX\u{0}{idx_id:08}\u{0}7fffffffffffffff\u{0}1");
+    let doc1 = serde_json::json!({"val": -0.0});
+    let mut seed = WriteBatch::new();
+    seed.set(
+        &format!("\u{0}IDX_CATALOG\u{0}{idx_id}"),
+        serde_json::to_string(&legacy_def).unwrap(),
+    )
+    .unwrap();
+    seed.set("metrics:1", doc1.to_string()).unwrap();
+    seed.set(&v0_neg_zero_key, "1".into()).unwrap();
+    db.commit_batch(&seed).unwrap();
+
+    // Lookup for -0.0 reproduces the v0 key and finds pk "1".
+    assert_eq!(
+        idx_mgr
+            .lookup("v0_float_idx", &[serde_json::json!(-0.0)])
+            .unwrap(),
+        vec!["1".to_string()]
+    );
+    // Unique v0 float index must still reject inserting +0.0 on another pk.
+    let mut dup_batch = WriteBatch::new();
+    let doc2 = serde_json::json!({"val": 0.0});
+    let dup_err = idx_mgr
+        .index_document("metrics", "2", &doc2, &mut dup_batch)
+        .unwrap_err();
+    assert!(
+        dup_err.to_string().contains("UNIQUE CONSTRAINT VIOLATION"),
+        "v0 unique float index must reject +0.0 colliding with -0.0, got: {dup_err}"
+    );
+    // Deleting doc1 reproduces and removes the exact v0 `-0.0` key (no orphan).
+    let mut del_batch = WriteBatch::new();
+    idx_mgr
+        .remove_document_indexes("metrics", "1", &doc1, &mut del_batch)
+        .unwrap();
+    del_batch.delete("metrics:1").unwrap();
+    db.commit_batch(&del_batch).unwrap();
+    assert_eq!(
+        db.find(&v0_neg_zero_key, db.get_seq()).unwrap(),
+        None,
+        "deleting -0.0 doc on v0 float index must remove its v0 key"
+    );
+}
+
+#[test]
+fn typed_float_update_preserves_unmatched_canonical_zero_row_and_allows_lone_neg_zero() {
+    let (db, _dir, executor) = setup();
+    execute(
+        &executor,
+        "CREATE TABLE fpk_pair (id FLOAT PRIMARY KEY, tag TEXT)",
+    );
+    // Seed pre-upgrade typed rows stored at separate "-0" and "0" suffixes.
+    let mut seed = WriteBatch::new();
+    seed.set(
+        "\u{0}T\u{0}fpk_pair\u{0}-0",
+        "{\"id\":\"-0\",\"tag\":\"neg\"}".into(),
+    )
+    .unwrap();
+    seed.set(
+        "\u{0}T\u{0}fpk_pair\u{0}0",
+        "{\"id\":\"0\",\"tag\":\"pos\"}".into(),
+    )
+    .unwrap();
+    db.commit_batch(&seed).unwrap();
+
+    // Updating ONLY the "-0" row must NOT overwrite or delete unmatched "0".
+    let err = executor
+        .execute(&parse_sql("UPDATE fpk_pair SET tag = 'moved' WHERE tag = 'neg'").unwrap())
+        .err()
+        .expect("updating -0 onto canonical 0 owned by unmatched row must fail");
+    assert!(
+        err.to_lowercase().contains("primary key") || err.to_lowercase().contains("duplicate"),
+        "expected PK conflict error, got: {err}"
+    );
+    assert_eq!(
+        rows(&executor, "SELECT id, tag FROM fpk_pair WHERE tag = 'pos'"),
+        vec![vec![Some("0".into()), Some("pos".into())]]
+    );
+
+    // A lone "-0" row with no competing "0" row CAN move cleanly to "0".
+    execute(
+        &executor,
+        "CREATE TABLE fpk_lone (id FLOAT PRIMARY KEY, tag TEXT)",
+    );
+    let mut lone = WriteBatch::new();
+    lone.set(
+        "\u{0}T\u{0}fpk_lone\u{0}-0",
+        "{\"id\":\"-0\",\"tag\":\"solo\"}".into(),
+    )
+    .unwrap();
+    db.commit_batch(&lone).unwrap();
+    execute(
+        &executor,
+        "UPDATE fpk_lone SET tag = 'updated' WHERE tag = 'solo'",
+    );
+    assert_eq!(
+        rows(&executor, "SELECT id, tag FROM fpk_lone"),
+        vec![vec![Some("0".into()), Some("updated".into())]]
+    );
+}
+
+#[test]
+fn legacy_delete_preflight_ignores_empty_rename_stage_without_markers() {
+    let dir = TempDir::new().unwrap();
+    let db = OmniKV::open(
+        dir.path().join("manifest.json").to_str().unwrap(),
+        dir.path().join("wal.bin").to_str().unwrap(),
+    )
+    .unwrap();
+    let table_name = "legacy_empty_stage_del";
+    let stage_key = test_rename_stage_key(table_name, "old_col", "new_col");
+    let manifest = format!(
+        "{{\"name\":\"{table_name}\",\"columns\":[{{\"name\":\"id\",\"col_type\":\"Integer\",\"nullable\":false,\"primary_key\":true,\"default\":null}},{{\"name\":\"old_col\",\"col_type\":\"Text\",\"nullable\":true,\"primary_key\":false,\"default\":null}}],\"primary_key\":\"id\",\"created_at\":1000}}"
+    );
+    let mut init = WriteBatch::new();
+    init.set(&format!("\u{0}CATALOG\u{0}{table_name}"), manifest)
+        .unwrap();
+    init.set(&stage_key, "old_col".into()).unwrap();
+    db.commit_batch(&init).unwrap();
+
+    // Seed 6,000 canonical legacy rows with NO row rename markers: 6,000 deletes
+    // + 1 catalog flip = 6,001 ops (fits easily within WriteBatch::MAX_OPS).
+    let mut wb = WriteBatch::new();
+    for id in 1..=6000usize {
+        if wb.op_count() >= 2000 {
+            db.commit_batch(&wb).unwrap();
+            wb = WriteBatch::new();
+        }
+        wb.set(
+            &format!("\u{0}T\u{0}{table_name}\u{0}{id}"),
+            format!("{{\"id\":\"{id}\",\"old_col\":\"v{id}\"}}"),
+        )
+        .unwrap();
+    }
+    if !wb.is_empty() {
+        db.commit_batch(&wb).unwrap();
+    }
+
+    let executor = SqlExecutor::new(db.clone(), Arc::new(Catalog::new(db)));
+    execute(&executor, &format!("DELETE FROM {table_name}"));
+    assert_eq!(
+        rows(&executor, &format!("SELECT id FROM {table_name}")).len(),
+        0
+    );
+}
+
+#[test]
+fn planned_index_scan_falls_back_when_same_named_index_recreated_with_new_id() {
+    use omni_engine::optimizer::{AccessMethod, PlanNode};
+    use omni_engine::plan_exec::PlanExecutor;
+    use omni_engine::sql::{CmpOp, SqlValue, WhereExpr};
+    use omni_engine::volcano::{ScanContext, compile_plan_with_scan};
+    use std::collections::HashMap;
+
+    let (db, _dir, executor) = setup();
+    let idx_mgr = IndexManager::new(db.clone());
+    execute(
+        &executor,
+        "CREATE TABLE items_reid (id INTEGER PRIMARY KEY, tag TEXT, note TEXT)",
+    );
+    execute(
+        &executor,
+        "INSERT INTO items_reid (id, tag, note) VALUES (1, 'hit', NULL), (2, 'hit', 'present')",
+    );
+    let catalog = Arc::new(Catalog::new(db.clone()));
+    let id_a = idx_mgr
+        .create_index(
+            "items_reid_shared_idx",
+            "items_reid",
+            vec![("tag".into(), IndexFieldType::String)],
+            false,
+        )
+        .unwrap();
+    idx_mgr.rebuild_index("items_reid_shared_idx").unwrap();
+
+    // Plan captured using index A (id = id_a) on `tag`.
+    let predicate = WhereExpr::Comparison {
+        column: "tag".into(),
+        op: CmpOp::Eq,
+        value: SqlValue::Text("hit".into()),
+    };
+    let plan = PlanNode::Scan {
+        table: "items_reid".into(),
+        access: AccessMethod::IndexScan {
+            index_name: "items_reid_shared_idx".into(),
+            index_id: id_a,
+        },
+        filter: Some(predicate),
+        estimated_rows: 2,
+        estimated_cost: 2.0,
+    };
+
+    // Drop index A and recreate a same-named index B on `note` (where row 1 is NULL!).
+    idx_mgr.drop_index("items_reid_shared_idx").unwrap();
+    let id_b = idx_mgr
+        .create_index(
+            "items_reid_shared_idx",
+            "items_reid",
+            vec![("note".into(), IndexFieldType::String)],
+            false,
+        )
+        .unwrap();
+    assert_ne!(id_a, id_b);
+    idx_mgr.rebuild_index("items_reid_shared_idx").unwrap();
+
+    // Volcano (`None` and `Some(ctx)` paths) and `PlanExecutor` must reject the
+    // mismatched ID and fall back to sequential scan, returning BOTH matching rows.
+    let mut volcano_iter = compile_plan_with_scan(&plan, &db, &catalog, None);
+    let volcano_rows = volcano_iter.try_collect_all().unwrap();
+    assert_eq!(
+        volcano_rows.len(),
+        2,
+        "Volcano (None scan) must fall back to SeqScan when same-named index has a different ID"
+    );
+
+    let scan_ctx = ScanContext {
+        scan_seq: db.get_seq(),
+        overlay: HashMap::new(),
+        reads: None,
+    };
+    let mut pinned_iter = compile_plan_with_scan(&plan, &db, &catalog, Some(&scan_ctx));
+    let pinned_rows = pinned_iter.try_collect_all().unwrap();
+    assert_eq!(
+        pinned_rows.len(),
+        2,
+        "Volcano (Some scan) must fall back to SeqScan when same-named index has a different ID"
+    );
+
+    let plan_exec = PlanExecutor::new(db, catalog);
+    let exec_rows = plan_exec.execute_plan(&plan).unwrap();
+    assert_eq!(
+        exec_rows.len(),
+        2,
+        "PlanExecutor must fall back to SeqScan when same-named index has a different ID"
+    );
+}
+
+#[test]
+fn schema_rename_retry_honors_receipt_when_old_column_readded() {
+    use omni_engine::schema::{Migration, SchemaManager, SchemaOp};
+
+    let (db, _dir, executor) = setup();
+    let schema = SchemaManager::new(db.clone(), Arc::new(IndexManager::new(db)));
+    execute(
+        &executor,
+        "CREATE TABLE retry_ren_tbl (id INTEGER PRIMARY KEY, old_c TEXT)",
+    );
+    execute(
+        &executor,
+        "INSERT INTO retry_ren_tbl (id, old_c) VALUES (1, 'orig')",
+    );
+    let failing_mig = Migration {
+        version: 1,
+        description: "rename then re-add then fail".into(),
+        up: vec![
+            SchemaOp::RenameField {
+                collection: "retry_ren_tbl".into(),
+                old_name: "old_c".into(),
+                new_name: "new_c".into(),
+            },
+            SchemaOp::AddField {
+                collection: "retry_ren_tbl".into(),
+                field_name: "old_c".into(),
+                default_value: serde_json::json!("fresh"),
+            },
+            SchemaOp::RemoveField {
+                collection: "retry_ren_tbl".into(),
+                field_name: "missing_col".into(),
+            },
+        ],
+        down: vec![],
+    };
+    assert!(schema.migrate_up(&failing_mig).is_err());
+
+    let fixed_mig = Migration {
+        version: 1,
+        description: "rename then re-add then succeed".into(),
+        up: vec![
+            SchemaOp::RenameField {
+                collection: "retry_ren_tbl".into(),
+                old_name: "old_c".into(),
+                new_name: "new_c".into(),
+            },
+            SchemaOp::AddField {
+                collection: "retry_ren_tbl".into(),
+                field_name: "old_c".into(),
+                default_value: serde_json::json!("fresh"),
+            },
+        ],
+        down: vec![],
+    };
+    schema
+        .migrate_up(&fixed_mig)
+        .expect("retry must honor rename receipt even after old_c was re-added");
+    assert_eq!(
+        rows(&executor, "SELECT id, new_c, old_c FROM retry_ren_tbl"),
+        vec![vec![
+            Some("1".into()),
+            Some("orig".into()),
+            Some("fresh".into()),
+        ]]
+    );
+}
+
+#[test]
+fn schema_drop_and_recreate_ignores_stale_cleanup_receipt() {
+    use omni_engine::schema::{Migration, SchemaManager, SchemaOp};
+
+    let (db, _dir, executor) = setup();
+    let schema = SchemaManager::new(db.clone(), Arc::new(IndexManager::new(db.clone())));
+    execute(
+        &executor,
+        "CREATE TABLE replace_tbl (id INTEGER PRIMARY KEY, bio TEXT)",
+    );
+    let orig_table: omni_engine::catalog::TableDef = serde_json::from_str(
+        &db.find("\u{0}CATALOG\u{0}replace_tbl", db.get_seq())
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    let attempt_id = "test_attempt_v1";
+    let orig_id = format!(
+        "{}:{}:{}",
+        orig_table.table_uid, orig_table.created_at, orig_table.name
+    );
+    let stale_done_key = format!(
+        "\u{0}SCHEMA\u{0}remove_done:000001:up:{}:{attempt_id}:000000:{}:{}:3:bio",
+        attempt_id.len(),
+        orig_table.name.len(),
+        orig_table.name
+    );
+    let mut seed = WriteBatch::new();
+    seed.set("\u{0}SCHEMA\u{0}attempt:000001:up", attempt_id.into())
+        .unwrap();
+    seed.set(
+        &stale_done_key,
+        format!("cleanup:{}:{orig_id}:bio", orig_id.len()),
+    )
+    .unwrap();
+    db.commit_batch(&seed).unwrap();
+
+    execute(&executor, "DROP TABLE replace_tbl");
+    execute(
+        &executor,
+        "CREATE TABLE replace_tbl (id INTEGER PRIMARY KEY, bio TEXT)",
+    );
+    execute(
+        &executor,
+        "INSERT INTO replace_tbl (id, bio) VALUES (1, 'keep_or_remove_consistently')",
+    );
+    let repl_table: omni_engine::catalog::TableDef = serde_json::from_str(
+        &db.find("\u{0}CATALOG\u{0}replace_tbl", db.get_seq())
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_ne!(orig_table.table_uid, repl_table.table_uid);
+
+    schema
+        .migrate_up(&Migration {
+            version: 1,
+            description: "remove bio".into(),
+            up: vec![SchemaOp::RemoveField {
+                collection: "replace_tbl".into(),
+                field_name: "bio".into(),
+            }],
+            down: vec![],
+        })
+        .unwrap();
+    let after_table: omni_engine::catalog::TableDef = serde_json::from_str(
+        &db.find("\u{0}CATALOG\u{0}replace_tbl", db.get_seq())
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(!after_table.columns.iter().any(|c| c.name == "bio"));
 }

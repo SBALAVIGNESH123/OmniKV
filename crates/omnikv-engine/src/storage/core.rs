@@ -855,6 +855,33 @@ struct ScanCandidate {
     expiry: u64,
 }
 
+#[derive(Clone, Copy)]
+enum ScanEnd<'a> {
+    Inclusive(&'a [u8]),
+    Exclusive(&'a [u8]),
+    Unbounded,
+}
+
+impl ScanEnd<'_> {
+    #[inline]
+    fn is_past(&self, key: &[u8]) -> bool {
+        match *self {
+            Self::Inclusive(end) => key > end,
+            Self::Exclusive(end) => key >= end,
+            Self::Unbounded => false,
+        }
+    }
+}
+
+fn next_unicode_scalar(ch: char) -> Option<char> {
+    let code = ch as u32;
+    if code == char::MAX as u32 {
+        return None;
+    }
+    let next = if code == 0xD7FF { 0xE000 } else { code + 1 };
+    char::from_u32(next)
+}
+
 pub struct ScanIterator<'a> {
     db: &'a OmniKV,
     candidates: std::vec::IntoIter<ScanCandidate>,
@@ -863,7 +890,7 @@ pub struct ScanIterator<'a> {
 }
 
 impl ScanIterator<'_> {
-    fn try_next(&mut self) -> Result<Option<(String, String)>, OmniError> {
+    pub(crate) fn try_next(&mut self) -> Result<Option<(String, String)>, OmniError> {
         for candidate in self.candidates.by_ref() {
             if candidate.length == 0 || (candidate.expiry > 0 && candidate.expiry <= self.now) {
                 continue;
@@ -1284,6 +1311,12 @@ pub struct OmniKV {
     /// [`crate::transaction::SsiHistory`].
     pub(crate) ssi_history: std::sync::Arc<crate::transaction::SsiHistory>,
 
+    /// Live in-flight 2PC coordinator transactions (`txn_id -> owner coordinator instance id`)
+    /// shared across `TwoPhaseCoordinator` handles on this `OmniKV` instance so
+    /// concurrent `recover_with` calls cannot presumed-abort a transaction while
+    /// another coordinator handle on the same database is actively collecting votes.
+    pub(crate) active_2pc_coord_txns: Mutex<HashMap<(u64, u64), u64>>,
+
     // Monotonic per-instance counter for compaction output filenames. The
     // wall clock alone is not unique: two flushes in the same millisecond
     // collide, and create_new(true) then fails with EEXIST.
@@ -1392,6 +1425,7 @@ impl OmniKV {
             transition_guard: RwLock::new(()),
             cluster_gateway: std::sync::OnceLock::new(),
             ssi_history,
+            active_2pc_coord_txns: Mutex::new(HashMap::new()),
             // Start from a process-unique seed so reopening a database does
             // not immediately reuse the previous instance's token sequence.
             file_seq: std::sync::atomic::AtomicU64::new(rand::random()),
@@ -1842,6 +1876,65 @@ impl OmniKV {
     }
 
     /// Collects the complete visible range, or returns the first heap read error.
+    /// Computes the smallest valid UTF-8 string strictly greater than every
+    /// UTF-8 string beginning with `prefix`, or `None` if `prefix` is empty or
+    /// consists solely of `char::MAX` (`'\u{10ffff}'`).
+    ///
+    /// Because UTF-8 preserves Unicode scalar ordering and is prefix-free on
+    /// scalar values, a valid UTF-8 key `k` starts with `prefix` if and only if
+    /// `k >= prefix` and (`successor.is_none()` or `k < successor`).
+    pub(crate) fn prefix_successor_str(prefix: &str) -> Option<String> {
+        let mut chars: Vec<char> = prefix.chars().collect();
+        while let Some(ch) = chars.pop() {
+            if let Some(next_ch) = next_unicode_scalar(ch) {
+                let mut out: String = chars.into_iter().collect();
+                out.push(next_ch);
+                return Some(out);
+            }
+        }
+        None
+    }
+
+    /// Returns the half-open `[start, end)` range covering every valid UTF-8
+    /// key with `prefix`.
+    pub(crate) fn prefix_range_exclusive(prefix: &str) -> (String, Option<String>) {
+        (prefix.to_string(), Self::prefix_successor_str(prefix))
+    }
+
+    /// Collects all visible entries whose keys begin with `prefix` at `read_seq`,
+    /// including keys containing `'\u{10ffff}'` while excluding the bytewise
+    /// prefix successor itself.
+    pub(crate) fn scan_prefix(
+        &self,
+        prefix: &str,
+        read_seq: u64,
+    ) -> Result<Vec<(String, String)>, OmniError> {
+        let end = Self::prefix_successor_str(prefix);
+        self.scan_exclusive(prefix, end.as_deref(), read_seq)
+    }
+
+    /// Collects all visible entries in the half-open lexical range
+    /// `[start_key, end_exclusive)` (or `[start_key, +inf)` when `end_exclusive`
+    /// is `None`).
+    pub(crate) fn scan_exclusive(
+        &self,
+        start_key: &str,
+        end_exclusive: Option<&str>,
+        read_seq: u64,
+    ) -> Result<Vec<(String, String)>, OmniError> {
+        let mut results = Vec::new();
+        let end_bytes = end_exclusive.map(string_to_key);
+        let end_bound = match end_bytes.as_deref() {
+            Some(bytes) => ScanEnd::Exclusive(bytes),
+            None => ScanEnd::Unbounded,
+        };
+        let mut iter = self.scan_iter_bounds(string_to_key(start_key), end_bound, read_seq)?;
+        while let Some(entry) = iter.try_next()? {
+            results.push(entry);
+        }
+        Ok(results)
+    }
+
     /// Unlike the legacy `scan_iter`, errors cannot yield a successful prefix.
     pub fn scan(
         &self,
@@ -1852,6 +1945,30 @@ impl OmniKV {
         let mut results = Vec::new();
         let mut iter = self.scan_iter_inner(start_key, end_key, read_seq)?;
         while let Some(entry) = iter.try_next()? {
+            results.push(entry);
+        }
+        Ok(results)
+    }
+
+    /// Collects up to `limit` visible entries whose keys begin with `prefix` at `read_seq`.
+    pub(crate) fn scan_prefix_limit(
+        &self,
+        prefix: &str,
+        read_seq: u64,
+        limit: usize,
+    ) -> Result<Vec<(String, String)>, OmniError> {
+        let end = Self::prefix_successor_str(prefix);
+        let end_bytes = end.as_deref().map(string_to_key);
+        let end_bound = match end_bytes.as_deref() {
+            Some(bytes) => ScanEnd::Exclusive(bytes),
+            None => ScanEnd::Unbounded,
+        };
+        let mut iter = self.scan_iter_bounds(string_to_key(prefix), end_bound, read_seq)?;
+        let mut results = Vec::with_capacity(limit.min(iter.candidates.len()));
+        while results.len() < limit {
+            let Some(entry) = iter.try_next()? else {
+                break;
+            };
             results.push(entry);
         }
         Ok(results)
@@ -2594,10 +2711,8 @@ impl OmniKV {
     }
 
     /// Internal bypass for Raft Snapshots: Iterates over the entire keyspace at the absolute latest sequence.
-    pub(crate) fn scan_all_latest_internal(
-        &self,
-    ) -> Result<impl Iterator<Item = (String, String)> + '_, OmniError> {
-        self.scan_iter("", "\u{10FFFF}", u64::MAX)
+    pub(crate) fn scan_all_latest_internal(&self) -> Result<ScanIterator<'_>, OmniError> {
+        self.scan_iter_bounds(Vec::new(), ScanEnd::Unbounded, u64::MAX)
     }
 
     pub fn find(&self, target_key: &str, read_seq: u64) -> Result<Option<String>, OmniError> {
@@ -2743,22 +2858,31 @@ impl OmniKV {
     ) -> Result<ScanIterator<'_>, OmniError> {
         let start_key = string_to_key(start_key);
         let end_key = string_to_key(end_key);
+        self.scan_iter_bounds(start_key, ScanEnd::Inclusive(&end_key), read_seq)
+    }
+
+    fn scan_iter_bounds(
+        &self,
+        start_key: Vec<u8>,
+        end_bound: ScanEnd<'_>,
+        read_seq: u64,
+    ) -> Result<ScanIterator<'_>, OmniError> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
 
-        // Phase 1: Collect candidate records from all levels into a single Vec.
-        // We use a Vec instead of BTreeMap to avoid per-insert O(log N) overhead.
+        // Phase 1: Collect candidate records from one consistent root snapshot.
+        let roots = self.roots.load();
         let mut candidates: Vec<ScanCandidate> = Vec::new();
 
-        // Memtable (highest priority â€” newest data)
-        let active_mem = self.roots.load().memtable.clone();
+        // Memtable (highest priority — newest data)
+        let active_mem = roots.memtable.clone();
         for shard in active_mem.iter() {
             let memtable_start = Reverse(read_seq.saturating_add(1));
             for entry in shard.range((start_key.clone(), memtable_start)..) {
                 let key = entry.key().0.clone();
-                if key > end_key {
+                if end_bound.is_past(&key) {
                     break;
                 }
                 let seq = entry.key().1.0;
@@ -2776,13 +2900,13 @@ impl OmniKV {
         }
 
         // Frozen memtables (second priority)
-        let frozen = self.roots.load().frozen_memtables.clone();
+        let frozen = roots.frozen_memtables.clone();
         for f_mem in frozen.iter().rev() {
             for shard in f_mem.iter() {
                 let frozen_start = Reverse(read_seq.saturating_add(1));
                 for entry in shard.range((start_key.clone(), frozen_start)..) {
                     let key = entry.key().0.clone();
-                    if key > end_key {
+                    if end_bound.is_past(&key) {
                         break;
                     }
                     let seq = entry.key().1.0;
@@ -2801,13 +2925,13 @@ impl OmniKV {
         }
 
         // L0 SSTables (newest first)
-        let sstables = self.roots.load().sstables.clone();
+        let sstables = roots.sstables.clone();
         for (mmap, _, _) in sstables.iter().rev() {
             let reader = SSTableReader::from_mmap(mmap.clone());
             // Sparse-index seeks may rewind before start_key; enforce both
-            // inclusive bounds before collecting any persisted candidate.
+            // bounds before collecting any persisted candidate.
             for rec in reader.iter_from(&start_key) {
-                if rec.key > end_key {
+                if end_bound.is_past(&rec.key) {
                     break;
                 }
                 if rec.key >= start_key && rec.is_valid() && rec.seq <= read_seq {
@@ -2824,11 +2948,11 @@ impl OmniKV {
         }
 
         // L1 SSTables
-        let l1_sstables = self.roots.load().l1_sstables.clone();
+        let l1_sstables = roots.l1_sstables.clone();
         for (mmap, _, _) in &**l1_sstables {
             let reader = SSTableReader::from_mmap(mmap.clone());
             for rec in reader.iter_from(&start_key) {
-                if rec.key > end_key {
+                if end_bound.is_past(&rec.key) {
                     break;
                 }
                 if rec.key >= start_key && rec.is_valid() && rec.seq <= read_seq {
@@ -2845,10 +2969,10 @@ impl OmniKV {
         }
 
         // Base file (oldest data, lowest priority)
-        let base_mmap = self.roots.load().base_mmap.clone();
+        let base_mmap = roots.base_mmap.clone();
         let reader = SSTableReader::from_mmap(base_mmap);
         for rec in reader.iter_from(&start_key) {
-            if rec.key > end_key {
+            if end_bound.is_past(&rec.key) {
                 break;
             }
             if rec.key >= start_key && rec.is_valid() && rec.seq <= read_seq {
@@ -3418,7 +3542,7 @@ impl OmniKV {
             .transition_guard
             .read()
             .map_err(|_| OmniError::LockPoisoned("transition_guard".into()))?;
-        let _guard = self
+        let write_guard = self
             .write_mutex
             .lock()
             .map_err(|_| OmniError::LockPoisoned("GC write mutex".into()))?;
@@ -3666,6 +3790,9 @@ impl OmniKV {
         }
 
         stats.record("heap_gc", started_at, self.compaction_backlog_sstables());
+        drop(heap_lock);
+        drop(write_guard);
+        self.notify_compaction_waiters();
         Ok(())
     }
 

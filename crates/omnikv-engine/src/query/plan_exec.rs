@@ -282,22 +282,23 @@ impl PlanExecutor {
                     None => Vec::new(),
                 }
             }
-            AccessMethod::IndexScan { index_name, .. } => {
+            AccessMethod::IndexScan {
+                index_name,
+                index_id,
+            } => {
                 let seq = self.read_seq();
                 let idx_catalog = self
                     .catalog
                     .index_manager()
                     .catalog_snapshot_at(seq)
                     .map_err(|error| format!("index catalog read failed: {error}"))?;
-                if idx_catalog
-                    .get_by_name(index_name)
-                    .is_some_and(|def| idx_catalog.is_ready(def.id))
-                {
-                    let mut iter = crate::volcano::IndexScanIter::with_scan(
+                if idx_catalog.is_ready_for_plan(*index_id, index_name, &table.name) {
+                    let mut iter = crate::volcano::IndexScanIter::with_scan_id(
                         &self.db,
                         &self.catalog,
                         &table,
                         index_name,
+                        *index_id,
                         filter,
                         seq,
                         None,
@@ -350,7 +351,7 @@ impl PlanExecutor {
         let prefix = table.row_prefix();
         let stored = self
             .db
-            .scan(&prefix, &format!("{}\u{10ffff}", prefix), seq)
+            .scan_prefix(&prefix, seq)
             .map_err(|error| format!("storage scan failed for table '{}': {error}", table.name))?;
         stored
             .into_iter()
@@ -377,7 +378,7 @@ impl PlanExecutor {
         let seq = self.read_seq();
         let stored = self
             .db
-            .scan(&prefix, &format!("{}\u{10ffff}", prefix), seq)
+            .scan_prefix(&prefix, seq)
             .map_err(|error| format!("storage scan failed for table '{}': {error}", table.name))?;
         stored
             .into_iter()

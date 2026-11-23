@@ -170,9 +170,13 @@ pub struct TwoPhaseLogEntry {
 ///
 /// The coordinator lives on the node that initiated the distributed
 /// transaction. It drives the 2PC protocol and handles recovery.
+static NEXT_COORDINATOR_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
+
 pub struct TwoPhaseCoordinator {
     /// This node's ID.
     node_id: u64,
+    /// Unique per-handle owner ID for shared in-flight coordination tracking.
+    instance_id: u64,
     /// Local OmniKV instance (used for coordinator log storage).
     db: Arc<OmniKV>,
     /// Next local transaction sequence.
@@ -181,6 +185,17 @@ pub struct TwoPhaseCoordinator {
     active_txns: Mutex<HashMap<GlobalTxnId, DistTransaction>>,
     /// Vote collection timeout (milliseconds).
     default_timeout_ms: u64,
+}
+
+impl Drop for TwoPhaseCoordinator {
+    fn drop(&mut self) {
+        let mut live = self
+            .db
+            .active_2pc_coord_txns
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        live.retain(|_, owner| *owner != self.instance_id);
+    }
 }
 
 impl TwoPhaseCoordinator {
@@ -193,13 +208,52 @@ impl TwoPhaseCoordinator {
                 0
             }
         };
+        let instance_id = NEXT_COORDINATOR_INSTANCE_ID.fetch_add(1, Ordering::Relaxed);
         Self {
             node_id,
+            instance_id,
             db,
             next_seq: AtomicU64::new(next_seq),
             active_txns: Mutex::new(HashMap::new()),
             default_timeout_ms: timeout_ms,
         }
+    }
+
+    fn decision_lock(
+        &self,
+        txn_id: GlobalTxnId,
+    ) -> Result<Arc<crate::storage::core::SqlTableLock>, OmniError> {
+        self.db
+            .sql_table_lock(&format!("\x002PC_COORD_TXN\x00{}_{}", txn_id.0, txn_id.1))
+    }
+
+    fn mark_live_in_flight(&self, txn_id: GlobalTxnId) {
+        let mut live = self
+            .db
+            .active_2pc_coord_txns
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        live.insert(txn_id, self.instance_id);
+    }
+
+    fn unmark_live_in_flight(&self, txn_id: GlobalTxnId) {
+        let mut live = self
+            .db
+            .active_2pc_coord_txns
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if live.get(&txn_id) == Some(&self.instance_id) {
+            live.remove(&txn_id);
+        }
+    }
+
+    fn has_live_in_flight(&self, txn_id: GlobalTxnId) -> bool {
+        let live = self
+            .db
+            .active_2pc_coord_txns
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        live.contains_key(&txn_id)
     }
 
     fn read_persisted_hwm(node_id: u64, db: &OmniKV, seq: u64) -> Result<Option<u64>, OmniError> {
@@ -282,6 +336,7 @@ impl TwoPhaseCoordinator {
         };
 
         active.insert(txn_id, txn);
+        self.mark_live_in_flight(txn_id);
         Ok(txn_id)
     }
 
@@ -322,6 +377,10 @@ impl TwoPhaseCoordinator {
     /// PREPARE PHASE — sends prepare requests to all participants.
     /// Returns the list of participant node IDs that need to be contacted.
     pub fn prepare(&self, txn_id: GlobalTxnId) -> Result<Vec<u64>, OmniError> {
+        let txn_lock = self.decision_lock(txn_id)?;
+        let _txn_guard = txn_lock
+            .lock()
+            .map_err(|_| OmniError::LockPoisoned("coordinator txn".into()))?;
         let mut active = self
             .active_txns
             .lock()
@@ -345,6 +404,7 @@ impl TwoPhaseCoordinator {
         )?;
 
         txn.state = DistTxnState::WaitingForVotes;
+        self.mark_live_in_flight(txn_id);
 
         Ok(txn.writes_by_node.keys().copied().collect())
     }
@@ -360,6 +420,10 @@ impl TwoPhaseCoordinator {
         txn_id: GlobalTxnId,
         result: PrepareResult,
     ) -> Result<DistTxnState, OmniError> {
+        let txn_lock = self.decision_lock(txn_id)?;
+        let _txn_guard = txn_lock
+            .lock()
+            .map_err(|_| OmniError::LockPoisoned("coordinator txn".into()))?;
         let mut active = self
             .active_txns
             .lock()
@@ -379,10 +443,12 @@ impl TwoPhaseCoordinator {
 
         if durable_commit {
             txn.state = DistTxnState::Committing;
+            self.unmark_live_in_flight(txn_id);
             return Ok(DistTxnState::Committing);
         }
         if durable_abort {
             txn.state = DistTxnState::Aborted;
+            self.unmark_live_in_flight(txn_id);
             return Err(OmniError::IoError(
                 "Distributed transaction was already aborted".into(),
             ));
@@ -410,11 +476,13 @@ impl TwoPhaseCoordinator {
                     let _ = self.db.ensure_cluster_linearizable();
                     if matches!(self.has_durable_state(txn_id, "COMMIT"), Ok(true)) {
                         txn.state = DistTxnState::Committing;
+                        self.unmark_live_in_flight(txn_id);
                         return Ok(DistTxnState::Committing);
                     }
                     return Err(err);
                 }
                 txn.state = DistTxnState::Committing;
+                self.unmark_live_in_flight(txn_id);
                 return Ok(DistTxnState::Committing);
             }
 
@@ -429,6 +497,7 @@ impl TwoPhaseCoordinator {
             let participants: Vec<u64> = all_participants.into_iter().collect();
             self.log_state(txn_id, "ABORT", &participants)?;
             txn.state = DistTxnState::Aborted;
+            self.unmark_live_in_flight(txn_id);
             return Err(OmniError::IoError(format!(
                 "Distributed transaction aborted: {}",
                 abort_reasons.join("; ")
@@ -440,6 +509,10 @@ impl TwoPhaseCoordinator {
 
     /// COMMIT PHASE — marks the transaction as committed after all ACKs.
     pub fn finalize_commit(&self, txn_id: GlobalTxnId) -> Result<(), OmniError> {
+        let txn_lock = self.decision_lock(txn_id)?;
+        let _txn_guard = txn_lock
+            .lock()
+            .map_err(|_| OmniError::LockPoisoned("coordinator txn".into()))?;
         let mut active = self
             .active_txns
             .lock()
@@ -484,11 +557,16 @@ impl TwoPhaseCoordinator {
             txn.state = DistTxnState::Committed;
             active.remove(&txn_id);
         }
+        self.unmark_live_in_flight(txn_id);
         Ok(())
     }
 
     /// Marks an aborted transaction as completed once all participants acknowledge the abort.
     pub fn finalize_abort(&self, txn_id: GlobalTxnId) -> Result<(), OmniError> {
+        let txn_lock = self.decision_lock(txn_id)?;
+        let _txn_guard = txn_lock
+            .lock()
+            .map_err(|_| OmniError::LockPoisoned("coordinator txn".into()))?;
         let mut active = self
             .active_txns
             .lock()
@@ -527,11 +605,16 @@ impl TwoPhaseCoordinator {
         };
         self.log_state(txn_id, "COMPLETE", &participants)?;
         active.remove(&txn_id);
+        self.unmark_live_in_flight(txn_id);
         Ok(())
     }
 
     /// ABORT — aborts a transaction if no commit decision has been durably recorded.
     pub fn abort(&self, txn_id: GlobalTxnId) -> Result<Vec<u64>, OmniError> {
+        let txn_lock = self.decision_lock(txn_id)?;
+        let _txn_guard = txn_lock
+            .lock()
+            .map_err(|_| OmniError::LockPoisoned("coordinator txn".into()))?;
         let mut active = self
             .active_txns
             .lock()
@@ -551,6 +634,7 @@ impl TwoPhaseCoordinator {
             if txn.state != DistTxnState::Committed {
                 txn.state = DistTxnState::Committing;
             }
+            self.unmark_live_in_flight(txn_id);
             return Err(OmniError::IoError(
                 "cannot abort a transaction after its commit decision".into(),
             ));
@@ -562,6 +646,7 @@ impl TwoPhaseCoordinator {
         }
         txn.state = DistTxnState::Aborted;
         active.remove(&txn_id);
+        self.unmark_live_in_flight(txn_id);
 
         Ok(participants)
     }
@@ -683,19 +768,26 @@ impl TwoPhaseCoordinator {
                 "COMMIT" => "COMMIT",
                 "ABORT" => "ABORT",
                 "PREPARE" => {
-                    // Never presumed-abort a transaction currently in flight on
-                    // this live coordinator while votes are still being collected.
-                    let in_flight = self
-                        .active_txns
+                    // Serialize with any live coordinator handle sharing this DB
+                    // across the live-owner check and durable decision write so
+                    // another TwoPhaseCoordinator cannot presumed-abort while
+                    // votes are still being collected.
+                    let txn_lock = self.decision_lock(txn_id)?;
+                    let _txn_guard = txn_lock
                         .lock()
-                        .map_err(|_| OmniError::LockPoisoned("coordinator".into()))?
-                        .get(&txn_id)
-                        .is_some_and(|txn| {
-                            matches!(
-                                txn.state,
-                                DistTxnState::Preparing | DistTxnState::WaitingForVotes
-                            )
-                        });
+                        .map_err(|_| OmniError::LockPoisoned("coordinator txn".into()))?;
+                    let in_flight = self.has_live_in_flight(txn_id)
+                        || self
+                            .active_txns
+                            .lock()
+                            .map_err(|_| OmniError::LockPoisoned("coordinator".into()))?
+                            .get(&txn_id)
+                            .is_some_and(|txn| {
+                                matches!(
+                                    txn.state,
+                                    DistTxnState::Preparing | DistTxnState::WaitingForVotes
+                                )
+                            });
                     if in_flight {
                         continue;
                     }
@@ -703,6 +795,8 @@ impl TwoPhaseCoordinator {
                     // before persisting ABORT so a durable COMMIT is never lost.
                     if self.has_durable_state(txn_id, "COMMIT")? {
                         "COMMIT"
+                    } else if self.has_durable_state(txn_id, "ABORT")? {
+                        "ABORT"
                     } else if let Err(err) = self.log_state(txn_id, "ABORT", &participants) {
                         let _ = self.db.ensure_cluster_linearizable();
                         if self.has_durable_state(txn_id, "COMMIT")? {
@@ -899,6 +993,13 @@ struct ParticipantLogEntry {
     commit_seq: Option<u64>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     snapshot_imported: bool,
+    /// Set on clustered `PREPARED` records before post-apply snapshot
+    /// validation completes. An `unvalidated` record keeps its write keys
+    /// reserved so concurrent writers cannot slip past it, but is NEVER
+    /// eligible for an affirmative `Vote::Commit` retry or `commit_outcome`;
+    /// recovery reconciles any lingering unvalidated record to `ABORTED`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    unvalidated: bool,
 }
 
 fn participant_prepare_key(node_id: u64, txn_id: GlobalTxnId) -> String {
@@ -981,6 +1082,7 @@ fn commit_entry_exceeds_storage_limit(
         prepare_seq: u64::MAX,
         commit_seq: Some(u64::MAX),
         snapshot_imported: false,
+        unvalidated: false,
     };
     let committed_encoded = serde_json::to_string(&worst_committed)
         .map_err(|error| OmniError::IoError(format!("commit log serialization failed: {error}")))?;
@@ -1571,7 +1673,21 @@ impl TwoPhaseParticipant {
                     ));
                 }
                 return Ok(match existing.state.as_str() {
-                    "PREPARED" | "COMMITTED" => PrepareResult {
+                    "PREPARED" if !existing.unvalidated => PrepareResult {
+                        node_id: self.node_id,
+                        txn_id,
+                        vote: Vote::Commit,
+                        prepare_seq: existing.prepare_seq,
+                    },
+                    "PREPARED" => PrepareResult {
+                        node_id: self.node_id,
+                        txn_id,
+                        vote: Vote::Abort(
+                            "prepared transaction did not complete snapshot validation".into(),
+                        ),
+                        prepare_seq: 0,
+                    },
+                    "COMMITTED" => PrepareResult {
                         node_id: self.node_id,
                         txn_id,
                         vote: Vote::Commit,
@@ -1731,6 +1847,9 @@ impl TwoPhaseParticipant {
         }
 
         // Write the complete prepared record durably before voting COMMIT.
+        // In clustered mode, mark it `unvalidated: true` until post-apply
+        // snapshot validation succeeds so a failed/indeterminate prepare can
+        // never turn into a `Vote::Commit` on retry.
         let prepare_key = participant_prepare_key(self.node_id, txn_id);
         let log_entry = ParticipantLogEntry {
             txn_id,
@@ -1740,6 +1859,7 @@ impl TwoPhaseParticipant {
             prepare_seq: 0,
             commit_seq: None,
             snapshot_imported: false,
+            unvalidated: self.db.is_clustered(),
         };
         let mut prepare_batch = WriteBatch::new();
         let encoded = match serde_json::to_string(&log_entry) {
@@ -1809,12 +1929,38 @@ impl TwoPhaseParticipant {
                     prepare_seq,
                     commit_seq: None,
                     snapshot_imported: false,
+                    unvalidated: false,
                 };
                 let mut update = WriteBatch::new();
-                if let Ok(encoded) = serde_json::to_string(&persisted)
-                    && update.set(&prepare_key, encoded).is_ok()
+                let update_res = serde_json::to_string(&persisted)
+                    .map_err(|error| {
+                        OmniError::IoError(format!("prepare log serialization failed: {error}"))
+                    })
+                    .and_then(|encoded| {
+                        update.set(&prepare_key, encoded)?;
+                        self.db.commit_2pc_batch(&update)
+                    });
+                if let Err(err) = update_res
+                    && self.db.is_clustered()
                 {
-                    let _ = self.db.commit_2pc_batch(&update);
+                    // Clustered prepares are only eligible to vote Commit once
+                    // the validated (`unvalidated: false`) record is durable.
+                    let already_validated = self
+                        .db
+                        .ensure_cluster_linearizable()
+                        .and_then(|()| self.load_participant_log(txn_id))
+                        .ok()
+                        .flatten()
+                        .is_some_and(|entry| entry.state == "PREPARED" && !entry.unvalidated);
+                    if !already_validated {
+                        self.reconcile_failed_prepare(txn_id, writes, &write_keys, &err);
+                        return PrepareResult {
+                            node_id: self.node_id,
+                            txn_id,
+                            vote: Vote::Abort(format!("validated prepare record failed: {err}")),
+                            prepare_seq: 0,
+                        };
+                    }
                 }
                 // Store the prepared batch for later commit
                 let mut prepared = self.prepared.lock().unwrap_or_else(|e| e.into_inner());
@@ -1863,7 +2009,9 @@ impl TwoPhaseParticipant {
         write_keys: &[String],
         error: &OmniError,
     ) {
-        if matches!(error, OmniError::NotLeader { .. }) {
+        if matches!(error, OmniError::NotLeader { .. })
+            && matches!(self.load_participant_log(txn_id), Ok(None))
+        {
             self.release_key_locks(txn_id, write_keys);
             return;
         }
@@ -1879,6 +2027,7 @@ impl TwoPhaseParticipant {
             prepare_seq: 0,
             commit_seq: None,
             snapshot_imported: false,
+            unvalidated: false,
         };
         let mut abort_batch = WriteBatch::new();
         let abort_committed = serde_json::to_string(&abort_entry)
@@ -1964,6 +2113,48 @@ impl TwoPhaseParticipant {
         let mut recovered = 0;
         let mut recovered_prepared = HashMap::new();
         let mut recovered_locks = HashMap::new();
+        let mut parsed_prepared = Vec::new();
+        for (_, value) in entries {
+            let entry: ParticipantLogEntry = serde_json::from_str(&value).map_err(|error| {
+                OmniError::IoError(format!("invalid prepared transaction log: {error}"))
+            })?;
+            if entry.node_id != self.node_id || entry.state != "PREPARED" {
+                continue;
+            }
+            if entry.unvalidated {
+                // An unvalidated PREPARED record never passed snapshot
+                // validation and never voted Commit. Reconcile it to ABORTED
+                // before clearing `needs_recovery`; if reconciliation fails,
+                // keep durable reservations intact and fail closed.
+                let abort_entry = ParticipantLogEntry {
+                    txn_id: entry.txn_id,
+                    node_id: self.node_id,
+                    state: "ABORTED".into(),
+                    writes: entry.writes,
+                    prepare_seq: 0,
+                    commit_seq: None,
+                    snapshot_imported: false,
+                    unvalidated: false,
+                };
+                let mut abort_batch = WriteBatch::new();
+                abort_batch.set(
+                    &participant_prepare_key(self.node_id, entry.txn_id),
+                    serde_json::to_string(&abort_entry).map_err(|error| {
+                        OmniError::IoError(format!("unvalidated abort log: {error}"))
+                    })?,
+                )?;
+                abort_batch.set(
+                    &legacy_participant_prepare_key(entry.txn_id),
+                    format!("ABORTED:{}", self.node_id),
+                )?;
+                if let Err(err) = self.db.commit_2pc_batch(&abort_batch) {
+                    self.needs_recovery.store(true, Ordering::SeqCst);
+                    return Err(err);
+                }
+                continue;
+            }
+            parsed_prepared.push(entry);
+        }
         let mut prepared = self
             .prepared
             .lock()
@@ -1972,13 +2163,7 @@ impl TwoPhaseParticipant {
             .key_locks
             .lock()
             .map_err(|_| OmniError::LockPoisoned("participant key locks".into()))?;
-        for (_, value) in entries {
-            let entry: ParticipantLogEntry = serde_json::from_str(&value).map_err(|error| {
-                OmniError::IoError(format!("invalid prepared transaction log: {error}"))
-            })?;
-            if entry.node_id != self.node_id || entry.state != "PREPARED" {
-                continue;
-            }
+        for entry in parsed_prepared {
             let batch = build_write_batch(&entry.writes)
                 .map_err(|error| OmniError::IoError(format!("recover prepared batch: {error}")))?;
             for write in &entry.writes {
@@ -2092,7 +2277,12 @@ impl TwoPhaseParticipant {
                 self.cleanup_terminal_state(txn_id)?;
                 return Ok(CommitOutcome::CommittedAt(commit_seq));
             }
-            "PREPARED" => {}
+            "PREPARED" if !state.unvalidated => {}
+            "PREPARED" => {
+                return Err(OmniError::IoError(
+                    "cannot commit an unvalidated prepared transaction".into(),
+                ));
+            }
             _ => {
                 return Err(OmniError::IoError(
                     "cannot commit an aborted or invalid transaction".into(),
@@ -2110,6 +2300,7 @@ impl TwoPhaseParticipant {
             prepare_seq: state.prepare_seq,
             commit_seq: None,
             snapshot_imported: false,
+            unvalidated: false,
         };
         commit_batch.set(
             &participant_prepare_key(self.node_id, txn_id),
@@ -2171,6 +2362,7 @@ impl TwoPhaseParticipant {
             prepare_seq: 0,
             commit_seq: None,
             snapshot_imported: false,
+            unvalidated: false,
         };
         let mut log_batch = WriteBatch::new();
         log_batch.set(
@@ -2366,6 +2558,7 @@ mod tests {
             prepare_seq: 1,
             commit_seq: None,
             snapshot_imported: false,
+            unvalidated: false,
         };
         commit_batch
             .set(
@@ -2518,6 +2711,7 @@ mod tests {
                 prepare_seq: 1,
                 commit_seq: None,
                 snapshot_imported: false,
+                unvalidated: false,
             };
             let mut batch = WriteBatch::new();
             batch
@@ -2645,6 +2839,7 @@ mod tests {
             prepare_seq: 0,
             commit_seq: None,
             snapshot_imported: false,
+            unvalidated: false,
         };
         let mut prepare_batch = WriteBatch::new();
         prepare_batch
@@ -2690,6 +2885,7 @@ mod tests {
                 prepare_seq: 1,
                 commit_seq: None,
                 snapshot_imported: false,
+                unvalidated: false,
             })
             .unwrap()
         };
@@ -2814,6 +3010,7 @@ mod tests {
             prepare_seq: 0,
             commit_seq: None,
             snapshot_imported: false,
+            unvalidated: false,
         };
         let mut pa_abort = WriteBatch::new();
         pa_abort
@@ -2884,6 +3081,7 @@ mod tests {
             prepare_seq: 1,
             commit_seq: None,
             snapshot_imported: false,
+            unvalidated: false,
         };
         let mut init = WriteBatch::new();
         init.set(&auth_key, serde_json::to_string(&valid_entry).unwrap())
@@ -3151,6 +3349,7 @@ mod tests {
             prepare_seq: 0,
             commit_seq: None,
             snapshot_imported: false,
+            unvalidated: false,
         };
         let mut abort_batch = WriteBatch::new();
         abort_batch
@@ -3397,5 +3596,94 @@ mod tests {
             p1_db.find("live_key", p1_db.get_seq()).unwrap(),
             Some("live_val".into())
         );
+    }
+
+    #[test]
+    fn second_coordinator_recover_with_respects_live_owner_and_aborts_after_drop() {
+        let (coord_db, _coord_dir) = test_db();
+        let (p1_db, _p1_dir) = test_db();
+        let primary_coord = TwoPhaseCoordinator::new(1, coord_db.clone(), 5_000);
+        let recovery_coord = TwoPhaseCoordinator::new(1, coord_db, 5_000);
+        let p1 = TwoPhaseParticipant::new(10, p1_db.clone());
+
+        let txn_a = primary_coord.begin().unwrap();
+        primary_coord
+            .add_write(txn_a, 10, "shared_live_k".into(), Some("v1".into()), 0)
+            .unwrap();
+        primary_coord.prepare(txn_a).unwrap();
+        let vote = p1.prepare(
+            txn_a,
+            &primary_coord.get_participant_writes(txn_a, 10).unwrap(),
+        );
+        assert_eq!(vote.vote, Vote::Commit);
+
+        // A second coordinator handle sharing the same DB must NOT abort txn_a
+        // while primary_coord is still alive and collecting votes.
+        let while_alive = recovery_coord.recover_participants(&[&p1]).unwrap();
+        assert_eq!(while_alive.completed.len(), 0);
+        assert_eq!(while_alive.pending.len(), 0);
+
+        // Dropping primary_coord releases live ownership (simulating coordinator crash);
+        // recovery_coord can now presumed-abort the abandoned PREPARE cleanly.
+        drop(primary_coord);
+        let after_drop = recovery_coord.recover_participants(&[&p1]).unwrap();
+        assert_eq!(after_drop.completed, vec![(txn_a, "ABORT".to_string())]);
+        assert_eq!(after_drop.pending.len(), 0);
+
+        let mut plain = WriteBatch::new();
+        plain.set("shared_live_k", "after_abort".into()).unwrap();
+        p1_db
+            .commit_batch(&plain)
+            .expect("abandoned reservation must be released after presumed abort");
+    }
+
+    #[test]
+    fn unvalidated_prepared_record_cannot_vote_commit_on_retry_and_aborts_on_recovery() {
+        let (db, _dir) = test_db();
+        let participant = TwoPhaseParticipant::new(10, db.clone());
+        let txn_id = (1, 777);
+        let writes = vec![DistWrite {
+            node_id: 10,
+            key: "unvalidated_k".into(),
+            value: Some("stale".into()),
+            ttl: 0,
+        }];
+        let unvalidated_entry = ParticipantLogEntry {
+            txn_id,
+            node_id: 10,
+            state: "PREPARED".into(),
+            writes: writes.clone(),
+            prepare_seq: 0,
+            commit_seq: None,
+            snapshot_imported: false,
+            unvalidated: true,
+        };
+        let mut seed = WriteBatch::new();
+        seed.set(
+            &participant_prepare_key(10, txn_id),
+            serde_json::to_string(&unvalidated_entry).unwrap(),
+        )
+        .unwrap();
+        db.commit_2pc_batch(&seed).unwrap();
+
+        // Key is reserved while the indeterminate record sits unvalidated.
+        let mut blocked = WriteBatch::new();
+        blocked.set("unvalidated_k", "plain".into()).unwrap();
+        assert!(db.commit_batch(&blocked).is_err());
+
+        // Retrying prepare_with_snapshot must reconcile the unvalidated record
+        // to ABORTED and vote Abort rather than turning it into Vote::Commit.
+        let retry = participant.prepare_with_snapshot(txn_id, &writes, db.get_seq());
+        assert!(
+            matches!(retry.vote, Vote::Abort(_)),
+            "unvalidated PREPARED record must never vote Commit on retry, got {:?}",
+            retry.vote
+        );
+        assert!(
+            participant.commit(txn_id).is_err(),
+            "reconciled unvalidated record must reject commit"
+        );
+        db.commit_batch(&blocked)
+            .expect("key reservation must be freed once recovery aborts unvalidated record");
     }
 }

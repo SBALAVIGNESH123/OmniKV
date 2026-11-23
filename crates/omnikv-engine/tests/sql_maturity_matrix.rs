@@ -1,5 +1,5 @@
 use omni_engine::OmniKV;
-use omni_engine::catalog::Catalog;
+use omni_engine::catalog::{Catalog, RowFormat};
 use omni_engine::optimizer::{AccessMethod, Optimizer, PlanNode, TableStats};
 use omni_engine::plan_exec::PlanCache;
 use omni_engine::prepared::QueryEngine;
@@ -20,6 +20,8 @@ fn table_stats(indexes: Vec<IndexDefinition>) -> HashMap<String, TableStats> {
             indexes,
             histograms: vec![],
             primary_key: "id".to_string(),
+            pk_type: None,
+            row_format: RowFormat::Typed,
         },
     )])
 }

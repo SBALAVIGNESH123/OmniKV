@@ -5168,6 +5168,7 @@ impl Contending2pcWorkers {
         db: &Arc<OmniKV>,
         paused: Arc<std::sync::atomic::AtomicBool>,
         plain_2pc_rejected: &Arc<std::sync::atomic::AtomicUsize>,
+        ssi_2pc_rejected: &Arc<std::sync::atomic::AtomicUsize>,
     ) -> Self {
         use omni_engine::WriteBatch;
         use omni_engine::transaction::TransactionManager;
@@ -5181,6 +5182,7 @@ impl Contending2pcWorkers {
             let paused = paused.clone();
             let stop = stop.clone();
             let plain_2pc_rejected = plain_2pc_rejected.clone();
+            let ssi_2pc_rejected = ssi_2pc_rejected.clone();
             handles.push(std::thread::spawn(move || {
                 let tm = TransactionManager::new(db.clone());
                 let mut iter = 0usize;
@@ -5204,7 +5206,11 @@ impl Contending2pcWorkers {
                         let _ = tm.get(&mut txn, "hot_2pc_key");
                         tm.set(&mut txn, "hot_2pc_key", format!("ssi_{worker}_{iter}"))
                             .unwrap();
-                        let _ = tm.commit(&mut txn);
+                        if let Err(err) = tm.commit(&mut txn)
+                            && err.to_string().contains("SSI CONFLICT (2PC)")
+                        {
+                            ssi_2pc_rejected.fetch_add(1, Ordering::Relaxed);
+                        }
                     }
                 }
             }));
@@ -5251,7 +5257,9 @@ fn test_clustered_live_raft_concurrent_2pc_vs_plain_and_ssi_isolation() {
     // Rounds 2..=12 then run completely unsynchronized for stress coverage.
     let paused = Arc::new(AtomicBool::new(true));
     let plain_2pc_rejected = Arc::new(AtomicUsize::new(0));
-    let guard = Contending2pcWorkers::spawn(&db, paused.clone(), &plain_2pc_rejected);
+    let ssi_2pc_rejected = Arc::new(AtomicUsize::new(0));
+    let guard =
+        Contending2pcWorkers::spawn(&db, paused.clone(), &plain_2pc_rejected, &ssi_2pc_rejected);
 
     let round1_val = "2pc_round_1".to_string();
     let round1_writes = vec![DistWrite {
@@ -5269,12 +5277,19 @@ fn test_clustered_live_raft_concurrent_2pc_vs_plain_and_ssi_isolation() {
     let seq_at_prepare = db.get_seq_for_key("hot_2pc_key", u64::MAX);
     paused.store(false, Ordering::Release);
     let reject_deadline = Instant::now() + Duration::from_secs(5);
-    while plain_2pc_rejected.load(Ordering::Relaxed) == 0 && Instant::now() < reject_deadline {
+    while (plain_2pc_rejected.load(Ordering::Relaxed) == 0
+        || ssi_2pc_rejected.load(Ordering::Relaxed) == 0)
+        && Instant::now() < reject_deadline
+    {
         std::thread::sleep(Duration::from_millis(5));
     }
     assert!(
         plain_2pc_rejected.load(Ordering::Relaxed) > 0,
         "competing clustered plain writers must observe SSI CONFLICT (2PC) during Round 1 prepared window"
+    );
+    assert!(
+        ssi_2pc_rejected.load(Ordering::Relaxed) > 0,
+        "competing clustered SSI transactions must observe SSI CONFLICT (2PC) during Round 1 prepared window"
     );
     std::thread::sleep(Duration::from_millis(15));
     assert_eq!(

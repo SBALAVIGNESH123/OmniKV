@@ -9,8 +9,10 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::str::FromStr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 const CATALOG_PREFIX: &str = "\x00CATALOG\x00";
+static NEXT_TABLE_UID_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum ColumnType {
@@ -112,9 +114,26 @@ pub struct TableDef {
     /// deserialized from a manifest written before the field existed.
     #[serde(default)]
     pub row_format: RowFormat,
+    /// Durable per-creation table identity so drop-and-recreate with the same
+    /// table name produces a distinct identity for schema migration receipts.
+    #[serde(default)]
+    pub table_uid: String,
 }
 
 impl TableDef {
+    pub(crate) fn generate_uid() -> String {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let seq = NEXT_TABLE_UID_COUNTER.fetch_add(1, Ordering::Relaxed);
+        format!("{nanos:x}_{seq:x}")
+    }
+
+    pub(crate) fn durable_identity(&self) -> String {
+        format!("{}:{}:{}", self.table_uid, self.created_at, self.name)
+    }
+
     pub fn row_prefix(&self) -> String {
         format!("\x00T\x00{}\x00", self.name)
     }
@@ -166,11 +185,7 @@ impl Catalog {
 
     fn load_all(&self, seq: Option<u64>) {
         let seq = seq.unwrap_or_else(|| self.db.get_seq());
-        if let Ok(results) = self.db.scan(
-            CATALOG_PREFIX,
-            &format!("{}\u{10ffff}", CATALOG_PREFIX),
-            seq,
-        ) {
+        if let Ok(results) = self.db.scan_prefix(CATALOG_PREFIX, seq) {
             let mut cache = self
                 .cache
                 .write()
@@ -183,8 +198,11 @@ impl Catalog {
         }
     }
 
-    pub fn create_table(&self, table: TableDef) -> Result<(), String> {
+    pub fn create_table(&self, mut table: TableDef) -> Result<(), String> {
         let name_lower = table.name.to_lowercase();
+        if table.table_uid.is_empty() {
+            table.table_uid = TableDef::generate_uid();
+        }
         {
             let cache = self
                 .cache
@@ -227,7 +245,7 @@ impl Catalog {
         let seq = self.db.get_seq();
         let rows = self
             .db
-            .scan(&prefix, &format!("{}\u{10ffff}", prefix), seq)
+            .scan_prefix(&prefix, seq)
             .map_err(|e| format!("{:?}", e))?;
         let (index_entry_keys, mut index_meta_keys) = self
             .index_manager
@@ -236,7 +254,7 @@ impl Catalog {
         let stage_prefix = crate::schema::SchemaManager::rename_stage_prefix_for_table(&table.name);
         let stage_entries = self
             .db
-            .scan(&stage_prefix, &format!("{stage_prefix}\u{10ffff}"), seq)
+            .scan_prefix(&stage_prefix, seq)
             .map_err(|e| format!("{e:?}"))?;
         let mut rename_row_marker_keys = Vec::new();
         for (stage_key, _) in stage_entries {
@@ -244,11 +262,7 @@ impl Catalog {
                 crate::schema::SchemaManager::rename_row_stage_prefix(&stage_key);
             for (marker_key, _) in self
                 .db
-                .scan(
-                    &row_marker_prefix,
-                    &format!("{row_marker_prefix}\u{10ffff}"),
-                    seq,
-                )
+                .scan_prefix(&row_marker_prefix, seq)
                 .map_err(|e| format!("{e:?}"))?
             {
                 rename_row_marker_keys.push(marker_key);
@@ -413,11 +427,7 @@ impl Catalog {
     ) -> Result<Vec<String>, String> {
         let mut entries: BTreeMap<_, _> = self
             .db
-            .scan(
-                CATALOG_PREFIX,
-                &format!("{}\u{10ffff}", CATALOG_PREFIX),
-                seq,
-            )
+            .scan_prefix(CATALOG_PREFIX, seq)
             .map_err(|e| format!("Catalog scan failed: {e:?}"))?
             .into_iter()
             .collect();

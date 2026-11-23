@@ -771,6 +771,7 @@ impl SqlExecutor {
             // JSON `null` and "NULL" is literal text. Old manifests lack the
             // field and default to legacy.
             row_format: crate::catalog::RowFormat::Typed,
+            table_uid: TableDef::generate_uid(),
         };
 
         // Inside a transaction the CREATE stages in the pending batch —
@@ -840,11 +841,7 @@ impl SqlExecutor {
                     crate::schema::SchemaManager::rename_row_stage_prefix(&stage_key);
                 for (marker_key, _) in self
                     .db
-                    .scan(
-                        &row_marker_prefix,
-                        &format!("{row_marker_prefix}\u{10ffff}"),
-                        read_seq,
-                    )
+                    .scan_prefix(&row_marker_prefix, read_seq)
                     .map_err(|e| format!("{e:?}"))?
                 {
                     Self::stage_batch_delete(&mut batch, &marker_key)?;
@@ -939,11 +936,12 @@ impl SqlExecutor {
         }
 
         let prefix = table.row_prefix();
-        let end = format!("{}\u{10ffff}", prefix);
-        self.record_range_read(&prefix, &end);
+        if let (_, Some(end)) = OmniKV::prefix_range_exclusive(&prefix) {
+            self.record_range_read(&prefix, &end);
+        }
         let mut stored = self
             .db
-            .scan(&prefix, &end, seq)
+            .scan_prefix(&prefix, seq)
             .map_err(|e| format!("{:?}", e))?;
 
         let overlay = self.pending_overlay();
@@ -1398,10 +1396,12 @@ impl SqlExecutor {
         // aborts this transaction's COMMIT (phantom/write-skew
         // protection). Autocommit executors collect nothing (their
         // collector is None — nothing to abort).
-        self.record_range_read(&prefix, &format!("{}\u{10ffff}", prefix));
+        if let (_, Some(end)) = OmniKV::prefix_range_exclusive(&prefix) {
+            self.record_range_read(&prefix, &end);
+        }
         let mut results = self
             .db
-            .scan(&prefix, &format!("{}\u{10ffff}", prefix), seq)
+            .scan_prefix(&prefix, seq)
             .map_err(|error| format!("storage scan failed for table '{}': {error}", table.name))?;
 
         // Read-your-own-writes: staged rows replace their stored copies,
@@ -2499,22 +2499,16 @@ impl SqlExecutor {
             .map(|(col, val)| Ok((resolve_column_name(&table, col)?, val)))
             .collect::<Result<_, String>>()?;
         let mut rows = self.load_table_rows_with_keys_at(&table, read_seq)?;
-        let mut available_keys = std::collections::HashSet::new();
         for (_, row) in &rows {
-            let Some(pk) = row.get(&table.primary_key).cloned().flatten() else {
+            if row.get(&table.primary_key).cloned().flatten().is_none() {
                 return Err(format!(
                     "table '{}' contains a row without a primary key; refusing to update",
                     table.name
                 ));
-            };
-            available_keys.insert(format!(
-                "{}{}",
-                table.row_prefix(),
-                crate::volcano::canonicalize_pk_key(&table, &pk)
-            ));
+            }
         }
 
-        let mut untouched_rows = Vec::new();
+        let mut untouched_rows_with_keys: Vec<(String, Row)> = Vec::new();
         if let Some(expr) = where_clause {
             let col_types = column_types_of_table(&table);
             let mut matched = Vec::new();
@@ -2522,15 +2516,35 @@ impl SqlExecutor {
                 if eval_where_typed(&item.1, expr, &col_types) {
                     matched.push(item);
                 } else {
-                    untouched_rows.push(item.1);
+                    untouched_rows_with_keys.push(item);
                 }
             }
             rows = matched;
         }
 
-        // Remove the keys of rows this statement will rewrite. This permits a
-        // no-op update of a row's existing key while still detecting a move
-        // onto a key owned by an untouched row or another updated row.
+        // Build occupied key reservations strictly from untouched rows so
+        // rewriting a matched row (e.g., a pre-existing "-0" FLOAT key) can
+        // never release a canonical key ("0") still owned by an unmatched row,
+        // while a lone "-0" row can still move cleanly to "0".
+        let mut available_keys = std::collections::HashSet::with_capacity(
+            untouched_rows_with_keys.len().saturating_mul(2),
+        );
+        let mut untouched_rows = Vec::with_capacity(untouched_rows_with_keys.len());
+        for (raw_stored_pk, row) in untouched_rows_with_keys {
+            let pk = row
+                .get(&table.primary_key)
+                .cloned()
+                .flatten()
+                .ok_or_else(|| format!("primary key is NULL in table '{}'", table.name))?;
+            available_keys.insert(format!(
+                "{}{}",
+                table.row_prefix(),
+                crate::volcano::canonicalize_pk_key(&table, &pk)
+            ));
+            available_keys.insert(format!("{}{}", table.row_prefix(), raw_stored_pk));
+            untouched_rows.push(row);
+        }
+
         let mut old_keys = Vec::with_capacity(rows.len());
         for (raw_stored_pk, row) in &rows {
             let pk = row
@@ -2543,7 +2557,6 @@ impl SqlExecutor {
                 table.row_prefix(),
                 crate::volcano::canonicalize_pk_key(&table, &pk)
             );
-            available_keys.remove(&canonical_old_key);
             // For Legacy tables, migration_batch rekeys rows to canonical_old_key
             // before this statement's writes run. For Typed tables, keep the
             // actual stored suffix (e.g. a pre-existing "-0" FLOAT key) so
@@ -2827,7 +2840,7 @@ impl SqlExecutor {
         } else {
             self.active_rename_stages(&table.name, read_seq)?
         };
-        let delete_reserved_ops = rows.len().saturating_mul(
+        let mut delete_reserved_ops = rows.len().saturating_mul(
             1 + index_catalog.indexes_for_collection(&table.name).len() + active_stages.len(),
         );
         let count = rows.len();
@@ -2858,8 +2871,8 @@ impl SqlExecutor {
         if table.row_format == crate::catalog::RowFormat::Legacy
             && self.pending_batch.borrow().is_none()
         {
-            let mut dry_ops: usize = 1; // catalog format flip
-            for (_, canonical_pk, key, _, document) in &planned_deletes {
+            let mut exact_delete_ops: usize = 0;
+            for (raw_stored_pk, canonical_pk, key, _, document) in &planned_deletes {
                 let mut probe = WriteBatch::new();
                 probe.delete(key).map_err(|e| format!("{:?}", e))?;
                 let entries = index_manager
@@ -2873,11 +2886,39 @@ impl SqlExecutor {
                 for (_, idx_key) in &entries {
                     probe.delete(idx_key).map_err(|e| format!("{:?}", e))?;
                 }
-                dry_ops = dry_ops
+                let raw_key = format!("{}{}", table.row_prefix(), raw_stored_pk);
+                let mut actual_marker_deletes: usize = 0;
+                for stage_key in &active_stages {
+                    let canonical_marker =
+                        crate::schema::SchemaManager::rename_row_stage_key(stage_key, key);
+                    let has_canonical = self
+                        .find_row_stage_marker_with_batch(None, &canonical_marker, read_seq)?
+                        .is_some();
+                    let has_moved_legacy = !has_canonical
+                        && raw_key != *key
+                        && self
+                            .find_row_stage_marker_with_batch(
+                                None,
+                                &crate::schema::SchemaManager::rename_row_stage_key(
+                                    stage_key, &raw_key,
+                                ),
+                                read_seq,
+                            )?
+                            .is_some();
+                    if has_canonical || has_moved_legacy {
+                        probe
+                            .delete(&canonical_marker)
+                            .map_err(|e| format!("{:?}", e))?;
+                        actual_marker_deletes = actual_marker_deletes.saturating_add(1);
+                    }
+                }
+                exact_delete_ops = exact_delete_ops
                     .saturating_add(1)
                     .saturating_add(entries.len())
-                    .saturating_add(active_stages.len());
+                    .saturating_add(actual_marker_deletes);
             }
+            delete_reserved_ops = exact_delete_ops;
+            let dry_ops = exact_delete_ops.saturating_add(1); // +1 catalog format flip
             if dry_ops > WriteBatch::MAX_OPS {
                 return Err(format!(
                     "{:?}",
@@ -2942,9 +2983,8 @@ impl SqlExecutor {
 
     fn active_rename_stages(&self, table_name: &str, read_seq: u64) -> Result<Vec<String>, String> {
         let prefix = crate::schema::SchemaManager::rename_stage_prefix_for_table(table_name);
-        let end = format!("{prefix}\u{10ffff}");
         self.db
-            .scan(&prefix, &end, read_seq)
+            .scan_prefix(&prefix, read_seq)
             .map(|entries| entries.into_iter().map(|(k, _)| k).collect())
             .map_err(|e| format!("{:?}", e))
     }
@@ -3198,6 +3238,7 @@ mod tests {
             primary_key: "id".into(),
             created_at: 1,
             row_format: RowFormat::Legacy,
+            table_uid: "legacy_t_1".into(),
         }
     }
 

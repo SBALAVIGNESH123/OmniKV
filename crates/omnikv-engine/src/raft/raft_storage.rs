@@ -338,11 +338,14 @@ impl RaftSnapshotBuilder<TypeConfig> for OmniRaftStorage {
             (meta, self.db.get_seq())
         };
 
-        let iter = self
+        let mut iter = self
             .db
             .scan_all_latest_internal()
             .map_err(|e| storage_read_err(format!("snapshot storage scan failed: {e}")))?;
-        for (k, v) in iter {
+        while let Some((k, v)) = iter
+            .try_next()
+            .map_err(|e| storage_read_err(format!("snapshot heap read failed: {e}")))?
+        {
             if k.starts_with("__sys__/raft/") {
                 continue;
             }
@@ -691,14 +694,40 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
             meta.last_purged_log_id.map(|id| id.index + 1).unwrap_or(1)
         };
 
+        let resolve_purge_boundary_id = |idx: u64| -> Result<LogId<u64>, String> {
+            let key = format!("{}{:020}", RAFT_LOG_PREFIX, idx);
+            match self
+                .db
+                .find(&key, self.db.get_seq())
+                .map_err(|e| format!("read purge boundary log {idx}: {e}"))?
+            {
+                Some(val) => Ok(serde_json::from_str::<Entry<TypeConfig>>(&val)
+                    .map(|entry| entry.log_id)
+                    .unwrap_or_else(|_| LogId::new(log_id.leader_id, idx))),
+                None => Ok(LogId::new(log_id.leader_id, idx)),
+            }
+        };
+
         for idx in start_idx..=log_id.index {
             let key = format!("{}{:020}", RAFT_LOG_PREFIX, idx);
             batch.delete(&key).map_err(|e| storage_write_err(&e))?;
             // A purge after snapshot/compaction can span far more log
-            // indexes than one batch holds; flush chunks as we go. The
-            // meta update (last_purged_log_id) rides the FINAL chunk
-            // only — a crash mid-purge just re-purges idempotently.
-            if batch.op_count() >= WriteBatch::MAX_OPS.saturating_sub(1) {
+            // indexes than one batch holds. Persist `last_purged_log_id`
+            // atomically WITH each intermediate chunk (matching the exact
+            // last index that chunk deletes) so a crash or failed commit
+            // never leaves deleted entries below a stale purge floor.
+            if idx < log_id.index && batch.op_count() >= WriteBatch::MAX_OPS.saturating_sub(1) {
+                let chunk_floor = resolve_purge_boundary_id(idx).map_err(storage_read_err)?;
+                let next_meta = {
+                    let meta = self
+                        .meta
+                        .lock()
+                        .expect("RaftStorage meta lock poisoned: fatal invariant");
+                    let mut next = meta.clone();
+                    next.last_purged_log_id = Some(chunk_floor);
+                    self.save_meta(&next, &mut batch);
+                    next
+                };
                 self.db
                     .commit_batch_local(&batch)
                     .map_err(|e| StorageError::IO {
@@ -708,6 +737,10 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
                             AnyError::error(e.to_string()),
                         ),
                     })?;
+                *self
+                    .meta
+                    .lock()
+                    .expect("RaftStorage meta lock poisoned: fatal invariant") = next_meta;
                 batch.clear();
             }
         }
@@ -804,6 +837,19 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
         // own history: recording at apply (not at the COMMIT on the node
         // that ran it) means a follower promoted after a failover already
         // has every pre-failover commit in its history when it first leads.
+        // Hold the shared transition lock across the entire apply call — both
+        // every staged data/history flush AND the final `last_applied` /
+        // `membership` metadata publication — so `build_snapshot` (which takes
+        // the exclusive transition lock) can never observe committed user data
+        // paired with a stale `last_applied` or missing SSI commit history.
+        // Every commit inside this span uses `commit_batch_local_locked*` so
+        // `transition_guard` is never re-entered while held.
+        let _topology_guard = self
+            .db
+            .transition_guard
+            .read()
+            .map_err(|_| io_err(crate::OmniError::LockPoisoned("transition_guard".into())))?;
+
         let flush_staged = |batch: &mut WriteBatch,
                             slots: &mut Vec<(usize, Option<SsiCommitRecord>)>,
                             keys: &mut std::collections::HashSet<Vec<u8>>,
@@ -812,20 +858,6 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
             if batch.is_empty() {
                 return Ok(());
             }
-            // One shared transition lock spans the data commit AND the
-            // history record(s) below, so an apply publishes a commit's data
-            // and its record as an indivisible pair. A concurrent
-            // build_snapshot takes the EXCLUSIVE lock for its capture reads
-            // and so cannot observe the data without the record (or the
-            // reverse); without this span the snapshot could carry a
-            // data/history pair that never existed together. Releasing the
-            // guard before the record — as the plain commit_batch_local
-            // would — is exactly the hole this closes.
-            let _topology_guard = self
-                .db
-                .transition_guard
-                .read()
-                .map_err(|_| crate::OmniError::LockPoisoned("transition_guard".into()))?;
             let touches_2pc = batch
                 .buffered_writes
                 .iter()
@@ -998,8 +1030,9 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
         flush_staged(&mut batch, &mut staged_slots, &mut staged_keys, &mut res).map_err(io_err)?;
 
         let next_meta = if last_applied.is_some() || new_membership.is_some() {
-            // Scoped: the guard must be released before the final commit
-            // takes the transition lock (lock order is transition -> meta).
+            // Lock order is `transition_guard -> meta`; `_topology_guard` is
+            // already held for the whole apply call, and we release `meta`
+            // before the final locked commit below.
             let meta = self
                 .meta
                 .lock()
@@ -1017,15 +1050,20 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
             None
         };
 
-        // Final chunk: the meta record only (user data flushed above).
-        // commit_chunked is belt-and-braces for that single op.
-        commit_chunked(&self.db, &mut batch).map_err(io_err)?;
+        // Final commit: the single meta op only (user data flushed above).
+        // Use `commit_batch_local_locked` because `_topology_guard` is already
+        // held across both data and metadata publication.
+        if !batch.is_empty() {
+            self.db.commit_batch_local_locked(&batch).map_err(io_err)?;
+            batch.clear();
+        }
         if let Some(next_meta) = next_meta {
             *self
                 .meta
                 .lock()
                 .expect("RaftStorage meta lock poisoned: fatal invariant") = next_meta;
         }
+        drop(_topology_guard);
 
         Ok(res)
     }
@@ -1114,13 +1152,26 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
             fs::remove_dir_all(&tmp_dir).map_err(|e| io_err(&format!("rm tmp dir: {}", e)))?;
         }
         fs::create_dir_all(&tmp_dir).map_err(|e| io_err(&format!("mkdir tmp: {}", e)))?;
-        struct TempDirGuard(std::path::PathBuf);
-        impl Drop for TempDirGuard {
-            fn drop(&mut self) {
-                let _ = std::fs::remove_dir_all(&self.0);
+        struct TempDirGuard {
+            path: std::path::PathBuf,
+            active: bool,
+        }
+        impl TempDirGuard {
+            fn disarm(&mut self) {
+                self.active = false;
             }
         }
-        let _tmp_cleanup = TempDirGuard(tmp_dir.clone());
+        impl Drop for TempDirGuard {
+            fn drop(&mut self) {
+                if self.active {
+                    let _ = std::fs::remove_dir_all(&self.path);
+                }
+            }
+        }
+        let mut tmp_cleanup = TempDirGuard {
+            path: tmp_dir.clone(),
+            active: true,
+        };
 
         // ── Phase C: Write snapshot entries into a fresh WriteBatch in tmp engine ──
         let manifest_file_name = std::path::Path::new(&manifest_path)
@@ -1270,69 +1321,92 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
             .file_name()
             .ok_or_else(|| io_err("temporary snapshot directory has no file name"))?
             .to_os_string();
-        let restore_active_files = || {
-            if let Ok(entries) = fs::read_dir(&data_dir) {
-                for entry in entries.flatten() {
-                    let name = entry.file_name();
-                    if name != "old_snapshot" && name != "LOCK" && name != tmp_dir_name {
-                        let _ = fs::rename(entry.path(), tmp_dir.join(&name));
-                    }
+        let mut moved_to_old: Vec<std::ffi::OsString> = Vec::new();
+        let mut promoted_from_tmp: Vec<std::ffi::OsString> = Vec::new();
+        let rollback_promotion = |moved_to_old: &[std::ffi::OsString],
+                                  promoted_from_tmp: &[std::ffi::OsString],
+                                  tmp_cleanup: &mut TempDirGuard| {
+            let mut rollback_ok = true;
+            for name in promoted_from_tmp.iter().rev() {
+                if fs::rename(data_dir.join(name), tmp_dir.join(name)).is_err() {
+                    rollback_ok = false;
                 }
             }
-            if let Ok(entries) = fs::read_dir(&old_dir) {
-                for entry in entries.flatten() {
-                    let name = entry.file_name();
-                    if name != "LOCK" {
-                        let _ = fs::rename(entry.path(), data_dir.join(&name));
-                    }
+            for name in moved_to_old.iter().rev() {
+                if fs::rename(old_dir.join(name), data_dir.join(name)).is_err() {
+                    rollback_ok = false;
                 }
+            }
+            if !rollback_ok {
+                // Preserve both `old_dir` and `tmp_dir` for recovery whenever
+                // any rollback rename fails; never delete original files.
+                tmp_cleanup.disarm();
+            } else {
+                let _ = fs::remove_dir(&old_dir);
             }
         };
 
-        // Move current files to old_dir
+        // Move current files to old_dir, recording each exact file moved.
         for entry in
             fs::read_dir(&data_dir).map_err(|e| io_err(&format!("read data dir: {}", e)))?
         {
-            let entry = entry.map_err(|e| io_err(&format!("read data dir entry: {}", e)))?;
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(e) => {
+                    rollback_promotion(&moved_to_old, &promoted_from_tmp, &mut tmp_cleanup);
+                    return Err(io_err(&format!("read data dir entry: {}", e)));
+                }
+            };
             let name = entry.file_name();
-            if name != "old_snapshot"
-                && name != "LOCK"
-                && name != tmp_dir_name
-                && let Err(e) = fs::rename(entry.path(), old_dir.join(&name))
-            {
-                restore_active_files();
-                return Err(io_err(&format!(
-                    "move current snapshot file {}: {}",
-                    name.to_string_lossy(),
-                    e
-                )));
+            if name != "old_snapshot" && name != "LOCK" && name != tmp_dir_name {
+                if let Err(e) = fs::rename(entry.path(), old_dir.join(&name)) {
+                    rollback_promotion(&moved_to_old, &promoted_from_tmp, &mut tmp_cleanup);
+                    return Err(io_err(&format!(
+                        "move current snapshot file {}: {}",
+                        name.to_string_lossy(),
+                        e
+                    )));
+                }
+                moved_to_old.push(name);
             }
         }
 
-        // Move tmp files to data_dir
-        for entry in
-            fs::read_dir(&tmp_dir).map_err(|e| io_err(&format!("read temp snapshot dir: {}", e)))?
-        {
-            let entry = entry.map_err(|e| io_err(&format!("read temp snapshot entry: {}", e)))?;
+        // Move tmp files to data_dir, recording each exact file promoted.
+        let tmp_entries = match fs::read_dir(&tmp_dir) {
+            Ok(entries) => entries,
+            Err(e) => {
+                rollback_promotion(&moved_to_old, &promoted_from_tmp, &mut tmp_cleanup);
+                return Err(io_err(&format!("read temp snapshot dir: {}", e)));
+            }
+        };
+        for entry in tmp_entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(e) => {
+                    rollback_promotion(&moved_to_old, &promoted_from_tmp, &mut tmp_cleanup);
+                    return Err(io_err(&format!("read temp snapshot entry: {}", e)));
+                }
+            };
             let name = entry.file_name();
             if name == "LOCK" {
                 continue;
             }
             if let Err(e) = fs::rename(entry.path(), data_dir.join(&name)) {
-                restore_active_files();
+                rollback_promotion(&moved_to_old, &promoted_from_tmp, &mut tmp_cleanup);
                 return Err(io_err(&format!(
                     "install snapshot file {}: {}",
                     name.to_string_lossy(),
                     e
                 )));
             }
+            promoted_from_tmp.push(name);
         }
 
         // ── Phase E: Recover fresh storage from installed snapshot ──
         let recovered = match OmniKV::recover_storage_roots(&manifest_path, &wal_path) {
             Ok(recovered) => recovered,
             Err(e) => {
-                restore_active_files();
+                rollback_promotion(&moved_to_old, &promoted_from_tmp, &mut tmp_cleanup);
                 return Err(io_err(&format!("recover snapshot storage: {}", e)));
             }
         };
@@ -1581,6 +1655,130 @@ mod tests {
             reloaded.read_log(total),
             None,
             "conflict tail end entry must be deleted"
+        );
+    }
+
+    #[tokio::test]
+    async fn purge_logs_upto_persists_floor_per_chunk_and_handles_exact_cap_minus_one() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let manifest = dir.path().join("manifest.json");
+        let wal = dir.path().join("wal.bin");
+        let db = OmniKV::open(
+            manifest.to_str().expect("manifest path"),
+            wal.to_str().expect("wal path"),
+        )
+        .expect("open db");
+        let mut storage = OmniRaftStorage::new(db.clone());
+        let leader1 = CommittedLeaderId::new(1, 1);
+
+        let exact_cap_minus_one = WriteBatch::MAX_OPS.saturating_sub(1) as u64;
+        let total = exact_cap_minus_one + 15;
+        let entries: Vec<Entry<TypeConfig>> = (1..=total)
+            .map(|idx| Entry {
+                log_id: LogId::new(leader1, idx),
+                payload: EntryPayload::Blank,
+            })
+            .collect();
+        storage.append_to_log(entries).await.expect("append logs");
+
+        // Purge exactly MAX_OPS - 1 entries (single atomic chunk with meta).
+        storage
+            .purge_logs_upto(LogId::new(leader1, exact_cap_minus_one))
+            .await
+            .expect("exact cap-1 purge must succeed");
+        assert_eq!(
+            storage
+                .get_log_state()
+                .await
+                .expect("log state")
+                .last_purged_log_id,
+            Some(LogId::new(leader1, exact_cap_minus_one))
+        );
+        assert_eq!(storage.read_log(exact_cap_minus_one), None);
+        assert!(storage.read_log(exact_cap_minus_one + 1).is_some());
+
+        // Purge a multi-chunk range cleanly and verify reloaded floor.
+        let more_start = total + 1;
+        let more_end = more_start + WriteBatch::MAX_OPS as u64 + 10;
+        let more_entries: Vec<Entry<TypeConfig>> = (more_start..=more_end)
+            .map(|idx| Entry {
+                log_id: LogId::new(leader1, idx),
+                payload: EntryPayload::Blank,
+            })
+            .collect();
+        storage
+            .append_to_log(more_entries)
+            .await
+            .expect("append second wave");
+        storage
+            .purge_logs_upto(LogId::new(leader1, more_end - 2))
+            .await
+            .expect("multi-chunk purge must succeed");
+
+        let reloaded = OmniRaftStorage::new(db);
+        let state = reloaded.meta.lock().expect("meta lock").last_purged_log_id;
+        assert_eq!(state, Some(LogId::new(leader1, more_end - 2)));
+        assert_eq!(reloaded.read_log(more_end - 2), None);
+        assert!(reloaded.read_log(more_end - 1).is_some());
+    }
+
+    #[tokio::test]
+    async fn build_snapshot_propagates_heap_read_error_instead_of_truncating() {
+        use openraft::RaftSnapshotBuilder;
+        use std::io::{Seek, SeekFrom, Write};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let manifest = dir.path().join("manifest.json");
+        let wal = dir.path().join("wal.bin");
+        let db = OmniKV::open(
+            manifest.to_str().expect("manifest path"),
+            wal.to_str().expect("wal path"),
+        )
+        .expect("open db");
+        let mut storage = OmniRaftStorage::new(db.clone());
+        let leader1 = CommittedLeaderId::new(1, 1);
+
+        storage
+            .apply_to_state_machine(&[
+                Entry {
+                    log_id: LogId::new(leader1, 1),
+                    payload: EntryPayload::Normal("SET snap_a val_a".into()),
+                },
+                Entry {
+                    log_id: LogId::new(leader1, 2),
+                    payload: EntryPayload::Normal("SET snap_b val_b".into()),
+                },
+                Entry {
+                    log_id: LogId::new(leader1, 3),
+                    payload: EntryPayload::Normal("SET snap_c val_c".into()),
+                },
+            ])
+            .await
+            .expect("apply snapshot entries");
+
+        // Corrupt bytes inside the active heap file so reading stored values
+        // fails CRC verification instead of returning a truncated snapshot.
+        let heap_path = db.load_roots().manifest.heap_path.clone();
+        let mut heap = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&heap_path)
+            .expect("open heap file");
+        let heap_len = heap.metadata().expect("heap metadata").len();
+        assert!(heap_len > 0, "heap must hold committed entries");
+        heap.seek(SeekFrom::Start(0)).expect("seek heap");
+        heap.write_all(&vec![0xFFu8; heap_len as usize])
+            .expect("corrupt heap bytes");
+        heap.sync_all().expect("sync corrupted heap");
+        drop(heap);
+
+        let err = storage
+            .build_snapshot()
+            .await
+            .expect_err("heap CRC error during snapshot capture must fail closed");
+        assert!(
+            err.to_string().contains("snapshot heap read failed"),
+            "unexpected snapshot error: {err}"
         );
     }
 }

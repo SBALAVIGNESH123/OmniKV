@@ -23,9 +23,12 @@
 
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::secondary_index::{IndexFieldType, IndexManager, collection_row_ranges};
 use crate::{OmniError, OmniKV, WriteBatch};
+
+static NEXT_MIGRATION_ATTEMPT_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 /// Prefix for schema metadata stored in OmniKV.
 const SCHEMA_PREFIX: &str = "\x00SCHEMA\x00";
@@ -186,6 +189,8 @@ impl SchemaManager {
             )));
         }
 
+        let attempt_id = self.get_or_create_attempt_id(migration.version, "up")?;
+
         // Mark as in-progress
         self.save_migration_record(&MigrationRecord {
             version: migration.version,
@@ -197,7 +202,7 @@ impl SchemaManager {
         // Execute each operation
         let total_ops = migration.up.len();
         for (i, op) in migration.up.iter().enumerate() {
-            match self.execute_op(op, migration.version, "up", i) {
+            match self.execute_op(op, migration.version, "up", &attempt_id, i) {
                 Ok(()) => {
                     let pct = ((i + 1) * 100).checked_div(total_ops).unwrap_or(100) as u8;
                     self.save_migration_record(&MigrationRecord {
@@ -232,6 +237,7 @@ impl SchemaManager {
                 applied_at: timestamp_ms(),
             },
             migration.version,
+            &attempt_id,
         )?;
 
         Ok(())
@@ -255,9 +261,11 @@ impl SchemaManager {
             )));
         }
 
+        let attempt_id = self.get_or_create_attempt_id(migration.version, "down")?;
+
         // Execute down operations in reverse
         for (i, op) in migration.down.iter().rev().enumerate() {
-            self.execute_op(op, migration.version, "down", i)?;
+            self.execute_op(op, migration.version, "down", &attempt_id, i)?;
         }
 
         // Publish the rollback record and predecessor version atomically.
@@ -269,6 +277,7 @@ impl SchemaManager {
                 applied_at: timestamp_ms(),
             },
             migration.version.saturating_sub(1),
+            &attempt_id,
         )?;
 
         Ok(())
@@ -377,6 +386,7 @@ impl SchemaManager {
         op: &SchemaOp,
         version: Version,
         direction: &str,
+        attempt_id: &str,
         step_index: usize,
     ) -> Result<(), OmniError> {
         match op {
@@ -475,21 +485,31 @@ impl SchemaManager {
                     .as_deref()
                     .and_then(|v| serde_json::from_str::<crate::catalog::TableDef>(v).ok())
                 {
+                    let table_id = table.durable_identity();
                     let done_key = Self::remove_done_key(
                         version,
                         direction,
+                        attempt_id,
                         step_index,
                         &table.name,
                         field_name,
                     );
+                    let expected_done = Self::sql_done_receipt(&table_id);
                     if let Some(receipt) = self.db.find(&done_key, seq)? {
-                        if let Some(canonical_name) = receipt.strip_prefix("cleanup:") {
+                        if receipt == expected_done {
+                            return Ok(());
+                        }
+                        if let Some(canonical_name) =
+                            Self::parse_sql_cleanup_receipt(&receipt, &table_id)
+                        {
                             self.backfill_field(&table.name, canonical_name, None)?;
                             let mut finish_batch = WriteBatch::new();
-                            finish_batch.set(&done_key, "done".into())?;
+                            finish_batch.set(&done_key, expected_done)?;
                             self.db.commit_batch(&finish_batch)?;
+                            return Ok(());
                         }
-                        return Ok(());
+                        // Receipt belonged to an earlier table instance that was
+                        // dropped and recreated; do not apply it to this replacement.
                     }
                     if table.primary_key.eq_ignore_ascii_case(field_name) {
                         return Err(crate::OmniError::IoError(format!(
@@ -525,6 +545,7 @@ impl SchemaManager {
                         .map_err(|e| crate::OmniError::IoError(e.to_string()))?;
                     return self.remove_sql_field_online(
                         &table_name,
+                        &table_id,
                         sql_row_format,
                         &canonical_name,
                         &catalog_key,
@@ -547,6 +568,23 @@ impl SchemaManager {
                     .as_deref()
                     .and_then(|v| serde_json::from_str::<crate::catalog::TableDef>(v).ok())
                 {
+                    let table_id = table.durable_identity();
+                    let done_key = Self::rename_done_key(
+                        version,
+                        direction,
+                        attempt_id,
+                        step_index,
+                        &table.name,
+                        old_name,
+                        new_name,
+                    );
+                    let expected_done = Self::sql_done_receipt(&table_id);
+                    // Honor a completed receipt for this table identity BEFORE
+                    // inspecting the current column layout so a retry after a
+                    // later step re-adds `old_name` does not trip `has_new`.
+                    if self.db.find(&done_key, seq)?.as_deref() == Some(expected_done.as_str()) {
+                        return Ok(());
+                    }
                     if table.primary_key.eq_ignore_ascii_case(old_name) {
                         return Err(crate::OmniError::IoError(format!(
                             "cannot rename primary key field '{}' in SQL table '{}' \
@@ -554,14 +592,6 @@ impl SchemaManager {
                             old_name, collection
                         )));
                     }
-                    let done_key = Self::rename_done_key(
-                        version,
-                        direction,
-                        step_index,
-                        &table.name,
-                        old_name,
-                        new_name,
-                    );
                     let canonical_new = table
                         .columns
                         .iter()
@@ -578,9 +608,8 @@ impl SchemaManager {
                         && !has_old
                     {
                         let stage_prefix = Self::rename_stage_prefix_for_table(&table.name);
-                        let stage_end = format!("{stage_prefix}\u{10ffff}");
                         for (candidate_stage_key, staged_old) in
-                            self.db.scan(&stage_prefix, &stage_end, seq)?
+                            self.db.scan_prefix(&stage_prefix, seq)?
                         {
                             if staged_old.eq_ignore_ascii_case(old_name)
                                 && candidate_stage_key
@@ -595,11 +624,9 @@ impl SchemaManager {
                                     &staged_old,
                                     &candidate_stage_key,
                                     &done_key,
+                                    &expected_done,
                                 );
                             }
-                        }
-                        if self.db.find(&done_key, seq)?.is_some() {
-                            return Ok(());
                         }
                     }
                     if has_new {
@@ -636,19 +663,68 @@ impl SchemaManager {
                         new_name,
                         Some((&catalog_key, &cat_value)),
                         &done_key,
+                        &expected_done,
                     );
                 }
                 let done_key = Self::rename_done_key(
-                    version, direction, step_index, collection, old_name, new_name,
+                    version, direction, attempt_id, step_index, collection, old_name, new_name,
                 );
-                self.rename_field_online(collection, old_name, new_name, None, &done_key)
+                self.rename_field_online(collection, old_name, new_name, None, &done_key, "done")
             }),
         }
     }
 
+    fn migration_attempt_key(version: Version, direction: &str) -> String {
+        format!("\x00SCHEMA\x00attempt:{version:06}:{direction}")
+    }
+
+    fn get_or_create_attempt_id(
+        &self,
+        version: Version,
+        direction: &str,
+    ) -> Result<String, OmniError> {
+        let attempt_key = Self::migration_attempt_key(version, direction);
+        if let Some(existing) = self.db.find(&attempt_key, self.db.get_seq())? {
+            return Ok(existing);
+        }
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let seq = NEXT_MIGRATION_ATTEMPT_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let attempt_id = format!("{nanos:x}_{seq:x}");
+        let mut batch = WriteBatch::new();
+        batch.set(&attempt_key, attempt_id.clone())?;
+        self.db.commit_batch(&batch)?;
+        Ok(attempt_id)
+    }
+
+    fn sql_done_receipt(table_id: &str) -> String {
+        format!("done:{}:{table_id}", table_id.len())
+    }
+
+    fn sql_cleanup_receipt(table_id: &str, canonical_name: &str) -> String {
+        format!("cleanup:{}:{table_id}:{canonical_name}", table_id.len())
+    }
+
+    fn parse_sql_cleanup_receipt<'a>(receipt: &'a str, expected_table_id: &str) -> Option<&'a str> {
+        let rest = receipt.strip_prefix("cleanup:")?;
+        let (len_str, remainder) = rest.split_once(':')?;
+        let id_len = len_str.parse::<usize>().ok()?;
+        if remainder.len() < id_len + 1 || !remainder.is_char_boundary(id_len) {
+            return None;
+        }
+        let (stored_id, tail) = remainder.split_at(id_len);
+        let canonical_name = tail.strip_prefix(':')?;
+        (stored_id == expected_table_id).then_some(canonical_name)
+    }
+
     pub(crate) fn rename_stage_prefix_for_table(collection: &str) -> String {
-        let col = collection.to_lowercase();
-        format!("\x00SCHEMA\x00rename_stage:{}:{}:", col.len(), col)
+        format!(
+            "\x00SCHEMA\x00rename_stage:{}:{}:",
+            collection.len(),
+            collection
+        )
     }
 
     pub(crate) fn rename_stage_key(collection: &str, old_name: &str, new_name: &str) -> String {
@@ -673,24 +749,27 @@ impl SchemaManager {
         format!("{}{row_key}", Self::rename_row_stage_prefix(stage_key))
     }
 
-    fn rename_done_prefix(version: Version, direction: &str) -> String {
-        format!("\x00SCHEMA\x00rename_done:{version:06}:{direction}:")
+    fn rename_done_prefix(version: Version, direction: &str, attempt_id: &str) -> String {
+        format!(
+            "\x00SCHEMA\x00rename_done:{version:06}:{direction}:{}:{attempt_id}:",
+            attempt_id.len()
+        )
     }
 
     fn rename_done_key(
         version: Version,
         direction: &str,
+        attempt_id: &str,
         step_index: usize,
         collection: &str,
         old_name: &str,
         new_name: &str,
     ) -> String {
-        let col = collection.to_lowercase();
         format!(
             "{}{step_index:06}:{}:{}:{}:{}:{}:{}",
-            Self::rename_done_prefix(version, direction),
-            col.len(),
-            col,
+            Self::rename_done_prefix(version, direction, attempt_id),
+            collection.len(),
+            collection,
             old_name.len(),
             old_name,
             new_name.len(),
@@ -698,32 +777,37 @@ impl SchemaManager {
         )
     }
 
-    fn remove_done_prefix(version: Version, direction: &str) -> String {
-        format!("\x00SCHEMA\x00remove_done:{version:06}:{direction}:")
+    fn remove_done_prefix(version: Version, direction: &str, attempt_id: &str) -> String {
+        format!(
+            "\x00SCHEMA\x00remove_done:{version:06}:{direction}:{}:{attempt_id}:",
+            attempt_id.len()
+        )
     }
 
     fn remove_done_key(
         version: Version,
         direction: &str,
+        attempt_id: &str,
         step_index: usize,
         collection: &str,
         field_name: &str,
     ) -> String {
-        let col = collection.to_lowercase();
         let field = field_name.to_lowercase();
         format!(
             "{}{step_index:06}:{}:{}:{}:{}",
-            Self::remove_done_prefix(version, direction),
-            col.len(),
-            col,
+            Self::remove_done_prefix(version, direction, attempt_id),
+            collection.len(),
+            collection,
             field.len(),
             field
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn remove_sql_field_online(
         &self,
         collection: &str,
+        table_id: &str,
         sql_row_format: crate::catalog::RowFormat,
         field_name: &str,
         catalog_key: &str,
@@ -743,7 +827,7 @@ impl SchemaManager {
 
         'ranges: for (prefix, end) in collection_row_ranges(collection) {
             let is_sql_rows = prefix.starts_with("\x00T\x00");
-            for (key, value) in self.db.scan(&prefix, &end, seq)? {
+            for (key, value) in self.db.scan_exclusive(&prefix, Some(&end), seq)? {
                 let Ok(mut doc) = serde_json::from_str::<serde_json::Value>(&value) else {
                     continue;
                 };
@@ -772,25 +856,26 @@ impl SchemaManager {
             }
         }
 
+        let done_receipt = Self::sql_done_receipt(table_id);
         if fits_in_one_batch {
             single_batch.set(catalog_key, cat_value.to_string())?;
-            single_batch.set(done_key, "done".into())?;
+            single_batch.set(done_key, done_receipt)?;
             self.db.commit_batch(&single_batch)?;
             return Ok(());
         }
 
-        // Large removal: commit the catalog cutover and a cleanup receipt
-        // atomically first so the old column stays readable until cutover is
-        // durable, then clean stored row values in safely retryable chunks.
+        // Large removal: commit the catalog cutover and a table-bound cleanup
+        // receipt atomically first so the old column stays readable until
+        // cutover is durable, then clean stored row values in retryable chunks.
         let mut cutover_batch = WriteBatch::new();
         cutover_batch.set(catalog_key, cat_value.to_string())?;
-        cutover_batch.set(done_key, format!("cleanup:{field_name}"))?;
+        cutover_batch.set(done_key, Self::sql_cleanup_receipt(table_id, field_name))?;
         self.db.commit_batch(&cutover_batch)?;
 
         self.backfill_field(collection, field_name, None)?;
 
         let mut finish_batch = WriteBatch::new();
-        finish_batch.set(done_key, "done".into())?;
+        finish_batch.set(done_key, done_receipt)?;
         self.db.commit_batch(&finish_batch)?;
         Ok(())
     }
@@ -866,9 +951,7 @@ impl SchemaManager {
             Some(serde_json::Value::String(s)) => {
                 if s == "NULL" && sql_row_format == crate::catalog::RowFormat::Legacy {
                     let sql_prefix = format!("\x00T\x00{}\x00", collection);
-                    let sql_end = format!("\x00T\x00{}\x00\u{10ffff}", collection);
-                    if sql_table.is_some() || !self.db.scan(&sql_prefix, &sql_end, seq)?.is_empty()
-                    {
+                    if sql_table.is_some() || !self.db.scan_prefix(&sql_prefix, seq)?.is_empty() {
                         return Err(OmniError::IoError(format!(
                             "literal \"NULL\" default for field '{field_name}' is not supported on legacy SQL table '{collection}'"
                         )));
@@ -880,8 +963,7 @@ impl SchemaManager {
             Some(serde_json::Value::Bool(b)) => Some(serde_json::Value::String(b.to_string())),
             Some(other) => {
                 let sql_prefix = format!("\x00T\x00{}\x00", collection);
-                let sql_end = format!("\x00T\x00{}\x00\u{10ffff}", collection);
-                if sql_table.is_some() || !self.db.scan(&sql_prefix, &sql_end, seq)?.is_empty() {
+                if sql_table.is_some() || !self.db.scan_prefix(&sql_prefix, seq)?.is_empty() {
                     return Err(OmniError::IoError(format!(
                         "unsupported SQL row value for field '{field_name}': {other}"
                     )));
@@ -896,7 +978,7 @@ impl SchemaManager {
 
         for (prefix, end) in collection_row_ranges(collection) {
             let is_sql_rows = prefix.starts_with("\x00T\x00");
-            for (key, value) in self.db.scan(&prefix, &end, seq)? {
+            for (key, value) in self.db.scan_exclusive(&prefix, Some(&end), seq)? {
                 let Ok(mut doc) = serde_json::from_str::<serde_json::Value>(&value) else {
                     continue;
                 };
@@ -959,6 +1041,7 @@ impl SchemaManager {
         new_name: &str,
         sql_catalog_update: Option<(&str, &str)>,
         done_key: &str,
+        done_value: &str,
     ) -> Result<(), OmniError> {
         self.index_manager.refresh_catalog()?;
         let seq = self.db.get_seq();
@@ -977,13 +1060,13 @@ impl SchemaManager {
         let is_staged_retry = self.db.find(&stage_key, seq)?.is_some();
         if !is_staged_retry
             && sql_catalog_update.is_none()
-            && self.db.find(done_key, seq)?.is_some()
+            && self.db.find(done_key, seq)?.as_deref() == Some(done_value)
         {
             return Ok(());
         }
 
         for (prefix, end) in collection_row_ranges(collection) {
-            for (key, value) in self.db.scan(&prefix, &end, seq)? {
+            for (key, value) in self.db.scan_exclusive(&prefix, Some(&end), seq)? {
                 if let Ok(serde_json::Value::Object(obj)) = serde_json::from_str(&value)
                     && let (Some(old_val), Some(new_val)) = (obj.get(old_name), obj.get(new_name))
                 {
@@ -1013,7 +1096,7 @@ impl SchemaManager {
 
             'ranges: for (prefix, end) in collection_row_ranges(collection) {
                 let is_sql_rows = prefix.starts_with("\x00T\x00");
-                for (key, value) in self.db.scan(&prefix, &end, seq)? {
+                for (key, value) in self.db.scan_exclusive(&prefix, Some(&end), seq)? {
                     let Ok(mut doc) = serde_json::from_str::<serde_json::Value>(&value) else {
                         continue;
                     };
@@ -1048,10 +1131,8 @@ impl SchemaManager {
                 if let Some((cat_key, cat_val)) = sql_catalog_update {
                     single_batch.set(cat_key, cat_val.to_string())?;
                 }
-                if !single_batch.is_empty() {
-                    single_batch.set(done_key, "done".into())?;
-                    self.db.commit_batch(&single_batch)?;
-                }
+                single_batch.set(done_key, done_value.to_string())?;
+                self.db.commit_batch(&single_batch)?;
                 return Ok(());
             }
         }
@@ -1066,7 +1147,7 @@ impl SchemaManager {
 
         for (prefix, end) in collection_row_ranges(collection) {
             let is_sql_rows = prefix.starts_with("\x00T\x00");
-            for (key, value) in self.db.scan(&prefix, &end, seq)? {
+            for (key, value) in self.db.scan_exclusive(&prefix, Some(&end), seq)? {
                 let Ok(mut doc) = serde_json::from_str::<serde_json::Value>(&value) else {
                     continue;
                 };
@@ -1119,7 +1200,7 @@ impl SchemaManager {
             self.db.commit_batch(&cat_batch)?;
         }
 
-        self.cleanup_staged_rename(collection, old_name, &stage_key, done_key)
+        self.cleanup_staged_rename(collection, old_name, &stage_key, done_key, done_value)
     }
 
     fn cleanup_staged_rename(
@@ -1128,6 +1209,7 @@ impl SchemaManager {
         old_name: &str,
         stage_key: &str,
         done_key: &str,
+        done_value: &str,
     ) -> Result<(), OmniError> {
         self.index_manager.refresh_catalog()?;
         let seq = self.db.get_seq();
@@ -1147,7 +1229,7 @@ impl SchemaManager {
 
         for (prefix, end) in collection_row_ranges(collection) {
             let is_sql_rows = prefix.starts_with("\x00T\x00");
-            for (key, value) in self.db.scan(&prefix, &end, seq)? {
+            for (key, value) in self.db.scan_exclusive(&prefix, Some(&end), seq)? {
                 let Ok(mut doc) = serde_json::from_str::<serde_json::Value>(&value) else {
                     continue;
                 };
@@ -1186,12 +1268,8 @@ impl SchemaManager {
         }
 
         let row_marker_prefix = Self::rename_row_stage_prefix(stage_key);
-        let row_marker_end = format!("{row_marker_prefix}\u{10ffff}");
         let latest_seq = self.db.get_seq();
-        for (marker_key, _) in self
-            .db
-            .scan(&row_marker_prefix, &row_marker_end, latest_seq)?
-        {
+        for (marker_key, _) in self.db.scan_prefix(&row_marker_prefix, latest_seq)? {
             if batch
                 .buffered_deletes
                 .iter()
@@ -1210,7 +1288,7 @@ impl SchemaManager {
             self.db.commit_batch(&batch)?;
             batch = WriteBatch::new();
         }
-        batch.set(done_key, "done".into())?;
+        batch.set(done_key, done_value.to_string())?;
         batch.delete(stage_key)?;
         self.db.commit_batch(&batch)?;
         Ok(())
@@ -1227,10 +1305,18 @@ impl SchemaManager {
     }
 
     /// Publishes a migration state and schema version atomically.
+    ///
+    /// Receipts are scoped to `attempt_id`. When all receipt deletions fit in
+    /// the publication batch they commit atomically alongside the terminal
+    /// state; otherwise the terminal migration state, schema version, and
+    /// attempt-token removal are published atomically FIRST, and the retired
+    /// attempt's receipts are trimmed afterward so a mid-cleanup crash can
+    /// never delete receipts ahead of terminal version publication.
     fn save_applied_version(
         &self,
         record: &MigrationRecord,
         version: Version,
+        attempt_id: &str,
     ) -> Result<(), OmniError> {
         let key = format!("{}{:06}", MIGRATION_PREFIX, record.version);
         let value = serde_json::to_string(record).map_err(|e| OmniError::IoError(e.to_string()))?;
@@ -1238,23 +1324,52 @@ impl SchemaManager {
             MigrationState::RolledBack => "down",
             _ => "up",
         };
-        let mut batch = WriteBatch::new();
+        let attempt_key = Self::migration_attempt_key(record.version, direction);
+        let seq = self.db.get_seq();
+        let mut receipt_keys = Vec::new();
         for done_prefix in [
-            Self::rename_done_prefix(record.version, direction),
-            Self::remove_done_prefix(record.version, direction),
+            Self::rename_done_prefix(record.version, direction, attempt_id),
+            Self::remove_done_prefix(record.version, direction, attempt_id),
         ] {
-            let done_end = format!("{done_prefix}\u{10ffff}");
-            for (done_key, _) in self.db.scan(&done_prefix, &done_end, self.db.get_seq())? {
-                if batch.op_count().saturating_add(3) > WriteBatch::MAX_OPS {
-                    self.db.commit_batch(&batch)?;
-                    batch = WriteBatch::new();
-                }
-                batch.delete(&done_key)?;
+            for (done_key, _) in self.db.scan_prefix(&done_prefix, seq)? {
+                receipt_keys.push(done_key);
             }
         }
-        batch.set(&key, value)?;
-        batch.set(VERSION_KEY, version.to_string())?;
-        self.db.commit_batch(&batch)?;
+
+        if receipt_keys.len().saturating_add(3) <= WriteBatch::MAX_OPS {
+            let mut batch = WriteBatch::new();
+            for done_key in receipt_keys {
+                batch.delete(&done_key)?;
+            }
+            batch.delete(&attempt_key)?;
+            batch.set(&key, value)?;
+            batch.set(VERSION_KEY, version.to_string())?;
+            self.db.commit_batch(&batch)?;
+            return Ok(());
+        }
+
+        // Publish terminal migration state + new schema version + clear
+        // active attempt token atomically BEFORE trimming any receipts.
+        let mut publish_batch = WriteBatch::new();
+        publish_batch.delete(&attempt_key)?;
+        publish_batch.set(&key, value)?;
+        publish_batch.set(VERSION_KEY, version.to_string())?;
+        self.db.commit_batch(&publish_batch)?;
+
+        // Best-effort post-publication cleanup of retired attempt receipts.
+        let mut cleanup_batch = WriteBatch::new();
+        for done_key in receipt_keys {
+            if cleanup_batch.op_count() >= WriteBatch::MAX_OPS {
+                let _ = self.db.commit_batch(&cleanup_batch);
+                cleanup_batch = WriteBatch::new();
+            }
+            if cleanup_batch.delete(&done_key).is_err() {
+                break;
+            }
+        }
+        if !cleanup_batch.is_empty() {
+            let _ = self.db.commit_batch(&cleanup_batch);
+        }
         Ok(())
     }
 }
