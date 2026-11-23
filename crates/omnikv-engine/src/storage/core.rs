@@ -672,6 +672,18 @@ impl WriteBatch {
         Ok(())
     }
 
+    /// Appends an internal metadata write (such as Raft's `last_applied`
+    /// bookmark) that must commit atomically with a full user batch, even when
+    /// the user entry already reached [`MAX_OPS`](Self::MAX_OPS). Still
+    /// enforces [`MAX_VALUE_SIZE`].
+    pub(crate) fn set_internal_meta(&mut self, key: &str, value: String) -> Result<(), OmniError> {
+        if value.len() > MAX_VALUE_SIZE {
+            return Err(OmniError::ValueTooLarge(MAX_VALUE_SIZE));
+        }
+        self.buffered_writes.push((string_to_key(key), value, 0));
+        Ok(())
+    }
+
     pub fn delete(&mut self, key: &str) -> Result<(), OmniError> {
         if self.buffered_writes.len() + self.buffered_deletes.len() >= MAX_BATCH_SIZE {
             return Err(OmniError::BatchTooLarge(MAX_BATCH_SIZE));
@@ -884,6 +896,8 @@ fn next_unicode_scalar(ch: char) -> Option<char> {
 
 pub struct ScanIterator<'a> {
     db: &'a OmniKV,
+    heap_reader: Arc<File>,
+    heap_generation: u64,
     candidates: std::vec::IntoIter<ScanCandidate>,
     now: u64,
     read_buffer: PooledScanBuffer,
@@ -896,7 +910,9 @@ impl ScanIterator<'_> {
                 continue;
             }
             let key = key_to_string(&candidate.key);
-            let value = self.db.read_from_heap_into(
+            let value = self.db.read_from_heap_with_reader_into(
+                &self.heap_reader,
+                self.heap_generation,
                 candidate.offset,
                 candidate.length,
                 candidate.crc,
@@ -1168,6 +1184,11 @@ pub struct StorageRoots {
     pub frozen_memtables: Arc<Vec<SharedMemtable>>,
     pub manifest: Arc<Manifest>,
     pub heap_reader: Arc<File>,
+    /// Monotonic identifier for the underlying heap file (`heap_reader`),
+    /// incremented whenever GC or Raft snapshot installation replaces the heap.
+    /// Pairs with byte offsets in `block_cache` so reads captured from an older
+    /// root snapshot never read or hit cache entries from a different heap.
+    pub heap_generation: u64,
 }
 
 /// Pure storage recovery result — returned by recover_storage_from_path().
@@ -1276,7 +1297,8 @@ pub struct OmniKV {
     pub metrics: Arc<Metrics>,
     pub(crate) active_snapshots: Mutex<std::collections::BTreeMap<u64, usize>>,
     pub(crate) replica_retention_floors: Mutex<BTreeMap<String, u64>>,
-    pub(crate) block_cache: moka::sync::Cache<u64, String>,
+    pub(crate) block_cache: moka::sync::Cache<(u64, u64), String>,
+    pub(crate) next_heap_generation: AtomicU64,
     scan_buffer_pool: Arc<ScanBufferPool>,
     compaction_policy: RwLock<CompactionPolicy>,
 
@@ -1397,6 +1419,7 @@ impl OmniKV {
             frozen_memtables: Arc::new(Vec::new()),
             manifest: recovered.manifest,
             heap_reader: recovered.heap_reader,
+            heap_generation: 1,
         };
 
         let ssi_history = std::sync::Arc::new(crate::transaction::SsiHistory::default());
@@ -1416,6 +1439,7 @@ impl OmniKV {
             active_snapshots: Mutex::new(std::collections::BTreeMap::new()),
             replica_retention_floors: Mutex::new(BTreeMap::new()),
             block_cache: moka::sync::Cache::builder().max_capacity(100_000).build(),
+            next_heap_generation: AtomicU64::new(2),
             scan_buffer_pool: Arc::new(ScanBufferPool::default()),
             compaction_policy: RwLock::new(CompactionPolicy::default()),
             compaction_cv: (std::sync::Mutex::new(()), std::sync::Condvar::new()),
@@ -2628,24 +2652,36 @@ impl OmniKV {
         result
     }
 
-    fn read_from_heap(
+    fn read_from_heap_with_reader(
         &self,
+        heap_reader: &File,
+        heap_generation: u64,
         offset: u64,
         length_with_flag: u64,
         expected_crc32: u32,
     ) -> Result<String, OmniError> {
         let mut buf = Vec::new();
-        self.read_from_heap_into(offset, length_with_flag, expected_crc32, &mut buf)
+        self.read_from_heap_with_reader_into(
+            heap_reader,
+            heap_generation,
+            offset,
+            length_with_flag,
+            expected_crc32,
+            &mut buf,
+        )
     }
 
-    fn read_from_heap_into(
+    fn read_from_heap_with_reader_into(
         &self,
+        heap_reader: &File,
+        heap_generation: u64,
         offset: u64,
         length_with_flag: u64,
         expected_crc32: u32,
         buf: &mut Vec<u8>,
     ) -> Result<String, OmniError> {
-        if let Some(cached) = self.block_cache.get(&offset) {
+        let cache_key = (heap_generation, offset);
+        if let Some(cached) = self.block_cache.get(&cache_key) {
             return Ok(cached);
         }
 
@@ -2655,24 +2691,18 @@ impl OmniKV {
         buf.clear();
         buf.resize(length as usize, 0);
 
-        // On Windows, use the writer handle (heap_file) for reads to guarantee
-        // visibility of recently written data. Windows doesn't guarantee
-        // read-after-write consistency across separate file handles for
-        // unflushed data. On Unix, pread on the reader handle is safe (POSIX).
         #[cfg(unix)]
         {
-            let file = self.roots.load().heap_reader.clone();
-            file.read_exact_at(buf.as_mut_slice(), offset)?;
+            heap_reader.read_exact_at(buf.as_mut_slice(), offset)?;
         }
         #[cfg(windows)]
         {
             use std::os::windows::fs::FileExt;
-            let file = self.roots.load().heap_reader.clone();
             // seek_read can return fewer bytes than requested (short read).
             // Loop until the entire buffer is filled.
             let mut total_read = 0usize;
             while total_read < buf.len() {
-                let n = file
+                let n = heap_reader
                     .seek_read(&mut buf[total_read..], offset + total_read as u64)
                     .map_err(|e| OmniError::IoError(format!("heap seek_read: {}", e)))?;
                 if n == 0 {
@@ -2697,7 +2727,7 @@ impl OmniKV {
         };
 
         if let Ok(ref val) = result {
-            self.block_cache.insert(offset, val.clone());
+            self.block_cache.insert(cache_key, val.clone());
         }
 
         result
@@ -2724,8 +2754,9 @@ impl OmniKV {
             .as_secs();
 
         let shard = shard_idx(&target_key);
+        let roots = self.roots.load();
 
-        let memtable = self.roots.load().memtable.clone();
+        let memtable = roots.memtable.clone();
         // Reverse(seq) ordering: exclusive lower bound at Reverse(read_seq+1) includes read_seq.
         let memtable_start = Reverse(read_seq.saturating_add(1));
         for entry in memtable[shard].range((target_key.clone(), memtable_start)..) {
@@ -2740,7 +2771,13 @@ impl OmniKV {
                 if *expiry > 0 && *expiry <= now {
                     return Ok(None);
                 }
-                let val = self.read_from_heap(entry.value().0, *length, entry.value().2)?;
+                let val = self.read_from_heap_with_reader(
+                    &roots.heap_reader,
+                    roots.heap_generation,
+                    entry.value().0,
+                    *length,
+                    entry.value().2,
+                )?;
                 if let Ok(mut lock) = self.metrics.read_latencies.lock() {
                     let _ = lock.record(start_time.elapsed().as_micros() as u64);
                 }
@@ -2748,7 +2785,7 @@ impl OmniKV {
             }
         }
 
-        let frozen_memtables = self.roots.load().frozen_memtables.clone();
+        let frozen_memtables = roots.frozen_memtables.clone();
         for frozen in frozen_memtables.iter().rev() {
             let frozen_start = Reverse(read_seq.saturating_add(1));
             for entry in frozen[shard].range((target_key.clone(), frozen_start)..) {
@@ -2763,7 +2800,13 @@ impl OmniKV {
                     if *expiry > 0 && *expiry <= now {
                         return Ok(None);
                     }
-                    let val = self.read_from_heap(entry.value().0, *length, entry.value().2)?;
+                    let val = self.read_from_heap_with_reader(
+                        &roots.heap_reader,
+                        roots.heap_generation,
+                        entry.value().0,
+                        *length,
+                        entry.value().2,
+                    )?;
                     if let Ok(mut lock) = self.metrics.read_latencies.lock() {
                         let _ = lock.record(start_time.elapsed().as_micros() as u64);
                     }
@@ -2773,7 +2816,7 @@ impl OmniKV {
         }
 
         let mut pointer = None;
-        let sstables = self.roots.load().sstables.clone();
+        let sstables = roots.sstables.clone();
         for (mmap, bloom, _) in sstables.iter().rev() {
             let mut h = FnvHasher::default();
             target_key.hash(&mut h);
@@ -2787,7 +2830,7 @@ impl OmniKV {
         }
 
         if pointer.is_none() {
-            let l1_sstables = self.roots.load().l1_sstables.clone();
+            let l1_sstables = roots.l1_sstables.clone();
             for (mmap, bloom, _) in l1_sstables.iter().rev() {
                 let mut h = FnvHasher::default();
                 target_key.hash(&mut h);
@@ -2802,11 +2845,11 @@ impl OmniKV {
         }
 
         if pointer.is_none() {
-            let base_bloom = self.roots.load().base_bloom.clone();
+            let base_bloom = roots.base_bloom.clone();
             let mut h = FnvHasher::default();
             target_key.hash(&mut h);
             if base_bloom.might_contain(h.finish()) {
-                let base_mmap = self.roots.load().base_mmap.clone();
+                let base_mmap = roots.base_mmap.clone();
                 let reader = SSTableReader::from_mmap(base_mmap);
                 pointer = reader.find(&target_key, read_seq);
             }
@@ -2819,7 +2862,13 @@ impl OmniKV {
             if expiry > 0 && expiry <= now {
                 return Ok(None);
             }
-            let val = self.read_from_heap(offset, length, crc)?;
+            let val = self.read_from_heap_with_reader(
+                &roots.heap_reader,
+                roots.heap_generation,
+                offset,
+                length,
+                crc,
+            )?;
             if let Ok(mut lock) = self.metrics.read_latencies.lock() {
                 let _ = lock.record(start_time.elapsed().as_micros() as u64);
             }
@@ -2994,9 +3043,12 @@ impl OmniKV {
         // Phase 3: Deduplicate â€” keep only the first (newest) entry per key.
         candidates.dedup_by(|a, b| a.key == b.key);
 
-        // Phase 4: Lazy heap I/O â€” only read values when the iterator is consumed.
+        // Phase 4: Lazy heap I/O — retain the heap reader and generation from
+        // the exact StorageRoots snapshot that produced these offsets.
         Ok(ScanIterator {
             db: self,
+            heap_reader: roots.heap_reader.clone(),
+            heap_generation: roots.heap_generation,
             candidates: candidates.into_iter(),
             now,
             read_buffer: self.scan_buffer_pool.acquire(),
@@ -3149,6 +3201,7 @@ impl OmniKV {
                     l1_sstables: current.l1_sstables.clone(),
                     manifest: current.manifest.clone(),
                     heap_reader: current.heap_reader.clone(),
+                    heap_generation: current.heap_generation,
                 }));
                 (old, new_frozen.len() - 1)
             };
@@ -3752,6 +3805,7 @@ impl OmniKV {
             sstables: Arc::new(Vec::new()),
             l1_sstables: Arc::new(Vec::new()),
             heap_reader: Arc::new(new_heap_reader),
+            heap_generation: self.next_heap_generation.fetch_add(1, Ordering::Relaxed),
             manifest: Arc::new(manifest_for_roots),
             memtable: cur.memtable.clone(),
             frozen_memtables: cur.frozen_memtables.clone(),
@@ -4572,6 +4626,66 @@ mod tests {
         assert!(
             reopened.commit_batch(&plain).is_err(),
             "plain write must not overwrite a durable 2PC PREPARED key after restart"
+        );
+    }
+
+    #[test]
+    fn scan_iterator_retains_captured_heap_generation_across_heap_gc_swap() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let manifest = dir
+            .path()
+            .join("manifest.json")
+            .to_str()
+            .expect("manifest path")
+            .to_string();
+        let wal = dir
+            .path()
+            .join("wal.bin")
+            .to_str()
+            .expect("wal path")
+            .to_string();
+        let db = OmniKV::open(&manifest, &wal).expect("open db");
+
+        let mut b1 = WriteBatch::new();
+        b1.set("gen/a", "old_value_a".into()).expect("stage a");
+        b1.set("gen/b", "old_value_b".into()).expect("stage b");
+        db.commit_batch(&b1).expect("commit gen 1");
+        let snap_seq = db.get_seq();
+
+        // Capture a lazy ScanIterator against generation 1 before GC replaces the heap.
+        let mut iter = db
+            .scan_iter_bounds(
+                string_to_key("gen/"),
+                ScanEnd::Exclusive(&string_to_key("gen0")),
+                snap_seq,
+            )
+            .expect("start scan on gen 1");
+
+        // Overwrite with new values and run heap GC to swap to generation 2,
+        // then read gen 2 so block_cache holds offset 0 of generation 2.
+        let mut b2 = WriteBatch::new();
+        b2.set("gen/a", "new_value_a".into()).expect("overwrite a");
+        b2.set("gen/b", "new_value_b".into()).expect("overwrite b");
+        db.commit_batch(&b2).expect("commit gen 2 writes");
+        db.flush_memtable_to_disk(1).expect("flush before gc");
+        db.run_garbage_collection().expect("run heap gc");
+        assert_eq!(
+            db.find("gen/a", db.get_seq()).expect("read gen 2 a"),
+            Some("new_value_a".into())
+        );
+
+        // Consuming the gen-1 ScanIterator must still return gen-1 values,
+        // never cross-reading or hitting block_cache entries from gen 2.
+        let mut collected = Vec::new();
+        while let Some(pair) = iter.try_next().expect("read gen 1 entry") {
+            collected.push(pair);
+        }
+        assert_eq!(
+            collected,
+            vec![
+                ("gen/a".to_string(), "old_value_a".to_string()),
+                ("gen/b".to_string(), "old_value_b".to_string()),
+            ]
         );
     }
 }

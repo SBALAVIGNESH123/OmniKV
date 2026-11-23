@@ -39,6 +39,7 @@ fn secondary_index(
         fields: vec![(field.to_string(), field_type)],
         unique: false,
         encoding_version: omni_engine::secondary_index::CURRENT_INDEX_ENCODING_VERSION,
+        namespace: omni_engine::secondary_index::IndexNamespace::Sql,
     }
 }
 

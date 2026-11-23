@@ -762,19 +762,57 @@ impl TwoPhaseCoordinator {
             pending: Vec::new(),
         };
 
-        for (txn_id, state, participants) in in_doubt {
-            let decision = match state.as_str() {
-                "COMMIT" => "COMMIT",
-                "ABORT" => "ABORT",
-                "PREPARE" => {
-                    // Serialize with any live coordinator handle sharing this DB
-                    // across the live-owner check and durable decision write so
-                    // another TwoPhaseCoordinator cannot presumed-abort while
-                    // votes are still being collected.
-                    let txn_lock = self.decision_lock(txn_id)?;
-                    let _txn_guard = txn_lock
-                        .lock()
-                        .map_err(|_| OmniError::LockPoisoned("coordinator txn".into()))?;
+        for (txn_id, state, _initial_participants) in in_doubt {
+            if !matches!(state.as_str(), "COMMIT" | "ABORT" | "PREPARE") {
+                report.pending.push(PendingRecovery {
+                    txn_id,
+                    decision: state,
+                    failures: vec![(
+                        self.node_id,
+                        "unrecognized coordinator log state".to_string(),
+                    )],
+                });
+                continue;
+            }
+            // Serialize with any live coordinator handle sharing this DB and
+            // re-read the coordinator records for `txn_id` from one consistent
+            // snapshot under the decision lock so a transaction that committed,
+            // finalized, and was garbage-collected after the initial scan can
+            // never receive a spurious presumed ABORT.
+            let Some((decision, participants)) = ({
+                let txn_lock = self.decision_lock(txn_id)?;
+                let _txn_guard = txn_lock
+                    .lock()
+                    .map_err(|_| OmniError::LockPoisoned("coordinator txn".into()))?;
+                self.db.ensure_cluster_linearizable()?;
+                let read_seq = self.db.get_seq();
+                let txn_prefix = format!("__2PC_LOG__/{}_{}/", txn_id.0, txn_id.1);
+                let records = self.db.scan_prefix(&txn_prefix, read_seq)?;
+                let mut has_complete = false;
+                let mut commit_entry: Option<TwoPhaseLogEntry> = None;
+                let mut abort_entry: Option<TwoPhaseLogEntry> = None;
+                let mut prepare_entry: Option<TwoPhaseLogEntry> = None;
+                for (key, value) in &records {
+                    let suffix = key.strip_prefix(&txn_prefix).unwrap_or("");
+                    if let Ok(entry) = serde_json::from_str::<TwoPhaseLogEntry>(value) {
+                        match entry.state.as_str() {
+                            "COMPLETE" => has_complete = true,
+                            "COMMIT" => commit_entry = Some(entry),
+                            "ABORT" => abort_entry = Some(entry),
+                            "PREPARE" => prepare_entry = Some(entry),
+                            _ => {}
+                        }
+                    } else if suffix == "COMPLETE" {
+                        has_complete = true;
+                    }
+                }
+                if has_complete {
+                    None
+                } else if let Some(entry) = commit_entry {
+                    Some(("COMMIT", entry.participants))
+                } else if let Some(entry) = abort_entry {
+                    Some(("ABORT", entry.participants))
+                } else if let Some(entry) = prepare_entry {
                     let in_flight = self.has_live_in_flight(txn_id)
                         || self
                             .active_txns
@@ -788,36 +826,23 @@ impl TwoPhaseCoordinator {
                                 )
                             });
                     if in_flight {
-                        continue;
-                    }
-                    // Presumed abort: check whether COMMIT landed concurrently
-                    // before persisting ABORT so a durable COMMIT is never lost.
-                    if self.has_durable_state(txn_id, "COMMIT")? {
-                        "COMMIT"
-                    } else if self.has_durable_state(txn_id, "ABORT")? {
-                        "ABORT"
-                    } else if let Err(err) = self.log_state(txn_id, "ABORT", &participants) {
+                        None
+                    } else if let Err(err) = self.log_state(txn_id, "ABORT", &entry.participants) {
                         let _ = self.db.ensure_cluster_linearizable();
                         if self.has_durable_state(txn_id, "COMMIT")? {
-                            "COMMIT"
+                            Some(("COMMIT", entry.participants))
                         } else {
                             return Err(err);
                         }
                     } else {
-                        "ABORT"
+                        Some(("ABORT", entry.participants))
                     }
+                } else {
+                    // Records were already finalized and garbage-collected.
+                    None
                 }
-                other => {
-                    report.pending.push(PendingRecovery {
-                        txn_id,
-                        decision: other.to_string(),
-                        failures: vec![(
-                            self.node_id,
-                            format!("unrecognized coordinator log state '{other}'"),
-                        )],
-                    });
-                    continue;
-                }
+            }) else {
+                continue;
             };
 
             let mut failures = Vec::new();
@@ -1553,7 +1578,9 @@ pub(crate) fn sanitize_2pc_entry_for_snapshot_install(key: &str, value: &str) ->
     serde_json::to_string(&entry).ok()
 }
 
-pub(crate) fn sync_all_prepared_reservations(db: &OmniKV) -> Result<(), OmniError> {
+pub(crate) fn collect_prepared_reservations(
+    db: &OmniKV,
+) -> Result<HashMap<String, (u64, GlobalTxnId)>, OmniError> {
     let entries = db.scan("__2PC_PREPARE__/", "__2PC_PREPARE__/~", u64::MAX)?;
     let mut reserved = HashMap::new();
     for (key, value) in entries {
@@ -1567,6 +1594,11 @@ pub(crate) fn sync_all_prepared_reservations(db: &OmniKV) -> Result<(), OmniErro
             reserved.insert(write.key, (entry.node_id, entry.txn_id));
         }
     }
+    Ok(reserved)
+}
+
+pub(crate) fn sync_all_prepared_reservations(db: &OmniKV) -> Result<(), OmniError> {
+    let reserved = collect_prepared_reservations(db)?;
     db.ssi_history.replace_all_prepared_keys(reserved);
     Ok(())
 }
@@ -3689,5 +3721,58 @@ mod tests {
         );
         db.commit_batch(&blocked)
             .expect("key reservation must be freed once recovery aborts unvalidated record");
+    }
+
+    #[test]
+    fn recover_with_skips_gc_removed_prepare_without_writing_spurious_abort() {
+        let (coord_db, _coord_dir) = test_db();
+        let (p1_db, _p1_dir) = test_db();
+        let primary = TwoPhaseCoordinator::new(1, coord_db.clone(), 5_000);
+        let peer = TwoPhaseCoordinator::new(1, coord_db.clone(), 5_000);
+        let p1 = TwoPhaseParticipant::new(10, p1_db);
+
+        let txn_id = primary.begin().unwrap();
+        primary
+            .add_write(txn_id, 10, "gc_race_k".into(), Some("v".into()), 0)
+            .unwrap();
+        primary.prepare(txn_id).unwrap();
+
+        // Hold `decision_lock(txn_id)` while a background `recover_with` runs
+        // its initial `recover()` scan and blocks right before the decision lock.
+        let lock = peer.decision_lock(txn_id).unwrap();
+        let guard = lock.lock().unwrap();
+
+        let peer_db = coord_db.clone();
+        let handle = std::thread::spawn(move || {
+            let recovery = TwoPhaseCoordinator::new(1, peer_db, 5_000);
+            recovery.recover_with(|_, _, _| Ok(())).unwrap()
+        });
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        // Simulate primary committing, finalizing, clearing live owner, and GC
+        // removing all coordinator log entries for `txn_id` before releasing lock.
+        let vote = p1.prepare(txn_id, &primary.get_participant_writes(txn_id, 10).unwrap());
+        assert_eq!(vote.vote, Vote::Commit);
+        p1.commit(txn_id).unwrap();
+        primary.unmark_live_in_flight(txn_id);
+        let mut gc = WriteBatch::new();
+        gc.delete(&format!("__2PC_LOG__/{}_{}/PREPARE", txn_id.0, txn_id.1))
+            .unwrap();
+        coord_db.commit_2pc_batch(&gc).unwrap();
+        drop(guard);
+
+        let report = handle.join().unwrap();
+        assert_eq!(report.completed.len(), 0);
+        assert_eq!(report.pending.len(), 0);
+        assert_eq!(
+            coord_db
+                .find(
+                    &format!("__2PC_LOG__/{}_{}/ABORT", txn_id.0, txn_id.1),
+                    coord_db.get_seq()
+                )
+                .unwrap(),
+            None,
+            "recover_with must not write spurious ABORT after PREPARE was finalized and GC'd"
+        );
     }
 }

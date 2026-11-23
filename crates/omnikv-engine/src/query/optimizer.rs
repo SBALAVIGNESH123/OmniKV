@@ -115,7 +115,10 @@ pub fn gather_stats_at_checked(
             };
 
             let indexes: Vec<IndexDefinition> = if let Some(ic) = index_catalog {
-                ic.indexes_for_collection(&table.name)
+                ic.indexes_for_namespace(
+                    &table.name,
+                    crate::secondary_index::IndexNamespace::Sql,
+                )
                     .into_iter()
                     .filter(|definition| {
                         ic.is_ready(definition.id)

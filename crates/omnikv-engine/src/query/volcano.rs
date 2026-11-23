@@ -378,6 +378,9 @@ impl IndexScanIter {
             Ok(definition)
                 if !definition.fields.is_empty()
                     && expected_index_id.is_none_or(|id| definition.id == id)
+                    && definition
+                        .namespace
+                        .matches(crate::secondary_index::IndexNamespace::Sql)
                     && definition.collection.eq_ignore_ascii_case(&table.name) =>
             {
                 definition
@@ -514,6 +517,10 @@ impl RowIterator for IndexScanIter {
         out.extend(self.rows[self.pos..self.pos + take].iter().cloned());
         self.pos += take;
         take
+    }
+
+    fn reset(&mut self) {
+        self.pos = 0;
     }
 }
 

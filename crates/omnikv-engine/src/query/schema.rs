@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::secondary_index::{IndexFieldType, IndexManager, collection_row_ranges};
+use crate::secondary_index::{IndexFieldType, IndexManager, IndexNamespace, collection_row_ranges};
 use crate::{OmniError, OmniKV, WriteBatch};
 
 static NEXT_MIGRATION_ATTEMPT_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -364,7 +364,7 @@ impl SchemaManager {
         for idx_def in self
             .index_manager
             .catalog_snapshot_at(seq)?
-            .indexes_for_collection(table_name)
+            .indexes_for_namespace(table_name, IndexNamespace::Sql)
         {
             if idx_def
                 .fields
@@ -396,12 +396,49 @@ impl SchemaManager {
                 fields,
                 unique,
             } => self.with_collection_lock(collection, || {
-                self.index_manager.create_index_locked(
-                    name,
-                    collection,
-                    fields.clone(),
-                    *unique,
-                )?;
+                let receipt_key = Self::create_index_done_key(
+                    version, direction, attempt_id, step_index, collection, name,
+                );
+                let seq = self.db.get_seq();
+                let owned_building_id = match self.db.find(&receipt_key, seq)? {
+                    Some(receipt)
+                        if receipt
+                            .strip_prefix("done:")
+                            .and_then(|s| s.parse::<u32>().ok())
+                            .is_some() =>
+                    {
+                        return Ok(());
+                    }
+                    Some(receipt) => receipt
+                        .strip_prefix("building:")
+                        .and_then(|s| s.parse::<u32>().ok()),
+                    None => None,
+                };
+                let index_id = if let Some(owned_id) = owned_building_id {
+                    let catalog = self.index_manager.catalog_snapshot_at(seq)?;
+                    if catalog
+                        .get_by_name(name)
+                        .is_some_and(|def| def.id == owned_id)
+                    {
+                        owned_id
+                    } else {
+                        self.index_manager.create_index_locked_with_receipt(
+                            name,
+                            collection,
+                            fields.clone(),
+                            *unique,
+                            Some(&receipt_key),
+                        )?
+                    }
+                } else {
+                    self.index_manager.create_index_locked_with_receipt(
+                        name,
+                        collection,
+                        fields.clone(),
+                        *unique,
+                        Some(&receipt_key),
+                    )?
+                };
                 if let Err(error) = self.index_manager.rebuild_index_locked(name, collection) {
                     if let Err(cleanup_error) =
                         self.index_manager.drop_index_locked(name, collection)
@@ -410,8 +447,14 @@ impl SchemaManager {
                             "{error}; failed index cleanup also failed: {cleanup_error}"
                         )));
                     }
+                    let mut clear_receipt = WriteBatch::new();
+                    clear_receipt.delete(&receipt_key)?;
+                    let _ = self.db.commit_batch(&clear_receipt);
                     return Err(error);
                 }
+                let mut done_batch = WriteBatch::new();
+                done_batch.set(&receipt_key, format!("done:{index_id}"))?;
+                self.db.commit_batch(&done_batch)?;
                 Ok(())
             }),
             SchemaOp::DropIndex { name } => self.index_manager.drop_index(name),
@@ -777,6 +820,32 @@ impl SchemaManager {
         )
     }
 
+    fn create_index_done_prefix(version: Version, direction: &str, attempt_id: &str) -> String {
+        format!(
+            "\x00SCHEMA\x00create_idx:{version:06}:{direction}:{}:{attempt_id}:",
+            attempt_id.len()
+        )
+    }
+
+    fn create_index_done_key(
+        version: Version,
+        direction: &str,
+        attempt_id: &str,
+        step_index: usize,
+        collection: &str,
+        index_name: &str,
+    ) -> String {
+        let idx_lower = index_name.to_ascii_lowercase();
+        format!(
+            "{}{step_index:06}:{}:{}:{}:{}",
+            Self::create_index_done_prefix(version, direction, attempt_id),
+            collection.len(),
+            collection,
+            idx_lower.len(),
+            idx_lower
+        )
+    }
+
     fn remove_done_prefix(version: Version, direction: &str, attempt_id: &str) -> String {
         format!(
             "\x00SCHEMA\x00remove_done:{version:06}:{direction}:{}:{attempt_id}:",
@@ -913,15 +982,23 @@ impl SchemaManager {
         } else {
             (old_doc, new_doc)
         };
-        self.index_manager.replace_document_indexes_with_catalog(
-            catalog,
-            collection,
-            primary_key,
-            &old_index_doc,
-            primary_key,
-            &new_index_doc,
-            batch,
-        )?;
+        let namespace = if is_sql_rows {
+            IndexNamespace::Sql
+        } else {
+            IndexNamespace::Document
+        };
+        self.index_manager
+            .replace_document_indexes_with_catalog_for_namespace(
+                catalog,
+                collection,
+                namespace,
+                primary_key,
+                &old_index_doc,
+                primary_key,
+                &new_index_doc,
+                batch,
+                None,
+            )?;
         batch.set(key, updated)?;
         Ok(())
     }
@@ -1330,6 +1407,7 @@ impl SchemaManager {
         let seq = self.db.get_seq();
         let mut receipt_keys = Vec::new();
         for done_prefix in [
+            Self::create_index_done_prefix(record.version, direction, attempt_id),
             Self::rename_done_prefix(record.version, direction, attempt_id),
             Self::remove_done_prefix(record.version, direction, attempt_id),
         ] {

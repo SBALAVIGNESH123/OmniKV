@@ -728,6 +728,7 @@ fn failed_unique_index_rebuild_over_batch_limit_cleans_up_and_allows_retry() {
                 fields: vec![("code".into(), IndexFieldType::String)],
                 unique: false,
                 encoding_version: omni_engine::secondary_index::CURRENT_INDEX_ENCODING_VERSION,
+                namespace: omni_engine::secondary_index::IndexNamespace::Sql,
             })
             .unwrap(),
         )
@@ -2776,11 +2777,11 @@ fn sql_prefix_scan_includes_u10ffff_primary_keys_and_excludes_successor() {
         &executor,
         &format!("INSERT INTO max_pk_tbl (id, tag) VALUES ('a', 't1'), ('{max_pk}', 't2')"),
     );
-    // Also plant a neighbor key right at the bytewise prefix successor to ensure exclusion.
+    // Also plant a neighbor key right at the exact bytewise prefix successor to ensure exclusion.
     let mut neighbor = WriteBatch::new();
     neighbor
         .set(
-            "\u{0}T\u{0}max_pk_tbl\u{1}stray",
+            "\u{0}T\u{0}max_pk_tbl\u{1}",
             "{\"id\":\"stray\",\"tag\":\"bad\"}".into(),
         )
         .unwrap();
@@ -3461,4 +3462,271 @@ fn legacy_v0_unique_float_preflight_blocks_pos_zero_collision_before_migration_c
             .is_none(),
         "canonical key 1 must not be written on failed legacy INSERT"
     );
+}
+
+#[test]
+fn schema_migration_resumes_after_completed_create_index_and_rejects_foreign_index() {
+    let (db, _dir, executor) = setup();
+    let idx_mgr = Arc::new(IndexManager::new(db.clone()));
+    let schema = SchemaManager::new(db, idx_mgr.clone());
+
+    execute(
+        &executor,
+        "CREATE TABLE mig_idx_tbl (id INTEGER PRIMARY KEY, email TEXT, old_col TEXT)",
+    );
+    execute(
+        &executor,
+        "INSERT INTO mig_idx_tbl VALUES (1, 'a@x.com', 'v1')",
+    );
+
+    // First attempt: CreateIndex succeeds, then step 2 fails on missing column.
+    let failing = Migration {
+        version: 1,
+        description: "create index then fail".into(),
+        up: vec![
+            SchemaOp::CreateIndex {
+                name: "mig_email_idx".into(),
+                collection: "mig_idx_tbl".into(),
+                fields: vec![("email".into(), IndexFieldType::String)],
+                unique: true,
+            },
+            SchemaOp::RemoveField {
+                collection: "mig_idx_tbl".into(),
+                field_name: "does_not_exist".into(),
+            },
+        ],
+        down: vec![],
+    };
+    assert!(schema.migrate_up(&failing).is_err());
+
+    // Retrying v1 with step 2 fixed must skip the already-completed CreateIndex
+    // owned by this attempt and succeed.
+    let fixed = Migration {
+        version: 1,
+        description: "create index then remove old_col".into(),
+        up: vec![
+            SchemaOp::CreateIndex {
+                name: "mig_email_idx".into(),
+                collection: "mig_idx_tbl".into(),
+                fields: vec![("email".into(), IndexFieldType::String)],
+                unique: true,
+            },
+            SchemaOp::RemoveField {
+                collection: "mig_idx_tbl".into(),
+                field_name: "old_col".into(),
+            },
+        ],
+        down: vec![],
+    };
+    schema
+        .migrate_up(&fixed)
+        .expect("retry must resume past completed CreateIndex owned by same attempt");
+    assert_eq!(
+        idx_mgr
+            .lookup("mig_email_idx", &[serde_json::json!("a@x.com")])
+            .unwrap(),
+        vec!["1".to_string()]
+    );
+
+    // A separate migration attempting to create an index with an already-taken
+    // name it does NOT own must still be rejected.
+    let foreign = Migration {
+        version: 2,
+        description: "colliding foreign index name".into(),
+        up: vec![SchemaOp::CreateIndex {
+            name: "mig_email_idx".into(),
+            collection: "mig_idx_tbl".into(),
+            fields: vec![("email".into(), IndexFieldType::String)],
+            unique: false,
+        }],
+        down: vec![],
+    };
+    assert!(
+        schema.migrate_up(&foreign).is_err(),
+        "new attempt must reject pre-existing foreign index with same name"
+    );
+}
+
+#[test]
+fn document_maintenance_never_corrupts_sql_index_and_rebuilds_stay_namespace_isolated() {
+    let (db, _dir, executor) = setup();
+    let idx_mgr = IndexManager::new(db.clone());
+
+    // SQL table `docs` has a unique index on `code`; document collection `DOCS`
+    // has NO index, and document collection `docs:` shares the same spelling.
+    execute(
+        &executor,
+        "CREATE TABLE docs (id INTEGER PRIMARY KEY, code TEXT)",
+    );
+    execute(&executor, "INSERT INTO docs VALUES (1, 'alpha')");
+    idx_mgr
+        .create_index(
+            "sql_docs_code_idx",
+            "docs",
+            vec![("code".into(), IndexFieldType::String)],
+            true,
+        )
+        .unwrap();
+    idx_mgr.rebuild_index("sql_docs_code_idx").unwrap();
+
+    // Deleting a document in `DOCS` (or `docs`) with matching pk & code must
+    // NEVER touch the SQL table's index entries.
+    let mut doc_del = WriteBatch::new();
+    idx_mgr
+        .remove_document_indexes(
+            "DOCS",
+            "1",
+            &serde_json::json!({"code": "alpha"}),
+            &mut doc_del,
+        )
+        .unwrap();
+    idx_mgr
+        .remove_document_indexes(
+            "docs",
+            "1",
+            &serde_json::json!({"code": "alpha"}),
+            &mut doc_del,
+        )
+        .unwrap();
+    if !doc_del.is_empty() {
+        db.commit_batch(&doc_del).unwrap();
+    }
+    assert_eq!(
+        rows(&executor, "SELECT id FROM docs WHERE code = 'alpha'"),
+        vec![vec![Some("1".into())]],
+        "document index maintenance must never delete SQL table index entries"
+    );
+
+    // Plant a document row `docs:99` with the SAME `code = 'alpha'` as SQL row 1:
+    // rebuilding the unique SQL index must scan ONLY SQL rows and succeed!
+    let mut doc_seed = WriteBatch::new();
+    doc_seed
+        .set("docs:99", "{\"code\":\"alpha\"}".into())
+        .unwrap();
+    db.commit_batch(&doc_seed).unwrap();
+    assert_eq!(
+        idx_mgr.rebuild_index("sql_docs_code_idx").unwrap(),
+        1,
+        "SQL unique index rebuild must ignore document rows under docs:"
+    );
+
+    // Duplicate SQL rows must still be rejected by SQL unique rebuild.
+    let mut dup_sql = WriteBatch::new();
+    dup_sql
+        .set(
+            "\u{0}T\u{0}docs\u{0}2",
+            "{\"id\":\"2\",\"code\":\"alpha\"}".into(),
+        )
+        .unwrap();
+    db.commit_batch(&dup_sql).unwrap();
+    assert!(
+        idx_mgr.rebuild_index("sql_docs_code_idx").is_err(),
+        "SQL unique index rebuild must still reject duplicate SQL rows"
+    );
+}
+
+#[test]
+fn v0_composite_24_float_zero_lookup_and_unique_check_avoids_exponential_expansion() {
+    let (db, _dir, _executor) = setup();
+    let idx_mgr = IndexManager::new(db.clone());
+    let fields: Vec<(String, IndexFieldType)> = (0..24)
+        .map(|i| (format!("f{i}"), IndexFieldType::Float))
+        .collect();
+    let idx_id = idx_mgr
+        .create_index("wide_v0_float_u", "vecs", fields, true)
+        .unwrap();
+
+    let mut def = idx_mgr.definition("wide_v0_float_u").unwrap();
+    def.encoding_version = 0;
+    let mut seed = WriteBatch::new();
+    seed.set(
+        &format!("\u{0}IDX_CATALOG\u{0}{idx_id}"),
+        serde_json::to_string(&def).unwrap(),
+    )
+    .unwrap();
+    seed.set(&format!("\u{0}IDX_READY\u{0}{idx_id}"), "ready".into())
+        .unwrap();
+    db.commit_batch(&seed).unwrap();
+
+    let mut neg_map = serde_json::Map::new();
+    let mut pos_map = serde_json::Map::new();
+    for i in 0..24 {
+        neg_map.insert(format!("f{i}"), serde_json::json!("-0.0"));
+        pos_map.insert(format!("f{i}"), serde_json::json!("0.0"));
+    }
+    let neg_doc = serde_json::Value::Object(neg_map);
+    let pos_doc = serde_json::Value::Object(pos_map);
+
+    let mut b1 = WriteBatch::new();
+    idx_mgr
+        .index_document("vecs", "v1", &neg_doc, &mut b1)
+        .unwrap();
+    db.commit_batch(&b1).unwrap();
+
+    // Uniqueness check and lookup across 24 zero FLOAT columns must complete
+    // immediately without enumerating 2^24 prefixes.
+    let mut b2 = WriteBatch::new();
+    assert!(
+        idx_mgr
+            .index_document("vecs", "v2", &pos_doc, &mut b2)
+            .is_err(),
+        "24-column v0 unique float index must reject +0.0 colliding with -0.0"
+    );
+    let zeros = vec![serde_json::json!(0.0); 24];
+    assert_eq!(
+        idx_mgr.lookup("wide_v0_float_u", &zeros).unwrap(),
+        vec!["v1".to_string()]
+    );
+}
+
+#[test]
+fn index_scan_iter_reset_replays_rows_and_preserves_error() {
+    use omni_engine::volcano::RowIterator;
+
+    let (db, _dir, executor) = setup();
+    let idx_mgr = IndexManager::new(db.clone());
+    create_index(&idx_mgr, "label", IndexFieldType::String, false);
+
+    let catalog = Arc::new(Catalog::new(db.clone()));
+    let table = catalog.get_table("items").unwrap();
+    let stmt = parse_sql("SELECT id FROM items WHERE label = 'red'").unwrap();
+    let omni_engine::sql::SqlStatement::Select { where_clause, .. } = stmt else {
+        panic!("expected SELECT");
+    };
+    let mut iter = omni_engine::volcano::IndexScanIter::with_scan(
+        &db,
+        &catalog,
+        &table,
+        "items_label_idx",
+        where_clause.as_ref(),
+        db.get_seq(),
+        None,
+    );
+    let mut first_pass = Vec::new();
+    while let Some(row) = iter.try_next_row().unwrap() {
+        first_pass.push(row.get("id").cloned().flatten().unwrap());
+    }
+    assert_eq!(first_pass.len(), 2);
+
+    iter.reset();
+    let mut second_pass = Vec::new();
+    while let Some(row) = iter.try_next_row().unwrap() {
+        second_pass.push(row.get("id").cloned().flatten().unwrap());
+    }
+    assert_eq!(second_pass, first_pass);
+
+    // Construction errors must persist across reset.
+    let mut broken = omni_engine::volcano::IndexScanIter::with_scan(
+        &db,
+        &catalog,
+        &table,
+        "missing_index_name",
+        where_clause.as_ref(),
+        db.get_seq(),
+        None,
+    );
+    assert!(broken.try_next_row().is_err());
+    broken.reset();
+    assert!(broken.try_next_row().is_err());
+    let _ = executor;
 }

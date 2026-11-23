@@ -496,8 +496,8 @@ fn coordinator_indoubt_txn_unmarks_live_in_flight_for_recovery() {
     let part_db = OmniKV::open(&part_manifest, &part_wal).expect("open part db");
 
     let primary = TwoPhaseCoordinator::new(1, coord_db.clone(), 5_000);
-    let peer = TwoPhaseCoordinator::new(1, coord_db, 5_000);
-    let participant = TwoPhaseParticipant::new(10, part_db);
+    let peer = TwoPhaseCoordinator::new(1, coord_db.clone(), 5_000);
+    let participant = TwoPhaseParticipant::new(10, part_db.clone());
 
     let txn = primary.begin().expect("begin");
     primary
@@ -530,4 +530,25 @@ fn coordinator_indoubt_txn_unmarks_live_in_flight_for_recovery() {
         peer.recover_participants(&[&participant]).is_err(),
         "peer coordinator must attempt recovery for InDoubt txn instead of skipping it"
     );
+
+    // Reopen the coordinator DB after the fsync failure and confirm recovery
+    // completes the presumed ABORT and releases the participant's reservation.
+    drop(primary);
+    drop(peer);
+    drop(coord_db);
+    let reopened_coord_db = OmniKV::open(&coord_manifest, &coord_wal).expect("reopen coord db");
+    let recovered_coord = TwoPhaseCoordinator::new(1, reopened_coord_db, 5_000);
+    let report = recovered_coord
+        .recover_participants(&[&participant])
+        .expect("reopened coordinator must complete InDoubt recovery");
+    assert_eq!(report.completed, vec![(txn, "ABORT".to_string())]);
+    assert_eq!(report.pending.len(), 0);
+
+    let mut plain = WriteBatch::new();
+    plain
+        .set("indoubt_k", "after_indoubt_abort".into())
+        .expect("stage plain write");
+    part_db
+        .commit_batch(&plain)
+        .expect("participant reservation must be released after InDoubt ABORT");
 }

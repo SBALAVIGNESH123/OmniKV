@@ -11,11 +11,16 @@ use serde::{Deserialize, Serialize};
 use std::fmt::Debug;
 use std::io::Cursor;
 use std::ops::RangeBounds;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 const RAFT_LOG_PREFIX: &str = "__sys__/raft/log/";
 const RAFT_META_KEY: &str = "__sys__/raft/meta";
+const LEGACY_OLD_SNAPSHOT_DIR: &str = "old_snapshot";
+const OLD_SNAPSHOT_DIR_PREFIX: &str = "old_snapshot_";
+const INSTALL_COMPLETE_MARKER: &str = ".install_complete";
+const ROLLBACK_FAILED_MARKER: &str = ".rollback_failed";
+static NEXT_SNAPSHOT_ROLLBACK_SEQ: AtomicU64 = AtomicU64::new(1);
 /// Bumped to 2 when the SSI committed history (`ssi_history`) joined the
 /// envelope. The version check below REJECTS any mismatch, so a snapshot
 /// written by pre-history code (same version number, no field) must not
@@ -686,7 +691,7 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
     async fn purge_logs_upto(&mut self, log_id: LogId<u64>) -> Result<(), StorageError<u64>> {
         let mut batch = WriteBatch::new();
 
-        let (start_idx, mut last_seen_leader_id) = {
+        let start_idx = {
             let meta = self
                 .meta
                 .lock()
@@ -694,28 +699,25 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
             if meta.last_purged_log_id.is_some_and(|cur| log_id <= cur) {
                 return Ok(());
             }
-            (
-                meta.last_purged_log_id.map(|id| id.index + 1).unwrap_or(1),
-                meta.last_purged_log_id
-                    .map(|id| id.leader_id)
-                    .unwrap_or_default(),
-            )
+            meta.last_purged_log_id.map(|id| id.index + 1).unwrap_or(1)
         };
 
-        let resolve_purge_boundary_id = |idx: u64,
-                                         fallback_leader_id: openraft::CommittedLeaderId<u64>|
-         -> Result<LogId<u64>, String> {
+        let resolve_purge_boundary_id = |idx: u64| -> Result<LogId<u64>, String> {
             let key = format!("{}{:020}", RAFT_LOG_PREFIX, idx);
-            match self
+            let val = self
                 .db
                 .find(&key, self.db.get_seq())
                 .map_err(|e| format!("read purge boundary log {idx}: {e}"))?
-            {
-                Some(val) => Ok(serde_json::from_str::<Entry<TypeConfig>>(&val)
-                    .map(|entry| entry.log_id)
-                    .unwrap_or_else(|_| LogId::new(fallback_leader_id, idx))),
-                None => Ok(LogId::new(fallback_leader_id, idx)),
+                .ok_or_else(|| format!("missing Raft log entry at purge boundary {idx}"))?;
+            let entry = serde_json::from_str::<Entry<TypeConfig>>(&val)
+                .map_err(|e| format!("corrupt Raft log entry at purge boundary {idx}: {e}"))?;
+            if entry.log_id.index != idx {
+                return Err(format!(
+                    "mismatched Raft log index at purge boundary {idx}: found {}",
+                    entry.log_id.index
+                ));
             }
+            Ok(entry.log_id)
         };
 
         for idx in start_idx..=log_id.index {
@@ -724,12 +726,10 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
             // A purge after snapshot/compaction can span far more log
             // indexes than one batch holds. Persist `last_purged_log_id`
             // atomically WITH each intermediate chunk (matching the exact
-            // last index that chunk deletes) so a crash or failed commit
-            // never leaves deleted entries below a stale purge floor.
+            // verified entry at `idx`) so a crash or corrupt boundary never
+            // deletes entries below a stale or guessed purge floor.
             if idx < log_id.index && batch.op_count() >= WriteBatch::MAX_OPS.saturating_sub(1) {
-                let chunk_floor = resolve_purge_boundary_id(idx, last_seen_leader_id)
-                    .map_err(storage_read_err)?;
-                last_seen_leader_id = chunk_floor.leader_id;
+                let chunk_floor = resolve_purge_boundary_id(idx).map_err(storage_read_err)?;
                 let next_meta = {
                     let meta = self
                         .meta
@@ -865,9 +865,11 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
         let flush_staged = |batch: &mut WriteBatch,
                             slots: &mut Vec<(usize, Option<SsiCommitRecord>)>,
                             keys: &mut std::collections::HashSet<Vec<u8>>,
-                            res: &mut Vec<String>|
+                            res: &mut Vec<String>,
+                            pending_applied: &mut Option<LogId<u64>>,
+                            pending_membership: &mut Option<StoredMembership<u64, OmniNode>>|
          -> Result<(), crate::OmniError> {
-            if batch.is_empty() {
+            if batch.is_empty() && pending_applied.is_none() && pending_membership.is_none() {
                 return Ok(());
             }
             let touches_2pc = batch
@@ -878,9 +880,33 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
                     .buffered_deletes
                     .iter()
                     .any(|key| key.starts_with(b"__2PC_PREPARE__/"));
+            // Atomically persist `last_applied` and `membership` in the SAME
+            // WAL batch as every durable state-machine flush (covering any
+            // preceding rejected/blank entries up to this point) so a crash or
+            // later flush failure can never replay a rejected entry against
+            // state committed by a later entry.
+            let next_meta = if pending_applied.is_some() || pending_membership.is_some() {
+                let meta = self
+                    .meta
+                    .lock()
+                    .expect("RaftStorage meta lock poisoned: fatal invariant");
+                let mut next = meta.clone();
+                if let Some(la) = *pending_applied {
+                    next.last_applied = Some(la);
+                }
+                if let Some(m) = pending_membership.as_ref() {
+                    next.membership = m.clone();
+                }
+                let json = serde_json::to_string(&next)
+                    .map_err(|e| crate::OmniError::IoError(format!("serialize raft meta: {e}")))?;
+                batch.set_internal_meta(RAFT_META_KEY, json)?;
+                Some(next)
+            } else {
+                None
+            };
             let history = self.db.ssi_history();
-            // Hold `committed_txns` across data commit, 2PC reservation sync,
-            // and SSI history insertion (preserving global lock order
+            // Hold `committed_txns` across data+meta commit, 2PC reservation
+            // sync, and SSI history insertion (preserving global lock order
             // `transition_guard -> committed_txns -> write_mutex -> prepared_keys`)
             // so concurrent validators cannot observe published data or
             // released 2PC reservations before the SSI commit record is visible.
@@ -893,12 +919,6 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
             // a transaction whose read_seq equals it sees all of them.
             for &(slot, ref ssi) in slots.iter() {
                 res[slot] = marker.to_string();
-                // The record's commit_seq is this LOCAL marker by design:
-                // the conflict check compares it against read_seqs taken
-                // from this same node's counter, and the marker is exactly
-                // where the write became visible here. The leader that ran
-                // the COMMIT stamps the same value through the same path —
-                // its own apply — so no record is made twice.
                 if let Some(record) = ssi {
                     history.record_committed_locked(
                         &mut committed_guard,
@@ -909,6 +929,12 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
                 }
             }
             drop(committed_guard);
+            if let Some(next_meta) = next_meta {
+                *self
+                    .meta
+                    .lock()
+                    .expect("RaftStorage meta lock poisoned: fatal invariant") = next_meta;
+            }
             // Records below the oldest in-play snapshot can never again
             // be a conflict; drop them so a node that only ever APPLIES
             // (never runs a local COMMIT) does not grow without bound.
@@ -916,6 +942,8 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
             slots.clear();
             keys.clear();
             batch.clear();
+            *pending_applied = None;
+            *pending_membership = None;
             Ok(())
         };
 
@@ -941,10 +969,9 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
                         if system_key || conflicting_2pc || cmd.is_empty() {
                             res.push("ERR".to_string());
                             // A rejected entry is still DECIDED and applied —
-                            // record the index so openraft advances past it.
-                            // Skipping it would leave the durable applied
-                            // index behind the committed log and stall the
-                            // state machine on this entry forever.
+                            // advance `last_applied` so the next durable flush
+                            // covers it atomically and replay never re-evaluates
+                            // it against later entries' state.
                             last_applied = Some(entry.log_id);
                             continue;
                         }
@@ -963,10 +990,17 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
                         if !batch.is_empty()
                             && (touches_staged_key
                                 || batch.op_count() + cmd.sets.len() + cmd.dels.len()
-                                    >= WriteBatch::MAX_OPS)
+                                    > WriteBatch::MAX_OPS)
                         {
-                            flush_staged(&mut batch, &mut staged_slots, &mut staged_keys, &mut res)
-                                .map_err(io_err)?;
+                            flush_staged(
+                                &mut batch,
+                                &mut staged_slots,
+                                &mut staged_keys,
+                                &mut res,
+                                &mut last_applied,
+                                &mut new_membership,
+                            )
+                            .map_err(io_err)?;
                         }
                         for op in cmd.sets {
                             // The entry carries the ABSOLUTE expiry the
@@ -1001,13 +1035,15 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
                             let touches_staged_key = staged_keys.contains(parts[0].as_bytes());
                             if !batch.is_empty()
                                 && (touches_staged_key
-                                    || batch.op_count() + 1 >= WriteBatch::MAX_OPS)
+                                    || batch.op_count() + 1 > WriteBatch::MAX_OPS)
                             {
                                 flush_staged(
                                     &mut batch,
                                     &mut staged_slots,
                                     &mut staged_keys,
                                     &mut res,
+                                    &mut last_applied,
+                                    &mut new_membership,
                                 )
                                 .map_err(io_err)?;
                             }
@@ -1032,49 +1068,18 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
             last_applied = Some(entry.log_id);
         }
 
-        // Flush any remaining staged user data BEFORE the meta record
-        // joins the batch. This stamps the last staged entries with their
-        // marker, and it is also the crash-safe order — data before
-        // pointer, so a crash between the two re-applies idempotently from
-        // the pre-crash last_applied. Flushing here (rather than letting
-        // data ride along with the meta op) removes the exact-cap special
-        // case: the batch is empty when the single meta op is appended.
-        flush_staged(&mut batch, &mut staged_slots, &mut staged_keys, &mut res).map_err(io_err)?;
-
-        let next_meta = if last_applied.is_some() || new_membership.is_some() {
-            // Lock order is `transition_guard -> meta`; `_topology_guard` is
-            // already held for the whole apply call, and we release `meta`
-            // before the final locked commit below.
-            let meta = self
-                .meta
-                .lock()
-                .expect("RaftStorage meta lock poisoned: fatal invariant");
-            let mut next = meta.clone();
-            if let Some(la) = last_applied {
-                next.last_applied = Some(la);
-            }
-            if let Some(m) = new_membership {
-                next.membership = m;
-            }
-            self.save_meta(&next, &mut batch);
-            Some(next)
-        } else {
-            None
-        };
-
-        // Final commit: the single meta op only (user data flushed above).
-        // Use `commit_batch_local_locked` because `_topology_guard` is already
-        // held across both data and metadata publication.
-        if !batch.is_empty() {
-            self.db.commit_batch_local_locked(&batch).map_err(io_err)?;
-            batch.clear();
-        }
-        if let Some(next_meta) = next_meta {
-            *self
-                .meta
-                .lock()
-                .expect("RaftStorage meta lock poisoned: fatal invariant") = next_meta;
-        }
+        // Atomically flush any remaining staged user writes together with the
+        // final `last_applied` / `membership` bookmark (or commit the bookmark
+        // alone when the suffix contained only blank/rejected/membership entries).
+        flush_staged(
+            &mut batch,
+            &mut staged_slots,
+            &mut staged_keys,
+            &mut res,
+            &mut last_applied,
+            &mut new_membership,
+        )
+        .map_err(io_err)?;
         drop(_topology_guard);
 
         Ok(res)
@@ -1269,6 +1274,11 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
                 .compact_sstables()
                 .map_err(|e| io_err(&format!("compact snapshot: {}", e)))?;
         }
+        // Rebuild and validate the 2PC prepared-reservation map from the staged
+        // database BEFORE promoting files or publishing live roots/metadata so
+        // any scan/read error leaves the original live state untouched.
+        let prepared_reservations = crate::dist_txn::collect_prepared_reservations(&tmp_db)
+            .map_err(|e| io_err(&format!("sync 2PC prepared reservations: {e}")))?;
         drop(tmp_db);
 
         let rebase_snapshot_path = |path: &str| -> Option<String> {
@@ -1321,11 +1331,43 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
             .map_err(|e| io_err(&format!("save installed snapshot manifest: {e}")))?;
 
         // ── Phase D: Same-filesystem directory promotion ──
-        let old_dir = data_dir.join("old_snapshot");
-        if old_dir.exists() {
-            fs::remove_dir_all(&old_dir)
-                .map_err(|e| io_err(&format!("remove old snapshot dir: {e}")))?;
+        // Never delete a rollback directory left by an unresolved failed
+        // promotion/rollback — it may hold the only copy of the original
+        // manifest and data files. Retire only directories explicitly marked
+        // `.install_complete`, and refuse promotion if any unresolved rollback
+        // directory remains.
+        let is_rollback_dir_name = |name: &std::ffi::OsStr| -> bool {
+            name == LEGACY_OLD_SNAPSHOT_DIR
+                || name
+                    .to_str()
+                    .is_some_and(|s| s.starts_with(OLD_SNAPSHOT_DIR_PREFIX))
+        };
+        for entry in
+            fs::read_dir(&data_dir).map_err(|e| io_err(&format!("read data dir: {}", e)))?
+        {
+            let entry = entry.map_err(|e| io_err(&format!("read data dir entry: {}", e)))?;
+            let name = entry.file_name();
+            if is_rollback_dir_name(&name) {
+                let path = entry.path();
+                if path.join(INSTALL_COMPLETE_MARKER).exists() {
+                    let _ = fs::remove_dir_all(&path);
+                } else {
+                    return Err(io_err(&format!(
+                        "unresolved snapshot rollback directory '{}' exists; restore or set it aside before installing another snapshot",
+                        name.to_string_lossy()
+                    )));
+                }
+            }
         }
+        let rollback_nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let rollback_seq = NEXT_SNAPSHOT_ROLLBACK_SEQ.fetch_add(1, Ordering::Relaxed);
+        let old_dir_name = std::ffi::OsString::from(format!(
+            "{OLD_SNAPSHOT_DIR_PREFIX}{rollback_nanos:x}_{rollback_seq:x}"
+        ));
+        let old_dir = data_dir.join(&old_dir_name);
         fs::create_dir_all(&old_dir)
             .map_err(|e| io_err(&format!("create old snapshot dir: {e}")))?;
 
@@ -1351,10 +1393,12 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
             }
             if !rollback_ok {
                 // Preserve both `old_dir` and `tmp_dir` for recovery whenever
-                // any rollback rename fails; never delete original files.
+                // any rollback rename fails; mark the rollback unresolved so
+                // future installs refuse to delete these recovery files.
+                let _ = fs::write(old_dir.join(ROLLBACK_FAILED_MARKER), b"rollback_incomplete");
                 tmp_cleanup.disarm();
-            } else {
-                let _ = fs::remove_dir(&old_dir);
+            } else if fs::remove_dir(&old_dir).is_err() {
+                let _ = fs::write(old_dir.join(INSTALL_COMPLETE_MARKER), b"rolled_back");
             }
         };
 
@@ -1370,7 +1414,11 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
                 }
             };
             let name = entry.file_name();
-            if name != "old_snapshot" && name != "LOCK" && name != tmp_dir_name {
+            if name != "LOCK"
+                && name != tmp_dir_name
+                && name != old_dir_name
+                && !is_rollback_dir_name(&name)
+            {
                 if let Err(e) = fs::rename(entry.path(), old_dir.join(&name)) {
                     rollback_promotion(&moved_to_old, &promoted_from_tmp, &mut tmp_cleanup);
                     return Err(io_err(&format!(
@@ -1433,6 +1481,7 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
             frozen_memtables: Arc::new(Vec::new()),
             manifest: recovered.manifest,
             heap_reader: recovered.heap_reader,
+            heap_generation: self.db.next_heap_generation.fetch_add(1, Ordering::Relaxed),
         };
         self.db.roots.store(Arc::new(new_roots));
         self.db.block_cache.invalidate_all();
@@ -1476,9 +1525,11 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
             envelope.ssi_eviction_floor,
         );
         self.db.ssi_history().advance_eviction_floor(final_floor);
+        // Publish the pre-validated 2PC prepared-reservation map infallibly
+        // alongside the installed roots and Raft metadata.
         self.db
-            .sync_prepared_2pc_reservations()
-            .map_err(|e| io_err(&format!("sync 2PC prepared reservations: {e}")))?;
+            .ssi_history()
+            .replace_all_prepared_keys(prepared_reservations);
 
         // Publish in-memory Raft metadata only after disk promotion and
         // storage recovery succeeded so a failed install cannot diverge
@@ -1487,6 +1538,12 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
             .meta
             .lock()
             .expect("RaftStorage meta lock poisoned: fatal invariant") = next_meta;
+
+        // Mark this attempt's rollback directory retired and remove it. Even if
+        // an open reader handle delays deletion on Windows, the marker allows
+        // a later install to retire this completed directory safely.
+        let _ = fs::write(old_dir.join(INSTALL_COMPLETE_MARKER), b"ok");
+        let _ = fs::remove_dir_all(&old_dir);
 
         // ── Phase I: Release exclusive lock (writers resume on new topology) ──
         drop(_exclusive);
@@ -1799,6 +1856,233 @@ mod tests {
         assert!(
             err.to_string().contains("snapshot heap read failed"),
             "unexpected snapshot error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn purge_logs_upto_rejects_corrupt_and_mismatched_intermediate_boundaries() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let manifest = dir.path().join("manifest.json");
+        let wal = dir.path().join("wal.bin");
+        let db = OmniKV::open(
+            manifest.to_str().expect("manifest path"),
+            wal.to_str().expect("wal path"),
+        )
+        .expect("open db");
+        let mut storage = OmniRaftStorage::new(db.clone());
+        let leader1 = CommittedLeaderId::new(1, 1);
+        let boundary = WriteBatch::MAX_OPS as u64 - 1;
+        let total = boundary + 5;
+
+        let mut chunk = Vec::with_capacity(2_500);
+        for idx in 1..=total {
+            chunk.push(Entry {
+                log_id: LogId::new(leader1, idx),
+                payload: EntryPayload::Blank,
+            });
+            if chunk.len() == 2_500 {
+                storage
+                    .append_to_log(std::mem::take(&mut chunk))
+                    .await
+                    .expect("append chunk");
+            }
+        }
+        if !chunk.is_empty() {
+            storage.append_to_log(chunk).await.expect("append tail");
+        }
+
+        // Case 1: invalid JSON at intermediate boundary must fail BEFORE deleting the chunk.
+        storage
+            .append_log(boundary, "{corrupt json")
+            .expect("seed corrupt boundary");
+        let err = storage
+            .purge_logs_upto(LogId::new(leader1, total))
+            .await
+            .expect_err("corrupt intermediate boundary must fail");
+        assert!(err.to_string().contains("corrupt Raft log entry"));
+        assert!(storage.read_log(1).is_some(), "chunk 1 must stay intact");
+        assert_eq!(
+            storage.meta.lock().expect("meta lock").last_purged_log_id,
+            None
+        );
+
+        // Case 2: valid JSON with mismatched index at boundary must also fail closed.
+        let wrong_entry: Entry<TypeConfig> = Entry {
+            log_id: LogId::new(leader1, boundary + 42),
+            payload: EntryPayload::Blank,
+        };
+        let wrong_json = serde_json::to_string(&wrong_entry).expect("serialize mismatched entry");
+        storage
+            .append_log(boundary, &wrong_json)
+            .expect("seed mismatched boundary");
+        let err2 = storage
+            .purge_logs_upto(LogId::new(leader1, total))
+            .await
+            .expect_err("mismatched boundary index must fail");
+        assert!(err2.to_string().contains("mismatched Raft log index"));
+        assert!(
+            storage.read_log(1).is_some(),
+            "chunk 1 must still stay intact"
+        );
+        assert_eq!(
+            storage.meta.lock().expect("meta lock").last_purged_log_id,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_to_state_machine_persists_last_applied_with_each_intermediate_flush() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let manifest = dir.path().join("manifest.json");
+        let wal = dir.path().join("wal.bin");
+        let db = OmniKV::open(
+            manifest.to_str().expect("manifest path"),
+            wal.to_str().expect("wal path"),
+        )
+        .expect("open db");
+        let mut storage = OmniRaftStorage::new(db.clone());
+        let leader = CommittedLeaderId::new(1, 1);
+
+        // Entry 1 reserves key `k_atom` via a durable 2PC PREPARED record.
+        let prep_entry = serde_json::json!({
+            "txn_id": [1, 1],
+            "node_id": 10,
+            "state": "PREPARED",
+            "writes": [{"node_id": 10, "key": "k_atom", "value": "prep", "ttl": 0}],
+            "prepare_seq": 1,
+            "commit_seq": null,
+            "snapshot_imported": false
+        });
+        let mut b1 = WriteBatch::new();
+        b1.set("__2PC_PREPARE__/10/1_1", prep_entry.to_string())
+            .expect("stage prepare");
+        let cmd1 = crate::raft_command::RaftCommand::from_batch(&b1).encode();
+        storage
+            .apply_to_state_machine(&[Entry {
+                log_id: LogId::new(leader, 1),
+                payload: EntryPayload::Normal(cmd1),
+            }])
+            .await
+            .expect("apply prepare");
+
+        // Entry 2 tries to write reserved `k_atom` (rejected ERR);
+        // Entry 3 aborts owner (flushed atomically with last_applied=3 before entry 4);
+        // Entry 4 writes `k_atom` touching the same key so entry 3 must flush first.
+        let mut b2 = WriteBatch::new();
+        b2.set("k_atom", "must_reject".into()).expect("stage b2");
+        let abort_entry = serde_json::json!({
+            "txn_id": [1, 1],
+            "node_id": 10,
+            "state": "ABORTED",
+            "writes": [],
+            "prepare_seq": 0,
+            "commit_seq": null,
+            "snapshot_imported": false
+        });
+        let mut b3 = WriteBatch::new();
+        b3.set("__2PC_PREPARE__/10/1_1", abort_entry.to_string())
+            .expect("stage abort");
+        let mut b4 = WriteBatch::new();
+        b4.set("__2PC_PREPARE__/10/1_1", abort_entry.to_string())
+            .expect("stage touch");
+        b4.set("k_atom", "after_abort".into()).expect("stage write");
+
+        let res = storage
+            .apply_to_state_machine(&[
+                Entry {
+                    log_id: LogId::new(leader, 2),
+                    payload: EntryPayload::Normal(
+                        crate::raft_command::RaftCommand::from_batch(&b2).encode(),
+                    ),
+                },
+                Entry {
+                    log_id: LogId::new(leader, 3),
+                    payload: EntryPayload::Normal(
+                        crate::raft_command::RaftCommand::from_batch(&b3).encode(),
+                    ),
+                },
+                Entry {
+                    log_id: LogId::new(leader, 4),
+                    payload: EntryPayload::Normal(
+                        crate::raft_command::RaftCommand::from_batch(&b4).encode(),
+                    ),
+                },
+            ])
+            .await
+            .expect("apply entries 2..=4");
+        assert_eq!(res[0], "ERR");
+        assert_ne!(res[1], "ERR");
+        assert_ne!(res[2], "ERR");
+        // Verify durable meta persisted alongside the flush covers all 4 entries.
+        let meta_raw = db
+            .find_latest_internal(RAFT_META_KEY)
+            .expect("read meta")
+            .expect("meta present");
+        let meta: RaftStateMeta = serde_json::from_str(&meta_raw).expect("parse meta");
+        assert_eq!(meta.last_applied, Some(LogId::new(leader, 4)));
+        assert_eq!(
+            db.find_latest_internal("k_atom").expect("read k_atom"),
+            Some("after_abort".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn install_snapshot_refuses_promotion_when_unresolved_rollback_dir_exists() {
+        use openraft::RaftSnapshotBuilder;
+
+        let src_dir = tempfile::tempdir().expect("src tempdir");
+        let src_db = OmniKV::open(
+            src_dir
+                .path()
+                .join("manifest.json")
+                .to_str()
+                .expect("src manifest"),
+            src_dir.path().join("wal.bin").to_str().expect("src wal"),
+        )
+        .expect("open src db");
+        let mut src_storage = OmniRaftStorage::new(src_db);
+        let leader = CommittedLeaderId::new(1, 1);
+        src_storage
+            .apply_to_state_machine(&[Entry {
+                log_id: LogId::new(leader, 1),
+                payload: EntryPayload::Normal("SET snap_k v1".into()),
+            }])
+            .await
+            .expect("apply src");
+        let snapshot = src_storage.build_snapshot().await.expect("build snapshot");
+
+        let dst_dir = tempfile::tempdir().expect("dst tempdir");
+        let dst_db = OmniKV::open(
+            dst_dir
+                .path()
+                .join("manifest.json")
+                .to_str()
+                .expect("dst manifest"),
+            dst_dir.path().join("wal.bin").to_str().expect("dst wal"),
+        )
+        .expect("open dst db");
+        let mut dst_storage = OmniRaftStorage::new(dst_db);
+
+        // Plant an unresolved rollback directory containing the original manifest copy.
+        let unresolved = dst_dir.path().join("old_snapshot_unresolved");
+        std::fs::create_dir_all(&unresolved).expect("create unresolved dir");
+        let sentinel = unresolved.join("manifest.json");
+        std::fs::write(&sentinel, b"original-manifest-backup").expect("write sentinel");
+
+        let err = dst_storage
+            .install_snapshot(&snapshot.meta, snapshot.snapshot)
+            .await
+            .expect_err(
+                "install_snapshot must refuse promotion when unresolved rollback dir exists",
+            );
+        assert!(
+            err.to_string()
+                .contains("unresolved snapshot rollback directory"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(
+            std::fs::read(&sentinel).expect("sentinel must survive untouched"),
+            b"original-manifest-backup"
         );
     }
 }

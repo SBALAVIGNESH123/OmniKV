@@ -4031,41 +4031,47 @@ async fn test_apply_to_state_machine_chunks_past_batch_cap() {
 #[tokio::test]
 async fn test_apply_response_is_the_commit_marker() {
     let (db, storage, _dir) = create_node("apply_marker");
-    let entries = vec![bulk_entry(1, 10, "m")];
+    // Two entries that touch an overlapping key force two atomic flushes in one
+    // apply call (each flushing user data + `last_applied` together), so
+    // `get_seq()` advances strictly past `marker1 + 1` by the time apply returns.
+    let mut second = bulk_entry(1, 10, "m");
+    second.log_id.index = 2;
+    let entries = vec![bulk_entry(1, 10, "m"), second];
 
     let res =
         openraft::storage::RaftStorage::apply_to_state_machine(&mut storage.clone(), &entries)
             .await
             .expect("apply must succeed");
 
-    assert_eq!(res.len(), 1, "one entry → one response");
+    assert_eq!(res.len(), 2, "two entries → two responses");
     let marker: u64 = res[0]
         .parse()
         .expect("apply response must be the commit marker, not a constant");
+    let marker2: u64 = res[1]
+        .parse()
+        .expect("second apply response must also carry its commit marker");
+    assert!(
+        marker2 > marker,
+        "second flush must land at a strictly higher commit marker"
+    );
 
-    // WHY the marker is carried rather than reconstructed: after the
-    // data lands, the apply writes its last_applied meta record, and
-    // that commit reserves sequences too (the meta op PLUS its own
-    // marker). So get_seq() ends up MORE than one past the data marker —
-    // marker+2 here — with no concurrency at all. get_seq()-1 would
-    // return the meta op's sequence, not the data marker. Only the
-    // carried marker is correct.
+    // WHY the marker is carried rather than reconstructed: once the second
+    // flush lands, `get_seq()` is strictly past `marker + 1`. Reconstructing
+    // from `get_seq() - 1` would return the later flush's marker, not entry 1's.
     assert!(
         db.get_seq() > marker + 1,
-        "the apply's own meta commit must advance the counter past marker+1; \
-         got {} for marker {} — if this ever equals marker+1, reconstructing \
-         from the counter would silently become correct and this guard is stale",
+        "subsequent flush must advance the counter past marker+1; got {} for marker {}",
         db.get_seq(),
         marker
     );
     assert_ne!(
         db.get_seq().saturating_sub(1),
         marker,
-        "get_seq()-1 must NOT equal the data marker — the meta commit shifts it"
+        "get_seq()-1 must NOT equal entry 1's commit marker"
     );
 
-    // The write is nevertheless visible to a snapshot taken AT the
-    // marker — the visibility property the SSI engine depends on.
+    // Both the data AND `last_applied` meta committed atomically at `marker` —
+    // visible to a snapshot taken AT `marker`.
     assert_eq!(
         db.find("m:bulk:1:0", marker).unwrap(),
         Some("v".into()),
@@ -4075,6 +4081,10 @@ async fn test_apply_response_is_the_commit_marker() {
         db.find("m:bulk:1:9", marker).unwrap(),
         Some("v".into()),
         "the last op of the entry must be visible at read_seq == marker"
+    );
+    assert!(
+        db.find("__sys__/raft/meta", marker).unwrap().is_some(),
+        "raft last_applied meta must commit atomically at the same marker as user data"
     );
     println!("✅ APPLY MARKER: response carried commit seq {marker}");
 }
@@ -4210,10 +4220,27 @@ async fn test_apply_single_entry_at_batch_cap_keeps_room_for_meta() {
 #[tokio::test]
 async fn test_purge_chunks_past_batch_cap() {
     let (db, storage, _dir) = create_node("bulk_purge");
-    // Stage a long log via the sync helper (raw text entries).
+    // Stage a long log of real JSON OpenRaft entries so intermediate purge
+    // boundaries can be verified against their exact committed `LogId`.
+    let leader = openraft::CommittedLeaderId::new(1, 1);
+    let mut entries = Vec::with_capacity(2_000);
     for idx in 1..=12_000u64 {
-        storage
-            .append_log(idx, &format!("SET purge_k{idx} v"))
+        entries.push(openraft::Entry {
+            log_id: openraft::LogId::new(leader, idx),
+            payload: openraft::EntryPayload::Normal(format!("SET purge_k{idx} v")),
+        });
+        if entries.len() == 2_000 {
+            openraft::storage::RaftStorage::append_to_log(
+                &mut storage.clone(),
+                std::mem::take(&mut entries),
+            )
+            .await
+            .unwrap();
+        }
+    }
+    if !entries.is_empty() {
+        openraft::storage::RaftStorage::append_to_log(&mut storage.clone(), entries)
+            .await
             .unwrap();
     }
     openraft::storage::RaftStorage::purge_logs_upto(

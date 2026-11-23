@@ -1002,17 +1002,19 @@ impl SqlExecutor {
             let new_document = serde_json::to_value(&row)
                 .map_err(|e| format!("Serialize new index document: {e}"))?;
             index_manager
-                .validate_document_indexes_with_catalog(
+                .validate_document_indexes_with_catalog_for_namespace(
                     &index_catalog,
                     &table.name,
+                    crate::secondary_index::IndexNamespace::Sql,
                     &stored_suffix,
                     &old_document,
                 )
                 .map_err(|e| format!("Index maintenance failed: {e}"))?;
             let new_entries = index_manager
-                .validate_document_indexes_with_catalog(
+                .validate_document_indexes_with_catalog_for_namespace(
                     &index_catalog,
                     &table.name,
+                    crate::secondary_index::IndexNamespace::Sql,
                     &canonical_suffix,
                     &new_document,
                 )
@@ -1052,7 +1054,9 @@ impl SqlExecutor {
         let mut batch = WriteBatch::new();
         self.seed_pending_indexes(&mut batch)?;
         let active_stages = self.active_rename_stages(&table.name, seq)?;
-        let index_count = index_catalog.indexes_for_collection(&table.name).len();
+        let index_count = index_catalog
+            .indexes_for_namespace(&table.name, crate::secondary_index::IndexNamespace::Sql)
+            .len();
         let per_row_budget = 2 + 2 * index_count + 2 * active_stages.len();
         let tail_reserve = reserved_statement_ops.saturating_add(1);
         // Only autocommit statements may flush intermediate chunks; explicit
@@ -1108,9 +1112,10 @@ impl SqlExecutor {
             }
             let mut reads = self.pending_reads.borrow_mut();
             index_manager
-                .replace_document_indexes_with_catalog_and_reads(
+                .replace_document_indexes_with_catalog_for_namespace(
                     &index_catalog,
                     &table.name,
+                    crate::secondary_index::IndexNamespace::Sql,
                     &stored_suffix,
                     &old_document,
                     &canonical_suffix,
@@ -1161,9 +1166,10 @@ impl SqlExecutor {
             let doc = serde_json::to_value(&migrated)
                 .map_err(|e| format!("Serialize index document: {e}"))?;
             let entries = index_manager
-                .validate_document_indexes_with_catalog(
+                .validate_document_indexes_with_catalog_for_namespace(
                     index_catalog,
                     &table.name,
+                    crate::secondary_index::IndexNamespace::Sql,
                     &canonical_pk,
                     &doc,
                 )
@@ -1240,9 +1246,11 @@ impl SqlExecutor {
 
         let index_manager = self.catalog.index_manager();
         let index_catalog = self.dml_index_catalog(read_seq)?;
-        let insert_reserved_ops = values
-            .len()
-            .saturating_mul(1 + index_catalog.indexes_for_collection(&table.name).len());
+        let insert_reserved_ops = values.len().saturating_mul(
+            1 + index_catalog
+                .indexes_for_namespace(&table.name, crate::secondary_index::IndexNamespace::Sql)
+                .len(),
+        );
 
         // Validate every inserted row (PK presence, PK uniqueness, serialization,
         // and for autocommit legacy migrations, unique indexes and batch caps)
@@ -1309,9 +1317,10 @@ impl SqlExecutor {
                     .set(key, value.clone())
                     .map_err(|e| format!("{:?}", e))?;
                 let entries = index_manager
-                    .validate_document_indexes_with_catalog(
+                    .validate_document_indexes_with_catalog_for_namespace(
                         &index_catalog,
                         &table.name,
+                        crate::secondary_index::IndexNamespace::Sql,
                         canonical_pk,
                         document,
                     )
@@ -1364,9 +1373,10 @@ impl SqlExecutor {
             batch.set(&key, value).map_err(|e| format!("{:?}", e))?;
             let mut reads = self.pending_reads.borrow_mut();
             index_manager
-                .index_document_with_catalog_and_reads(
+                .index_document_with_catalog_for_namespace(
                     &index_catalog,
                     &table.name,
+                    crate::secondary_index::IndexNamespace::Sql,
                     &canonical_pk,
                     &document,
                     &mut batch,
@@ -2589,7 +2599,9 @@ impl SqlExecutor {
             self.active_rename_stages(&table.name, read_seq)?.len()
         };
         let update_reserved_ops = rows.len().saturating_mul(
-            2 + 2 * index_catalog.indexes_for_collection(&table.name).len()
+            2 + 2 * index_catalog
+                .indexes_for_namespace(&table.name, crate::secondary_index::IndexNamespace::Sql)
+                .len()
                 + 2 * update_stage_count,
         );
 
@@ -2701,17 +2713,19 @@ impl SqlExecutor {
                     .set(key, value.clone())
                     .map_err(|e| format!("{:?}", e))?;
                 let old_entries = index_manager
-                    .validate_document_indexes_with_catalog(
+                    .validate_document_indexes_with_catalog_for_namespace(
                         &index_catalog,
                         &table.name,
+                        crate::secondary_index::IndexNamespace::Sql,
                         effective_old_pk,
                         old_document,
                     )
                     .map_err(|e| format!("Index maintenance failed: {e}"))?;
                 let new_entries = index_manager
-                    .validate_document_indexes_with_catalog(
+                    .validate_document_indexes_with_catalog_for_namespace(
                         &index_catalog,
                         &table.name,
+                        crate::secondary_index::IndexNamespace::Sql,
                         canonical_pk,
                         new_document,
                     )
@@ -2790,9 +2804,10 @@ impl SqlExecutor {
             batch.set(&key, value).map_err(|e| format!("{:?}", e))?;
             let mut reads = self.pending_reads.borrow_mut();
             index_manager
-                .replace_document_indexes_with_catalog_and_reads(
+                .replace_document_indexes_with_catalog_for_namespace(
                     &index_catalog,
                     &table.name,
+                    crate::secondary_index::IndexNamespace::Sql,
                     &effective_old_pk,
                     &old_document,
                     &canonical_pk,
@@ -2857,7 +2872,10 @@ impl SqlExecutor {
             self.active_rename_stages(&table.name, read_seq)?
         };
         let mut delete_reserved_ops = rows.len().saturating_mul(
-            1 + index_catalog.indexes_for_collection(&table.name).len() + active_stages.len(),
+            1 + index_catalog
+                .indexes_for_namespace(&table.name, crate::secondary_index::IndexNamespace::Sql)
+                .len()
+                + active_stages.len(),
         );
         let count = rows.len();
         let mut planned_deletes = Vec::with_capacity(rows.len());
@@ -2892,9 +2910,10 @@ impl SqlExecutor {
                 let mut probe = WriteBatch::new();
                 probe.delete(key).map_err(|e| format!("{:?}", e))?;
                 let entries = index_manager
-                    .validate_document_indexes_with_catalog(
+                    .validate_document_indexes_with_catalog_for_namespace(
                         &index_catalog,
                         &table.name,
+                        crate::secondary_index::IndexNamespace::Sql,
                         canonical_pk,
                         document,
                     )
@@ -2962,9 +2981,10 @@ impl SqlExecutor {
                     (raw_stored_pk, stored_key, old_raw_document)
                 };
             index_manager
-                .remove_document_indexes_with_catalog(
+                .remove_document_indexes_with_catalog_for_namespace(
                     &index_catalog,
                     &table.name,
+                    crate::secondary_index::IndexNamespace::Sql,
                     &target_pk,
                     &target_doc,
                     &mut batch,
