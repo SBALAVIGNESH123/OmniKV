@@ -81,6 +81,49 @@ impl IndexNamespace {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DropIndexReceiptState {
+    Dropping,
+    Done,
+}
+
+/// Strictly validates a schema-migration `DropIndex` receipt.
+/// Accepts only `dropping:<id[,id...]>` or `done:<id[,id...]>`, requiring a
+/// non-empty comma-separated list where every token parses cleanly as `IndexId`.
+pub(crate) fn parse_drop_index_receipt(
+    receipt: &str,
+) -> Result<(DropIndexReceiptState, Vec<IndexId>), OmniError> {
+    let (state, ids_csv) = if let Some(rest) = receipt.strip_prefix("done:") {
+        (DropIndexReceiptState::Done, rest)
+    } else if let Some(rest) = receipt.strip_prefix("dropping:") {
+        (DropIndexReceiptState::Dropping, rest)
+    } else {
+        return Err(OmniError::IoError(format!(
+            "invalid drop receipt '{receipt}': expected 'dropping:<ids>' or 'done:<ids>'"
+        )));
+    };
+    if ids_csv.is_empty() {
+        return Err(OmniError::IoError(format!(
+            "invalid drop receipt '{receipt}': missing index IDs"
+        )));
+    }
+    let mut ids = Vec::new();
+    for token in ids_csv.split(',') {
+        if token.is_empty() || token != token.trim() {
+            return Err(OmniError::IoError(format!(
+                "invalid drop receipt '{receipt}': empty or padded index ID token"
+            )));
+        }
+        let id = token.parse::<IndexId>().map_err(|e| {
+            OmniError::IoError(format!(
+                "invalid drop receipt '{receipt}': invalid index ID '{token}': {e}"
+            ))
+        })?;
+        ids.push(id);
+    }
+    Ok((state, ids))
+}
+
 /// Resolves an unbound legacy `IndexNamespace::Both` definition to a single
 /// owning namespace when only one domain exists for `collection`. Returns
 /// `Ok(None)` when ownership is ambiguous (both SQL and document domains exist,
@@ -627,15 +670,16 @@ impl IndexManager {
         Self { db }
     }
 
-    /// Resolves `collection` to its canonical SQL `TableDef.name` when a SQL
-    /// table exists for it (preserving case-insensitive SQL semantics), or
-    /// returns `collection` verbatim for document collections so differently
-    /// cased prefixes (e.g., `docs` vs `DOCS`) stay distinct.
-    pub(crate) fn resolve_collection_name_at(
+    /// Resolves `collection` to its canonical SQL `TableDef.name` and
+    /// `IndexNamespace::Sql` when a SQL table exists for it (preserving
+    /// case-insensitive SQL semantics), or returns `(collection, Document)`
+    /// verbatim for document collections so differently cased prefixes stay
+    /// distinct. Fails closed on corrupt SQL table metadata.
+    pub(crate) fn resolve_collection_and_namespace_at(
         &self,
         collection: &str,
         seq: u64,
-    ) -> Result<String, OmniError> {
+    ) -> Result<(String, IndexNamespace), OmniError> {
         let table = self
             .db
             .find(&crate::catalog::Catalog::catalog_key(collection), seq)?
@@ -645,7 +689,22 @@ impl IndexManager {
                 })
             })
             .transpose()?;
-        Ok(table.map_or_else(|| collection.to_string(), |t| t.name))
+        Ok(table.map_or_else(
+            || (collection.to_string(), IndexNamespace::Document),
+            |t| (t.name, IndexNamespace::Sql),
+        ))
+    }
+
+    /// Resolves `collection` to its canonical SQL `TableDef.name` when a SQL
+    /// table exists for it (preserving case-insensitive SQL semantics), or
+    /// returns `collection` verbatim for document collections so differently
+    /// cased prefixes (e.g., `docs` vs `DOCS`) stay distinct.
+    pub(crate) fn resolve_collection_name_at(
+        &self,
+        collection: &str,
+        seq: u64,
+    ) -> Result<String, OmniError> {
+        Ok(self.resolve_collection_and_namespace_at(collection, seq)?.0)
     }
 
     /// Refreshes definitions from durable storage for the latest sequence.
@@ -993,51 +1052,45 @@ impl IndexManager {
     }
 
     /// Resumable `DROP INDEX` for schema migrations: tracks `dropping:<ids>`
-    /// atomically alongside retirement and `done` once all entries are purged,
-    /// while still failing a fresh drop of a non-existent index.
+    /// atomically alongside retirement and `done:<ids>` once all entries are
+    /// purged, while still failing a fresh drop of a non-existent index or any
+    /// malformed receipt.
     pub(crate) fn drop_index_with_receipt(
         &self,
         name: &str,
         receipt_key: &str,
     ) -> Result<(), OmniError> {
         let seq = self.db.get_seq();
-        match self.db.find(receipt_key, seq)?.as_deref() {
-            Some(receipt) if receipt == "done" || receipt.starts_with("done:") => return Ok(()),
-            Some(receipt) if receipt.starts_with("dropping:") => {
-                let ids_csv = receipt.strip_prefix("dropping:").unwrap_or("");
-                let ids: Vec<IndexId> = ids_csv
-                    .split(',')
-                    .filter(|s| !s.is_empty())
-                    .map(|s| {
-                        s.parse::<IndexId>().map_err(|e| {
-                            OmniError::IoError(format!("invalid drop receipt '{receipt}': {e}"))
-                        })
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                if ids.is_empty() {
-                    return Err(OmniError::IoError(format!(
-                        "invalid drop receipt '{receipt}': missing index IDs"
-                    )));
-                }
-                for id in ids {
-                    self.purge_retired_index_if_present(id)?;
-                    if let Some(def) = IndexCatalog::load_checked_at(&self.db, self.db.get_seq())?
-                        .get(id)
-                        .cloned()
-                    {
-                        let lock = self.db.sql_table_lock(&def.collection)?;
-                        let _guard = lock
-                            .lock()
-                            .map_err(|_| OmniError::LockPoisoned("index collection".into()))?;
-                        self.drop_index_locked_inner(&def.name, &def.collection, false, None)?;
+        if let Some(receipt) = self.db.find(receipt_key, seq)? {
+            let (state, ids) = parse_drop_index_receipt(&receipt)?;
+            match state {
+                DropIndexReceiptState::Done => return Ok(()),
+                DropIndexReceiptState::Dropping => {
+                    for &id in &ids {
+                        self.purge_retired_index_if_present(id)?;
+                        if let Some(def) =
+                            IndexCatalog::load_checked_at(&self.db, self.db.get_seq())?
+                                .get(id)
+                                .cloned()
+                        {
+                            let lock = self.db.sql_table_lock(&def.collection)?;
+                            let _guard = lock
+                                .lock()
+                                .map_err(|_| OmniError::LockPoisoned("index collection".into()))?;
+                            self.drop_index_locked_inner(&def.name, &def.collection, false, None)?;
+                        }
                     }
+                    let ids_csv = ids
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    let mut done = WriteBatch::new();
+                    done.set(receipt_key, format!("done:{ids_csv}"))?;
+                    self.db.commit_batch(&done)?;
+                    return Ok(());
                 }
-                let mut done = WriteBatch::new();
-                done.set(receipt_key, format!("done:{ids_csv}"))?;
-                self.db.commit_batch(&done)?;
-                return Ok(());
             }
-            _ => {}
         }
 
         let target_collection = self.resolve_drop_target_at(name, seq)?;

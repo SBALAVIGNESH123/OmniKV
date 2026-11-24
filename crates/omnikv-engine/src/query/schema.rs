@@ -402,9 +402,9 @@ impl SchemaManager {
                 unique,
             } => self.with_collection_lock(collection, || {
                 let seq = self.db.get_seq();
-                let resolved_collection = self
+                let (resolved_collection, expected_namespace) = self
                     .index_manager
-                    .resolve_collection_name_at(collection, seq)?;
+                    .resolve_collection_and_namespace_at(collection, seq)?;
                 let receipt_key = Self::create_index_done_key(
                     version,
                     direction,
@@ -416,6 +416,7 @@ impl SchemaManager {
                 let matches_requested =
                     |def: &crate::secondary_index::IndexDefinition, expected_id: u32| -> bool {
                         def.id == expected_id
+                            && def.namespace == expected_namespace
                             && def.name.eq_ignore_ascii_case(name)
                             && (def.collection == *collection
                                 || def.collection == resolved_collection)
@@ -433,14 +434,27 @@ impl SchemaManager {
                             )
                     };
                 let (done_id, owned_building_id) = match self.db.find(&receipt_key, seq)? {
-                    Some(receipt) => (
-                        receipt
-                            .strip_prefix("done:")
-                            .and_then(|s| s.parse::<u32>().ok()),
-                        receipt
-                            .strip_prefix("building:")
-                            .and_then(|s| s.parse::<u32>().ok()),
-                    ),
+                    Some(receipt) => {
+                        if let Some(id_str) = receipt.strip_prefix("done:") {
+                            let id = id_str.parse::<u32>().map_err(|e| {
+                                OmniError::IoError(format!(
+                                    "invalid CreateIndex receipt '{receipt}': {e}"
+                                ))
+                            })?;
+                            (Some(id), None)
+                        } else if let Some(id_str) = receipt.strip_prefix("building:") {
+                            let id = id_str.parse::<u32>().map_err(|e| {
+                                OmniError::IoError(format!(
+                                    "invalid CreateIndex receipt '{receipt}': {e}"
+                                ))
+                            })?;
+                            (None, Some(id))
+                        } else {
+                            return Err(OmniError::IoError(format!(
+                                "invalid CreateIndex receipt '{receipt}': expected 'building:<id>' or 'done:<id>'"
+                            )));
+                        }
+                    }
                     None => (None, None),
                 };
                 if let Some(done_id) = done_id {
@@ -981,15 +995,8 @@ impl SchemaManager {
             if !still_has_drop_step {
                 continue;
             }
-            let ids_csv = value
-                .strip_prefix("done:")
-                .or_else(|| value.strip_prefix("dropping:"))
-                .unwrap_or("");
-            if ids_csv
-                .split(',')
-                .filter_map(|s| s.parse::<u32>().ok())
-                .any(|dropped_id| dropped_id == index_id)
-            {
+            let (_, dropped_ids) = crate::secondary_index::parse_drop_index_receipt(&value)?;
+            if dropped_ids.contains(&index_id) {
                 return Ok(true);
             }
         }

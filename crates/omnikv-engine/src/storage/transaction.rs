@@ -919,6 +919,17 @@ impl TransactionManager {
             )));
         }
 
+        let floor = self.db.load_roots().read_seq_floor;
+        if txn.read_seq < floor {
+            self.metrics.txns_aborted.fetch_add(1, Ordering::Relaxed);
+            txn.state = TxnState::Aborted;
+            self.cleanup_txn(txn.id, txn.read_seq);
+            return Err(OmniError::StaleSnapshot {
+                read_seq: txn.read_seq,
+                floor,
+            });
+        }
+
         // Read-your-own-writes: check local write buffer first
         if let Some((value, _ttl)) = txn.write_set.get(key) {
             txn.read_set.insert(key.to_string());
@@ -927,7 +938,16 @@ impl TransactionManager {
 
         // Read from storage at our snapshot
         txn.read_set.insert(key.to_string());
-        self.db.find(key, txn.read_seq)
+        match self.db.find(key, txn.read_seq) {
+            Ok(value) => Ok(value),
+            Err(err @ OmniError::StaleSnapshot { .. }) => {
+                self.metrics.txns_aborted.fetch_add(1, Ordering::Relaxed);
+                txn.state = TxnState::Aborted;
+                self.cleanup_txn(txn.id, txn.read_seq);
+                Err(err)
+            }
+            Err(err) => Err(err),
+        }
     }
 
     /// Records a range read ([start, end)) for SSI conflict detection —
@@ -1090,7 +1110,18 @@ impl TransactionManager {
         }
 
         if txn.write_set.is_empty() {
-            // Read-only transaction — no conflicts possible
+            // Verify this read-only snapshot was not superseded by a Raft
+            // snapshot installation before marking it committed.
+            let floor = self.db.load_roots().read_seq_floor;
+            if txn.read_seq < floor {
+                self.metrics.txns_aborted.fetch_add(1, Ordering::Relaxed);
+                txn.state = TxnState::Aborted;
+                self.cleanup_txn(txn.id, txn.read_seq);
+                return Err(OmniError::StaleSnapshot {
+                    read_seq: txn.read_seq,
+                    floor,
+                });
+            }
             txn.state = TxnState::Committed;
             self.cleanup_txn(txn.id, txn.read_seq);
             self.metrics.txns_committed.fetch_add(1, Ordering::Relaxed);

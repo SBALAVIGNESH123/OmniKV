@@ -5569,10 +5569,13 @@ async fn test_snapshot_install_does_not_return_source_commit_seq_for_2pc_retry()
         "precondition: rebuilt z_key seq ({}) must exceed source commit_seq ({source_commit_seq})",
         dest_db.get_seq_for_key("z_key", u64::MAX)
     );
-    assert_eq!(
-        dest_db.find("z_key", source_commit_seq).unwrap(),
-        None,
-        "precondition: reading at source_commit_seq on destination does not see z_key"
+    assert!(
+        matches!(
+            dest_db.find("z_key", source_commit_seq),
+            Err(omni_engine::OmniError::StaleSnapshot { read_seq, floor })
+                if read_seq == source_commit_seq && floor > source_commit_seq
+        ),
+        "precondition: reading at source_commit_seq ({source_commit_seq}) on destination must fail closed with StaleSnapshot"
     );
 
     // Retry on the destination MUST NOT return the invalid source commit_seq;

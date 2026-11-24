@@ -223,6 +223,7 @@ fn sanitize_storage_err(e: &OmniError) -> String {
         OmniError::BatchTooLarge(_) => "BATCH_TOO_LARGE".to_string(),
         OmniError::ValueTooLarge(_) => "VALUE_TOO_LARGE".to_string(),
         OmniError::UnsupportedVersion { .. } => "UNSUPPORTED_VERSION".to_string(),
+        OmniError::StaleSnapshot { .. } => "STALE_SNAPSHOT".to_string(),
         // The one client-caused error that is safe — and useful — to
         // explain: the write hit a follower, and the caller needs the
         // leader's id to retry there. Without it, a clustered client
@@ -246,6 +247,7 @@ fn sanitize_err(e: &impl std::fmt::Debug) -> String {
 fn http_status_for_storage_err(e: &OmniError) -> StatusCode {
     match e {
         OmniError::KeyNotFound => StatusCode::NOT_FOUND,
+        OmniError::StaleSnapshot { .. } => StatusCode::CONFLICT,
         OmniError::BatchTooLarge(_) | OmniError::ValueTooLarge(_) => StatusCode::BAD_REQUEST,
         // The client asked the wrong node: the write is well-formed, it
         // just has to go to the leader. 503 (not 500) keeps it out of the

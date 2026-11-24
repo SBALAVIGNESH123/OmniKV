@@ -4483,3 +4483,284 @@ fn schema_retry_rejects_building_schema_change_and_removed_drop_step() {
         .expect_err("building:<id> retry with altered unique flag must fail closed");
     assert!(err.to_string().contains("building receipt mismatch"));
 }
+
+#[test]
+fn schema_create_index_retry_rejects_namespace_change_on_done_and_building_receipts() {
+    let (db, _dir, executor) = setup();
+    let idx_mgr = Arc::new(IndexManager::new(db.clone()));
+    let schema = SchemaManager::new(db.clone(), idx_mgr.clone());
+
+    execute(
+        &executor,
+        "CREATE TABLE ns_retry_tbl (id INTEGER PRIMARY KEY, email TEXT)",
+    );
+    execute(&executor, "INSERT INTO ns_retry_tbl VALUES (1, 'a@x.com')");
+
+    let failing_v1 = Migration {
+        version: 1,
+        description: "create unique SQL index then fail".into(),
+        up: vec![
+            SchemaOp::CreateIndex {
+                name: "ns_done_idx".into(),
+                collection: "ns_retry_tbl".into(),
+                fields: vec![("email".into(), IndexFieldType::String)],
+                unique: true,
+            },
+            SchemaOp::RemoveField {
+                collection: "ns_retry_tbl".into(),
+                field_name: "does_not_exist".into(),
+            },
+        ],
+        down: vec![],
+    };
+    assert!(schema.migrate_up(&failing_v1).is_err());
+    let def = idx_mgr.definition("ns_done_idx").unwrap();
+    assert_eq!(def.namespace, IndexNamespace::Sql);
+
+    let retry_v1 = Migration {
+        version: 1,
+        description: "retry unique SQL index".into(),
+        up: vec![SchemaOp::CreateIndex {
+            name: "ns_done_idx".into(),
+            collection: "ns_retry_tbl".into(),
+            fields: vec![("email".into(), IndexFieldType::String)],
+            unique: true,
+        }],
+        down: vec![],
+    };
+
+    // 1. Rebind SQL index to Document: done:<id> retry must fail closed.
+    idx_mgr
+        .bind_index_namespace("ns_done_idx", IndexNamespace::Document)
+        .unwrap();
+    let err = schema
+        .migrate_up(&retry_v1)
+        .expect_err("done:<id> retry must reject SQL->Document namespace change");
+    assert!(err.to_string().contains("receipt mismatch"), "got: {err}");
+    assert_eq!(schema.current_version().unwrap(), 0);
+
+    // 2. building:<id> receipt with Document namespace must also fail closed.
+    let receipts = db
+        .scan(
+            "\x00SCHEMA\x00create_idx:",
+            "\x00SCHEMA\x00create_idx:\u{10ffff}",
+            db.get_seq(),
+        )
+        .unwrap();
+    let (receipt_key, _) = &receipts[0];
+    let mut wb = WriteBatch::new();
+    wb.set(receipt_key, format!("building:{}", def.id)).unwrap();
+    db.commit_batch(&wb).unwrap();
+    let err = schema
+        .migrate_up(&retry_v1)
+        .expect_err("building:<id> retry must reject SQL->Document namespace change");
+    assert!(
+        err.to_string().contains("building receipt mismatch"),
+        "got: {err}"
+    );
+
+    // 3. Corrupt CreateIndex receipts must fail closed.
+    for bad in ["done", "done:", "done:abc", "building:", "building:abc"] {
+        let mut bad_wb = WriteBatch::new();
+        bad_wb.set(receipt_key, bad.into()).unwrap();
+        db.commit_batch(&bad_wb).unwrap();
+        let err = schema
+            .migrate_up(&retry_v1)
+            .expect_err("corrupt CreateIndex receipt must fail closed");
+        assert!(
+            err.to_string().contains("invalid CreateIndex receipt"),
+            "bad={bad}, got: {err}"
+        );
+    }
+
+    // 4. Legacy Both namespace must also be rejected on done:<id> retry.
+    let mut both_wb = WriteBatch::new();
+    let cat_key = format!("\u{0}IDX_CATALOG\u{0}{}", def.id);
+    let mut legacy_def = idx_mgr.definition("ns_done_idx").unwrap();
+    legacy_def.namespace = IndexNamespace::Both;
+    both_wb
+        .set(&cat_key, serde_json::to_string(&legacy_def).unwrap())
+        .unwrap();
+    both_wb
+        .set(receipt_key, format!("done:{}", def.id))
+        .unwrap();
+    db.commit_batch(&both_wb).unwrap();
+    let err = schema
+        .migrate_up(&retry_v1)
+        .expect_err("done:<id> retry must reject legacy Both namespace");
+    assert!(err.to_string().contains("receipt mismatch"), "got: {err}");
+
+    // 5. Restoring Sql namespace lets retry succeed.
+    idx_mgr
+        .bind_index_namespace("ns_done_idx", IndexNamespace::Sql)
+        .unwrap();
+    schema.migrate_up(&retry_v1).unwrap();
+    assert_eq!(schema.current_version().unwrap(), 1);
+}
+
+const BAD_DROP_RECEIPTS: [&str; 8] = [
+    "done",
+    "done:",
+    "done:1,bad",
+    "done:1,",
+    "done: 1",
+    "dropping:",
+    "dropping:1,bad",
+    "junk",
+];
+
+#[test]
+fn schema_create_index_later_drop_receipt_rejects_malformed_and_empty_values() {
+    let (db, _dir, executor) = setup();
+    let idx_mgr = Arc::new(IndexManager::new(db.clone()));
+    let schema = SchemaManager::new(db.clone(), idx_mgr);
+
+    execute(
+        &executor,
+        "CREATE TABLE drop_rcpt_tbl (id INTEGER PRIMARY KEY, email TEXT)",
+    );
+    execute(&executor, "INSERT INTO drop_rcpt_tbl VALUES (1, 'a@x.com')");
+
+    let failing_v1 = Migration {
+        version: 1,
+        description: "create, drop, fail".into(),
+        up: vec![
+            SchemaOp::CreateIndex {
+                name: "drop_rcpt_idx".into(),
+                collection: "drop_rcpt_tbl".into(),
+                fields: vec![("email".into(), IndexFieldType::String)],
+                unique: false,
+            },
+            SchemaOp::DropIndex {
+                name: "drop_rcpt_idx".into(),
+            },
+            SchemaOp::RemoveField {
+                collection: "drop_rcpt_tbl".into(),
+                field_name: "does_not_exist".into(),
+            },
+        ],
+        down: vec![],
+    };
+    assert!(schema.migrate_up(&failing_v1).is_err());
+
+    let drop_receipts = db
+        .scan(
+            "\x00SCHEMA\x00drop_idx:",
+            "\x00SCHEMA\x00drop_idx:\u{10ffff}",
+            db.get_seq(),
+        )
+        .unwrap();
+    assert_eq!(drop_receipts.len(), 1);
+    let (drop_receipt_key, valid_drop_receipt) = drop_receipts[0].clone();
+
+    let retry_create_drop = Migration {
+        version: 1,
+        description: "retry create and drop".into(),
+        up: vec![
+            SchemaOp::CreateIndex {
+                name: "drop_rcpt_idx".into(),
+                collection: "drop_rcpt_tbl".into(),
+                fields: vec![("email".into(), IndexFieldType::String)],
+                unique: false,
+            },
+            SchemaOp::DropIndex {
+                name: "drop_rcpt_idx".into(),
+            },
+        ],
+        down: vec![],
+    };
+
+    for bad in BAD_DROP_RECEIPTS {
+        let mut wb = WriteBatch::new();
+        wb.set(&drop_receipt_key, bad.into()).unwrap();
+        db.commit_batch(&wb).unwrap();
+        let err = schema
+            .migrate_up(&retry_create_drop)
+            .expect_err("malformed later drop receipt must fail closed");
+        assert!(
+            err.to_string().contains("invalid drop receipt"),
+            "bad={bad}, got: {err}"
+        );
+    }
+
+    let mut restore = WriteBatch::new();
+    restore.set(&drop_receipt_key, valid_drop_receipt).unwrap();
+    db.commit_batch(&restore).unwrap();
+    schema.migrate_up(&retry_create_drop).unwrap();
+    assert_eq!(schema.current_version().unwrap(), 1);
+}
+
+#[test]
+fn schema_drop_index_retry_rejects_malformed_and_empty_receipts() {
+    let (db, _dir, executor) = setup();
+    let idx_mgr = Arc::new(IndexManager::new(db.clone()));
+    let schema = SchemaManager::new(db.clone(), idx_mgr.clone());
+
+    execute(
+        &executor,
+        "CREATE TABLE drop_rcpt_tbl2 (id INTEGER PRIMARY KEY, email TEXT)",
+    );
+    execute(
+        &executor,
+        "INSERT INTO drop_rcpt_tbl2 VALUES (1, 'a@x.com')",
+    );
+    idx_mgr
+        .create_index(
+            "drop_rcpt_idx2",
+            "drop_rcpt_tbl2",
+            vec![("email".into(), IndexFieldType::String)],
+            false,
+        )
+        .unwrap();
+
+    let failing_v1 = Migration {
+        version: 1,
+        description: "drop index then fail".into(),
+        up: vec![
+            SchemaOp::DropIndex {
+                name: "drop_rcpt_idx2".into(),
+            },
+            SchemaOp::RemoveField {
+                collection: "drop_rcpt_tbl2".into(),
+                field_name: "does_not_exist".into(),
+            },
+        ],
+        down: vec![],
+    };
+    assert!(schema.migrate_up(&failing_v1).is_err());
+
+    let receipts = db
+        .scan(
+            "\x00SCHEMA\x00drop_idx:000001:",
+            "\x00SCHEMA\x00drop_idx:000001:\u{10ffff}",
+            db.get_seq(),
+        )
+        .unwrap();
+    assert_eq!(receipts.len(), 1);
+    let (key, valid) = receipts[0].clone();
+    let retry_v1 = Migration {
+        version: 1,
+        description: "retry drop index".into(),
+        up: vec![SchemaOp::DropIndex {
+            name: "drop_rcpt_idx2".into(),
+        }],
+        down: vec![],
+    };
+    for bad in BAD_DROP_RECEIPTS {
+        let mut wb = WriteBatch::new();
+        wb.set(&key, bad.into()).unwrap();
+        db.commit_batch(&wb).unwrap();
+        let err = schema
+            .migrate_up(&retry_v1)
+            .expect_err("DropIndex retry must reject malformed receipt");
+        assert!(
+            err.to_string().contains("invalid drop receipt"),
+            "bad={bad}, got: {err}"
+        );
+    }
+    let mut restore = WriteBatch::new();
+    restore.set(&key, valid).unwrap();
+    db.commit_batch(&restore).unwrap();
+    schema.migrate_up(&retry_v1).unwrap();
+    assert_eq!(schema.current_version().unwrap(), 1);
+}

@@ -64,6 +64,12 @@ pub enum OmniError {
         found: u32,
         supported: u32,
     },
+    /// A read or read-only commit attempted to use an MVCC `read_seq` older
+    /// than the currently installed snapshot's minimum readable sequence floor.
+    StaleSnapshot {
+        read_seq: u64,
+        floor: u64,
+    },
 }
 
 impl std::fmt::Display for OmniError {
@@ -75,6 +81,10 @@ impl std::fmt::Display for OmniError {
             OmniError::UnsupportedVersion { found, supported } => write!(
                 f,
                 "unsupported manifest version {found}: this build supports up to {supported}"
+            ),
+            OmniError::StaleSnapshot { read_seq, floor } => write!(
+                f,
+                "stale MVCC snapshot: read_seq {read_seq} precedes installed snapshot floor {floor}"
             ),
             OmniError::InvalidCompactionPolicy(reason) => {
                 write!(f, "invalid compaction policy: {reason}")
@@ -1195,6 +1205,10 @@ pub struct StorageRoots {
     /// Pairs with byte offsets in `block_cache` so reads captured from an older
     /// root snapshot never read or hit cache entries from a different heap.
     pub heap_generation: u64,
+    /// Minimum MVCC `read_seq` valid against this topology. Advanced to the
+    /// installed snapshot's floor by Raft `install_snapshot` so pre-install
+    /// transactions cannot silently read records from the replacement snapshot.
+    pub read_seq_floor: u64,
 }
 
 /// Pure storage recovery result — returned by recover_storage_from_path().
@@ -1479,6 +1493,7 @@ impl OmniKV {
             manifest: recovered.manifest,
             heap_reader: recovered.heap_reader,
             heap_generation: 1,
+            read_seq_floor: 0,
         };
 
         let ssi_history = std::sync::Arc::new(crate::transaction::SsiHistory::default());
@@ -2829,6 +2844,12 @@ impl OmniKV {
 
         let shard = shard_idx(&target_key);
         let roots = self.roots.load();
+        if read_seq < roots.read_seq_floor {
+            return Err(OmniError::StaleSnapshot {
+                read_seq,
+                floor: roots.read_seq_floor,
+            });
+        }
 
         let memtable = roots.memtable.clone();
         // Reverse(seq) ordering: exclusive lower bound at Reverse(read_seq+1) includes read_seq.
@@ -2997,6 +3018,12 @@ impl OmniKV {
 
         // Phase 1: Collect candidate records from one consistent root snapshot.
         let roots = self.roots.load();
+        if read_seq < roots.read_seq_floor {
+            return Err(OmniError::StaleSnapshot {
+                read_seq,
+                floor: roots.read_seq_floor,
+            });
+        }
         let mut candidates: Vec<ScanCandidate> = Vec::new();
 
         // Memtable (highest priority — newest data)
@@ -3276,6 +3303,7 @@ impl OmniKV {
                     manifest: current.manifest.clone(),
                     heap_reader: current.heap_reader.clone(),
                     heap_generation: current.heap_generation,
+                    read_seq_floor: current.read_seq_floor,
                 }));
                 (old, new_frozen.len() - 1)
             };
@@ -3916,6 +3944,7 @@ impl OmniKV {
             l1_sstables: Arc::new(Vec::new()),
             heap_reader: Arc::new(new_heap_reader),
             heap_generation: self.next_heap_generation.fetch_add(1, Ordering::Relaxed),
+            read_seq_floor: cur_roots.read_seq_floor,
             manifest: Arc::new(manifest_for_roots),
             memtable: new_empty_memtable,
             frozen_memtables: Arc::new(Vec::new()),

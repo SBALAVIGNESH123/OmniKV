@@ -405,6 +405,10 @@ fn storage_read_err(e: impl std::fmt::Display) -> openraft::StorageError<u64> {
     )
 }
 
+/// Flush directory metadata so renames and unlinks inside `dir` survive power
+/// loss. On non-Unix targets (such as Windows), opening a directory handle with
+/// `File::open` is unsupported and this function is an explicit no-op; crash
+/// durability of directory renames there relies on OS filesystem semantics.
 fn sync_dir(dir: &std::path::Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
@@ -826,43 +830,46 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
             let has_more = entries.len() > chunk_cap;
             let chunk_len = entries.len().min(chunk_cap);
 
-            for (key, _) in entries.iter().take(chunk_len) {
-                if parse_canonical_raft_log_key(key).is_none() {
-                    return Err(storage_read_err(format!(
+            // Validate EVERY entry in this chunk (including the final partial
+            // chunk) before staging any deletes or advancing the purge floor:
+            // canonical 20-digit key, valid JSON Entry, exact key/index match,
+            // strictly monotonic full LogId starting from `current_floor`, and
+            // `entry.log_id <= log_id`.
+            let mut prev_log_id = current_floor;
+            let mut last_validated: Option<(u64, LogId<u64>)> = None;
+            for (key, val) in entries.iter().take(chunk_len) {
+                let idx = parse_canonical_raft_log_key(key).ok_or_else(|| {
+                    storage_read_err(format!(
                         "non-canonical Raft log key '{key}' encountered during purge"
+                    ))
+                })?;
+                let entry = serde_json::from_str::<Entry<TypeConfig>>(val).map_err(|e| {
+                    storage_read_err(format!("corrupt Raft log entry at purge index {idx}: {e}"))
+                })?;
+                if entry.log_id.index != idx {
+                    return Err(storage_read_err(format!(
+                        "mismatched Raft log index at purge index {idx}: found {}",
+                        entry.log_id.index
                     )));
                 }
+                if entry.log_id > log_id || prev_log_id.is_some_and(|prev| entry.log_id <= prev) {
+                    return Err(storage_read_err(format!(
+                        "non-monotonic Raft log id at purge index {idx}: found {}, expected strictly after {:?} and at most {}",
+                        entry.log_id, prev_log_id, log_id
+                    )));
+                }
+                prev_log_id = Some(entry.log_id);
+                last_validated = Some((idx, entry.log_id));
             }
 
             // Chunk actual existing local log entries instead of numeric
             // indexes so purging over a sparse or empty local prefix succeeds,
-            // while populated intermediate chunk boundaries still verify their
-            // exact stored LogId and strict monotonicity before deleting.
+            // while every populated intermediate chunk advances the durable
+            // purge floor to the exact validated LogId of its final entry.
             let chunk_floor = if has_more {
-                let (last_key, last_val) = &entries[chunk_len - 1];
-                let idx = parse_canonical_raft_log_key(last_key).ok_or_else(|| {
-                    storage_read_err(format!(
-                        "invalid Raft log key at purge boundary '{last_key}'"
-                    ))
-                })?;
-                let entry = serde_json::from_str::<Entry<TypeConfig>>(last_val).map_err(|e| {
-                    storage_read_err(format!(
-                        "corrupt Raft log entry at purge boundary {idx}: {e}"
-                    ))
-                })?;
-                if entry.log_id.index != idx {
-                    return Err(storage_read_err(format!(
-                        "mismatched Raft log index at purge boundary {idx}: found {}",
-                        entry.log_id.index
-                    )));
-                }
-                if entry.log_id > log_id || current_floor.is_some_and(|cur| entry.log_id <= cur) {
-                    return Err(storage_read_err(format!(
-                        "non-monotonic Raft log id at purge boundary {idx}: found {}, expected between {:?} and {}",
-                        entry.log_id, current_floor, log_id
-                    )));
-                }
-                Some((idx, entry.log_id))
+                Some(last_validated.ok_or_else(|| {
+                    storage_read_err("empty Raft purge chunk with remaining entries")
+                })?)
             } else {
                 None
             };
@@ -1451,12 +1458,17 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
         installed_manifest.l1_sstables = rebased_l1_sstables;
         let cur_seq = self.db.global_seq.load(Ordering::SeqCst);
         let prev_floor = self.db.ssi_history().eviction_floor();
+        let prev_read_floor = self.db.load_roots().read_seq_floor;
         let snapshot_floor = envelope
             .max_seq
             .max(installed_manifest.max_seq)
             .max(cur_seq.saturating_add(1))
             .max(prev_floor)
+            .max(prev_read_floor)
             .max(envelope.ssi_eviction_floor);
+        if snapshot_floor == u64::MAX {
+            return Err(io_err("snapshot sequence floor overflow"));
+        }
         installed_manifest.max_seq = snapshot_floor;
         installed_manifest
             .save(&tmp_manifest_path)
@@ -1648,22 +1660,22 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
             }
         };
 
-        // ── Phase F: Single atomic StorageRoots publish ──
-        let new_roots = crate::StorageRoots {
-            base_mmap: recovered.base_mmap,
-            base_bloom: recovered.base_bloom,
-            sstables: recovered.sstables,
-            l1_sstables: recovered.l1_sstables,
-            memtable: recovered.memtable,
-            frozen_memtables: Arc::new(Vec::new()),
-            manifest: recovered.manifest,
-            heap_reader: recovered.heap_reader,
-            heap_generation: self.db.next_heap_generation.fetch_add(1, Ordering::Relaxed),
+        // CRITICAL: Advance global_seq strictly past the persisted snapshot
+        // floor (and any recovered sequence) BEFORE publishing `new_roots` so
+        // every pre-install `read_seq` sits strictly below `read_seq_floor`
+        // while post-install snapshots (`global_seq - 1 == final_floor`) pass,
+        // and no lock-free reader can observe `new_roots` alongside a stale
+        // sequence counter, SSI history, 2PC reservation table, or Raft meta.
+        let final_floor = snapshot_floor.max(recovered.max_seq);
+        let next_global_seq = match final_floor.checked_add(1) {
+            Some(next) => next,
+            None => {
+                rollback_promotion(&moved_to_old, &promoted_from_tmp, &mut tmp_cleanup);
+                return Err(io_err("snapshot sequence floor overflow"));
+            }
         };
-        self.db.roots.store(Arc::new(new_roots));
-        self.db.block_cache.invalidate_all();
 
-        // ── Phase G: Swap mutable write handles ──
+        // ── Phase F: Swap mutable write handles & advance sequence/SSI/meta state ──
         *self
             .db
             .heap_file
@@ -1677,14 +1689,7 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
         self.db
             .heap_offset
             .store(recovered.heap_offset, Ordering::Release);
-
-        // CRITICAL: Advance global_seq strictly past the persisted snapshot
-        // floor (and any recovered sequence) so every pre-install read_seq sits
-        // below the new floor while post-install snapshots (global_seq - 1) pass.
-        let final_floor = snapshot_floor.max(recovered.max_seq);
-        self.db
-            .global_seq
-            .store(final_floor.saturating_add(1), Ordering::SeqCst);
+        self.db.global_seq.store(next_global_seq, Ordering::SeqCst);
 
         // The snapshot replaced the data wholesale, so the committed
         // history must be replaced too — otherwise a node promoted after
@@ -1716,12 +1721,36 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
             .lock()
             .expect("RaftStorage meta lock poisoned: fatal invariant") = next_meta;
 
+        // ── Phase G: Single atomic StorageRoots publish ──
+        let new_roots = crate::StorageRoots {
+            base_mmap: recovered.base_mmap,
+            base_bloom: recovered.base_bloom,
+            sstables: recovered.sstables,
+            l1_sstables: recovered.l1_sstables,
+            memtable: recovered.memtable,
+            frozen_memtables: Arc::new(Vec::new()),
+            manifest: recovered.manifest,
+            heap_reader: recovered.heap_reader,
+            heap_generation: self.db.next_heap_generation.fetch_add(1, Ordering::Relaxed),
+            read_seq_floor: final_floor,
+        };
+        self.db.roots.store(Arc::new(new_roots));
+        self.db.block_cache.invalidate_all();
+
+        // ── Phase H: Durably mark completion and retire rollback backup ──
         // Promoted filenames were already synced in Phase D before live
         // publication; durably record `.install_complete` (syncing marker and
-        // rollback dir) and retire backups only if that barrier succeeds.
-        if write_durable_marker(&old_dir.join(INSTALL_COMPLETE_MARKER), b"ok").is_ok() {
-            let _ = retire_completed_rollback_dir(&old_dir);
+        // rollback dir) before retiring backups. If persisting that marker
+        // fails, preserve `old_dir` and surface an explicit recovery-required
+        // error instead of reporting clean success.
+        if let Err(e) = write_durable_marker(&old_dir.join(INSTALL_COMPLETE_MARKER), b"ok") {
+            drop(_exclusive);
+            return Err(io_err(&format!(
+                "snapshot promoted live, but persisting completion marker in '{}' failed ({e}); rollback directory preserved — operator recovery required before restart or next snapshot install",
+                old_dir.display()
+            )));
         }
+        let _ = retire_completed_rollback_dir(&old_dir);
 
         // ── Phase I: Release exclusive lock (writers resume on new topology) ──
         drop(_exclusive);
@@ -2569,6 +2598,358 @@ mod tests {
         assert_eq!(
             storage.meta.lock().expect("meta lock").last_purged_log_id,
             None
+        );
+    }
+
+    #[tokio::test]
+    async fn install_snapshot_invalidates_pre_install_read_only_transactions() {
+        let src_dir = tempfile::tempdir().expect("src tempdir");
+        let src_db = OmniKV::open(
+            src_dir
+                .path()
+                .join("manifest.json")
+                .to_str()
+                .expect("src manifest"),
+            src_dir.path().join("wal.bin").to_str().expect("src wal"),
+        )
+        .expect("open src db");
+        let mut src_storage = OmniRaftStorage::new(src_db.clone());
+        let leader = CommittedLeaderId::new(1, 1);
+        src_storage
+            .apply_to_state_machine(&[Entry {
+                log_id: LogId::new(leader, 1),
+                payload: EntryPayload::Normal("SET k new".into()),
+            }])
+            .await
+            .expect("apply src write");
+        let snapshot = src_storage.build_snapshot().await.expect("build snapshot");
+
+        let dst_dir = tempfile::tempdir().expect("dst tempdir");
+        let dst_db = OmniKV::open(
+            dst_dir
+                .path()
+                .join("manifest.json")
+                .to_str()
+                .expect("dst manifest"),
+            dst_dir.path().join("wal.bin").to_str().expect("dst wal"),
+        )
+        .expect("open dst db");
+        let mut dst_storage = OmniRaftStorage::new(dst_db.clone());
+        // Advance dst_db sequence above src_db's temporary record sequences so
+        // pre-install read_seq > snapshot record seq reproduces the MVCC leak.
+        let mut seed = WriteBatch::new();
+        seed.set("k", "old".into()).expect("seed k");
+        for i in 0..8 {
+            seed.set(&format!("pad_{i}"), "x".into()).expect("seed pad");
+        }
+        dst_db.commit_batch_local(&seed).expect("commit dst seed");
+
+        let tm = crate::transaction::TransactionManager::new(dst_db.clone());
+        let mut txn_read = tm.begin();
+        let mut txn_commit_only = tm.begin();
+        assert_eq!(
+            tm.get(&mut txn_commit_only, "k").expect("pre-install read"),
+            Some("old".into())
+        );
+        let mut pre_iter = dst_db
+            .scan_iter("k", "k\u{10ffff}", txn_read.read_seq)
+            .expect("pre-install scan_iter");
+
+        dst_storage
+            .install_snapshot(&snapshot.meta, snapshot.snapshot)
+            .await
+            .expect("install snapshot");
+
+        let get_err = tm
+            .get(&mut txn_read, "k")
+            .expect_err("stale read-only txn get must fail closed after install_snapshot");
+        assert!(
+            matches!(get_err, crate::OmniError::StaleSnapshot { .. }),
+            "expected StaleSnapshot on get, got: {get_err}"
+        );
+        assert_eq!(txn_read.state, crate::transaction::TxnState::Aborted);
+        assert!(tm.commit(&mut txn_read).is_err());
+
+        let scan_err = dst_db
+            .scan("k", "k\u{10ffff}", txn_read.read_seq)
+            .expect_err("stale scan must fail closed after install_snapshot");
+        assert!(
+            matches!(scan_err, crate::OmniError::StaleSnapshot { .. }),
+            "expected StaleSnapshot on scan, got: {scan_err}"
+        );
+
+        let commit_err = tm
+            .commit(&mut txn_commit_only)
+            .expect_err("pre-install read-only txn commit must fail closed after install_snapshot");
+        assert!(
+            matches!(commit_err, crate::OmniError::StaleSnapshot { .. }),
+            "expected StaleSnapshot on read-only commit, got: {commit_err}"
+        );
+        assert_eq!(txn_commit_only.state, crate::transaction::TxnState::Aborted);
+        assert_eq!(tm.active_count(), 0);
+        assert_eq!(
+            pre_iter.next(),
+            Some(("k".into(), "old".into())),
+            "pre-install ScanIterator must stay pinned to old heap/roots"
+        );
+
+        let mut fresh_txn = tm.begin();
+        assert_eq!(
+            tm.get(&mut fresh_txn, "k").expect("post-install read"),
+            Some("new".into())
+        );
+        tm.commit(&mut fresh_txn)
+            .expect("post-install read-only txn must commit cleanly");
+    }
+
+    #[tokio::test]
+    async fn purge_logs_upto_rejects_interior_chunk_defects() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = OmniKV::open(
+            dir.path().join("manifest.json").to_str().expect("manifest"),
+            dir.path().join("wal.bin").to_str().expect("wal"),
+        )
+        .expect("open db");
+        let mut storage = OmniRaftStorage::new(db.clone());
+        let leader2 = CommittedLeaderId::new(2, 1);
+        let leader5 = CommittedLeaderId::new(5, 1);
+        let boundary = WriteBatch::MAX_OPS as u64 - 1;
+        let total = boundary + 5;
+        let interior = 3u64;
+        let interior_key = format!("{RAFT_LOG_PREFIX}{interior:020}");
+
+        let mut chunk = Vec::with_capacity(2_500);
+        for idx in 1..=total {
+            chunk.push(Entry {
+                log_id: LogId::new(leader2, idx),
+                payload: EntryPayload::Blank,
+            });
+            if chunk.len() == 2_500 {
+                storage
+                    .append_to_log(std::mem::take(&mut chunk))
+                    .await
+                    .expect("append chunk");
+            }
+        }
+        if !chunk.is_empty() {
+            storage.append_to_log(chunk).await.expect("append tail");
+        }
+
+        let cases = [
+            (
+                "not_valid_json".to_string(),
+                "corrupt Raft log entry",
+                "malformed interior entry",
+            ),
+            (
+                serde_json::to_string(&Entry::<TypeConfig> {
+                    log_id: LogId::new(leader5, interior),
+                    payload: EntryPayload::Blank,
+                })
+                .expect("serialize higher term"),
+                "non-monotonic Raft log id",
+                "higher-term interior entry",
+            ),
+            (
+                serde_json::to_string(&Entry::<TypeConfig> {
+                    log_id: LogId::new(leader2, 999),
+                    payload: EntryPayload::Blank,
+                })
+                .expect("serialize mismatched index"),
+                "mismatched Raft log index",
+                "mismatched key/index interior entry",
+            ),
+        ];
+
+        for (bad_val, expected_msg, label) in cases {
+            let mut wb = WriteBatch::new();
+            wb.set(&interior_key, bad_val).expect("set bad interior");
+            db.commit_batch_local(&wb).expect("commit bad interior");
+            let err = storage
+                .purge_logs_upto(LogId::new(leader2, total))
+                .await
+                .expect_err(label);
+            assert!(
+                err.to_string().contains(expected_msg),
+                "{label}: unexpected error: {err}"
+            );
+            assert!(
+                storage.read_log(1).is_some(),
+                "{label}: chunk 1 must stay intact"
+            );
+            assert_eq!(
+                storage.meta.lock().expect("meta lock").last_purged_log_id,
+                None,
+                "{label}: purge floor must not advance"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn purge_logs_upto_rejects_defects_in_final_partial_chunk() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = OmniKV::open(
+            dir.path().join("manifest.json").to_str().expect("manifest"),
+            dir.path().join("wal.bin").to_str().expect("wal"),
+        )
+        .expect("open db");
+        let mut storage = OmniRaftStorage::new(db.clone());
+        let leader1 = CommittedLeaderId::new(1, 1);
+        let leader2 = CommittedLeaderId::new(2, 1);
+        let leader5 = CommittedLeaderId::new(5, 1);
+
+        let entries: Vec<Entry<TypeConfig>> = (1..=6u64)
+            .map(|idx| Entry {
+                log_id: LogId::new(leader2, idx),
+                payload: EntryPayload::Blank,
+            })
+            .collect();
+        storage.append_to_log(entries).await.expect("append logs");
+
+        let key3 = format!("{RAFT_LOG_PREFIX}{:020}", 3);
+        let key4 = format!("{RAFT_LOG_PREFIX}{:020}", 4);
+
+        // 1. Corrupt entry in final partial chunk (has_more == false).
+        let mut wb = WriteBatch::new();
+        wb.set(&key3, "{broken".into()).expect("set corrupt");
+        db.commit_batch_local(&wb).expect("commit corrupt");
+        let err = storage
+            .purge_logs_upto(LogId::new(leader2, 6))
+            .await
+            .expect_err("corrupt entry in final partial chunk must fail");
+        assert!(err.to_string().contains("corrupt Raft log entry"));
+        assert!(storage.read_log(1).is_some());
+        assert_eq!(
+            storage.meta.lock().expect("meta lock").last_purged_log_id,
+            None
+        );
+
+        // 2. Non-monotonic term regression (term 2 at idx 3 -> term 1 at idx 4).
+        let mut wb2 = WriteBatch::new();
+        wb2.set(
+            &key3,
+            serde_json::to_string(&Entry::<TypeConfig> {
+                log_id: LogId::new(leader2, 3),
+                payload: EntryPayload::Blank,
+            })
+            .expect("serialize valid idx 3"),
+        )
+        .expect("restore idx 3");
+        wb2.set(
+            &key4,
+            serde_json::to_string(&Entry::<TypeConfig> {
+                log_id: LogId::new(leader1, 4),
+                payload: EntryPayload::Blank,
+            })
+            .expect("serialize regressed term"),
+        )
+        .expect("set regressed idx 4");
+        db.commit_batch_local(&wb2).expect("commit term regression");
+        let err = storage
+            .purge_logs_upto(LogId::new(leader2, 6))
+            .await
+            .expect_err("term regression inside final chunk must fail");
+        assert!(err.to_string().contains("non-monotonic Raft log id"));
+        assert!(storage.read_log(1).is_some());
+
+        // 3. Higher term than purge target inside final partial chunk.
+        let mut wb3 = WriteBatch::new();
+        wb3.set(
+            &key4,
+            serde_json::to_string(&Entry::<TypeConfig> {
+                log_id: LogId::new(leader5, 4),
+                payload: EntryPayload::Blank,
+            })
+            .expect("serialize higher term"),
+        )
+        .expect("set higher term idx 4");
+        db.commit_batch_local(&wb3).expect("commit higher term");
+        let err = storage
+            .purge_logs_upto(LogId::new(leader2, 6))
+            .await
+            .expect_err("higher-term entry inside final chunk must fail");
+        assert!(err.to_string().contains("non-monotonic Raft log id"));
+        assert!(storage.read_log(1).is_some());
+        assert_eq!(
+            storage.meta.lock().expect("meta lock").last_purged_log_id,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_authoritative_2pc_record_fails_open_and_snapshot_install_closed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let manifest = dir.path().join("manifest.json");
+        let wal = dir.path().join("wal.bin");
+        {
+            let db = OmniKV::open(
+                manifest.to_str().expect("manifest"),
+                wal.to_str().expect("wal"),
+            )
+            .expect("open db");
+            let mut wb = WriteBatch::new();
+            wb.set("live_k", "keep".into()).expect("set live_k");
+            wb.set("__2PC_PREPARE__/1/1_1", "{not_valid_json".into())
+                .expect("set corrupt 2pc");
+            db.commit_batch_local(&wb).expect("commit corrupt 2pc");
+        }
+        let open_res = OmniKV::open(
+            manifest.to_str().expect("manifest"),
+            wal.to_str().expect("wal"),
+        );
+        assert!(
+            open_res.is_err(),
+            "OmniKV::open must fail closed on a malformed authoritative 2PC record"
+        );
+
+        let dst_dir = tempfile::tempdir().expect("dst tempdir");
+        let dst_db = OmniKV::open(
+            dst_dir
+                .path()
+                .join("manifest.json")
+                .to_str()
+                .expect("dst manifest"),
+            dst_dir.path().join("wal.bin").to_str().expect("dst wal"),
+        )
+        .expect("open dst db");
+        let mut init = WriteBatch::new();
+        init.set("live_k", "original".into()).expect("set original");
+        dst_db.commit_batch_local(&init).expect("commit original");
+
+        let mut dst_storage = OmniRaftStorage::new(dst_db.clone());
+        let snap_log = LogId::new(CommittedLeaderId::new(1, 1), 10);
+        let envelope = SnapshotEnvelope {
+            version: SNAPSHOT_VERSION,
+            last_log_id: Some(snap_log),
+            membership: StoredMembership::default(),
+            max_seq: 100,
+            entries: vec![
+                ("live_k".into(), "corrupted_snap".into()),
+                ("__2PC_PREPARE__/1/1_1".into(), "{not_valid_json".into()),
+            ],
+            ssi_history: Vec::new(),
+            ssi_eviction_floor: 0,
+        };
+        let snap_meta = SnapshotMeta {
+            last_log_id: Some(snap_log),
+            last_membership: StoredMembership::default(),
+            snapshot_id: "bad-2pc-snap".into(),
+        };
+        let bytes = serde_json::to_vec(&envelope).expect("encode envelope");
+        let err = dst_storage
+            .install_snapshot(&snap_meta, Box::new(Cursor::new(bytes)))
+            .await
+            .expect_err("install_snapshot must fail closed on malformed 2PC record");
+        assert!(
+            err.to_string().contains("sync 2PC prepared reservations"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(
+            dst_db
+                .find_latest_internal("live_k")
+                .expect("read untouched key"),
+            Some("original".into()),
+            "failed snapshot install must leave live state untouched"
         );
     }
 }

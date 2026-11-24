@@ -1176,6 +1176,7 @@ fn tcp_err_response(e: &omni_engine::OmniError) -> String {
             "ERROR: REQUEST_TOO_LARGE\n".into()
         }
         omni_engine::OmniError::WriteStall => "ERROR: BUSY\n".into(),
+        omni_engine::OmniError::StaleSnapshot { .. } => "ERROR: STALE_SNAPSHOT\n".into(),
         // Client-caused and safe to expose: in a cluster the caller hit a
         // follower, and it needs the leader's identity to retry there.
         // Answering INTERNAL for the most common clustered-write failure
