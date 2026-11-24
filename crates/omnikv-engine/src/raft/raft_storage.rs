@@ -397,6 +397,61 @@ fn storage_read_err(e: impl std::fmt::Display) -> openraft::StorageError<u64> {
     )
 }
 
+fn sync_dir_best_effort(dir: &std::path::Path) {
+    #[cfg(unix)]
+    {
+        if let Ok(handle) = std::fs::File::open(dir) {
+            let _ = handle.sync_all();
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+    }
+}
+
+fn write_durable_marker(path: &std::path::Path, contents: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut file = std::fs::File::create(path)?;
+    file.write_all(contents)?;
+    file.sync_all()?;
+    if let Some(parent) = path.parent() {
+        sync_dir_best_effort(parent);
+    }
+    Ok(())
+}
+
+fn is_empty_dir(path: &std::path::Path) -> std::io::Result<bool> {
+    Ok(std::fs::read_dir(path)?.next().is_none())
+}
+
+fn retire_completed_rollback_dir(dir: &std::path::Path) -> std::io::Result<()> {
+    let marker_path = dir.join(INSTALL_COMPLETE_MARKER);
+    if !marker_path.exists() || dir.join(ROLLBACK_FAILED_MARKER).exists() {
+        return Err(std::io::Error::other(
+            "cannot retire rollback directory without a clean install-complete marker",
+        ));
+    }
+    // Remove every non-marker entry first; if any deletion fails (e.g., an open
+    // Windows handle), `.install_complete` stays intact so a later attempt can
+    // finish retiring the directory instead of mistaking it for an unresolved rollback.
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        if entry.file_name() == INSTALL_COMPLETE_MARKER {
+            continue;
+        }
+        let path = entry.path();
+        if path.is_dir() {
+            std::fs::remove_dir_all(&path)?;
+        } else {
+            std::fs::remove_file(&path)?;
+        }
+    }
+    std::fs::remove_file(&marker_path)?;
+    std::fs::remove_dir(dir)?;
+    Ok(())
+}
+
 /// Commits `batch` locally, in [`WriteBatch::MAX_OPS`]-sized chunks if
 /// it exceeds the op cap. The raft storage paths are the only callers
 /// that can legitimately exceed one client batch: a follower catch-up
@@ -702,6 +757,29 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
             meta.last_purged_log_id.map(|id| id.index + 1).unwrap_or(1)
         };
 
+        // Validate the final target log entry upfront whenever it exists in
+        // storage so a corrupt or mismatched target LogId fails closed before
+        // any intermediate chunk is deleted.
+        let target_key = format!("{}{:020}", RAFT_LOG_PREFIX, log_id.index);
+        if let Some(val) = self
+            .db
+            .find(&target_key, self.db.get_seq())
+            .map_err(|e| storage_read_err(format!("read purge target log {}: {e}", log_id.index)))?
+        {
+            let entry = serde_json::from_str::<Entry<TypeConfig>>(&val).map_err(|e| {
+                storage_read_err(format!(
+                    "corrupt Raft log entry at purge target {}: {e}",
+                    log_id.index
+                ))
+            })?;
+            if entry.log_id != log_id {
+                return Err(storage_read_err(format!(
+                    "mismatched Raft log id at purge target {}: expected {}, found {}",
+                    log_id.index, log_id, entry.log_id
+                )));
+            }
+        }
+
         let resolve_purge_boundary_id = |idx: u64| -> Result<LogId<u64>, String> {
             let key = format!("{}{:020}", RAFT_LOG_PREFIX, idx);
             let val = self
@@ -912,9 +990,11 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
             // released 2PC reservations before the SSI commit record is visible.
             let mut committed_guard = history.lock_committed();
             let marker = self.db.commit_batch_local_locked_skip_prepared(batch)?;
-            if touches_2pc {
-                self.db.sync_prepared_2pc_from_batch(batch)?;
-            }
+            let sync_res = if touches_2pc {
+                self.db.sync_prepared_2pc_from_batch(batch)
+            } else {
+                Ok(())
+            };
             // Entries sharing a batch committed atomically at one marker —
             // a transaction whose read_seq equals it sees all of them.
             for &(slot, ref ssi) in slots.iter() {
@@ -944,6 +1024,7 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
             batch.clear();
             *pending_applied = None;
             *pending_membership = None;
+            sync_res?;
             Ok(())
         };
 
@@ -1349,8 +1430,16 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
             let name = entry.file_name();
             if is_rollback_dir_name(&name) {
                 let path = entry.path();
-                if path.join(INSTALL_COMPLETE_MARKER).exists() {
-                    let _ = fs::remove_dir_all(&path);
+                if path.join(INSTALL_COMPLETE_MARKER).exists()
+                    && !path.join(ROLLBACK_FAILED_MARKER).exists()
+                {
+                    let _ = retire_completed_rollback_dir(&path);
+                } else if path.is_dir() && is_empty_dir(&path).unwrap_or(false) {
+                    // An empty rollback dir can only remain after a clean
+                    // rollback or a crash between deleting `.install_complete`
+                    // and removing the now-empty directory; remove it instead
+                    // of wedging future snapshot installations.
+                    let _ = fs::remove_dir(&path);
                 } else {
                     return Err(io_err(&format!(
                         "unresolved snapshot rollback directory '{}' exists; restore or set it aside before installing another snapshot",
@@ -1375,6 +1464,9 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
             .file_name()
             .ok_or_else(|| io_err("temporary snapshot directory has no file name"))?
             .to_os_string();
+        let manifest_file_name = std::path::Path::new(&manifest_path)
+            .file_name()
+            .unwrap_or_else(|| std::ffi::OsStr::new("manifest.json"));
         let mut moved_to_old: Vec<std::ffi::OsString> = Vec::new();
         let mut promoted_from_tmp: Vec<std::ffi::OsString> = Vec::new();
         let rollback_promotion = |moved_to_old: &[std::ffi::OsString],
@@ -1395,14 +1487,20 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
                 // Preserve both `old_dir` and `tmp_dir` for recovery whenever
                 // any rollback rename fails; mark the rollback unresolved so
                 // future installs refuse to delete these recovery files.
-                let _ = fs::write(old_dir.join(ROLLBACK_FAILED_MARKER), b"rollback_incomplete");
+                let _ = write_durable_marker(
+                    &old_dir.join(ROLLBACK_FAILED_MARKER),
+                    b"rollback_incomplete",
+                );
                 tmp_cleanup.disarm();
             } else if fs::remove_dir(&old_dir).is_err() {
-                let _ = fs::write(old_dir.join(INSTALL_COMPLETE_MARKER), b"rolled_back");
+                let _ =
+                    write_durable_marker(&old_dir.join(INSTALL_COMPLETE_MARKER), b"rolled_back");
             }
         };
 
-        // Move current files to old_dir, recording each exact file moved.
+        // Move current files to old_dir with the manifest moved FIRST so a
+        // reverse rollback restores all data files before restoring the manifest.
+        let mut current_names: Vec<std::ffi::OsString> = Vec::new();
         for entry in
             fs::read_dir(&data_dir).map_err(|e| io_err(&format!("read data dir: {}", e)))?
         {
@@ -1419,19 +1517,29 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
                 && name != old_dir_name
                 && !is_rollback_dir_name(&name)
             {
-                if let Err(e) = fs::rename(entry.path(), old_dir.join(&name)) {
-                    rollback_promotion(&moved_to_old, &promoted_from_tmp, &mut tmp_cleanup);
-                    return Err(io_err(&format!(
-                        "move current snapshot file {}: {}",
-                        name.to_string_lossy(),
-                        e
-                    )));
-                }
-                moved_to_old.push(name);
+                current_names.push(name);
             }
         }
+        current_names.sort_by(|a, b| {
+            (a.as_os_str() != manifest_file_name)
+                .cmp(&(b.as_os_str() != manifest_file_name))
+                .then_with(|| a.cmp(b))
+        });
+        for name in current_names {
+            if let Err(e) = fs::rename(data_dir.join(&name), old_dir.join(&name)) {
+                rollback_promotion(&moved_to_old, &promoted_from_tmp, &mut tmp_cleanup);
+                return Err(io_err(&format!(
+                    "move current snapshot file {}: {}",
+                    name.to_string_lossy(),
+                    e
+                )));
+            }
+            moved_to_old.push(name);
+        }
 
-        // Move tmp files to data_dir, recording each exact file promoted.
+        // Move tmp files to data_dir with the manifest promoted LAST so data
+        // files (heap, SSTables, bloom, WAL) are in place before the manifest
+        // points at them, and rollback removes the manifest first.
         let tmp_entries = match fs::read_dir(&tmp_dir) {
             Ok(entries) => entries,
             Err(e) => {
@@ -1439,6 +1547,7 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
                 return Err(io_err(&format!("read temp snapshot dir: {}", e)));
             }
         };
+        let mut tmp_names: Vec<std::ffi::OsString> = Vec::new();
         for entry in tmp_entries {
             let entry = match entry {
                 Ok(entry) => entry,
@@ -1451,7 +1560,15 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
             if name == "LOCK" {
                 continue;
             }
-            if let Err(e) = fs::rename(entry.path(), data_dir.join(&name)) {
+            tmp_names.push(name);
+        }
+        tmp_names.sort_by(|a, b| {
+            (a.as_os_str() == manifest_file_name)
+                .cmp(&(b.as_os_str() == manifest_file_name))
+                .then_with(|| a.cmp(b))
+        });
+        for name in tmp_names {
+            if let Err(e) = fs::rename(tmp_dir.join(&name), data_dir.join(&name)) {
                 rollback_promotion(&moved_to_old, &promoted_from_tmp, &mut tmp_cleanup);
                 return Err(io_err(&format!(
                     "install snapshot file {}: {}",
@@ -1539,11 +1656,13 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
             .lock()
             .expect("RaftStorage meta lock poisoned: fatal invariant") = next_meta;
 
-        // Mark this attempt's rollback directory retired and remove it. Even if
-        // an open reader handle delays deletion on Windows, the marker allows
-        // a later install to retire this completed directory safely.
-        let _ = fs::write(old_dir.join(INSTALL_COMPLETE_MARKER), b"ok");
-        let _ = fs::remove_dir_all(&old_dir);
+        // Sync the promoted directory before durably writing `.install_complete`,
+        // then retire non-marker backup entries before removing `.install_complete`
+        // so an interrupted cleanup never leaves backup files without the marker.
+        sync_dir_best_effort(&data_dir);
+        if write_durable_marker(&old_dir.join(INSTALL_COMPLETE_MARKER), b"ok").is_ok() {
+            let _ = retire_completed_rollback_dir(&old_dir);
+        }
 
         // ── Phase I: Release exclusive lock (writers resume on new topology) ──
         drop(_exclusive);
@@ -2083,6 +2202,169 @@ mod tests {
         assert_eq!(
             std::fs::read(&sentinel).expect("sentinel must survive untouched"),
             b"original-manifest-backup"
+        );
+    }
+
+    #[tokio::test]
+    async fn purge_logs_upto_rejects_corrupt_or_mismatched_final_target_log_id() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let manifest = dir.path().join("manifest.json");
+        let wal = dir.path().join("wal.bin");
+        let db = OmniKV::open(
+            manifest.to_str().expect("manifest path"),
+            wal.to_str().expect("wal path"),
+        )
+        .expect("open db");
+        let mut storage = OmniRaftStorage::new(db.clone());
+        let leader1 = CommittedLeaderId::new(1, 1);
+        let leader2 = CommittedLeaderId::new(2, 1);
+
+        let entries: Vec<Entry<TypeConfig>> = (1..=5)
+            .map(|idx| Entry {
+                log_id: LogId::new(leader1, idx),
+                payload: EntryPayload::Blank,
+            })
+            .collect();
+        storage.append_to_log(entries).await.expect("append logs");
+
+        // Mismatched term/leader at the final purge target must fail closed
+        // before deleting any log entries.
+        let err = storage
+            .purge_logs_upto(LogId::new(leader2, 5))
+            .await
+            .expect_err("mismatched final target LogId must fail");
+        assert!(
+            err.to_string().contains("mismatched Raft log id"),
+            "unexpected error: {err}"
+        );
+        assert!(storage.read_log(1).is_some(), "entry 1 must remain intact");
+        assert_eq!(
+            storage.meta.lock().expect("meta lock").last_purged_log_id,
+            None
+        );
+
+        // Corrupt JSON at the final purge target must also fail closed.
+        storage
+            .append_log(5, "{corrupt target json")
+            .expect("seed corrupt target");
+        let err2 = storage
+            .purge_logs_upto(LogId::new(leader1, 5))
+            .await
+            .expect_err("corrupt final target entry must fail");
+        assert!(
+            err2.to_string()
+                .contains("corrupt Raft log entry at purge target"),
+            "unexpected error: {err2}"
+        );
+        assert!(storage.read_log(1).is_some(), "entry 1 must remain intact");
+        assert_eq!(
+            storage.meta.lock().expect("meta lock").last_purged_log_id,
+            None
+        );
+
+        // When the final target entry is absent (e.g., snapshot already moved
+        // past local log), advancing the purge floor remains permitted.
+        let mut del = WriteBatch::new();
+        del.delete(&format!("{RAFT_LOG_PREFIX}{:020}", 5))
+            .expect("stage delete target");
+        db.commit_batch_local(&del).expect("delete target entry");
+        storage
+            .purge_logs_upto(LogId::new(leader1, 5))
+            .await
+            .expect("purge past absent target entry should succeed");
+        assert_eq!(
+            storage.meta.lock().expect("meta lock").last_purged_log_id,
+            Some(LogId::new(leader1, 5))
+        );
+        assert_eq!(storage.read_log(1), None);
+    }
+
+    #[tokio::test]
+    async fn install_snapshot_retires_empty_and_completed_rollback_dirs_without_wedging() {
+        use openraft::RaftSnapshotBuilder;
+
+        let src_dir = tempfile::tempdir().expect("src tempdir");
+        let src_db = OmniKV::open(
+            src_dir
+                .path()
+                .join("manifest.json")
+                .to_str()
+                .expect("src manifest"),
+            src_dir.path().join("wal.bin").to_str().expect("src wal"),
+        )
+        .expect("open src db");
+        let mut src_storage = OmniRaftStorage::new(src_db);
+        let leader = CommittedLeaderId::new(1, 1);
+        src_storage
+            .apply_to_state_machine(&[Entry {
+                log_id: LogId::new(leader, 1),
+                payload: EntryPayload::Normal("SET snap_k v_ok".into()),
+            }])
+            .await
+            .expect("apply src");
+        let snapshot = src_storage.build_snapshot().await.expect("build snapshot");
+
+        let dst_dir = tempfile::tempdir().expect("dst tempdir");
+        let dst_db = OmniKV::open(
+            dst_dir
+                .path()
+                .join("manifest.json")
+                .to_str()
+                .expect("dst manifest"),
+            dst_dir.path().join("wal.bin").to_str().expect("dst wal"),
+        )
+        .expect("open dst db");
+        let mut dst_storage = OmniRaftStorage::new(dst_db.clone());
+
+        // 1. Empty rollback dir left by a crash between removing `.install_complete`
+        //    and removing the empty directory must NOT wedge future installs.
+        let empty_old = dst_dir.path().join("old_snapshot_empty_crash");
+        std::fs::create_dir_all(&empty_old).expect("create empty rollback dir");
+
+        // 2. Completed rollback dir with `.install_complete` and leftover backup file
+        //    must be retired cleanly (removing backup files before the marker).
+        let completed_old = dst_dir.path().join("old_snapshot_completed_retry");
+        std::fs::create_dir_all(&completed_old).expect("create completed rollback dir");
+        std::fs::write(completed_old.join("stale_backup.bin"), b"stale")
+            .expect("write stale backup");
+        write_durable_marker(&completed_old.join(INSTALL_COMPLETE_MARKER), b"ok")
+            .expect("write durable install-complete marker");
+
+        // 3. Direct guard check: `retire_completed_rollback_dir` refuses to touch
+        //    a directory carrying `.rollback_failed` even if `.install_complete` exists.
+        let conflicted_dir = tempfile::tempdir().expect("conflicted tempdir");
+        std::fs::write(conflicted_dir.path().join("keep.bin"), b"keep").expect("write keep");
+        std::fs::write(conflicted_dir.path().join(INSTALL_COMPLETE_MARKER), b"ok")
+            .expect("write complete marker");
+        std::fs::write(
+            conflicted_dir.path().join(ROLLBACK_FAILED_MARKER),
+            b"rollback_incomplete",
+        )
+        .expect("write failed marker");
+        assert!(
+            retire_completed_rollback_dir(conflicted_dir.path()).is_err(),
+            "directory marked rollback_failed must never be retired automatically"
+        );
+        assert!(conflicted_dir.path().join("keep.bin").exists());
+
+        dst_storage
+            .install_snapshot(&snapshot.meta, snapshot.snapshot)
+            .await
+            .expect("install_snapshot must succeed past empty and completed rollback dirs");
+
+        assert!(
+            !empty_old.exists(),
+            "empty rollback directory must be removed"
+        );
+        assert!(
+            !completed_old.exists(),
+            "completed rollback directory must be retired"
+        );
+        assert_eq!(
+            dst_db
+                .find_latest_internal("snap_k")
+                .expect("read installed key"),
+            Some("v_ok".into())
         );
     }
 }

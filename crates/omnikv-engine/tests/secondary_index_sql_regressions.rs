@@ -3730,3 +3730,166 @@ fn index_scan_iter_reset_replays_rows_and_preserves_error() {
     assert!(broken.try_next_row().is_err());
     let _ = executor;
 }
+
+#[test]
+fn schema_create_index_retry_recovers_after_drop_before_receipt_deletion() {
+    let (db, _dir, executor) = setup();
+    let idx_mgr = Arc::new(IndexManager::new(db.clone()));
+    let schema = SchemaManager::new(db.clone(), idx_mgr.clone());
+
+    execute(
+        &executor,
+        "CREATE TABLE mig_recover_tbl (id INTEGER PRIMARY KEY, email TEXT, drop_me TEXT)",
+    );
+    execute(
+        &executor,
+        "INSERT INTO mig_recover_tbl VALUES (1, 'first@x.com', 'old')",
+    );
+
+    // Trigger an incomplete migration attempt so an attempt_id and receipt key are persisted.
+    let failing = Migration {
+        version: 1,
+        description: "create index then fail step 2".into(),
+        up: vec![
+            SchemaOp::CreateIndex {
+                name: "mig_recover_email_idx".into(),
+                collection: "mig_recover_tbl".into(),
+                fields: vec![("email".into(), IndexFieldType::String)],
+                unique: true,
+            },
+            SchemaOp::RemoveField {
+                collection: "mig_recover_tbl".into(),
+                field_name: "nonexistent_col".into(),
+            },
+        ],
+        down: vec![],
+    };
+    assert!(schema.migrate_up(&failing).is_err());
+
+    // Simulate a crash immediately after `drop_index_locked()` removed the catalog
+    // entry on a failed rebuild, leaving behind the stale `building:<id>` receipt.
+    let receipts: Vec<(String, String)> = db
+        .scan(
+            "\x00SCHEMA\x00create_idx:",
+            "\x00SCHEMA\x00create_idx:\u{10ffff}",
+            db.get_seq(),
+        )
+        .unwrap();
+    assert_eq!(receipts.len(), 1);
+    let (receipt_key, receipt_val) = &receipts[0];
+    let created_id: u32 = receipt_val
+        .strip_prefix("done:")
+        .expect("expected done:<id> receipt")
+        .parse()
+        .unwrap();
+    idx_mgr.drop_index("mig_recover_email_idx").unwrap();
+    let mut crash_state = WriteBatch::new();
+    crash_state
+        .set(receipt_key, format!("building:{created_id}"))
+        .unwrap();
+    db.commit_batch(&crash_state).unwrap();
+
+    // Retrying with the same persisted attempt_id must recreate and rebuild the
+    // index cleanly instead of wedging on the stale `building:<id>` receipt.
+    let fixed = Migration {
+        version: 1,
+        description: "create index then remove drop_me".into(),
+        up: vec![
+            SchemaOp::CreateIndex {
+                name: "mig_recover_email_idx".into(),
+                collection: "mig_recover_tbl".into(),
+                fields: vec![("email".into(), IndexFieldType::String)],
+                unique: true,
+            },
+            SchemaOp::RemoveField {
+                collection: "mig_recover_tbl".into(),
+                field_name: "drop_me".into(),
+            },
+        ],
+        down: vec![],
+    };
+    schema
+        .migrate_up(&fixed)
+        .expect("retry must recover when building:<id> receipt outlives dropped catalog entry");
+    assert_eq!(
+        idx_mgr
+            .lookup("mig_recover_email_idx", &[serde_json::json!("first@x.com")])
+            .unwrap(),
+        vec!["1".to_string()]
+    );
+}
+
+#[test]
+fn schema_create_index_ssi_blocks_stale_pre_index_dml_transaction() {
+    let (db, _dir, executor) = setup();
+    let idx_mgr = Arc::new(IndexManager::new(db.clone()));
+    let schema = SchemaManager::new(db.clone(), idx_mgr.clone());
+
+    execute(
+        &executor,
+        "CREATE TABLE ssi_race_tbl (id INTEGER PRIMARY KEY, code TEXT)",
+    );
+    execute(&executor, "INSERT INTO ssi_race_tbl VALUES (1, 'seed')");
+
+    let mgr = TransactionManager::new(db.clone());
+    let mut txn = mgr.begin();
+    let mut tx_exec = SqlExecutor::with_transaction(
+        db.clone(),
+        Arc::new(Catalog::at_snapshot(db, txn.read_seq)),
+        txn.read_seq,
+        &HashMap::new(),
+    );
+    execute(
+        &tx_exec,
+        "INSERT INTO ssi_race_tbl VALUES (2, 'unindexed_if_allowed')",
+    );
+    if let Some(reads) = tx_exec.drain_reads() {
+        txn.read_set.extend(reads.keys);
+        txn.read_ranges.extend(reads.ranges);
+    }
+    if let Some(batch) = tx_exec.flush_batch() {
+        for (k, v, ttl) in batch.buffered_writes {
+            txn.write_set
+                .insert(String::from_utf8(k).unwrap(), (Some(v), ttl));
+        }
+        for k in batch.buffered_deletes {
+            txn.write_set
+                .insert(String::from_utf8(k).unwrap(), (None, 0));
+        }
+    }
+
+    let add_idx = Migration {
+        version: 1,
+        description: "create index while tx is open".into(),
+        up: vec![SchemaOp::CreateIndex {
+            name: "ssi_race_code_idx".into(),
+            collection: "ssi_race_tbl".into(),
+            fields: vec![("code".into(), IndexFieldType::String)],
+            unique: false,
+        }],
+        down: vec![],
+    };
+    schema.migrate_up(&add_idx).unwrap();
+
+    let commit_res = mgr.commit(&mut txn);
+    assert!(
+        commit_res.is_err(),
+        "explicit tx with stale pre-index catalog snapshot must abort on COMMIT, got: {commit_res:?}"
+    );
+    assert_eq!(
+        idx_mgr
+            .lookup("ssi_race_code_idx", &[serde_json::json!("seed")])
+            .unwrap(),
+        vec!["1".to_string()]
+    );
+    assert_eq!(
+        idx_mgr
+            .lookup(
+                "ssi_race_code_idx",
+                &[serde_json::json!("unindexed_if_allowed")]
+            )
+            .unwrap()
+            .len(),
+        0
+    );
+}
