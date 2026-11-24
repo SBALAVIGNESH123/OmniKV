@@ -292,6 +292,8 @@ impl WriteAheadLog {
             .truncate(true)
             .open(&self.path)
             .map_err(|e| OmniError::IoError(format!("WAL rotate: {}", e)))?;
+        file.sync_all()
+            .map_err(|e| OmniError::IoError(format!("WAL rotate fsync: {}", e)))?;
 
         self.writer = BufWriter::new(file);
         self.durable_offset = 0;

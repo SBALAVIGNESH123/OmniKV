@@ -4222,3 +4222,264 @@ fn v0_single_signed_zero_composite_uses_two_exact_ranges_without_spurious_ssi_co
     mgr.commit(&mut txn)
         .expect("single-zero composite unique check should use two exact SSI ranges");
 }
+
+#[test]
+fn namespace_isolation_covers_list_indexes_drop_table_with_catalog_wrappers_and_v0_dedup() {
+    let (db, _dir, executor) = setup();
+    let idx_mgr = IndexManager::new(db.clone());
+
+    execute(
+        &executor,
+        "CREATE TABLE docs (id INTEGER PRIMARY KEY, code TEXT)",
+    );
+    execute(&executor, "INSERT INTO docs VALUES (1, 'sql_alpha')");
+    idx_mgr
+        .create_sql_index(
+            "docs_sql_code_idx",
+            "docs",
+            vec![("code".into(), IndexFieldType::String)],
+            false,
+        )
+        .unwrap();
+    idx_mgr.rebuild_index("docs_sql_code_idx").unwrap();
+
+    // Case-differing explicit document indexes must remain visible and isolated
+    // from each other in `list_indexes`, while SQL indexes match case-insensitively.
+    idx_mgr
+        .create_document_index(
+            "docs_upper_tag_idx",
+            "DOCS",
+            vec![("tag".into(), IndexFieldType::String)],
+            false,
+        )
+        .unwrap();
+    idx_mgr
+        .create_document_index(
+            "docs_lower_tag_idx",
+            "docs",
+            vec![("tag".into(), IndexFieldType::String)],
+            false,
+        )
+        .unwrap();
+    let upper_names: Vec<String> = idx_mgr
+        .list_indexes("DOCS")
+        .unwrap()
+        .into_iter()
+        .map(|d| d.name)
+        .collect();
+    assert!(upper_names.contains(&"docs_upper_tag_idx".to_string()));
+    assert!(upper_names.contains(&"docs_sql_code_idx".to_string()));
+    assert!(!upper_names.contains(&"docs_lower_tag_idx".to_string()));
+    let lower_names: Vec<String> = idx_mgr
+        .list_indexes("docs")
+        .unwrap()
+        .into_iter()
+        .map(|d| d.name)
+        .collect();
+    assert!(lower_names.contains(&"docs_lower_tag_idx".to_string()));
+    assert!(lower_names.contains(&"docs_sql_code_idx".to_string()));
+    assert!(!lower_names.contains(&"docs_upper_tag_idx".to_string()));
+
+    // Public `*_with_catalog` document wrappers must NOT mutate SQL indexes.
+    let catalog = idx_mgr.catalog_snapshot_at(db.get_seq()).unwrap();
+    let mut doc_batch = WriteBatch::new();
+    idx_mgr
+        .index_document_with_catalog(
+            &catalog,
+            "docs",
+            "99",
+            &serde_json::json!({"code": "doc_injected"}),
+            &mut doc_batch,
+        )
+        .unwrap();
+    assert_eq!(doc_batch.op_count(), 0);
+
+    // DROP TABLE must fail closed when an ambiguous legacy `Both` index exists.
+    let mut amb = WriteBatch::new();
+    amb.set(
+        "\u{0}IDX_CATALOG\u{0}91",
+        "{\"id\":91,\"name\":\"legacy_docs_amb_idx\",\"collection\":\"docs\",\"fields\":[[\"code\",\"String\"]],\"unique\":false,\"encoding_version\":1}".into(),
+    )
+    .unwrap();
+    amb.set("\u{0}IDX_READY\u{0}91", "ready".into()).unwrap();
+    amb.set("docs:1", "{\"code\":\"doc_val\"}".into()).unwrap();
+    db.commit_batch(&amb).unwrap();
+    assert!(
+        executor
+            .execute(&parse_sql("DROP TABLE docs").unwrap())
+            .is_err(),
+        "DROP TABLE must refuse to leave an ambiguous legacy Both index behind"
+    );
+
+    // lookup_at must deduplicate PKs when a legacy v0 float index has both -0.0 and +0.0 for same PK.
+    let mut v0 = WriteBatch::new();
+    v0.set(
+        "\u{0}IDX_CATALOG\u{0}92",
+        "{\"id\":92,\"name\":\"v0_dedup_idx\",\"collection\":\"v0_dedup\",\"fields\":[[\"score\",\"Float\"]],\"unique\":false,\"encoding_version\":0,\"namespace\":\"Document\"}".into(),
+    )
+    .unwrap();
+    v0.set(
+        "\u{0}IDX\u{0}00000092\u{0}7fffffffffffffff\u{0}pk1",
+        "pk1".into(),
+    )
+    .unwrap();
+    v0.set(
+        "\u{0}IDX\u{0}00000092\u{0}8000000000000000\u{0}pk1",
+        "pk1".into(),
+    )
+    .unwrap();
+    db.commit_batch(&v0).unwrap();
+    assert_eq!(
+        idx_mgr
+            .lookup("v0_dedup_idx", &[serde_json::json!(0.0)])
+            .unwrap(),
+        vec!["pk1".to_string()]
+    );
+}
+
+#[test]
+fn schema_sql_remove_field_isolates_coexisting_doc_rows_and_indexes() {
+    let (db, _dir, executor) = setup();
+    let idx_mgr = Arc::new(IndexManager::new(db.clone()));
+    let schema = SchemaManager::new(db.clone(), idx_mgr.clone());
+
+    execute(
+        &executor,
+        "CREATE TABLE iso_tbl (id INTEGER PRIMARY KEY, email TEXT, extra TEXT)",
+    );
+    execute(&executor, "INSERT INTO iso_tbl VALUES (1, 'a@x.com', 's1')");
+    // Coexisting document row under the same collection name with same field `extra`.
+    let mut doc_seed = WriteBatch::new();
+    doc_seed
+        .set(
+            "iso_tbl:1",
+            "{\"email\":\"doc@x.com\",\"extra\":\"keep_doc\"}".into(),
+        )
+        .unwrap();
+    db.commit_batch(&doc_seed).unwrap();
+    idx_mgr
+        .create_document_index(
+            "iso_doc_extra_idx",
+            "iso_tbl",
+            vec![("extra".into(), IndexFieldType::String)],
+            false,
+        )
+        .unwrap();
+    idx_mgr.rebuild_index("iso_doc_extra_idx").unwrap();
+
+    // SQL RemoveField on `iso_tbl.extra` must NOT touch coexisting document `iso_tbl:1`
+    // or its Document index.
+    let rm_sql = Migration {
+        version: 1,
+        description: "remove SQL extra only".into(),
+        up: vec![SchemaOp::RemoveField {
+            collection: "iso_tbl".into(),
+            field_name: "extra".into(),
+        }],
+        down: vec![],
+    };
+    schema.migrate_up(&rm_sql).unwrap();
+    let surviving_doc = db.find("iso_tbl:1", db.get_seq()).unwrap().unwrap();
+    assert!(
+        surviving_doc.contains("keep_doc"),
+        "SQL RemoveField must not strip fields from coexisting document row: {surviving_doc}"
+    );
+    assert_eq!(
+        idx_mgr
+            .lookup("iso_doc_extra_idx", &[serde_json::json!("keep_doc")])
+            .unwrap(),
+        vec!["1".to_string()]
+    );
+}
+
+#[test]
+fn schema_retry_rejects_building_schema_change_and_removed_drop_step() {
+    let (db, _dir, executor) = setup();
+    let idx_mgr = Arc::new(IndexManager::new(db.clone()));
+    let schema = SchemaManager::new(db.clone(), idx_mgr.clone());
+
+    execute(
+        &executor,
+        "CREATE TABLE retry_chk_tbl (id INTEGER PRIMARY KEY, email TEXT)",
+    );
+    execute(&executor, "INSERT INTO retry_chk_tbl VALUES (1, 'a@x.com')");
+
+    // Simulate failed migration with CreateIndex -> DropIndex -> failing RemoveField,
+    // then edit the retry to REMOVE DropIndex: Step 0 must reject the orphaned drop receipt.
+    let failing = Migration {
+        version: 1,
+        description: "create, drop, fail".into(),
+        up: vec![
+            SchemaOp::CreateIndex {
+                name: "edited_idx".into(),
+                collection: "retry_chk_tbl".into(),
+                fields: vec![("email".into(), IndexFieldType::String)],
+                unique: false,
+            },
+            SchemaOp::DropIndex {
+                name: "edited_idx".into(),
+            },
+            SchemaOp::RemoveField {
+                collection: "retry_chk_tbl".into(),
+                field_name: "does_not_exist".into(),
+            },
+        ],
+        down: vec![],
+    };
+    assert!(schema.migrate_up(&failing).is_err());
+
+    let edited_without_drop = Migration {
+        version: 1,
+        description: "drop step removed before retry".into(),
+        up: vec![SchemaOp::CreateIndex {
+            name: "edited_idx".into(),
+            collection: "retry_chk_tbl".into(),
+            fields: vec![("email".into(), IndexFieldType::String)],
+            unique: false,
+        }],
+        down: vec![],
+    };
+    assert!(
+        schema.migrate_up(&edited_without_drop).is_err(),
+        "removing DropIndex before retry must not silently mark migration Applied without index"
+    );
+
+    // Verify building:<id> receipt rejects changed schema (unique false -> true) on retry.
+    let created_id = idx_mgr
+        .create_index(
+            "bldg_mismatch_idx",
+            "retry_chk_tbl",
+            vec![("email".into(), IndexFieldType::String)],
+            false,
+        )
+        .unwrap();
+    let receipts: Vec<(String, String)> = db
+        .scan(
+            "\x00SCHEMA\x00create_idx:",
+            "\x00SCHEMA\x00create_idx:\u{10ffff}",
+            db.get_seq(),
+        )
+        .unwrap();
+    let (v1_create_key, _) = &receipts[0];
+    let bldg_key = v1_create_key.replace("10:edited_idx", "17:bldg_mismatch_idx");
+    let mut plant = WriteBatch::new();
+    plant
+        .set(&bldg_key, format!("building:{created_id}"))
+        .unwrap();
+    db.commit_batch(&plant).unwrap();
+    let changed_schema = Migration {
+        version: 1,
+        description: "changed unique flag on retry".into(),
+        up: vec![SchemaOp::CreateIndex {
+            name: "bldg_mismatch_idx".into(),
+            collection: "retry_chk_tbl".into(),
+            fields: vec![("email".into(), IndexFieldType::String)],
+            unique: true,
+        }],
+        down: vec![],
+    };
+    let err = schema
+        .migrate_up(&changed_schema)
+        .expect_err("building:<id> retry with altered unique flag must fail closed");
+    assert!(err.to_string().contains("building receipt mismatch"));
+}

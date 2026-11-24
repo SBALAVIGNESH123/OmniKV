@@ -374,18 +374,23 @@ impl IndexScanIter {
         _reads: Option<&Arc<std::sync::Mutex<ReadCollector>>>,
     ) -> Self {
         let manager = catalog.index_manager();
-        let definition = match manager.definition_at(index_name, scan_seq) {
-            Ok(definition)
+        let definition = match manager.catalog_snapshot_at(scan_seq).and_then(|idx_cat| {
+            let def = idx_cat.get_by_name(index_name).cloned().ok_or_else(|| {
+                crate::OmniError::IoError(format!("Index '{}' not found", index_name))
+            })?;
+            let is_sql = idx_cat.effective_namespace(&def)
+                == Some(crate::secondary_index::IndexNamespace::Sql);
+            Ok((def, is_sql))
+        }) {
+            Ok((definition, is_sql))
                 if !definition.fields.is_empty()
                     && expected_index_id.is_none_or(|id| definition.id == id)
-                    && definition
-                        .namespace
-                        .matches(crate::secondary_index::IndexNamespace::Sql)
+                    && is_sql
                     && definition.collection.eq_ignore_ascii_case(&table.name) =>
             {
                 definition
             }
-            Ok(definition) if definition.fields.is_empty() => {
+            Ok((definition, _)) if definition.fields.is_empty() => {
                 return Self {
                     rows: Vec::new(),
                     pos: 0,

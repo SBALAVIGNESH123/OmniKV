@@ -14,6 +14,7 @@ fn test_manifest(dir: &TempDir) -> Manifest {
         sstables: vec![],
         l1_sstables: vec![],
         max_seq: 0,
+        wal_checkpoint_seq: 0,
         format_version: MANIFEST_FORMAT_VERSION,
     }
 }
@@ -98,6 +99,7 @@ fn test_manifest_round_trip() {
         sstables: vec!["a.sst".into(), "b.sst".into()],
         l1_sstables: vec!["c.sst".into()],
         max_seq: 12345,
+        wal_checkpoint_seq: 0,
         format_version: MANIFEST_FORMAT_VERSION,
     };
     original.save(&path).expect("save");

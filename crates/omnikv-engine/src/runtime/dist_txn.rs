@@ -1047,10 +1047,25 @@ fn parse_participant_prepare_key(key: &str) -> Option<(u64, GlobalTxnId)> {
     let rest = key.strip_prefix("__2PC_PREPARE__/")?;
     let (node_str, txn_str) = rest.split_once('/')?;
     let (coord_str, seq_str) = txn_str.split_once('_')?;
-    Some((
-        node_str.parse().ok()?,
-        (coord_str.parse().ok()?, seq_str.parse().ok()?),
-    ))
+    let node_id: u64 = node_str.parse().ok()?;
+    let txn_id: GlobalTxnId = (coord_str.parse().ok()?, seq_str.parse().ok()?);
+    (participant_prepare_key(node_id, txn_id) == key).then_some((node_id, txn_id))
+}
+
+fn is_canonical_legacy_participant_key(key: &str) -> bool {
+    let Some(rest) = key.strip_prefix("__2PC_PREPARE__/") else {
+        return false;
+    };
+    if rest.contains('/') {
+        return false;
+    }
+    let Some((coord_str, seq_str)) = rest.split_once('_') else {
+        return false;
+    };
+    let (Ok(coord), Ok(seq)) = (coord_str.parse::<u64>(), seq_str.parse::<u64>()) else {
+        return false;
+    };
+    legacy_participant_prepare_key((coord, seq)) == key
 }
 
 fn legacy_participant_prepare_key(txn_id: GlobalTxnId) -> String {
@@ -1285,7 +1300,7 @@ fn check_2pc_participant_writes(
     }
 
     let mut active_records: HashMap<String, String> = db
-        .scan("__2PC_PREPARE__/", "__2PC_PREPARE__/~", u64::MAX)?
+        .scan_prefix("__2PC_PREPARE__/", u64::MAX)?
         .into_iter()
         .collect();
     if let Some(staged) = staged {
@@ -1421,7 +1436,7 @@ fn effective_prepared_owner(
         .any(|k| k.starts_with(b"__2PC_PREPARE__/"))
     {
         let mut active_records: HashMap<String, String> = db
-            .scan("__2PC_PREPARE__/", "__2PC_PREPARE__/~", u64::MAX)?
+            .scan_prefix("__2PC_PREPARE__/", u64::MAX)?
             .into_iter()
             .collect();
         for (k_bytes, val, _) in &staged.buffered_writes {
@@ -1594,12 +1609,17 @@ pub(crate) fn sanitize_2pc_entry_for_snapshot_install(key: &str, value: &str) ->
 pub(crate) fn collect_prepared_reservations(
     db: &OmniKV,
 ) -> Result<HashMap<String, (u64, GlobalTxnId)>, OmniError> {
-    let entries = db.scan("__2PC_PREPARE__/", "__2PC_PREPARE__/~", u64::MAX)?;
+    let entries = db.scan_prefix("__2PC_PREPARE__/", u64::MAX)?;
     let mut reserved: HashMap<String, (u64, GlobalTxnId)> = HashMap::new();
     for (key, value) in entries {
         if !is_authoritative_participant_key(&key) {
-            // Explicit legacy marker (`__2PC_PREPARE__/{coord}_{seq}` without node_id): skip.
-            continue;
+            if is_canonical_legacy_participant_key(&key) {
+                // Explicit canonical legacy marker (`__2PC_PREPARE__/{coord}_{seq}`): skip.
+                continue;
+            }
+            return Err(OmniError::IoError(format!(
+                "malformed 2PC participant key '{key}'"
+            )));
         }
         let Some((key_node_id, key_txn_id)) = parse_participant_prepare_key(&key) else {
             return Err(OmniError::IoError(format!(
@@ -3925,5 +3945,68 @@ mod tests {
                 .to_string()
                 .contains("malformed authoritative 2PC participant record")
         );
+    }
+
+    #[test]
+    fn collect_prepared_reservations_rejects_non_canonical_high_unicode_and_invalid_state_keys() {
+        let valid_entry = ParticipantLogEntry {
+            txn_id: (1, 1),
+            node_id: 10,
+            state: "PREPARED".into(),
+            writes: vec![DistWrite {
+                node_id: 10,
+                key: "k1".into(),
+                value: Some("v".into()),
+                ttl: 0,
+            }],
+            prepare_seq: 1,
+            commit_seq: None,
+            snapshot_imported: false,
+            unvalidated: false,
+        };
+        let valid_json = serde_json::to_string(&valid_entry).unwrap();
+
+        for (bad_key, bad_val, expected_substr) in [
+            (
+                "__2PC_PREPARE__/010/1_1",
+                valid_json.clone(),
+                "malformed authoritative 2PC participant key",
+            ),
+            (
+                "__2PC_PREPARE__/\u{0080}/1_1",
+                valid_json.clone(),
+                "malformed authoritative 2PC participant key",
+            ),
+            (
+                "__2PC_PREPARE__/corrupt",
+                "PREPARED:10".to_string(),
+                "malformed 2PC participant key",
+            ),
+            (
+                "__2PC_PREPARE__/10/1_2",
+                valid_json,
+                "mismatched authoritative 2PC participant identity",
+            ),
+            (
+                "__2PC_PREPARE__/10/1_1",
+                serde_json::to_string(&ParticipantLogEntry {
+                    state: "BOGUS".into(),
+                    ..valid_entry
+                })
+                .unwrap(),
+                "invalid 2PC participant state",
+            ),
+        ] {
+            let (db, _dir) = test_db();
+            let mut seed = WriteBatch::new();
+            seed.set(bad_key, bad_val).unwrap();
+            db.commit_batch_local(&seed).unwrap();
+            let err = collect_prepared_reservations(&db)
+                .expect_err(&format!("expected failure for key '{bad_key}'"));
+            assert!(
+                err.to_string().contains(expected_substr),
+                "for key '{bad_key}' expected '{expected_substr}', got: {err}"
+            );
+        }
     }
 }

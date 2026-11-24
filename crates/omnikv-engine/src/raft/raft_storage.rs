@@ -389,6 +389,14 @@ fn storage_write_err(e: impl std::fmt::Display) -> openraft::StorageError<u64> {
     )
 }
 
+fn parse_canonical_raft_log_key(key: &str) -> Option<u64> {
+    let rest = key.strip_prefix(RAFT_LOG_PREFIX)?;
+    if rest.len() != 20 || !rest.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    rest.parse::<u64>().ok()
+}
+
 fn storage_read_err(e: impl std::fmt::Display) -> openraft::StorageError<u64> {
     openraft::StorageError::from_io_error(
         openraft::ErrorSubject::Store,
@@ -751,7 +759,7 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
     async fn purge_logs_upto(&mut self, log_id: LogId<u64>) -> Result<(), StorageError<u64>> {
         let mut batch = WriteBatch::new();
 
-        let start_idx = {
+        let (mut current_floor, mut cursor_idx) = {
             let meta = self
                 .meta
                 .lock()
@@ -759,7 +767,11 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
             if meta.last_purged_log_id.is_some_and(|cur| log_id <= cur) {
                 return Ok(());
             }
-            meta.last_purged_log_id.map(|id| id.index + 1).unwrap_or(1)
+            (
+                meta.last_purged_log_id,
+                meta.last_purged_log_id
+                    .map_or(Some(0), |id| id.index.checked_add(1)),
+            )
         };
 
         // Validate the final target log entry upfront whenever it exists in
@@ -786,16 +798,19 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
         }
 
         let chunk_cap = WriteBatch::MAX_OPS.saturating_sub(1);
-        let end_exclusive = log_id
-            .index
-            .checked_add(1)
-            .map(|next| format!("{RAFT_LOG_PREFIX}{next:020}"))
-            .or_else(|| OmniKV::prefix_successor_str(RAFT_LOG_PREFIX));
-        let mut cursor_idx = start_idx;
+        // Use u128 arithmetic so even `log_id.index == u64::MAX` forms a 20-digit
+        // exclusive upper bound (`18446744073709551616`), staying strictly below
+        // non-numeric sibling keys such as `__sys__/raft/log/vote`.
+        let end_exclusive = Some(format!(
+            "{RAFT_LOG_PREFIX}{:020}",
+            u128::from(log_id.index) + 1
+        ));
 
         loop {
-            let entries = if cursor_idx <= log_id.index {
-                let start_key = format!("{RAFT_LOG_PREFIX}{cursor_idx:020}");
+            let entries = if let Some(c) = cursor_idx
+                && c <= log_id.index
+            {
+                let start_key = format!("{RAFT_LOG_PREFIX}{c:020}");
                 self.db
                     .scan_exclusive_limit(
                         &start_key,
@@ -811,20 +826,25 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
             let has_more = entries.len() > chunk_cap;
             let chunk_len = entries.len().min(chunk_cap);
 
+            for (key, _) in entries.iter().take(chunk_len) {
+                if parse_canonical_raft_log_key(key).is_none() {
+                    return Err(storage_read_err(format!(
+                        "non-canonical Raft log key '{key}' encountered during purge"
+                    )));
+                }
+            }
+
             // Chunk actual existing local log entries instead of numeric
             // indexes so purging over a sparse or empty local prefix succeeds,
             // while populated intermediate chunk boundaries still verify their
-            // exact stored LogId before deleting the chunk.
+            // exact stored LogId and strict monotonicity before deleting.
             let chunk_floor = if has_more {
                 let (last_key, last_val) = &entries[chunk_len - 1];
-                let idx = last_key
-                    .strip_prefix(RAFT_LOG_PREFIX)
-                    .and_then(|s| s.parse::<u64>().ok())
-                    .ok_or_else(|| {
-                        storage_read_err(format!(
-                            "invalid Raft log key at purge boundary '{last_key}'"
-                        ))
-                    })?;
+                let idx = parse_canonical_raft_log_key(last_key).ok_or_else(|| {
+                    storage_read_err(format!(
+                        "invalid Raft log key at purge boundary '{last_key}'"
+                    ))
+                })?;
                 let entry = serde_json::from_str::<Entry<TypeConfig>>(last_val).map_err(|e| {
                     storage_read_err(format!(
                         "corrupt Raft log entry at purge boundary {idx}: {e}"
@@ -834,6 +854,12 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
                     return Err(storage_read_err(format!(
                         "mismatched Raft log index at purge boundary {idx}: found {}",
                         entry.log_id.index
+                    )));
+                }
+                if entry.log_id > log_id || current_floor.is_some_and(|cur| entry.log_id <= cur) {
+                    return Err(storage_read_err(format!(
+                        "non-monotonic Raft log id at purge boundary {idx}: found {}, expected between {:?} and {}",
+                        entry.log_id, current_floor, log_id
                     )));
                 }
                 Some((idx, entry.log_id))
@@ -869,13 +895,14 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
                 .meta
                 .lock()
                 .expect("RaftStorage meta lock poisoned: fatal invariant") = next_meta;
+            current_floor = Some(floor_log_id);
             batch.clear();
 
             if let Some((idx, _)) = chunk_floor {
-                let Some(next_idx) = idx.checked_add(1) else {
+                cursor_idx = idx.checked_add(1);
+                if cursor_idx.is_none() {
                     break;
-                };
-                cursor_idx = next_idx;
+                }
             } else {
                 break;
             }
@@ -1249,10 +1276,12 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
 
         let data_dir = std::path::Path::new(&manifest_path)
             .parent()
+            .filter(|p| !p.as_os_str().is_empty())
             .unwrap_or(std::path::Path::new("."))
             .to_path_buf();
         let wal_dir = std::path::Path::new(&wal_path)
             .parent()
+            .filter(|p| !p.as_os_str().is_empty())
             .unwrap_or(std::path::Path::new("."))
             .to_path_buf();
         if wal_dir != data_dir {
@@ -1314,6 +1343,7 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
             sstables: vec![],
             l1_sstables: vec![],
             max_seq: 0,
+            wal_checkpoint_seq: 0,
         };
         tmp_manifest
             .save(&tmp_manifest_path)
@@ -1503,6 +1533,9 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
                 if fs::rename(old_dir.join(name), data_dir.join(name)).is_err() {
                     rollback_ok = false;
                 }
+            }
+            if rollback_ok && sync_dir(&data_dir).is_err() {
+                rollback_ok = false;
             }
             if !rollback_ok {
                 // Preserve both `old_dir` and `tmp_dir` for recovery whenever
@@ -2418,18 +2451,124 @@ mod tests {
             wal.to_str().expect("wal path"),
         )
         .expect("open db");
-        let mut storage = OmniRaftStorage::new(db);
+        let mut storage = OmniRaftStorage::new(db.clone());
         let leader = CommittedLeaderId::new(1, 1);
 
-        // No local log entries exist at all, and target index exceeds MAX_OPS.
+        // Seed index 0 (initial membership log entry) and a durable vote under
+        // both the RaftStorage trait and legacy `__sys__/raft/log/vote` key.
+        let vote = Vote::new(1, 1);
+        RaftStorage::save_vote(&mut storage, &vote)
+            .await
+            .expect("save trait vote");
+        storage
+            .save_vote("{\"term\":1,\"node_id\":1}")
+            .expect("save raw log-prefix vote");
+        storage
+            .append_to_log(vec![Entry {
+                log_id: LogId::new(CommittedLeaderId::new(0, 0), 0),
+                payload: EntryPayload::Blank,
+            }])
+            .await
+            .expect("append index 0");
+
+        // No local log entries exist past index 0, and target index exceeds MAX_OPS.
         let target = LogId::new(leader, WriteBatch::MAX_OPS as u64 + 2_000);
         storage
             .purge_logs_upto(target)
             .await
             .expect("purge over empty local prefix past batch cap must succeed");
         assert_eq!(
+            storage.read_log(0),
+            None,
+            "log index 0 must be purged when last_purged_log_id started at None"
+        );
+        let reloaded = OmniRaftStorage::new(db.clone());
+        assert_eq!(
+            reloaded.meta.lock().expect("meta lock").last_purged_log_id,
+            Some(target),
+            "persisted RAFT_META_KEY must reflect advanced purge floor"
+        );
+
+        // Purging at u64::MAX must never overflow or delete `__sys__/raft/log/vote`.
+        let max_target = LogId::new(leader, u64::MAX);
+        storage
+            .purge_logs_upto(max_target)
+            .await
+            .expect("purge at u64::MAX must succeed");
+        assert_eq!(
+            RaftStorage::read_vote(&mut storage)
+                .await
+                .expect("read trait vote"),
+            Some(vote),
+            "purge at u64::MAX must preserve trait Raft vote"
+        );
+        assert_eq!(
+            storage.read_vote(),
+            Some("{\"term\":1,\"node_id\":1}".to_string()),
+            "purge at u64::MAX must preserve `__sys__/raft/log/vote`"
+        );
+        // Higher-term purge at u64::MAX must not overflow `id.index + 1`.
+        let higher_term_max = LogId::new(CommittedLeaderId::new(2, 1), u64::MAX);
+        storage
+            .purge_logs_upto(higher_term_max)
+            .await
+            .expect("higher-term purge at u64::MAX must not overflow");
+        assert_eq!(
+            OmniRaftStorage::new(db)
+                .meta
+                .lock()
+                .expect("meta lock")
+                .last_purged_log_id,
+            Some(higher_term_max)
+        );
+    }
+
+    #[tokio::test]
+    async fn purge_logs_upto_rejects_non_monotonic_intermediate_boundary_term() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let manifest = dir.path().join("manifest.json");
+        let wal = dir.path().join("wal.bin");
+        let db = OmniKV::open(
+            manifest.to_str().expect("manifest path"),
+            wal.to_str().expect("wal path"),
+        )
+        .expect("open db");
+        let mut storage = OmniRaftStorage::new(db);
+        let leader2 = CommittedLeaderId::new(2, 1);
+        let leader5 = CommittedLeaderId::new(5, 1);
+        let boundary = WriteBatch::MAX_OPS as u64 - 1;
+        let total = boundary + 5;
+
+        let mut chunk = Vec::with_capacity(2_500);
+        for idx in 1..=total {
+            let entry_leader = if idx == boundary { leader5 } else { leader2 };
+            chunk.push(Entry {
+                log_id: LogId::new(entry_leader, idx),
+                payload: EntryPayload::Blank,
+            });
+            if chunk.len() == 2_500 {
+                storage
+                    .append_to_log(std::mem::take(&mut chunk))
+                    .await
+                    .expect("append chunk");
+            }
+        }
+        if !chunk.is_empty() {
+            storage.append_to_log(chunk).await.expect("append tail");
+        }
+
+        let err = storage
+            .purge_logs_upto(LogId::new(leader2, total))
+            .await
+            .expect_err("higher-term intermediate boundary above target LogId must fail");
+        assert!(
+            err.to_string().contains("non-monotonic Raft log id"),
+            "unexpected error: {err}"
+        );
+        assert!(storage.read_log(1).is_some(), "chunk 1 must stay intact");
+        assert_eq!(
             storage.meta.lock().expect("meta lock").last_purged_log_id,
-            Some(target)
+            None
         );
     }
 }

@@ -729,6 +729,12 @@ pub struct Manifest {
     pub l1_sstables: Vec<String>,
     #[serde(default)]
     pub max_seq: u64,
+    /// Highest MVCC sequence already rewritten into the current base/heap files
+    /// by heap GC. WAL replay skips records with `seq <= wal_checkpoint_seq` so
+    /// a crash before `wal.clear()` can never replay old-heap offsets into a
+    /// replacement heap.
+    #[serde(default)]
+    pub wal_checkpoint_seq: u64,
     /// Format version. Missing in old manifests → treated as v1.
     #[serde(default = "default_manifest_format_version")]
     pub format_version: u32,
@@ -1435,9 +1441,10 @@ impl OmniKV {
                 continue;
             }
             let path = entry.path();
-            if path.is_dir() && std::fs::read_dir(&path)?.next().is_none() {
+            if manifest_exists && path.is_dir() && std::fs::read_dir(&path)?.next().is_none() {
                 // Empty rollback directory left by a clean rollback or crash
-                // right before removing the empty dir; safe to clean up.
+                // right before removing the empty dir while the live manifest
+                // is present; safe to clean up.
                 let _ = std::fs::remove_dir(&path);
                 continue;
             }
@@ -1634,6 +1641,7 @@ impl OmniKV {
                 sstables: vec![],
                 l1_sstables: vec![],
                 max_seq: 0,
+                wal_checkpoint_seq: 0,
             };
             m.save(manifest_path)?;
             m
@@ -1749,6 +1757,9 @@ impl OmniKV {
         let recovered_records = wal::WriteAheadLog::replay(wal_path, &manifest.heap_path)?;
         if !recovered_records.is_empty() {
             for rec in recovered_records {
+                if rec.seq <= manifest.wal_checkpoint_seq {
+                    continue;
+                }
                 let shard = shard_idx(&rec.key);
                 memtable[shard].insert(
                     (rec.key, Reverse(rec.seq)),
@@ -3873,9 +3884,19 @@ impl OmniKV {
         manifest_for_roots.base_path = new_base_path.clone();
         manifest_for_roots.sstables.clear();
         manifest_for_roots.l1_sstables.clear();
-        manifest_for_roots.max_seq = manifest_for_roots
-            .max_seq
-            .max(self.global_seq.load(Ordering::SeqCst));
+        let cur_next_seq = self.global_seq.load(Ordering::SeqCst);
+        let checkpoint_seq = cur_next_seq.saturating_sub(1);
+        manifest_for_roots.wal_checkpoint_seq =
+            manifest_for_roots.wal_checkpoint_seq.max(checkpoint_seq);
+        manifest_for_roots.max_seq = manifest_for_roots.max_seq.max(cur_next_seq);
+
+        // Acquire `heap_file` BEFORE persisting the replacement manifest so no
+        // fallible lock acquisition remains between `manifest.save()` and
+        // `output_guard.disarm()`.
+        let mut heap_lock = self
+            .heap_file
+            .lock()
+            .map_err(|_| OmniError::LockPoisoned("heap_file".into()))?;
         bloom.save(&bloom_path_for_base(&new_base_path))?;
         manifest_for_roots.save(&self.manifest_path)?;
 
@@ -3886,10 +3907,6 @@ impl OmniKV {
         // ever be read against the replacement heap. Existing readers keep
         // reading the previous `Arc<StorageRoots>` untouched.
         let new_empty_memtable: SharedMemtable = Arc::new(std::array::from_fn(|_| SkipMap::new()));
-        let mut heap_lock = self
-            .heap_file
-            .lock()
-            .map_err(|_| OmniError::LockPoisoned("heap_file".into()))?;
         *heap_lock = new_heap_file;
         self.heap_offset.store(current_offset, Ordering::SeqCst);
         self.roots.store(Arc::new(StorageRoots {
@@ -3919,8 +3936,15 @@ impl OmniKV {
             }
         });
 
-        if let Ok(mut wal) = self.wal.lock() {
-            let _ = wal.clear();
+        match self.wal.lock() {
+            Ok(mut wal) => {
+                if let Err(err) = wal.clear() {
+                    tracing::warn!(error = %err, "heap_gc WAL clear failed (checkpointed in manifest)");
+                }
+            }
+            Err(_) => {
+                tracing::warn!("heap_gc WAL lock poisoned while clearing WAL");
+            }
         }
 
         stats.record("heap_gc", started_at, self.compaction_backlog_sstables());
@@ -4796,6 +4820,14 @@ mod tests {
         b2.set("a", "A".into()).expect("stage a");
         db.commit_batch(&b2).expect("commit a");
 
+        // Capture pre-GC WAL bytes to simulate a crash right after manifest.save()
+        // and before wal.clear() completes.
+        let pre_gc_wal_bytes = std::fs::read(&wal).expect("read pre-gc wal bytes");
+        assert!(
+            !pre_gc_wal_bytes.is_empty(),
+            "pre-gc WAL must contain unflushed records"
+        );
+
         // Capture a pre-GC lazy iterator before GC runs (still without flushing).
         let snap_seq = db.get_seq();
         let mut pre_gc_iter = db
@@ -4827,6 +4859,22 @@ mod tests {
                 ("z".to_string(), "Z".to_string()),
             ]
         );
+
+        // Drop DB, restore pre-GC WAL bytes (old heap offsets!), reopen, and
+        // verify wal_checkpoint_seq prevents stale WAL replay from corrupting reads.
+        drop(pre_gc_iter);
+        drop(db);
+        std::fs::write(&wal, &pre_gc_wal_bytes).expect("restore pre-gc wal bytes");
+        let reopened =
+            OmniKV::open(&manifest, &wal).expect("reopen after gc crash before wal clear");
+        assert_eq!(
+            reopened.find("z", reopened.get_seq()).expect("reopen z"),
+            Some("Z".into())
+        );
+        assert_eq!(
+            reopened.find("a", reopened.get_seq()).expect("reopen a"),
+            Some("A".into())
+        );
     }
 
     #[test]
@@ -4837,8 +4885,7 @@ mod tests {
         let manifest_str = manifest_path.to_str().expect("manifest path").to_string();
         let wal_str = wal_path.to_str().expect("wal path").to_string();
 
-        // Simulate crash after moving active manifest into `old_snapshot_*`
-        // before promoting the new snapshot (manifest absent from data_dir).
+        // Case 1: non-empty unresolved rollback dir without manifest fails closed.
         let unresolved = dir.path().join("old_snapshot_interrupted");
         std::fs::create_dir_all(&unresolved).expect("create unresolved dir");
         let backup_manifest = unresolved.join("manifest.json");
@@ -4860,9 +4907,27 @@ mod tests {
             b"original-manifest"
         );
 
+        // Case 2: even an empty rollback dir without a live manifest fails closed.
+        std::fs::remove_file(&backup_manifest).expect("remove sentinel");
+        assert!(
+            OmniKV::open(&manifest_str, &wal_str).is_err(),
+            "empty rollback dir without live manifest must fail closed"
+        );
+        assert!(!manifest_path.exists());
+
         // Removing the unresolved dir lets a genuinely fresh database open cleanly.
         std::fs::remove_dir_all(&unresolved).expect("clear unresolved dir");
         let fresh = OmniKV::open(&manifest_str, &wal_str).expect("fresh open should succeed");
         drop(fresh);
+
+        // Case 3: `.install_complete` paired with `.rollback_failed` must fail closed even with manifest present.
+        let failed_dir = dir.path().join("old_snapshot_failed");
+        std::fs::create_dir_all(&failed_dir).expect("create failed dir");
+        std::fs::write(failed_dir.join(".install_complete"), b"ok").expect("write complete");
+        std::fs::write(failed_dir.join(".rollback_failed"), b"failed").expect("write failed");
+        assert!(
+            OmniKV::open(&manifest_str, &wal_str).is_err(),
+            "rollback_failed marker must fail closed even when manifest exists"
+        );
     }
 }

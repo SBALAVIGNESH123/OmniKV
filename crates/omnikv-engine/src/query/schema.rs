@@ -25,7 +25,9 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::secondary_index::{IndexFieldType, IndexManager, IndexNamespace, collection_row_ranges};
+use crate::secondary_index::{
+    IndexFieldType, IndexManager, IndexNamespace, collection_row_ranges_for_namespace,
+};
 use crate::{OmniError, OmniKV, WriteBatch};
 
 static NEXT_MIGRATION_ATTEMPT_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -201,8 +203,9 @@ impl SchemaManager {
 
         // Execute each operation
         let total_ops = migration.up.len();
-        for (i, op) in migration.up.iter().enumerate() {
-            match self.execute_op(op, migration.version, "up", &attempt_id, i) {
+        let exec_ops: Vec<&SchemaOp> = migration.up.iter().collect();
+        for (i, op) in exec_ops.iter().enumerate() {
+            match self.execute_op(op, &exec_ops, migration.version, "up", &attempt_id, i) {
                 Ok(()) => {
                     let pct = ((i + 1) * 100).checked_div(total_ops).unwrap_or(100) as u8;
                     self.save_migration_record(&MigrationRecord {
@@ -264,8 +267,9 @@ impl SchemaManager {
         let attempt_id = self.get_or_create_attempt_id(migration.version, "down")?;
 
         // Execute down operations in reverse
-        for (i, op) in migration.down.iter().rev().enumerate() {
-            self.execute_op(op, migration.version, "down", &attempt_id, i)?;
+        let exec_ops: Vec<&SchemaOp> = migration.down.iter().rev().collect();
+        for (i, op) in exec_ops.iter().enumerate() {
+            self.execute_op(op, &exec_ops, migration.version, "down", &attempt_id, i)?;
         }
 
         // Publish the rollback record and predecessor version atomically.
@@ -361,11 +365,11 @@ impl SchemaManager {
         canonical_field: &str,
         action: &str,
     ) -> Result<(), OmniError> {
-        for idx_def in self
-            .index_manager
-            .catalog_snapshot_at(seq)?
-            .indexes_for_namespace(table_name, IndexNamespace::Sql)
-        {
+        let catalog = self.index_manager.catalog_snapshot_at(seq)?;
+        for idx_def in catalog.indexes_for_collection(table_name) {
+            if catalog.effective_namespace(idx_def) == Some(IndexNamespace::Document) {
+                continue;
+            }
             if idx_def
                 .fields
                 .iter()
@@ -384,6 +388,7 @@ impl SchemaManager {
     fn execute_op(
         &self,
         op: &SchemaOp,
+        exec_ops: &[&SchemaOp],
         version: Version,
         direction: &str,
         attempt_id: &str,
@@ -396,10 +401,37 @@ impl SchemaManager {
                 fields,
                 unique,
             } => self.with_collection_lock(collection, || {
-                let receipt_key = Self::create_index_done_key(
-                    version, direction, attempt_id, step_index, collection, name,
-                );
                 let seq = self.db.get_seq();
+                let resolved_collection = self
+                    .index_manager
+                    .resolve_collection_name_at(collection, seq)?;
+                let receipt_key = Self::create_index_done_key(
+                    version,
+                    direction,
+                    attempt_id,
+                    step_index,
+                    &resolved_collection,
+                    name,
+                );
+                let matches_requested =
+                    |def: &crate::secondary_index::IndexDefinition, expected_id: u32| -> bool {
+                        def.id == expected_id
+                            && def.name.eq_ignore_ascii_case(name)
+                            && (def.collection == *collection
+                                || def.collection == resolved_collection)
+                            && def.unique == *unique
+                            && def.fields.len() == fields.len()
+                            && def.fields.iter().zip(fields.iter()).all(
+                                |((af, at), (bf, bt))| {
+                                    let name_ok = if def.namespace == IndexNamespace::Document {
+                                        af == bf
+                                    } else {
+                                        af.eq_ignore_ascii_case(bf)
+                                    };
+                                    name_ok && at == bt
+                                },
+                            )
+                    };
                 let (done_id, owned_building_id) = match self.db.find(&receipt_key, seq)? {
                     Some(receipt) => (
                         receipt
@@ -413,32 +445,8 @@ impl SchemaManager {
                 };
                 if let Some(done_id) = done_id {
                     let catalog = self.index_manager.catalog_snapshot_at(seq)?;
-                    let resolved_collection = self
-                        .index_manager
-                        .resolve_collection_name_at(collection, seq)?;
-                    let matches_requested =
-                        |def: &crate::secondary_index::IndexDefinition| -> bool {
-                            def.id == done_id
-                                && def.name.eq_ignore_ascii_case(name)
-                                && (def.collection == *collection
-                                    || def.collection == resolved_collection)
-                                && def.unique == *unique
-                                && def.fields.len() == fields.len()
-                                && def.fields.iter().zip(fields.iter()).all(
-                                    |((af, at), (bf, bt))| {
-                                        let name_ok = if def.namespace
-                                            == crate::secondary_index::IndexNamespace::Document
-                                        {
-                                            af == bf
-                                        } else {
-                                            af.eq_ignore_ascii_case(bf)
-                                        };
-                                        name_ok && at == bt
-                                    },
-                                )
-                        };
                     if let Some(def) = catalog.get(done_id)
-                        && matches_requested(def)
+                        && matches_requested(def, done_id)
                     {
                         if catalog.is_ready(done_id) {
                             return Ok(());
@@ -449,10 +457,12 @@ impl SchemaManager {
                         return Ok(());
                     }
                     if self.was_index_dropped_by_later_step(
+                        exec_ops,
                         version,
                         direction,
                         attempt_id,
                         step_index,
+                        name,
                         done_id,
                         seq,
                     )? {
@@ -464,10 +474,12 @@ impl SchemaManager {
                 }
                 let index_id = if let Some(owned_id) = owned_building_id {
                     let catalog = self.index_manager.catalog_snapshot_at(seq)?;
-                    if catalog
-                        .get_by_name(name)
-                        .is_some_and(|def| def.id == owned_id)
-                    {
+                    if let Some(def) = catalog.get(owned_id) {
+                        if !matches_requested(def, owned_id) {
+                            return Err(OmniError::IoError(format!(
+                                "migration CreateIndex '{name}' (id {owned_id}) building receipt mismatch: existing index definition does not match requested schema"
+                            )));
+                        }
                         owned_id
                     } else {
                         self.index_manager.create_index_locked_with_receipt(
@@ -532,10 +544,16 @@ impl SchemaManager {
                             .map(|c| c.name.clone())
                     })
                     .unwrap_or_else(|| field_name.clone());
-                let target_collection = sql_table
-                    .as_ref()
-                    .map_or(collection.as_str(), |t| t.name.as_str());
-                self.backfill_field(target_collection, &effective_field, Some(default_value))?;
+                let (target_collection, target_namespace) = match sql_table.as_ref() {
+                    Some(t) => (t.name.as_str(), IndexNamespace::Sql),
+                    None => (collection.as_str(), IndexNamespace::Document),
+                };
+                self.backfill_field(
+                    target_collection,
+                    target_namespace,
+                    &effective_field,
+                    Some(default_value),
+                )?;
                 if let Some(mut table) = sql_table
                     && !table
                         .columns
@@ -598,7 +616,12 @@ impl SchemaManager {
                         if let Some(canonical_name) =
                             Self::parse_sql_cleanup_receipt(&receipt, &table_id)
                         {
-                            self.backfill_field(&table.name, canonical_name, None)?;
+                            self.backfill_field(
+                                &table.name,
+                                IndexNamespace::Sql,
+                                canonical_name,
+                                None,
+                            )?;
                             let mut finish_batch = WriteBatch::new();
                             finish_batch.set(&done_key, expected_done)?;
                             self.db.commit_batch(&finish_batch)?;
@@ -649,7 +672,7 @@ impl SchemaManager {
                         &done_key,
                     );
                 }
-                self.backfill_field(collection, field_name, None)
+                self.backfill_field(collection, IndexNamespace::Document, field_name, None)
             }),
             SchemaOp::RenameField {
                 collection,
@@ -717,6 +740,7 @@ impl SchemaManager {
                             {
                                 return self.cleanup_staged_rename(
                                     &table.name,
+                                    IndexNamespace::Sql,
                                     &staged_old,
                                     &candidate_stage_key,
                                     &done_key,
@@ -921,12 +945,15 @@ impl SchemaManager {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn was_index_dropped_by_later_step(
         &self,
+        exec_ops: &[&SchemaOp],
         version: Version,
         direction: &str,
         attempt_id: &str,
         create_step_index: usize,
+        index_name: &str,
         index_id: crate::secondary_index::IndexId,
         seq: u64,
     ) -> Result<bool, OmniError> {
@@ -942,6 +969,16 @@ impl SchemaManager {
                 continue;
             };
             if drop_step <= create_step_index {
+                continue;
+            }
+            // Only honor the later drop receipt if the current migration still
+            // contains a matching `DropIndex` op at that exact step index.
+            let still_has_drop_step = matches!(
+                exec_ops.get(drop_step),
+                Some(SchemaOp::DropIndex { name: drop_name })
+                    if drop_name.eq_ignore_ascii_case(index_name)
+            );
+            if !still_has_drop_step {
                 continue;
             }
             let ids_csv = value
@@ -1007,7 +1044,9 @@ impl SchemaManager {
         let mut single_batch = WriteBatch::new();
         let mut fits_in_one_batch = true;
 
-        'ranges: for (prefix, end) in collection_row_ranges(collection) {
+        'ranges: for (prefix, end) in
+            collection_row_ranges_for_namespace(collection, IndexNamespace::Sql)
+        {
             let is_sql_rows = prefix.starts_with("\x00T\x00");
             for (key, value) in self.db.scan_exclusive(&prefix, Some(&end), seq)? {
                 let Ok(mut doc) = serde_json::from_str::<serde_json::Value>(&value) else {
@@ -1054,7 +1093,7 @@ impl SchemaManager {
         cutover_batch.set(done_key, Self::sql_cleanup_receipt(table_id, field_name))?;
         self.db.commit_batch(&cutover_batch)?;
 
-        self.backfill_field(collection, field_name, None)?;
+        self.backfill_field(collection, IndexNamespace::Sql, field_name, None)?;
 
         let mut finish_batch = WriteBatch::new();
         finish_batch.set(done_key, done_receipt)?;
@@ -1119,19 +1158,23 @@ impl SchemaManager {
     fn backfill_field(
         &self,
         collection: &str,
+        namespace: IndexNamespace,
         field_name: &str,
         default_value: Option<&serde_json::Value>,
     ) -> Result<(), OmniError> {
         self.index_manager.refresh_catalog()?;
         let seq = self.db.get_seq();
         let catalog = self.index_manager.catalog_snapshot_at(seq)?;
-        let sql_table = self
-            .db
-            .find(
-                &format!("\x00CATALOG\x00{}", collection.to_lowercase()),
-                seq,
-            )?
-            .and_then(|raw| serde_json::from_str::<crate::catalog::TableDef>(&raw).ok());
+        let sql_table = if namespace == IndexNamespace::Sql {
+            self.db
+                .find(
+                    &format!("\x00CATALOG\x00{}", collection.to_lowercase()),
+                    seq,
+                )?
+                .and_then(|raw| serde_json::from_str::<crate::catalog::TableDef>(&raw).ok())
+        } else {
+            None
+        };
         let sql_row_format = sql_table
             .as_ref()
             .map(|table| table.row_format)
@@ -1139,7 +1182,10 @@ impl SchemaManager {
         let sql_default = match default_value {
             Some(serde_json::Value::Null) => Some(serde_json::Value::Null),
             Some(serde_json::Value::String(s)) => {
-                if s == "NULL" && sql_row_format == crate::catalog::RowFormat::Legacy {
+                if namespace == IndexNamespace::Sql
+                    && s == "NULL"
+                    && sql_row_format == crate::catalog::RowFormat::Legacy
+                {
                     let sql_prefix = format!("\x00T\x00{}\x00", collection);
                     if sql_table.is_some() || !self.db.scan_prefix(&sql_prefix, seq)?.is_empty() {
                         return Err(OmniError::IoError(format!(
@@ -1152,11 +1198,13 @@ impl SchemaManager {
             Some(serde_json::Value::Number(n)) => Some(serde_json::Value::String(n.to_string())),
             Some(serde_json::Value::Bool(b)) => Some(serde_json::Value::String(b.to_string())),
             Some(other) => {
-                let sql_prefix = format!("\x00T\x00{}\x00", collection);
-                if sql_table.is_some() || !self.db.scan_prefix(&sql_prefix, seq)?.is_empty() {
-                    return Err(OmniError::IoError(format!(
-                        "unsupported SQL row value for field '{field_name}': {other}"
-                    )));
+                if namespace == IndexNamespace::Sql {
+                    let sql_prefix = format!("\x00T\x00{}\x00", collection);
+                    if sql_table.is_some() || !self.db.scan_prefix(&sql_prefix, seq)?.is_empty() {
+                        return Err(OmniError::IoError(format!(
+                            "unsupported SQL row value for field '{field_name}': {other}"
+                        )));
+                    }
                 }
                 None
             }
@@ -1166,7 +1214,7 @@ impl SchemaManager {
         let mut batch = WriteBatch::new();
         let max_doc_ops = 1 + 2 * catalog.indexes_for_collection(collection).len();
 
-        for (prefix, end) in collection_row_ranges(collection) {
+        for (prefix, end) in collection_row_ranges_for_namespace(collection, namespace) {
             let is_sql_rows = prefix.starts_with("\x00T\x00");
             for (key, value) in self.db.scan_exclusive(&prefix, Some(&end), seq)? {
                 let Ok(mut doc) = serde_json::from_str::<serde_json::Value>(&value) else {
@@ -1256,8 +1304,15 @@ impl SchemaManager {
             return Ok(());
         }
 
-        for (prefix, end) in collection_row_ranges(collection) {
-            for (key, value) in self.db.scan_exclusive(&prefix, Some(&end), seq)? {
+        let namespace = if sql_catalog_update.is_some() {
+            IndexNamespace::Sql
+        } else {
+            IndexNamespace::Document
+        };
+        let row_ranges = collection_row_ranges_for_namespace(collection, namespace);
+
+        for (prefix, end) in &row_ranges {
+            for (key, value) in self.db.scan_exclusive(prefix, Some(end), seq)? {
                 if let Ok(serde_json::Value::Object(obj)) = serde_json::from_str(&value)
                     && let (Some(old_val), Some(new_val)) = (obj.get(old_name), obj.get(new_name))
                 {
@@ -1285,9 +1340,9 @@ impl SchemaManager {
             let mut single_batch = WriteBatch::new();
             let mut fits_in_one_batch = true;
 
-            'ranges: for (prefix, end) in collection_row_ranges(collection) {
+            'ranges: for (prefix, end) in &row_ranges {
                 let is_sql_rows = prefix.starts_with("\x00T\x00");
-                for (key, value) in self.db.scan_exclusive(&prefix, Some(&end), seq)? {
+                for (key, value) in self.db.scan_exclusive(prefix, Some(end), seq)? {
                     let Ok(mut doc) = serde_json::from_str::<serde_json::Value>(&value) else {
                         continue;
                     };
@@ -1305,7 +1360,7 @@ impl SchemaManager {
                         self.stage_doc_update(
                             &catalog,
                             collection,
-                            &prefix,
+                            prefix,
                             is_sql_rows,
                             sql_row_format,
                             &key,
@@ -1336,9 +1391,9 @@ impl SchemaManager {
             batch.set(&stage_key, old_name.to_string())?;
         }
 
-        for (prefix, end) in collection_row_ranges(collection) {
+        for (prefix, end) in &row_ranges {
             let is_sql_rows = prefix.starts_with("\x00T\x00");
-            for (key, value) in self.db.scan_exclusive(&prefix, Some(&end), seq)? {
+            for (key, value) in self.db.scan_exclusive(prefix, Some(end), seq)? {
                 let Ok(mut doc) = serde_json::from_str::<serde_json::Value>(&value) else {
                     continue;
                 };
@@ -1364,7 +1419,7 @@ impl SchemaManager {
                 self.stage_doc_update(
                     &catalog,
                     collection,
-                    &prefix,
+                    prefix,
                     is_sql_rows,
                     sql_row_format,
                     &key,
@@ -1391,12 +1446,15 @@ impl SchemaManager {
             self.db.commit_batch(&cat_batch)?;
         }
 
-        self.cleanup_staged_rename(collection, old_name, &stage_key, done_key, done_value)
+        self.cleanup_staged_rename(
+            collection, namespace, old_name, &stage_key, done_key, done_value,
+        )
     }
 
     fn cleanup_staged_rename(
         &self,
         collection: &str,
+        namespace: IndexNamespace,
         old_name: &str,
         stage_key: &str,
         done_key: &str,
@@ -1419,7 +1477,7 @@ impl SchemaManager {
         let mut batch = WriteBatch::new();
         let cleanup_doc_ops = 2 + 2 * catalog.indexes_for_collection(collection).len();
 
-        for (prefix, end) in collection_row_ranges(collection) {
+        for (prefix, end) in collection_row_ranges_for_namespace(collection, namespace) {
             let is_sql_rows = prefix.starts_with("\x00T\x00");
             for (key, value) in self.db.scan_exclusive(&prefix, Some(&end), seq)? {
                 let Ok(mut doc) = serde_json::from_str::<serde_json::Value>(&value) else {
