@@ -400,20 +400,68 @@ impl SchemaManager {
                     version, direction, attempt_id, step_index, collection, name,
                 );
                 let seq = self.db.get_seq();
-                let owned_building_id = match self.db.find(&receipt_key, seq)? {
-                    Some(receipt)
-                        if receipt
+                let (done_id, owned_building_id) = match self.db.find(&receipt_key, seq)? {
+                    Some(receipt) => (
+                        receipt
                             .strip_prefix("done:")
-                            .and_then(|s| s.parse::<u32>().ok())
-                            .is_some() =>
+                            .and_then(|s| s.parse::<u32>().ok()),
+                        receipt
+                            .strip_prefix("building:")
+                            .and_then(|s| s.parse::<u32>().ok()),
+                    ),
+                    None => (None, None),
+                };
+                if let Some(done_id) = done_id {
+                    let catalog = self.index_manager.catalog_snapshot_at(seq)?;
+                    let resolved_collection = self
+                        .index_manager
+                        .resolve_collection_name_at(collection, seq)?;
+                    let matches_requested =
+                        |def: &crate::secondary_index::IndexDefinition| -> bool {
+                            def.id == done_id
+                                && def.name.eq_ignore_ascii_case(name)
+                                && (def.collection == *collection
+                                    || def.collection == resolved_collection)
+                                && def.unique == *unique
+                                && def.fields.len() == fields.len()
+                                && def.fields.iter().zip(fields.iter()).all(
+                                    |((af, at), (bf, bt))| {
+                                        let name_ok = if def.namespace
+                                            == crate::secondary_index::IndexNamespace::Document
+                                        {
+                                            af == bf
+                                        } else {
+                                            af.eq_ignore_ascii_case(bf)
+                                        };
+                                        name_ok && at == bt
+                                    },
+                                )
+                        };
+                    if let Some(def) = catalog.get(done_id)
+                        && matches_requested(def)
                     {
+                        if catalog.is_ready(done_id) {
+                            return Ok(());
+                        }
+                        // Still owned by this attempt with matching definition,
+                        // just not ready yet: rebuild to recover cleanly.
+                        self.index_manager.rebuild_index_locked(name, collection)?;
                         return Ok(());
                     }
-                    Some(receipt) => receipt
-                        .strip_prefix("building:")
-                        .and_then(|s| s.parse::<u32>().ok()),
-                    None => None,
-                };
+                    if self.was_index_dropped_by_later_step(
+                        version,
+                        direction,
+                        attempt_id,
+                        step_index,
+                        done_id,
+                        seq,
+                    )? {
+                        return Ok(());
+                    }
+                    return Err(OmniError::IoError(format!(
+                        "migration CreateIndex '{name}' (id {done_id}) receipt mismatch: index is missing, unready, or was replaced before retry"
+                    )));
+                }
                 let index_id = if let Some(owned_id) = owned_building_id {
                     let catalog = self.index_manager.catalog_snapshot_at(seq)?;
                     if catalog
@@ -457,7 +505,12 @@ impl SchemaManager {
                 self.db.commit_batch(&done_batch)?;
                 Ok(())
             }),
-            SchemaOp::DropIndex { name } => self.index_manager.drop_index(name),
+            SchemaOp::DropIndex { name } => {
+                let receipt_key =
+                    Self::drop_index_done_key(version, direction, attempt_id, step_index, name);
+                self.index_manager
+                    .drop_index_with_receipt(name, &receipt_key)
+            }
             SchemaOp::AddField {
                 collection,
                 field_name,
@@ -844,6 +897,66 @@ impl SchemaManager {
             idx_lower.len(),
             idx_lower
         )
+    }
+
+    fn drop_index_done_prefix(version: Version, direction: &str, attempt_id: &str) -> String {
+        format!(
+            "\x00SCHEMA\x00drop_idx:{version:06}:{direction}:{}:{attempt_id}:",
+            attempt_id.len()
+        )
+    }
+
+    fn drop_index_done_key(
+        version: Version,
+        direction: &str,
+        attempt_id: &str,
+        step_index: usize,
+        index_name: &str,
+    ) -> String {
+        let idx_lower = index_name.to_ascii_lowercase();
+        format!(
+            "{}{step_index:06}:{}:{idx_lower}",
+            Self::drop_index_done_prefix(version, direction, attempt_id),
+            idx_lower.len()
+        )
+    }
+
+    fn was_index_dropped_by_later_step(
+        &self,
+        version: Version,
+        direction: &str,
+        attempt_id: &str,
+        create_step_index: usize,
+        index_id: crate::secondary_index::IndexId,
+        seq: u64,
+    ) -> Result<bool, OmniError> {
+        let prefix = Self::drop_index_done_prefix(version, direction, attempt_id);
+        for (key, value) in self.db.scan_prefix(&prefix, seq)? {
+            let Some(rest) = key.strip_prefix(&prefix) else {
+                continue;
+            };
+            let Some((step_str, _)) = rest.split_once(':') else {
+                continue;
+            };
+            let Ok(drop_step) = step_str.parse::<usize>() else {
+                continue;
+            };
+            if drop_step <= create_step_index {
+                continue;
+            }
+            let ids_csv = value
+                .strip_prefix("done:")
+                .or_else(|| value.strip_prefix("dropping:"))
+                .unwrap_or("");
+            if ids_csv
+                .split(',')
+                .filter_map(|s| s.parse::<u32>().ok())
+                .any(|dropped_id| dropped_id == index_id)
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     fn remove_done_prefix(version: Version, direction: &str, attempt_id: &str) -> String {
@@ -1408,6 +1521,7 @@ impl SchemaManager {
         let mut receipt_keys = Vec::new();
         for done_prefix in [
             Self::create_index_done_prefix(record.version, direction, attempt_id),
+            Self::drop_index_done_prefix(record.version, direction, attempt_id),
             Self::rename_done_prefix(record.version, direction, attempt_id),
             Self::remove_done_prefix(record.version, direction, attempt_id),
         ] {

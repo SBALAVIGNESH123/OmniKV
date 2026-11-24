@@ -81,6 +81,33 @@ impl IndexNamespace {
     }
 }
 
+/// Resolves an unbound legacy `IndexNamespace::Both` definition to a single
+/// owning namespace when only one domain exists for `collection`. Returns
+/// `Ok(None)` when ownership is ambiguous (both SQL and document domains exist,
+/// or neither exists yet) so callers can require explicit binding and rebuild.
+fn resolve_legacy_namespace_at(
+    db: &OmniKV,
+    collection: &str,
+    seq: u64,
+) -> Result<Option<IndexNamespace>, OmniError> {
+    let has_sql_table = db
+        .find(&crate::catalog::Catalog::catalog_key(collection), seq)?
+        .and_then(|raw| serde_json::from_str::<crate::catalog::TableDef>(&raw).ok())
+        .is_some_and(|table| table.name == collection);
+    let has_sql_rows = !db
+        .scan_prefix_limit(&format!("\x00T\x00{collection}\x00"), seq, 1)?
+        .is_empty();
+    let has_sql = has_sql_table || has_sql_rows;
+    let has_doc = !db
+        .scan_prefix_limit(&format!("{collection}:"), seq, 1)?
+        .is_empty();
+    match (has_sql, has_doc) {
+        (true, false) => Ok(Some(IndexNamespace::Sql)),
+        (false, true) => Ok(Some(IndexNamespace::Document)),
+        _ => Ok(None),
+    }
+}
+
 /// Definition of a single index.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IndexDefinition {
@@ -113,6 +140,9 @@ pub struct IndexCatalog {
     next_id: IndexId,
     /// An index becomes a query access path only after a successful backfill.
     ready: HashSet<IndexId>,
+    /// Disambiguated ownership for legacy `IndexNamespace::Both` definitions at
+    /// this catalog snapshot (`None` means ownership is ambiguous).
+    resolved_legacy_namespaces: HashMap<IndexId, Option<IndexNamespace>>,
 }
 
 impl IndexCatalog {
@@ -132,6 +162,7 @@ impl IndexCatalog {
             field_index: HashMap::new(),
             next_id: 1,
             ready: HashSet::new(),
+            resolved_legacy_namespaces: HashMap::new(),
         }
     }
 
@@ -161,6 +192,10 @@ impl IndexCatalog {
                 == Some("ready")
             {
                 catalog.ready.insert(def.id);
+            }
+            if def.namespace == IndexNamespace::Both {
+                let resolved = resolve_legacy_namespace_at(db, &def.collection, seq)?;
+                catalog.resolved_legacy_namespaces.insert(def.id, resolved);
             }
             catalog.register_in_memory(def);
         }
@@ -208,6 +243,18 @@ impl IndexCatalog {
             .collect()
     }
 
+    pub(crate) fn effective_namespace(&self, def: &IndexDefinition) -> Option<IndexNamespace> {
+        match def.namespace {
+            IndexNamespace::Sql => Some(IndexNamespace::Sql),
+            IndexNamespace::Document => Some(IndexNamespace::Document),
+            IndexNamespace::Both => self
+                .resolved_legacy_namespaces
+                .get(&def.id)
+                .copied()
+                .flatten(),
+        }
+    }
+
     pub(crate) fn indexes_for_namespace(
         &self,
         collection: &str,
@@ -215,7 +262,13 @@ impl IndexCatalog {
     ) -> Vec<&IndexDefinition> {
         self.indexes
             .values()
-            .filter(|idx| idx.collection == collection && idx.namespace.matches(namespace))
+            .filter(|idx| {
+                idx.collection == collection
+                    && match namespace {
+                        IndexNamespace::Both => true,
+                        target => self.effective_namespace(idx) == Some(target),
+                    }
+            })
             .collect()
     }
 
@@ -240,7 +293,7 @@ impl IndexCatalog {
     pub fn is_ready_for_plan(&self, index_id: IndexId, index_name: &str, table_name: &str) -> bool {
         self.is_ready(index_id)
             && self.get(index_id).is_some_and(|def| {
-                def.namespace.matches(IndexNamespace::Sql)
+                self.effective_namespace(def) == Some(IndexNamespace::Sql)
                     && def.name.eq_ignore_ascii_case(index_name)
                     && def.collection.eq_ignore_ascii_case(table_name)
             })
@@ -407,6 +460,18 @@ fn index_entries_for_namespace(
     primary_key: &str,
     document: &serde_json::Value,
 ) -> Result<Vec<(IndexDefinition, String)>, OmniError> {
+    if namespace != IndexNamespace::Both {
+        for def in catalog.indexes_for_collection(collection) {
+            if def.namespace == IndexNamespace::Both
+                && catalog.effective_namespace(def) != Some(namespace)
+            {
+                return Err(OmniError::IoError(format!(
+                    "legacy index '{}' on collection '{}' has unbound namespace 'Both' and cannot be shared across SQL and document writes; call bind_index_namespace('{}', IndexNamespace::Sql | IndexNamespace::Document) to bind and rebuild it",
+                    def.name, collection, def.name
+                )));
+            }
+        }
+    }
     let mut entries = Vec::new();
     'indexes: for definition in catalog.indexes_for_namespace(collection, namespace) {
         let mut values = Vec::new();
@@ -461,6 +526,30 @@ fn unique_violation(idx_def: &IndexDefinition) -> OmniError {
             .map(|(field, _)| field.as_str())
             .collect::<Vec<_>>()
     ))
+}
+
+fn validate_sql_index_fields(
+    table: &crate::catalog::TableDef,
+    fields: &[(String, IndexFieldType)],
+) -> Result<(), OmniError> {
+    for (field, field_type) in fields {
+        let column = table
+            .columns
+            .iter()
+            .find(|column| column.name.eq_ignore_ascii_case(field))
+            .ok_or_else(|| OmniError::IoError(format!("unknown indexed column '{field}'")))?;
+        let compatible = match field_type {
+            IndexFieldType::Integer => column.col_type == crate::catalog::ColumnType::Integer,
+            IndexFieldType::Float => column.col_type == crate::catalog::ColumnType::Float,
+            IndexFieldType::String => !column.col_type.is_numeric(),
+        };
+        if !compatible {
+            return Err(OmniError::IoError(format!(
+                "index field type does not match SQL column '{field}'"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Batch helpers: last-write-wins even when an indexed value is replaced more than once.
@@ -560,9 +649,10 @@ impl IndexManager {
 
     /// CREATE INDEX — defines a new secondary index on a collection.
     ///
-    /// The index is persisted in the catalog and immediately available for
-    /// future writes. Existing data is NOT retroactively indexed (use
-    /// `rebuild_index` for that).
+    /// Infers `IndexNamespace::Sql` when a SQL table exists for `collection`,
+    /// otherwise `IndexNamespace::Document`. Use [`Self::create_document_index`]
+    /// or [`Self::create_sql_index`] to bind a namespace explicitly when a SQL
+    /// table and a document collection share the same name.
     pub fn create_index(
         &self,
         name: &str,
@@ -575,6 +665,132 @@ impl IndexManager {
             .lock()
             .map_err(|_| OmniError::LockPoisoned("index collection".into()))?;
         self.create_index_locked(name, collection, fields, unique)
+    }
+
+    /// Explicitly creates an index bound to `IndexNamespace::Document`, even
+    /// when a SQL table with the same name exists. Skips SQL table resolution
+    /// and SQL column validation.
+    pub fn create_document_index(
+        &self,
+        name: &str,
+        collection: &str,
+        fields: Vec<(String, IndexFieldType)>,
+        unique: bool,
+    ) -> Result<IndexId, OmniError> {
+        let lock = self.db.sql_table_lock(collection)?;
+        let _guard = lock
+            .lock()
+            .map_err(|_| OmniError::LockPoisoned("index collection".into()))?;
+        self.create_index_locked_with_options(
+            name,
+            collection,
+            fields,
+            unique,
+            None,
+            Some(IndexNamespace::Document),
+        )
+    }
+
+    /// Explicitly creates an index bound to `IndexNamespace::Sql`, requiring a
+    /// matching SQL table and compatible column types.
+    pub fn create_sql_index(
+        &self,
+        name: &str,
+        table_name: &str,
+        fields: Vec<(String, IndexFieldType)>,
+        unique: bool,
+    ) -> Result<IndexId, OmniError> {
+        let lock = self.db.sql_table_lock(table_name)?;
+        let _guard = lock
+            .lock()
+            .map_err(|_| OmniError::LockPoisoned("index collection".into()))?;
+        self.create_index_locked_with_options(
+            name,
+            table_name,
+            fields,
+            unique,
+            None,
+            Some(IndexNamespace::Sql),
+        )
+    }
+
+    /// Binds a legacy `IndexNamespace::Both` (or existing) index explicitly to
+    /// `IndexNamespace::Sql` or `IndexNamespace::Document` and rebuilds it from
+    /// that single namespace only.
+    pub fn bind_index_namespace(
+        &self,
+        name: &str,
+        namespace: IndexNamespace,
+    ) -> Result<usize, OmniError> {
+        if namespace == IndexNamespace::Both {
+            return Err(OmniError::IoError(
+                "cannot bind index to IndexNamespace::Both; choose IndexNamespace::Sql or IndexNamespace::Document"
+                    .into(),
+            ));
+        }
+        let initial = self.definition(name)?;
+        let lock = self.db.sql_table_lock(&initial.collection)?;
+        let _guard = lock
+            .lock()
+            .map_err(|_| OmniError::LockPoisoned("index collection".into()))?;
+        let target_collection = {
+            let ddl_lock = self.db.sql_table_lock(DDL_LOCK_NAME)?;
+            let _ddl_guard = ddl_lock
+                .lock()
+                .map_err(|_| OmniError::LockPoisoned("index DDL".into()))?;
+            let seq = self.db.get_seq();
+            let catalog = IndexCatalog::load_checked_at(&self.db, seq)?;
+            let mut def = catalog
+                .get_by_name(name)
+                .cloned()
+                .ok_or_else(|| OmniError::IoError(format!("Index '{}' not found", name)))?;
+            if def.collection != initial.collection {
+                return Err(OmniError::IoError(format!(
+                    "Index '{}' collection changed concurrently; retry bind_index_namespace",
+                    name
+                )));
+            }
+            if namespace == IndexNamespace::Sql {
+                let table = self
+                    .db
+                    .find(&crate::catalog::Catalog::catalog_key(&def.collection), seq)?
+                    .map(|value| {
+                        serde_json::from_str::<crate::catalog::TableDef>(&value).map_err(|error| {
+                            OmniError::IoError(format!("invalid SQL table definition: {error}"))
+                        })
+                    })
+                    .transpose()?
+                    .ok_or_else(|| {
+                        OmniError::IoError(format!(
+                            "cannot bind index '{}' to SQL namespace: SQL table '{}' not found",
+                            name, def.collection
+                        ))
+                    })?;
+                validate_sql_index_fields(&table, &def.fields)?;
+                def.collection = table.name;
+            }
+            def.namespace = namespace;
+            let catalog_key = format!("{CATALOG_PREFIX}{}", def.id);
+            let ready_key = format!("{READY_PREFIX}{}", def.id);
+            let catalog_value =
+                serde_json::to_string(&def).map_err(|e| OmniError::IoError(e.to_string()))?;
+            let mut batch = WriteBatch::new();
+            batch.set(&catalog_key, catalog_value)?;
+            batch.delete(&ready_key)?;
+            let commit_seq = self.db.commit_batch(&batch)?;
+            self.db.ssi_history().record_committed(
+                0,
+                commit_seq,
+                &crate::transaction::SsiCommitRecord {
+                    txn_id: 0,
+                    write_keys: vec![catalog_key],
+                    read_keys: Vec::new(),
+                    read_ranges: Vec::new(),
+                },
+            );
+            def.collection
+        };
+        self.rebuild_index_locked(name, &target_collection)
     }
 
     pub(crate) fn create_index_locked(
@@ -595,6 +811,30 @@ impl IndexManager {
         unique: bool,
         building_receipt_key: Option<&str>,
     ) -> Result<IndexId, OmniError> {
+        self.create_index_locked_with_options(
+            name,
+            collection,
+            fields,
+            unique,
+            building_receipt_key,
+            None,
+        )
+    }
+
+    fn create_index_locked_with_options(
+        &self,
+        name: &str,
+        collection: &str,
+        fields: Vec<(String, IndexFieldType)>,
+        unique: bool,
+        building_receipt_key: Option<&str>,
+        explicit_namespace: Option<IndexNamespace>,
+    ) -> Result<IndexId, OmniError> {
+        if explicit_namespace == Some(IndexNamespace::Both) {
+            return Err(OmniError::IoError(
+                "cannot create a new index with IndexNamespace::Both".into(),
+            ));
+        }
         let ddl_lock = self.db.sql_table_lock(DDL_LOCK_NAME)?;
         let _ddl_guard = ddl_lock
             .lock()
@@ -613,45 +853,50 @@ impl IndexManager {
                 "index fields must be non-empty and unique".into(),
             ));
         }
-        let table = self
-            .db
-            .find(
-                &crate::catalog::Catalog::catalog_key(collection),
-                self.db.get_seq(),
-            )?
-            .map(|value| {
-                serde_json::from_str::<crate::catalog::TableDef>(&value).map_err(|error| {
-                    OmniError::IoError(format!("invalid SQL table definition: {error}"))
-                })
-            })
-            .transpose()?;
-        if let Some(table) = &table {
-            for (field, field_type) in &fields {
-                let column = table
-                    .columns
-                    .iter()
-                    .find(|column| column.name.eq_ignore_ascii_case(field))
+        let (collection, namespace) = match explicit_namespace {
+            Some(IndexNamespace::Document) => (collection.to_string(), IndexNamespace::Document),
+            Some(IndexNamespace::Sql) => {
+                let table = self
+                    .db
+                    .find(
+                        &crate::catalog::Catalog::catalog_key(collection),
+                        self.db.get_seq(),
+                    )?
+                    .map(|value| {
+                        serde_json::from_str::<crate::catalog::TableDef>(&value).map_err(|error| {
+                            OmniError::IoError(format!("invalid SQL table definition: {error}"))
+                        })
+                    })
+                    .transpose()?
                     .ok_or_else(|| {
-                        OmniError::IoError(format!("unknown indexed column '{field}'"))
+                        OmniError::IoError(format!("SQL table '{collection}' not found"))
                     })?;
-                let compatible = match field_type {
-                    IndexFieldType::Integer => {
-                        column.col_type == crate::catalog::ColumnType::Integer
-                    }
-                    IndexFieldType::Float => column.col_type == crate::catalog::ColumnType::Float,
-                    IndexFieldType::String => !column.col_type.is_numeric(),
-                };
-                if !compatible {
-                    return Err(OmniError::IoError(format!(
-                        "index field type does not match SQL column '{field}'"
-                    )));
+                validate_sql_index_fields(&table, &fields)?;
+                (table.name, IndexNamespace::Sql)
+            }
+            None => {
+                let table = self
+                    .db
+                    .find(
+                        &crate::catalog::Catalog::catalog_key(collection),
+                        self.db.get_seq(),
+                    )?
+                    .map(|value| {
+                        serde_json::from_str::<crate::catalog::TableDef>(&value).map_err(|error| {
+                            OmniError::IoError(format!("invalid SQL table definition: {error}"))
+                        })
+                    })
+                    .transpose()?;
+                if let Some(table) = table {
+                    validate_sql_index_fields(&table, &fields)?;
+                    (table.name, IndexNamespace::Sql)
+                } else {
+                    (collection.to_string(), IndexNamespace::Document)
                 }
             }
-        }
-        let (collection, namespace) = match table.as_ref() {
-            Some(table) => (table.name.as_str(), IndexNamespace::Sql),
-            None => (collection, IndexNamespace::Document),
+            Some(IndexNamespace::Both) => unreachable!("rejected above"),
         };
+        let collection = collection.as_str();
         self.cleanup_retired_indexes_for_collection(collection, namespace)?;
         let catalog = IndexCatalog::load_checked_at(&self.db, self.db.get_seq())?;
 
@@ -709,7 +954,61 @@ impl IndexManager {
         let _guard = lock
             .lock()
             .map_err(|_| OmniError::LockPoisoned("index collection".into()))?;
-        self.drop_index_locked_inner(name, &target_collection, true)
+        self.drop_index_locked_inner(name, &target_collection, true, None)
+    }
+
+    /// Resumable `DROP INDEX` for schema migrations: tracks `dropping:<ids>`
+    /// atomically alongside retirement and `done` once all entries are purged,
+    /// while still failing a fresh drop of a non-existent index.
+    pub(crate) fn drop_index_with_receipt(
+        &self,
+        name: &str,
+        receipt_key: &str,
+    ) -> Result<(), OmniError> {
+        let seq = self.db.get_seq();
+        match self.db.find(receipt_key, seq)?.as_deref() {
+            Some(receipt) if receipt == "done" || receipt.starts_with("done:") => return Ok(()),
+            Some(receipt) if receipt.starts_with("dropping:") => {
+                let ids_csv = receipt.strip_prefix("dropping:").unwrap_or("");
+                let ids: Vec<IndexId> = ids_csv
+                    .split(',')
+                    .filter(|s| !s.is_empty())
+                    .map(|s| {
+                        s.parse::<IndexId>().map_err(|e| {
+                            OmniError::IoError(format!("invalid drop receipt '{receipt}': {e}"))
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                for id in ids {
+                    let retired_key = format!("{RETIRED_PREFIX}{id}");
+                    if self.db.find(&retired_key, self.db.get_seq())?.is_some() {
+                        self.purge_retired_index(id)?;
+                    } else if let Some(def) =
+                        IndexCatalog::load_checked_at(&self.db, self.db.get_seq())?
+                            .get(id)
+                            .cloned()
+                    {
+                        let lock = self.db.sql_table_lock(&def.collection)?;
+                        let _guard = lock
+                            .lock()
+                            .map_err(|_| OmniError::LockPoisoned("index collection".into()))?;
+                        self.drop_index_locked_inner(&def.name, &def.collection, false, None)?;
+                    }
+                }
+                let mut done = WriteBatch::new();
+                done.set(receipt_key, format!("done:{ids_csv}"))?;
+                self.db.commit_batch(&done)?;
+                return Ok(());
+            }
+            _ => {}
+        }
+
+        let target_collection = self.resolve_drop_target_at(name, seq)?;
+        let lock = self.db.sql_table_lock(&target_collection)?;
+        let _guard = lock
+            .lock()
+            .map_err(|_| OmniError::LockPoisoned("index collection".into()))?;
+        self.drop_index_locked_inner(name, &target_collection, true, Some(receipt_key))
     }
 
     fn resolve_drop_target_at(&self, name: &str, seq: u64) -> Result<String, OmniError> {
@@ -757,7 +1056,7 @@ impl IndexManager {
         name: &str,
         expected_collection: &str,
     ) -> Result<(), OmniError> {
-        self.drop_index_locked_inner(name, expected_collection, false)
+        self.drop_index_locked_inner(name, expected_collection, false, None)
     }
 
     fn drop_index_locked_inner(
@@ -765,6 +1064,7 @@ impl IndexManager {
         name: &str,
         expected_collection: &str,
         revalidate_unambiguous: bool,
+        receipt_key: Option<&str>,
     ) -> Result<(), OmniError> {
         let ddl_lock = self.db.sql_table_lock(DDL_LOCK_NAME)?;
         let _ddl_guard = ddl_lock
@@ -803,6 +1103,9 @@ impl IndexManager {
             .filter(|d| d.collection == target_collection)
         {
             let id = def.id;
+            if !ids_to_purge.contains(&id) {
+                ids_to_purge.push(id);
+            }
             let catalog_key = format!("{CATALOG_PREFIX}{id}");
             let ready_key = format!("{READY_PREFIX}{id}");
             let retired_key = format!("{RETIRED_PREFIX}{id}");
@@ -812,6 +1115,14 @@ impl IndexManager {
             meta_batch.delete(&catalog_key)?;
             meta_batch.delete(&ready_key)?;
             meta_batch.set(&retired_key, retired_value)?;
+            if let Some(receipt_key) = receipt_key {
+                let ids_csv = ids_to_purge
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(",");
+                meta_batch.set(receipt_key, format!("dropping:{ids_csv}"))?;
+            }
             let commit_seq = self.db.commit_batch(&meta_batch)?;
             self.db.ssi_history().record_committed(
                 0,
@@ -823,15 +1134,31 @@ impl IndexManager {
                     read_ranges: Vec::new(),
                 },
             );
-            if !ids_to_purge.contains(&id) {
-                ids_to_purge.push(id);
-            }
         } else if ids_to_purge.is_empty() {
             return Err(OmniError::IoError(format!("Index '{}' not found", name)));
+        } else if let Some(receipt_key) = receipt_key {
+            let ids_csv = ids_to_purge
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(",");
+            let mut dropping = WriteBatch::new();
+            dropping.set(receipt_key, format!("dropping:{ids_csv}"))?;
+            self.db.commit_batch(&dropping)?;
         }
 
+        let ids_csv = ids_to_purge
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
         for id in ids_to_purge {
             self.purge_retired_index_entries(id)?;
+        }
+        if let Some(receipt_key) = receipt_key {
+            let mut done = WriteBatch::new();
+            done.set(receipt_key, format!("done:{ids_csv}"))?;
+            self.db.commit_batch(&done)?;
         }
         Ok(())
     }
@@ -1349,36 +1676,76 @@ impl IndexManager {
         Ok(())
     }
 
-    /// Computes a single half-open bounding range `[low_prefix, high_end)` that
-    /// encloses every stored index key equivalent to `parts` (treating v0 float
-    /// `-0.0` and `+0.0` as equivalent) in O(fields) memory without enumerating
-    /// all 2^k combinations. Returns `(low_prefix, high_end, needs_v0_filter)`.
-    fn v0_bounding_range_for_parts(
+    /// Computes exact half-open scan ranges covering every stored index key
+    /// equivalent to `parts` (treating v0 float `-0.0` and `+0.0` as
+    /// equivalent):
+    /// - 0 v0 signed-zero fields: 1 exact range (`needs_v0_filter = false`)
+    /// - 1 v0 signed-zero field: 2 exact ranges (`-0.0` and `+0.0`, no
+    ///   unrelated suffix scanning, `needs_v0_filter = false`)
+    /// - 2 or more v0 signed-zero fields: 1 O(fields) bounding range fallback
+    ///   avoiding 2^k blowup (`needs_v0_filter = true`)
+    fn v0_scan_ranges_for_parts(
         idx_def: &IndexDefinition,
         parts: &[&str],
-    ) -> (String, String, bool) {
+    ) -> (Vec<(String, String)>, bool) {
         let scan_prefix = build_index_scan_prefix(idx_def.id);
-        let mut low = scan_prefix.clone();
-        let mut high = scan_prefix;
-        let mut has_v0_float_zero = false;
         let is_v0 = idx_def.encoding_version < CURRENT_INDEX_ENCODING_VERSION;
-        for (segment, (_, field_type)) in parts.iter().zip(idx_def.fields.iter()) {
-            if is_v0
-                && *field_type == IndexFieldType::Float
-                && (*segment == V0_NEG_ZERO_HEX || *segment == V0_POS_ZERO_HEX)
-            {
-                has_v0_float_zero = true;
-                low.push_str(V0_NEG_ZERO_HEX);
-                high.push_str(V0_POS_ZERO_HEX);
-            } else {
-                low.push_str(segment);
-                high.push_str(segment);
+        let zero_positions: Vec<usize> = parts
+            .iter()
+            .zip(idx_def.fields.iter())
+            .enumerate()
+            .filter_map(|(i, (segment, (_, field_type)))| {
+                (is_v0
+                    && *field_type == IndexFieldType::Float
+                    && (*segment == V0_NEG_ZERO_HEX || *segment == V0_POS_ZERO_HEX))
+                    .then_some(i)
+            })
+            .collect();
+
+        let build_exact_range = |override_zero: Option<(usize, &str)>| -> (String, String) {
+            let mut prefix = scan_prefix.clone();
+            for (i, segment) in parts.iter().enumerate() {
+                let seg = match override_zero {
+                    Some((pos, replacement)) if pos == i => replacement,
+                    _ => *segment,
+                };
+                prefix.push_str(seg);
+                prefix.push('\x00');
             }
-            low.push('\x00');
-            high.push('\x00');
+            let end = format!("{}\x01", &prefix[..prefix.len() - 1]);
+            (prefix, end)
+        };
+
+        match zero_positions.as_slice() {
+            [] => (vec![build_exact_range(None)], false),
+            &[pos] => (
+                vec![
+                    build_exact_range(Some((pos, V0_NEG_ZERO_HEX))),
+                    build_exact_range(Some((pos, V0_POS_ZERO_HEX))),
+                ],
+                false,
+            ),
+            _ => {
+                let mut low = scan_prefix.clone();
+                let mut high = scan_prefix;
+                for (segment, (_, field_type)) in parts.iter().zip(idx_def.fields.iter()) {
+                    if is_v0
+                        && *field_type == IndexFieldType::Float
+                        && (*segment == V0_NEG_ZERO_HEX || *segment == V0_POS_ZERO_HEX)
+                    {
+                        low.push_str(V0_NEG_ZERO_HEX);
+                        high.push_str(V0_POS_ZERO_HEX);
+                    } else {
+                        low.push_str(segment);
+                        high.push_str(segment);
+                    }
+                    low.push('\x00');
+                    high.push('\x00');
+                }
+                let high_end = format!("{}\x01", &high[..high.len() - 1]);
+                (vec![(low, high_end)], true)
+            }
         }
-        let high_end = format!("{}\x01", &high[..high.len() - 1]);
-        (low, high_end, has_v0_float_zero)
     }
 
     /// Returns true if stored index `key` has encoded field segments matching
@@ -1468,20 +1835,24 @@ impl IndexManager {
             .map(|rest| rest.split('\x00').collect::<Vec<_>>())
             .filter(|parts| parts.len() == idx_def.fields.len());
 
-        let (range_start, range_end, needs_v0_filter) = match parsed_parts.as_deref() {
-            Some(parts) => Self::v0_bounding_range_for_parts(idx_def, parts),
+        let (ranges, needs_v0_filter) = match parsed_parts.as_deref() {
+            Some(parts) => Self::v0_scan_ranges_for_parts(idx_def, parts),
             None => (
-                base_prefix.to_string(),
-                format!("{}\x01", &base_prefix[..base_prefix.len() - 1]),
+                vec![(
+                    base_prefix.to_string(),
+                    format!("{}\x01", &base_prefix[..base_prefix.len() - 1]),
+                )],
                 false,
             ),
         };
 
         let seq = self.db.get_seq();
         if let Some(collector) = read_collector {
-            collector
-                .ranges
-                .push((range_start.clone(), range_end.clone()));
+            for (range_start, range_end) in &ranges {
+                collector
+                    .ranges
+                    .push((range_start.clone(), range_end.clone()));
+            }
         }
         let key_matches = |candidate: &str| -> bool {
             if needs_v0_filter {
@@ -1489,25 +1860,28 @@ impl IndexManager {
                     Self::v0_index_key_matches_parts(idx_def, candidate, parts)
                 })
             } else {
-                candidate >= range_start.as_str() && candidate < range_end.as_str()
+                ranges
+                    .iter()
+                    .any(|(start, end)| candidate >= start.as_str() && candidate < end.as_str())
             }
         };
-        for (existing_key, existing_pk) in
-            self.db
-                .scan_exclusive(&range_start, Some(&range_end), seq)?
-        {
-            if !key_matches(&existing_key) {
-                continue;
-            }
-            if batch
-                .buffered_deletes
-                .iter()
-                .any(|deleted| deleted.as_slice() == existing_key.as_bytes())
+        for (range_start, range_end) in &ranges {
+            for (existing_key, existing_pk) in
+                self.db.scan_exclusive(range_start, Some(range_end), seq)?
             {
-                continue;
-            }
-            if existing_pk != primary_key {
-                return Err(unique_violation(idx_def));
+                if !key_matches(&existing_key) {
+                    continue;
+                }
+                if batch
+                    .buffered_deletes
+                    .iter()
+                    .any(|deleted| deleted.as_slice() == existing_key.as_bytes())
+                {
+                    continue;
+                }
+                if existing_pk != primary_key {
+                    return Err(unique_violation(idx_def));
+                }
             }
         }
         // Dedup against conflicting staged writes/deletes in the same batch.
@@ -1571,18 +1945,16 @@ impl IndexManager {
 
         let hex_parts: Vec<String> = encoded.iter().map(|part| hex_encode(part)).collect();
         let part_refs: Vec<&str> = hex_parts.iter().map(String::as_str).collect();
-        let (range_start, range_end, needs_v0_filter) =
-            Self::v0_bounding_range_for_parts(idx_def, &part_refs);
+        let (ranges, needs_v0_filter) = Self::v0_scan_ranges_for_parts(idx_def, &part_refs);
 
         let mut results = Vec::new();
-        for (key, pk) in self
-            .db
-            .scan_exclusive(&range_start, Some(&range_end), seq)?
-        {
-            if needs_v0_filter && !Self::v0_index_key_matches_parts(idx_def, &key, &part_refs) {
-                continue;
+        for (range_start, range_end) in &ranges {
+            for (key, pk) in self.db.scan_exclusive(range_start, Some(range_end), seq)? {
+                if needs_v0_filter && !Self::v0_index_key_matches_parts(idx_def, &key, &part_refs) {
+                    continue;
+                }
+                results.push(pk);
             }
-            results.push(pk);
         }
 
         Ok(results)
@@ -1712,6 +2084,20 @@ impl IndexManager {
         if upgraded_encoding {
             idx_def.encoding_version = CURRENT_INDEX_ENCODING_VERSION;
         }
+        let upgraded_namespace = if idx_def.namespace == IndexNamespace::Both {
+            let resolved =
+                resolve_legacy_namespace_at(&self.db, &idx_def.collection, self.db.get_seq())?
+                    .ok_or_else(|| {
+                        OmniError::IoError(format!(
+                            "legacy index '{}' on collection '{}' has ambiguous namespace ownership; call bind_index_namespace('{}', IndexNamespace::Sql | IndexNamespace::Document) to bind and rebuild it",
+                            idx_def.name, idx_def.collection, idx_def.name
+                        ))
+                    })?;
+            idx_def.namespace = resolved;
+            true
+        } else {
+            false
+        };
         let mut invalidate = WriteBatch::new();
         invalidate.delete(&format!("{READY_PREFIX}{}", idx_def.id))?;
         self.db.commit_batch(&invalidate)?;
@@ -1734,10 +2120,10 @@ impl IndexManager {
             self.db.commit_batch(&clear_batch)?;
         }
 
-        if upgraded_encoding {
-            // Publish the upgraded encoding version after clearing all legacy
-            // entries and BEFORE writing any v1 entries so a crash mid-rebuild
-            // can never leave v0 catalog metadata pointing at v1 index keys.
+        if upgraded_encoding || upgraded_namespace {
+            // Publish upgraded encoding/namespace metadata after clearing all
+            // legacy entries and BEFORE writing rebuilt entries so a crash
+            // mid-rebuild never leaves mismatched catalog metadata on disk.
             let catalog_key = format!("{CATALOG_PREFIX}{}", idx_def.id);
             let catalog_value =
                 serde_json::to_string(&idx_def).map_err(|e| OmniError::IoError(e.to_string()))?;

@@ -1,6 +1,6 @@
 use omni_engine::catalog::Catalog;
 use omni_engine::schema::{Migration, SchemaManager, SchemaOp};
-use omni_engine::secondary_index::{IndexFieldType, IndexManager};
+use omni_engine::secondary_index::{IndexFieldType, IndexManager, IndexNamespace};
 use omni_engine::sql::parse_sql;
 use omni_engine::sql_exec::{ExecResult, SqlExecutor};
 use omni_engine::transaction::TransactionManager;
@@ -3892,4 +3892,333 @@ fn schema_create_index_ssi_blocks_stale_pre_index_dml_transaction() {
             .len(),
         0
     );
+}
+
+#[test]
+fn schema_create_index_rejects_externally_dropped_or_replaced_index_on_retry() {
+    let (db, _dir, executor) = setup();
+    let idx_mgr = Arc::new(IndexManager::new(db.clone()));
+    let schema = SchemaManager::new(db, idx_mgr.clone());
+
+    execute(
+        &executor,
+        "CREATE TABLE ext_drop_tbl (id INTEGER PRIMARY KEY, email TEXT, drop_me TEXT)",
+    );
+    execute(
+        &executor,
+        "INSERT INTO ext_drop_tbl VALUES (1, 'a@x.com', 'v')",
+    );
+
+    let failing = Migration {
+        version: 1,
+        description: "create index then fail".into(),
+        up: vec![
+            SchemaOp::CreateIndex {
+                name: "ext_drop_email_idx".into(),
+                collection: "ext_drop_tbl".into(),
+                fields: vec![("email".into(), IndexFieldType::String)],
+                unique: true,
+            },
+            SchemaOp::RemoveField {
+                collection: "ext_drop_tbl".into(),
+                field_name: "missing_col".into(),
+            },
+        ],
+        down: vec![],
+    };
+    assert!(schema.migrate_up(&failing).is_err());
+
+    let fixed = Migration {
+        version: 1,
+        description: "create index then remove drop_me".into(),
+        up: vec![
+            SchemaOp::CreateIndex {
+                name: "ext_drop_email_idx".into(),
+                collection: "ext_drop_tbl".into(),
+                fields: vec![("email".into(), IndexFieldType::String)],
+                unique: true,
+            },
+            SchemaOp::RemoveField {
+                collection: "ext_drop_tbl".into(),
+                field_name: "drop_me".into(),
+            },
+        ],
+        down: vec![],
+    };
+
+    // Out-of-band drop before retry must NOT silently mark migration Applied.
+    idx_mgr.drop_index("ext_drop_email_idx").unwrap();
+    let err = schema
+        .migrate_up(&fixed)
+        .expect_err("retry must reject missing index from done:<id> receipt");
+    assert!(err.to_string().contains("receipt mismatch"));
+
+    // Replacing with a new same-named index (different ID) must also be rejected.
+    idx_mgr
+        .create_index(
+            "ext_drop_email_idx",
+            "ext_drop_tbl",
+            vec![("email".into(), IndexFieldType::String)],
+            true,
+        )
+        .unwrap();
+    idx_mgr.rebuild_index("ext_drop_email_idx").unwrap();
+    let err2 = schema
+        .migrate_up(&fixed)
+        .expect_err("retry must reject same-named replacement with different ID");
+    assert!(err2.to_string().contains("receipt mismatch"));
+}
+
+#[test]
+fn schema_migration_resumes_completed_create_then_drop_index_and_rejects_fresh_missing_drop() {
+    let (db, _dir, executor) = setup();
+    let idx_mgr = Arc::new(IndexManager::new(db.clone()));
+    let schema = SchemaManager::new(db, idx_mgr.clone());
+
+    execute(
+        &executor,
+        "CREATE TABLE drop_resume_tbl (id INTEGER PRIMARY KEY, email TEXT, old_col TEXT)",
+    );
+    execute(
+        &executor,
+        "INSERT INTO drop_resume_tbl VALUES (1, 'a@x.com', 'v')",
+    );
+
+    // Fresh DropIndex of a non-existent index must still fail.
+    let missing_drop = Migration {
+        version: 1,
+        description: "drop missing index".into(),
+        up: vec![SchemaOp::DropIndex {
+            name: "never_existed_idx".into(),
+        }],
+        down: vec![],
+    };
+    assert!(schema.migrate_up(&missing_drop).is_err());
+
+    // CreateIndex -> DropIndex -> failing RemoveField, then fix RemoveField and retry.
+    let failing = Migration {
+        version: 1,
+        description: "create, drop, then fail".into(),
+        up: vec![
+            SchemaOp::CreateIndex {
+                name: "ephemeral_idx".into(),
+                collection: "drop_resume_tbl".into(),
+                fields: vec![("email".into(), IndexFieldType::String)],
+                unique: false,
+            },
+            SchemaOp::DropIndex {
+                name: "ephemeral_idx".into(),
+            },
+            SchemaOp::RemoveField {
+                collection: "drop_resume_tbl".into(),
+                field_name: "no_such_col".into(),
+            },
+        ],
+        down: vec![],
+    };
+    assert!(schema.migrate_up(&failing).is_err());
+
+    let fixed = Migration {
+        version: 1,
+        description: "create, drop, then remove old_col".into(),
+        up: vec![
+            SchemaOp::CreateIndex {
+                name: "ephemeral_idx".into(),
+                collection: "drop_resume_tbl".into(),
+                fields: vec![("email".into(), IndexFieldType::String)],
+                unique: false,
+            },
+            SchemaOp::DropIndex {
+                name: "ephemeral_idx".into(),
+            },
+            SchemaOp::RemoveField {
+                collection: "drop_resume_tbl".into(),
+                field_name: "old_col".into(),
+            },
+        ],
+        down: vec![],
+    };
+    schema
+        .migrate_up(&fixed)
+        .expect("retry must resume past completed CreateIndex + DropIndex pair");
+    assert!(idx_mgr.definition("ephemeral_idx").is_err());
+}
+
+#[test]
+fn legacy_both_index_blocks_cross_namespace_collision_and_explicit_doc_index_coexists() {
+    let (db, _dir, executor) = setup();
+    let idx_mgr = IndexManager::new(db.clone());
+
+    execute(
+        &executor,
+        "CREATE TABLE shared_dom (id INTEGER PRIMARY KEY, code TEXT)",
+    );
+    execute(&executor, "INSERT INTO shared_dom VALUES (1, 'alpha')");
+
+    // Seed a pre-upgrade legacy index without `namespace` (loads as `Both`),
+    // plus a coexisting document row under the same collection & PK.
+    let mut seed = WriteBatch::new();
+    seed.set(
+        "\u{0}IDX_CATALOG\u{0}88",
+        "{\"id\":88,\"name\":\"legacy_shared_code_idx\",\"collection\":\"shared_dom\",\"fields\":[[\"code\",\"String\"]],\"unique\":false,\"encoding_version\":1}".into(),
+    )
+    .unwrap();
+    seed.set("\u{0}IDX_READY\u{0}88", "ready".into()).unwrap();
+    seed.set("\u{0}IDX_NEXT_ID\u{0}", "89".into()).unwrap();
+    seed.set(
+        "shared_dom:1",
+        "{\"code\":\"alpha\",\"doc_tag\":\"d1\"}".into(),
+    )
+    .unwrap();
+    db.commit_batch(&seed).unwrap();
+
+    // Ambiguous legacy `Both` index must NOT be used by SQL optimizer,
+    // must block document index removal/writes, and must fail rebuild until bound.
+    let plan = explain_plan(
+        &executor,
+        "EXPLAIN SELECT id FROM shared_dom WHERE code = 'alpha'",
+    );
+    assert!(
+        !plan.contains("legacy_shared_code_idx"),
+        "ambiguous legacy Both index must not be planned for SQL: {plan}"
+    );
+    let mut doc_del = WriteBatch::new();
+    assert!(
+        idx_mgr
+            .remove_document_indexes(
+                "shared_dom",
+                "1",
+                &serde_json::json!({"code": "alpha"}),
+                &mut doc_del
+            )
+            .is_err(),
+        "document delete must not silently remove keys from an unbound legacy Both index"
+    );
+    assert!(
+        idx_mgr.rebuild_index("legacy_shared_code_idx").is_err(),
+        "rebuild must require explicit namespace binding when ownership is ambiguous"
+    );
+
+    // Explicitly bind the legacy index to SQL and verify SQL planning + explicit
+    // document index creation on the same collection name both work cleanly.
+    assert_eq!(
+        idx_mgr
+            .bind_index_namespace("legacy_shared_code_idx", IndexNamespace::Sql)
+            .unwrap(),
+        1
+    );
+    let plan_after = explain_plan(
+        &executor,
+        "EXPLAIN SELECT id FROM shared_dom WHERE code = 'alpha'",
+    );
+    assert!(
+        plan_after.contains("legacy_shared_code_idx"),
+        "explicitly SQL-bound legacy index must be usable by SQL planner: {plan_after}"
+    );
+
+    // Explicit document index on `shared_dom` works even with a SQL-only table of
+    // the same name and even on a document-only field (`doc_tag`).
+    idx_mgr
+        .create_document_index(
+            "shared_dom_doc_tag_idx",
+            "shared_dom",
+            vec![("doc_tag".into(), IndexFieldType::String)],
+            false,
+        )
+        .unwrap();
+    assert_eq!(idx_mgr.rebuild_index("shared_dom_doc_tag_idx").unwrap(), 1);
+    assert_eq!(
+        idx_mgr
+            .lookup("shared_dom_doc_tag_idx", &[serde_json::json!("d1")])
+            .unwrap(),
+        vec!["1".to_string()]
+    );
+}
+
+#[test]
+fn v0_single_signed_zero_composite_uses_two_exact_ranges_without_spurious_ssi_conflict() {
+    let (db, _dir, executor) = setup();
+    let idx_mgr = IndexManager::new(db.clone());
+
+    execute(
+        &executor,
+        "CREATE TABLE v0_pair_tbl (id INTEGER PRIMARY KEY, score FLOAT, tag TEXT)",
+    );
+    let idx_id = idx_mgr
+        .create_index(
+            "v0_pair_u",
+            "v0_pair_tbl",
+            vec![
+                ("score".into(), IndexFieldType::Float),
+                ("tag".into(), IndexFieldType::String),
+            ],
+            true,
+        )
+        .unwrap();
+    let mut def = idx_mgr.definition("v0_pair_u").unwrap();
+    def.encoding_version = 0;
+
+    let mut seed = WriteBatch::new();
+    seed.set(
+        &format!("\u{0}IDX_CATALOG\u{0}{idx_id}"),
+        serde_json::to_string(&def).unwrap(),
+    )
+    .unwrap();
+    seed.set(&format!("\u{0}IDX_READY\u{0}{idx_id}"), "ready".into())
+        .unwrap();
+    // Seed (-0.0, 'm') and (+0.0, 'a') in v0 format.
+    let m_hex = "6d";
+    let a_hex = "61";
+    seed.set(
+        &format!("\u{0}IDX\u{0}{idx_id:08}\u{0}7fffffffffffffff\u{0}{m_hex}\u{0}1"),
+        "1".into(),
+    )
+    .unwrap();
+    seed.set(
+        &format!("\u{0}IDX\u{0}{idx_id:08}\u{0}8000000000000000\u{0}{a_hex}\u{0}2"),
+        "2".into(),
+    )
+    .unwrap();
+    db.commit_batch(&seed).unwrap();
+
+    // Lookup (0.0, 'm') finds row 1 and does not return row 2.
+    assert_eq!(
+        idx_mgr
+            .lookup(
+                "v0_pair_u",
+                &[serde_json::json!(0.0), serde_json::json!("m")]
+            )
+            .unwrap(),
+        vec!["1".to_string()]
+    );
+
+    // Explicit SSI transaction inserting (0.0, 'n') must record two exact ranges
+    // (for -0.0/'n' and +0.0/'n') rather than one broad range spanning (+0.0, 'a'),
+    // so a concurrent insert of (+0.0, 'b') commits without a spurious SSI abort.
+    let mgr = TransactionManager::new(db.clone());
+    let mut txn = mgr.begin();
+    let mut tx_exec = SqlExecutor::with_transaction(
+        db.clone(),
+        Arc::new(Catalog::at_snapshot(db, txn.read_seq)),
+        txn.read_seq,
+        &HashMap::new(),
+    );
+    execute(&tx_exec, "INSERT INTO v0_pair_tbl VALUES (3, 0.0, 'n')");
+    if let Some(reads) = tx_exec.drain_reads() {
+        txn.read_set.extend(reads.keys);
+        txn.read_ranges.extend(reads.ranges);
+    }
+    if let Some(batch) = tx_exec.flush_batch() {
+        for (k, v, ttl) in batch.buffered_writes {
+            txn.write_set
+                .insert(String::from_utf8(k).unwrap(), (Some(v), ttl));
+        }
+    }
+
+    // Concurrent autocommit insert at (+0.0, 'b') sits between (-0.0, 'n') and (+0.0, 'n')
+    // lexicographically, so it would collide with a broad bounding range but NOT with
+    // two exact ranges.
+    execute(&executor, "INSERT INTO v0_pair_tbl VALUES (4, 0.0, 'b')");
+    mgr.commit(&mut txn)
+        .expect("single-zero composite unique check should use two exact SSI ranges");
 }

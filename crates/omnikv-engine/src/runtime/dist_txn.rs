@@ -749,9 +749,21 @@ impl TwoPhaseCoordinator {
     /// by durably logging `"ABORT"` first for `"PREPARE"`-only records) to each
     /// participant via `dispatch(participant_id, txn_id, decision)`. Writes
     /// `"COMPLETE"` ONLY after every participant acknowledges the decision.
-    pub fn recover_with<F>(&self, mut dispatch: F) -> Result<RecoveryReport, OmniError>
+    pub fn recover_with<F>(&self, dispatch: F) -> Result<RecoveryReport, OmniError>
     where
         F: FnMut(u64, GlobalTxnId, &str) -> Result<(), OmniError>,
+    {
+        self.recover_with_before_lock_hook(dispatch, |_| {})
+    }
+
+    fn recover_with_before_lock_hook<F, H>(
+        &self,
+        mut dispatch: F,
+        mut before_lock: H,
+    ) -> Result<RecoveryReport, OmniError>
+    where
+        F: FnMut(u64, GlobalTxnId, &str) -> Result<(), OmniError>,
+        H: FnMut(GlobalTxnId),
     {
         self.db.ensure_cluster_linearizable()?;
         let mut in_doubt = self.recover()?;
@@ -774,6 +786,7 @@ impl TwoPhaseCoordinator {
                 });
                 continue;
             }
+            before_lock(txn_id);
             // Serialize with any live coordinator handle sharing this DB and
             // re-read the coordinator records for `txn_id` from one consistent
             // snapshot under the decision lock so a transaction that committed,
@@ -1582,16 +1595,47 @@ pub(crate) fn collect_prepared_reservations(
     db: &OmniKV,
 ) -> Result<HashMap<String, (u64, GlobalTxnId)>, OmniError> {
     let entries = db.scan("__2PC_PREPARE__/", "__2PC_PREPARE__/~", u64::MAX)?;
-    let mut reserved = HashMap::new();
+    let mut reserved: HashMap<String, (u64, GlobalTxnId)> = HashMap::new();
     for (key, value) in entries {
-        let Some(entry) = parse_participant_entry(&key, &value) else {
+        if !is_authoritative_participant_key(&key) {
+            // Explicit legacy marker (`__2PC_PREPARE__/{coord}_{seq}` without node_id): skip.
             continue;
+        }
+        let Some((key_node_id, key_txn_id)) = parse_participant_prepare_key(&key) else {
+            return Err(OmniError::IoError(format!(
+                "malformed authoritative 2PC participant key '{key}'"
+            )));
         };
+        let entry: ParticipantLogEntry = serde_json::from_str(&value).map_err(|error| {
+            OmniError::IoError(format!(
+                "malformed authoritative 2PC participant record '{key}': {error}"
+            ))
+        })?;
+        if entry.node_id != key_node_id || entry.txn_id != key_txn_id {
+            return Err(OmniError::IoError(format!(
+                "mismatched authoritative 2PC participant identity in '{key}'"
+            )));
+        }
+        if !matches!(entry.state.as_str(), "PREPARED" | "COMMITTED" | "ABORTED") {
+            return Err(OmniError::IoError(format!(
+                "invalid 2PC participant state '{}' in '{key}'",
+                entry.state
+            )));
+        }
         if entry.state != "PREPARED" {
             continue;
         }
+        let owner = (entry.node_id, entry.txn_id);
         for write in entry.writes {
-            reserved.insert(write.key, (entry.node_id, entry.txn_id));
+            if let Some(&existing) = reserved.get(&write.key)
+                && existing != owner
+            {
+                return Err(OmniError::IoError(format!(
+                    "conflicting 2PC prepared reservation for key '{}': owned by {:?} and {:?}",
+                    write.key, existing, owner
+                )));
+            }
+            reserved.insert(write.key, owner);
         }
     }
     Ok(reserved)
@@ -3737,17 +3781,33 @@ mod tests {
             .unwrap();
         primary.prepare(txn_id).unwrap();
 
-        // Hold `decision_lock(txn_id)` while a background `recover_with` runs
-        // its initial `recover()` scan and blocks right before the decision lock.
+        // Hold `decision_lock(txn_id)` while a background recovery runs its
+        // initial `recover()` scan and signals right after selecting `txn_id`
+        // (before attempting to acquire `decision_lock`).
         let lock = peer.decision_lock(txn_id).unwrap();
         let guard = lock.lock().unwrap();
+        let (selected_tx, selected_rx) = std::sync::mpsc::channel();
 
         let peer_db = coord_db.clone();
         let handle = std::thread::spawn(move || {
             let recovery = TwoPhaseCoordinator::new(1, peer_db, 5_000);
-            recovery.recover_with(|_, _, _| Ok(())).unwrap()
+            recovery
+                .recover_with_before_lock_hook(
+                    |participant, dispatched_txn, decision| {
+                        panic!(
+                            "recover_with must not dispatch a decision for GC'd txn (participant={participant}, txn={dispatched_txn:?}, decision={decision})"
+                        )
+                    },
+                    |selected| {
+                        let _ = selected_tx.send(selected);
+                    },
+                )
+                .unwrap()
         });
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        let selected = selected_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("recovery must select txn_id during initial scan");
+        assert_eq!(selected, txn_id);
 
         // Simulate primary committing, finalizing, clearing live owner, and GC
         // removing all coordinator log entries for `txn_id` before releasing lock.
@@ -3773,6 +3833,97 @@ mod tests {
                 .unwrap(),
             None,
             "recover_with must not write spurious ABORT after PREPARE was finalized and GC'd"
+        );
+    }
+
+    #[test]
+    fn collect_prepared_reservations_rejects_malformed_authoritative_records_and_conflicting_owners()
+     {
+        // Case 1: legacy marker skipped, repeated keys for same owner valid,
+        // conflicting owners for the same key rejected.
+        let (db, _dir) = test_db();
+        let t1 = (1, 10);
+        let t2 = (1, 11);
+        let entry1 = ParticipantLogEntry {
+            txn_id: t1,
+            node_id: 10,
+            state: "PREPARED".into(),
+            writes: vec![
+                DistWrite {
+                    node_id: 10,
+                    key: "shared_k".into(),
+                    value: Some("v1".into()),
+                    ttl: 0,
+                },
+                DistWrite {
+                    node_id: 10,
+                    key: "shared_k".into(),
+                    value: Some("v1b".into()),
+                    ttl: 0,
+                },
+            ],
+            prepare_seq: 1,
+            commit_seq: None,
+            snapshot_imported: false,
+            unvalidated: false,
+        };
+        let mut seed = WriteBatch::new();
+        seed.set(&legacy_participant_prepare_key(t1), "PREPARED:10".into())
+            .unwrap();
+        seed.set(
+            &participant_prepare_key(10, t1),
+            serde_json::to_string(&entry1).unwrap(),
+        )
+        .unwrap();
+        db.commit_batch_local(&seed).unwrap();
+        let reserved = collect_prepared_reservations(&db).unwrap();
+        assert_eq!(reserved.get("shared_k"), Some(&(10, t1)));
+
+        // Insert a second valid PREPARED record reserving the same key for t2.
+        let entry2 = ParticipantLogEntry {
+            txn_id: t2,
+            node_id: 10,
+            state: "PREPARED".into(),
+            writes: vec![DistWrite {
+                node_id: 10,
+                key: "shared_k".into(),
+                value: Some("v2".into()),
+                ttl: 0,
+            }],
+            prepare_seq: 2,
+            commit_seq: None,
+            snapshot_imported: false,
+            unvalidated: false,
+        };
+        let mut conflict = WriteBatch::new();
+        conflict
+            .set(
+                &participant_prepare_key(10, t2),
+                serde_json::to_string(&entry2).unwrap(),
+            )
+            .unwrap();
+        db.commit_batch_local(&conflict).unwrap();
+        let conflict_err = collect_prepared_reservations(&db)
+            .expect_err("conflicting owners in prepared reservations must fail");
+        assert!(
+            conflict_err
+                .to_string()
+                .contains("conflicting 2PC prepared")
+        );
+
+        // Case 2: malformed JSON on an authoritative key must fail closed.
+        let (db2, _dir2) = test_db();
+        let mut corrupt = WriteBatch::new();
+        corrupt
+            .set(&participant_prepare_key(10, t1), "{not-json".into())
+            .unwrap();
+        db2.commit_batch_local(&corrupt).unwrap();
+        let corrupt_err = collect_prepared_reservations(&db2)
+            .expect_err("malformed authoritative 2PC record must fail closed");
+        assert!(
+            corrupt_err
+                .to_string()
+                .contains("malformed authoritative 2PC participant record")
         );
     }
 }

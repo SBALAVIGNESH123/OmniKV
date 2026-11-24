@@ -1404,10 +1404,62 @@ impl OmniKV {
         self.ssi_history.clone()
     }
 
+    /// Fails closed if `manifest_path`'s directory contains an unfinished
+    /// snapshot promotion or failed rollback directory, preventing `open()`
+    /// from silently initializing an empty database over preserved recovery data.
+    fn check_no_unfinished_snapshot_promotion(manifest_path: &str) -> Result<(), OmniError> {
+        const LEGACY_OLD_SNAPSHOT_DIR: &str = "old_snapshot";
+        const OLD_SNAPSHOT_DIR_PREFIX: &str = "old_snapshot_";
+        const INSTALL_COMPLETE_MARKER: &str = ".install_complete";
+        const ROLLBACK_FAILED_MARKER: &str = ".rollback_failed";
+
+        let manifest_exists = Path::new(manifest_path).exists();
+        let data_dir = Path::new(manifest_path)
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let entries = match std::fs::read_dir(data_dir) {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == ErrorKind::NotFound => return Ok(()),
+            Err(err) => return Err(err.into()),
+        };
+
+        for entry in entries {
+            let entry = entry?;
+            let name = entry.file_name();
+            let is_rollback_dir = name == LEGACY_OLD_SNAPSHOT_DIR
+                || name
+                    .to_str()
+                    .is_some_and(|s| s.starts_with(OLD_SNAPSHOT_DIR_PREFIX));
+            if !is_rollback_dir {
+                continue;
+            }
+            let path = entry.path();
+            if path.is_dir() && std::fs::read_dir(&path)?.next().is_none() {
+                // Empty rollback directory left by a clean rollback or crash
+                // right before removing the empty dir; safe to clean up.
+                let _ = std::fs::remove_dir(&path);
+                continue;
+            }
+            let has_complete = path.join(INSTALL_COMPLETE_MARKER).exists();
+            let has_failed = path.join(ROLLBACK_FAILED_MARKER).exists();
+            if has_complete && !has_failed && manifest_exists {
+                continue;
+            }
+            return Err(OmniError::IoError(format!(
+                "cannot open database '{}': unfinished snapshot promotion/rollback directory '{}' exists; restore from the rollback directory or explicitly set it aside before reopening",
+                manifest_path,
+                path.display()
+            )));
+        }
+        Ok(())
+    }
+
     /// Opens an OmniKV database from the given manifest and WAL paths.
     /// Recovers state from WAL and initializes the storage engine.
     pub fn open(manifest_path: &str, wal_path: &str) -> Result<Arc<Self>, OmniError> {
         let db_lock = DatabaseLock::acquire(manifest_path)?;
+        Self::check_no_unfinished_snapshot_promotion(manifest_path)?;
         let recovered = Self::recover_storage_roots(manifest_path, wal_path)?;
 
         let initial_roots = StorageRoots {
@@ -1974,20 +2026,20 @@ impl OmniKV {
         Ok(results)
     }
 
-    /// Collects up to `limit` visible entries whose keys begin with `prefix` at `read_seq`.
-    pub(crate) fn scan_prefix_limit(
+    /// Collects up to `limit` visible entries in `[start_key, end_exclusive)` at `read_seq`.
+    pub(crate) fn scan_exclusive_limit(
         &self,
-        prefix: &str,
+        start_key: &str,
+        end_exclusive: Option<&str>,
         read_seq: u64,
         limit: usize,
     ) -> Result<Vec<(String, String)>, OmniError> {
-        let end = Self::prefix_successor_str(prefix);
-        let end_bytes = end.as_deref().map(string_to_key);
+        let end_bytes = end_exclusive.map(string_to_key);
         let end_bound = match end_bytes.as_deref() {
             Some(bytes) => ScanEnd::Exclusive(bytes),
             None => ScanEnd::Unbounded,
         };
-        let mut iter = self.scan_iter_bounds(string_to_key(prefix), end_bound, read_seq)?;
+        let mut iter = self.scan_iter_bounds(string_to_key(start_key), end_bound, read_seq)?;
         let mut results = Vec::with_capacity(limit.min(iter.candidates.len()));
         while results.len() < limit {
             let Some(entry) = iter.try_next()? else {
@@ -1996,6 +2048,17 @@ impl OmniKV {
             results.push(entry);
         }
         Ok(results)
+    }
+
+    /// Collects up to `limit` visible entries whose keys begin with `prefix` at `read_seq`.
+    pub(crate) fn scan_prefix_limit(
+        &self,
+        prefix: &str,
+        read_seq: u64,
+        limit: usize,
+    ) -> Result<Vec<(String, String)>, OmniError> {
+        let end = Self::prefix_successor_str(prefix);
+        self.scan_exclusive_limit(prefix, end.as_deref(), read_seq, limit)
     }
 
     /// Collects up to `limit` visible entries in the lexical range `[start_key, end_key]`.
@@ -3591,9 +3654,13 @@ impl OmniKV {
     pub fn run_garbage_collection(&self) -> Result<(), OmniError> {
         let started_at = std::time::Instant::now();
         let mut stats = CompactionStats::default();
+        // Acquire the exclusive transition barrier plus write_mutex so no
+        // writer or L0/L1 compaction can mutate memtables, publish stale-heap
+        // SSTables, or race heap swaps until GC publishes the replacement root.
+        // Lock-free readers keep using their previously captured Arc<StorageRoots>.
         let _topology_guard = self
             .transition_guard
-            .read()
+            .write()
             .map_err(|_| OmniError::LockPoisoned("transition_guard".into()))?;
         let write_guard = self
             .write_mutex
@@ -3613,8 +3680,8 @@ impl OmniKV {
                 versions.insert(seq, (offset, length, crc, expiry));
             };
 
-        let base_mmap = self.roots.load().base_mmap.clone();
-        let reader = SSTableReader::from_mmap(base_mmap);
+        let cur_roots = self.roots.load();
+        let reader = SSTableReader::from_mmap(cur_roots.base_mmap.clone());
         for rec in reader.iter_from(b"") {
             if rec.is_valid() {
                 add_to_merged(
@@ -3628,8 +3695,7 @@ impl OmniKV {
             }
         }
 
-        let sstables = self.roots.load().sstables.clone();
-        for (mmap, _, _) in &**sstables {
+        for (mmap, _, _) in &**cur_roots.sstables {
             let reader = SSTableReader::from_mmap(mmap.clone());
             for rec in reader.iter_from(b"") {
                 if rec.is_valid() {
@@ -3645,8 +3711,7 @@ impl OmniKV {
             }
         }
 
-        let l1_sstables = self.roots.load().l1_sstables.clone();
-        for (mmap, _, _) in &**l1_sstables {
+        for (mmap, _, _) in &**cur_roots.l1_sstables {
             let reader = SSTableReader::from_mmap(mmap.clone());
             for rec in reader.iter_from(b"") {
                 if rec.is_valid() {
@@ -3662,8 +3727,24 @@ impl OmniKV {
             }
         }
 
-        let memtable = self.roots.load().memtable.clone();
-        for shard in memtable.iter() {
+        for frozen in cur_roots.frozen_memtables.iter() {
+            for shard in frozen.iter() {
+                for entry in shard.iter() {
+                    let key = entry.key().0.clone();
+                    let seq = entry.key().1.0;
+                    add_to_merged(
+                        key,
+                        seq,
+                        entry.value().0,
+                        entry.value().1,
+                        entry.value().2,
+                        entry.value().3,
+                    );
+                }
+            }
+        }
+
+        for shard in cur_roots.memtable.iter() {
             for entry in shard.iter() {
                 let key = entry.key().0.clone();
                 let seq = entry.key().1.0;
@@ -3786,19 +3867,31 @@ impl OmniKV {
         let new_base_mmap = unsafe { MmapOptions::new().map(&new_base_file)? };
 
         let new_heap_reader = OpenOptions::new().read(true).open(&new_heap_path)?;
-        // Capture the pre-GC manifest before publishing the replacement
-        // topology. Cleanup must delete these obsolete files, never the new
-        // paths that are about to become the active roots.
-        let old_manifest = self.roots.load().manifest.clone().as_ref().clone();
+        let old_manifest = cur_roots.manifest.as_ref().clone();
         let mut manifest_for_roots = old_manifest.clone();
         manifest_for_roots.heap_path = new_heap_path.clone();
         manifest_for_roots.base_path = new_base_path.clone();
         manifest_for_roots.sstables.clear();
         manifest_for_roots.l1_sstables.clear();
+        manifest_for_roots.max_seq = manifest_for_roots
+            .max_seq
+            .max(self.global_seq.load(Ordering::SeqCst));
         bloom.save(&bloom_path_for_base(&new_base_path))?;
         manifest_for_roots.save(&self.manifest_path)?;
 
-        let cur = self.roots.load();
+        // Writers and compactions are fenced by exclusive `transition_guard` +
+        // `write_mutex`, and every memtable/frozen_memtable entry has been
+        // rewritten into `new_base_mmap` / `new_heap_path`. Publish brand-new
+        // empty memtables so no pointer addressing the old heap generation can
+        // ever be read against the replacement heap. Existing readers keep
+        // reading the previous `Arc<StorageRoots>` untouched.
+        let new_empty_memtable: SharedMemtable = Arc::new(std::array::from_fn(|_| SkipMap::new()));
+        let mut heap_lock = self
+            .heap_file
+            .lock()
+            .map_err(|_| OmniError::LockPoisoned("heap_file".into()))?;
+        *heap_lock = new_heap_file;
+        self.heap_offset.store(current_offset, Ordering::SeqCst);
         self.roots.store(Arc::new(StorageRoots {
             base_mmap: Arc::new(new_base_mmap),
             base_bloom: Arc::new(bloom),
@@ -3807,24 +3900,11 @@ impl OmniKV {
             heap_reader: Arc::new(new_heap_reader),
             heap_generation: self.next_heap_generation.fetch_add(1, Ordering::Relaxed),
             manifest: Arc::new(manifest_for_roots),
-            memtable: cur.memtable.clone(),
-            frozen_memtables: cur.frozen_memtables.clone(),
+            memtable: new_empty_memtable,
+            frozen_memtables: Arc::new(Vec::new()),
         }));
         output_guard.disarm();
         self.block_cache.invalidate_all();
-
-        let mut heap_lock = self
-            .heap_file
-            .lock()
-            .map_err(|_| OmniError::LockPoisoned("heap_file".into()))?;
-        *heap_lock = new_heap_file;
-        self.heap_offset.store(current_offset, Ordering::SeqCst);
-        // NOTE: Do NOT clear the active memtable here.
-        // Writes that arrived between GC start and this point are in the
-        // active memtable but NOT in the new base file. Clearing them
-        // would silently discard committed data.
-        // These entries are harmless duplicates that will be deduplicated
-        // during the next compaction cycle.
 
         std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_secs(5));
@@ -4687,5 +4767,102 @@ mod tests {
                 ("gen/b".to_string(), "old_value_b".to_string()),
             ]
         );
+    }
+
+    #[test]
+    fn heap_gc_without_prior_flush_does_not_publish_stale_memtable_offsets() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let manifest = dir
+            .path()
+            .join("manifest.json")
+            .to_str()
+            .expect("manifest path")
+            .to_string();
+        let wal = dir
+            .path()
+            .join("wal.bin")
+            .to_str()
+            .expect("wal path")
+            .to_string();
+        let db = OmniKV::open(&manifest, &wal).expect("open db");
+
+        // Commit `z` first (heap offset 0) and then `a` without flushing.
+        // GC rewrites the heap in sorted key order (`a` at offset 0, `z` later).
+        let mut b1 = WriteBatch::new();
+        b1.set("z", "Z".into()).expect("stage z");
+        db.commit_batch(&b1).expect("commit z");
+
+        let mut b2 = WriteBatch::new();
+        b2.set("a", "A".into()).expect("stage a");
+        db.commit_batch(&b2).expect("commit a");
+
+        // Capture a pre-GC lazy iterator before GC runs (still without flushing).
+        let snap_seq = db.get_seq();
+        let mut pre_gc_iter = db
+            .scan_iter_bounds(string_to_key("a"), ScanEnd::Inclusive(b"z"), snap_seq)
+            .expect("start pre-gc scan");
+
+        db.run_garbage_collection()
+            .expect("heap gc without prior flush must succeed");
+
+        // Uncached post-GC reads must read the replacement heap via the rebuilt
+        // base SSTable instead of stale memtable pointers into the old heap.
+        assert_eq!(
+            db.find("z", db.get_seq()).expect("read z after gc"),
+            Some("Z".into())
+        );
+        assert_eq!(
+            db.find("a", db.get_seq()).expect("read a after gc"),
+            Some("A".into())
+        );
+
+        let mut pre_gc_rows = Vec::new();
+        while let Some(pair) = pre_gc_iter.try_next().expect("read pre-gc iter") {
+            pre_gc_rows.push(pair);
+        }
+        assert_eq!(
+            pre_gc_rows,
+            vec![
+                ("a".to_string(), "A".to_string()),
+                ("z".to_string(), "Z".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn open_fails_closed_when_unfinished_snapshot_rollback_dir_exists() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let manifest_path = dir.path().join("manifest.json");
+        let wal_path = dir.path().join("wal.bin");
+        let manifest_str = manifest_path.to_str().expect("manifest path").to_string();
+        let wal_str = wal_path.to_str().expect("wal path").to_string();
+
+        // Simulate crash after moving active manifest into `old_snapshot_*`
+        // before promoting the new snapshot (manifest absent from data_dir).
+        let unresolved = dir.path().join("old_snapshot_interrupted");
+        std::fs::create_dir_all(&unresolved).expect("create unresolved dir");
+        let backup_manifest = unresolved.join("manifest.json");
+        std::fs::write(&backup_manifest, b"original-manifest").expect("write backup manifest");
+
+        let err = OmniKV::open(&manifest_str, &wal_str)
+            .err()
+            .expect("open must fail closed on unfinished snapshot promotion");
+        assert!(
+            err.to_string().contains("unfinished snapshot promotion"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            !manifest_path.exists(),
+            "open must not create an empty manifest when unfinished rollback dir exists"
+        );
+        assert_eq!(
+            std::fs::read(&backup_manifest).expect("backup must remain intact"),
+            b"original-manifest"
+        );
+
+        // Removing the unresolved dir lets a genuinely fresh database open cleanly.
+        std::fs::remove_dir_all(&unresolved).expect("clear unresolved dir");
+        let fresh = OmniKV::open(&manifest_str, &wal_str).expect("fresh open should succeed");
+        drop(fresh);
     }
 }
