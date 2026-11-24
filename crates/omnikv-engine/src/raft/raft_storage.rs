@@ -425,15 +425,39 @@ fn sync_dir(dir: &std::path::Path) -> std::io::Result<()> {
     Ok(())
 }
 
+fn has_valid_complete_marker(dir: &std::path::Path) -> bool {
+    std::fs::read(dir.join(INSTALL_COMPLETE_MARKER))
+        .ok()
+        .as_deref()
+        .is_some_and(|b| b == b"ok" || b == b"rolled_back")
+}
+
 fn write_durable_marker(path: &std::path::Path, contents: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
-    let mut file = std::fs::File::create(path)?;
-    file.write_all(contents)?;
-    file.sync_all()?;
-    if let Some(parent) = path.parent() {
-        sync_dir(parent)?;
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| std::io::Error::other("invalid marker path"))?;
+    let tmp_path = path.with_file_name(format!("{file_name}.tmp"));
+    let result = (|| {
+        let mut file = std::fs::File::create(&tmp_path)?;
+        file.write_all(contents)?;
+        file.sync_all()?;
+        drop(file);
+        crate::failpoints::maybe_fail("snapshot::write_install_complete_after_create")?;
+        std::fs::rename(&tmp_path, path)?;
+        if let Some(parent) = path.parent()
+            && let Err(err) = sync_dir(parent)
+        {
+            let _ = std::fs::remove_file(path);
+            return Err(err);
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp_path);
     }
-    Ok(())
+    result
 }
 
 fn is_empty_dir(path: &std::path::Path) -> std::io::Result<bool> {
@@ -442,7 +466,7 @@ fn is_empty_dir(path: &std::path::Path) -> std::io::Result<bool> {
 
 fn retire_completed_rollback_dir(dir: &std::path::Path) -> std::io::Result<()> {
     let marker_path = dir.join(INSTALL_COMPLETE_MARKER);
-    if !marker_path.exists() || dir.join(ROLLBACK_FAILED_MARKER).exists() {
+    if !has_valid_complete_marker(dir) || dir.join(ROLLBACK_FAILED_MARKER).exists() {
         return Err(std::io::Error::other(
             "cannot retire rollback directory without a clean install-complete marker",
         ));
@@ -890,6 +914,9 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
                     .expect("RaftStorage meta lock poisoned: fatal invariant");
                 let mut next = meta.clone();
                 next.last_purged_log_id = Some(floor_log_id);
+                if next.last_log_id.is_none_or(|last| last < floor_log_id) {
+                    next.last_log_id = Some(floor_log_id);
+                }
                 self.save_meta(&next, &mut batch);
                 next
             };
@@ -1357,6 +1384,7 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
             l1_sstables: vec![],
             max_seq: 0,
             wal_checkpoint_seq: 0,
+            read_seq_floor: 0,
         };
         tmp_manifest
             .save(&tmp_manifest_path)
@@ -1476,6 +1504,7 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
             return Err(io_err("snapshot sequence floor overflow"));
         }
         installed_manifest.max_seq = snapshot_floor;
+        installed_manifest.read_seq_floor = snapshot_floor;
         installed_manifest
             .save(&tmp_manifest_path)
             .map_err(|e| io_err(&format!("save installed snapshot manifest: {e}")))?;
@@ -1499,9 +1528,7 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
             let name = entry.file_name();
             if is_rollback_dir_name(&name) {
                 let path = entry.path();
-                if path.join(INSTALL_COMPLETE_MARKER).exists()
-                    && !path.join(ROLLBACK_FAILED_MARKER).exists()
-                {
+                if has_valid_complete_marker(&path) && !path.join(ROLLBACK_FAILED_MARKER).exists() {
                     let _ = retire_completed_rollback_dir(&path);
                 } else if path.is_dir() && is_empty_dir(&path).unwrap_or(false) {
                     // An empty rollback dir can only remain after a clean
@@ -2558,11 +2585,19 @@ mod tests {
             "log index 0 must be purged when last_purged_log_id started at None"
         );
         let reloaded = OmniRaftStorage::new(db.clone());
-        assert_eq!(
-            reloaded.meta.lock().expect("meta lock").last_purged_log_id,
-            Some(target),
-            "persisted RAFT_META_KEY must reflect advanced purge floor"
-        );
+        {
+            let meta = reloaded.meta.lock().expect("meta lock");
+            assert_eq!(
+                meta.last_purged_log_id,
+                Some(target),
+                "persisted RAFT_META_KEY must reflect advanced purge floor"
+            );
+            assert_eq!(
+                meta.last_log_id,
+                Some(target),
+                "persisted last_log_id must advance to purge floor when no local entries remain"
+            );
+        }
 
         // Purging at u64::MAX must never overflow or delete `__sys__/raft/log/vote`.
         let max_target = LogId::new(leader, u64::MAX);
@@ -2746,6 +2781,37 @@ mod tests {
         );
         tm.commit(&mut fresh_txn)
             .expect("post-install read-only txn must commit cleanly");
+
+        // Reopen DB: persisted read_seq_floor must keep rejecting the stale pre-install seq.
+        let stale_seq = txn_read.read_seq;
+        drop(pre_iter);
+        drop(tm);
+        drop(dst_storage);
+        drop(dst_db);
+        let reopened = OmniKV::open(
+            dst_dir
+                .path()
+                .join("manifest.json")
+                .to_str()
+                .expect("reopen manifest"),
+            dst_dir.path().join("wal.bin").to_str().expect("reopen wal"),
+        )
+        .expect("reopen dst db");
+        assert!(
+            matches!(
+                reopened.find("k", stale_seq),
+                Err(crate::OmniError::StaleSnapshot { .. })
+            ),
+            "stale pre-install seq must remain rejected after restart"
+        );
+        let fresh_snap = reopened.snapshot();
+        assert_eq!(
+            reopened
+                .find("k", fresh_snap)
+                .expect("fresh post-reopen read"),
+            Some("new".into())
+        );
+        reopened.unregister_snapshot(fresh_snap);
     }
 
     #[tokio::test]

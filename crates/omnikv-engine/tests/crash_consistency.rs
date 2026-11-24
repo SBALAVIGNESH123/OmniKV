@@ -682,14 +682,18 @@ fn snapshot_promotion_rollback_on_rename_and_directory_sync_failures() {
 
                 registry.reset();
                 registry.arm(fp);
-                let res = dst_storage
+                let err = dst_storage
                     .install_snapshot(
                         &snap_meta,
                         Box::new(std::io::Cursor::new(snap_bytes.clone())),
                     )
-                    .await;
+                    .await
+                    .expect_err("armed failpoint must fail install_snapshot");
                 registry.reset();
-                assert!(res.is_err(), "failpoint {fp} must fail install_snapshot");
+                assert!(
+                    err.to_string().contains(fp),
+                    "expected error to identify armed failpoint '{fp}', got: {err}"
+                );
             }
             let reopened = OmniKV::open(&dst_m, &dst_w)
                 .unwrap_or_else(|e| panic!("reopen after rollback at {fp} failed: {e}"));
@@ -745,7 +749,7 @@ fn snapshot_promotion_fails_closed_when_rollback_sync_or_marker_fails() {
             "failed rollback sync must leave .rollback_failed and fail reopen closed"
         );
 
-        // Case 2: `.install_complete` marker persistence fails in Phase H.
+        // Case 2: `.install_complete` marker persistence fails AFTER temp file creation.
         let dir2 = TempDir::new().expect("dir2");
         let (m2, w2) = fresh_db_paths(&dir2);
         {
@@ -754,13 +758,18 @@ fn snapshot_promotion_fails_closed_when_rollback_sync_or_marker_fails() {
             wb.set("k", "original".into()).expect("set");
             db2.commit_batch(&wb).expect("commit");
             let mut storage2 = OmniRaftStorage::new(db2.clone());
-            registry.arm("snapshot::write_install_complete");
+            registry.arm("snapshot::write_install_complete_after_create");
             let err = storage2
                 .install_snapshot(&snap_meta, Box::new(std::io::Cursor::new(snap_bytes)))
                 .await
                 .expect_err("Phase H marker write failure must surface error");
             registry.reset();
             assert!(err.to_string().contains("operator recovery required"));
+            assert!(
+                err.to_string()
+                    .contains("snapshot::write_install_complete_after_create"),
+                "expected armed marker failpoint in error: {err}"
+            );
             assert_eq!(
                 db2.find_latest_internal("k").expect("read live k"),
                 Some("snap_new".into())
@@ -768,7 +777,7 @@ fn snapshot_promotion_fails_closed_when_rollback_sync_or_marker_fails() {
         }
         assert!(
             OmniKV::open(&m2, &w2).is_err(),
-            "preserved rollback dir without .install_complete must fail reopen closed"
+            "failed marker write after temp creation must leave no .install_complete and fail reopen closed"
         );
     });
 }

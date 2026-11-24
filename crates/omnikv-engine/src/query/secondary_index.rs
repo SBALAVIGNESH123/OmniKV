@@ -2190,7 +2190,6 @@ impl IndexManager {
         };
         let mut start_hex = start_value.map(encode_bound).transpose()?;
         let mut end_hex = end_value.map(encode_bound).transpose()?;
-        let mut widened_v0_zero = false;
         if idx_def.encoding_version < CURRENT_INDEX_ENCODING_VERSION && *ft == IndexFieldType::Float
         {
             // Legacy v0 float indexes stored `-0.0` at `7fffffffffffffff` and
@@ -2198,11 +2197,9 @@ impl IndexManager {
             // range scans never drop the opposite-signed zero.
             if start_hex.as_deref() == Some(V0_POS_ZERO_HEX) {
                 start_hex = Some(V0_NEG_ZERO_HEX.to_string());
-                widened_v0_zero = true;
             }
             if end_hex.as_deref() == Some(V0_NEG_ZERO_HEX) {
                 end_hex = Some(V0_POS_ZERO_HEX.to_string());
-                widened_v0_zero = true;
             }
         }
         if start_hex
@@ -2212,6 +2209,10 @@ impl IndexManager {
         {
             return Ok(Vec::new());
         }
+        let needs_v0_zero_dedup = idx_def.encoding_version < CURRENT_INDEX_ENCODING_VERSION
+            && *ft == IndexFieldType::Float
+            && start_hex.as_deref().is_none_or(|s| s <= V0_NEG_ZERO_HEX)
+            && end_hex.as_deref().is_none_or(|e| e >= V0_POS_ZERO_HEX);
         let start_key = start_hex.as_ref().map_or_else(
             || index_prefix.clone(),
             |value| format!("{index_prefix}{value}\x00"),
@@ -2222,7 +2223,7 @@ impl IndexManager {
         );
 
         let mut results = Vec::new();
-        let mut seen = widened_v0_zero.then(HashSet::new);
+        let mut seen = needs_v0_zero_dedup.then(HashSet::new);
         for (key, pk) in self.db.scan_exclusive(&start_key, Some(&end_key), seq)? {
             let Some(value_hex) = key
                 .strip_prefix(&index_prefix)

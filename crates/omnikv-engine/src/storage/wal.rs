@@ -284,7 +284,8 @@ impl WriteAheadLog {
     }
 
     /// Rotate the WAL — truncate the current segment.
-    /// Called after a successful flush to SSTable.
+    /// Must only be called after every record in the WAL has been durably
+    /// flushed and published in the manifest.
     pub fn rotate_segment(&mut self) -> Result<(), OmniError> {
         let file = OpenOptions::new()
             .create(true)
@@ -292,12 +293,16 @@ impl WriteAheadLog {
             .truncate(true)
             .open(&self.path)
             .map_err(|e| OmniError::IoError(format!("WAL rotate: {}", e)))?;
-        file.sync_all()
-            .map_err(|e| OmniError::IoError(format!("WAL rotate fsync: {}", e)))?;
-
+        // Once open(truncate=true) succeeds, the on-disk file length is 0.
+        // Reconcile the handle and durability offsets BEFORE calling sync_all
+        // so a failed sync never leaves a stale non-zero durable_offset behind.
         self.writer = BufWriter::new(file);
         self.durable_offset = 0;
         self.pending = 0;
+        self.writer
+            .get_ref()
+            .sync_all()
+            .map_err(|e| OmniError::IoError(format!("WAL rotate fsync: {}", e)))?;
         Ok(())
     }
 

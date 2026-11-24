@@ -4205,6 +4205,27 @@ fn v0_single_signed_zero_composite_uses_two_exact_ranges_without_spurious_ssi_co
     );
     execute(&tx_exec, "INSERT INTO v0_pair_tbl VALUES (3, 0.0, 'n')");
     if let Some(reads) = tx_exec.drain_reads() {
+        let n_hex = "6e";
+        let neg_zero_prefix =
+            format!("\u{0}IDX\u{0}{idx_id:08}\u{0}7fffffffffffffff\u{0}{n_hex}\u{0}");
+        let pos_zero_prefix =
+            format!("\u{0}IDX\u{0}{idx_id:08}\u{0}8000000000000000\u{0}{n_hex}\u{0}");
+        assert!(
+            reads
+                .ranges
+                .iter()
+                .any(|(start, _)| start == &neg_zero_prefix),
+            "expected exact -0.0/'n' SSI range in {:?}",
+            reads.ranges
+        );
+        assert!(
+            reads
+                .ranges
+                .iter()
+                .any(|(start, _)| start == &pos_zero_prefix),
+            "expected exact +0.0/'n' SSI range in {:?}",
+            reads.ranges
+        );
         txn.read_set.extend(reads.keys);
         txn.read_ranges.extend(reads.ranges);
     }
@@ -4310,8 +4331,12 @@ fn namespace_isolation_covers_list_indexes_drop_table_with_catalog_wrappers_and_
             .is_err(),
         "DROP TABLE must refuse to leave an ambiguous legacy Both index behind"
     );
+}
 
-    // lookup_at must deduplicate PKs when a legacy v0 float index has both -0.0 and +0.0 for same PK.
+#[test]
+fn v0_float_index_deduplicates_signed_zero_lookup_and_spanning_range() {
+    let (db, _dir, _executor) = setup();
+    let idx_mgr = IndexManager::new(db.clone());
     let mut v0 = WriteBatch::new();
     v0.set(
         "\u{0}IDX_CATALOG\u{0}92",
@@ -4335,6 +4360,18 @@ fn namespace_isolation_covers_list_indexes_drop_table_with_catalog_wrappers_and_
             .unwrap(),
         vec!["pk1".to_string()]
     );
+    for (lo, hi) in [(-1.0_f64, 1.0_f64), (-0.0_f64, 0.0_f64)] {
+        assert_eq!(
+            idx_mgr
+                .range_scan(
+                    "v0_dedup_idx",
+                    &serde_json::json!(lo),
+                    &serde_json::json!(hi)
+                )
+                .unwrap(),
+            vec!["pk1".to_string()]
+        );
+    }
 }
 
 #[test]

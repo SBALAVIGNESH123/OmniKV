@@ -745,6 +745,11 @@ pub struct Manifest {
     /// replacement heap.
     #[serde(default)]
     pub wal_checkpoint_seq: u64,
+    /// Minimum MVCC `read_seq` valid against the persisted storage topology,
+    /// advanced by Raft snapshot installation so stale pre-install snapshots
+    /// stay rejected even after restart.
+    #[serde(default)]
+    pub read_seq_floor: u64,
     /// Format version. Missing in old manifests → treated as v1.
     #[serde(default = "default_manifest_format_version")]
     pub format_version: u32,
@@ -1462,7 +1467,10 @@ impl OmniKV {
                 let _ = std::fs::remove_dir(&path);
                 continue;
             }
-            let has_complete = path.join(INSTALL_COMPLETE_MARKER).exists();
+            let has_complete = std::fs::read(path.join(INSTALL_COMPLETE_MARKER))
+                .ok()
+                .as_deref()
+                .is_some_and(|b| b == b"ok" || b == b"rolled_back");
             let has_failed = path.join(ROLLBACK_FAILED_MARKER).exists();
             if has_complete && !has_failed && manifest_exists {
                 continue;
@@ -1483,6 +1491,8 @@ impl OmniKV {
         Self::check_no_unfinished_snapshot_promotion(manifest_path)?;
         let recovered = Self::recover_storage_roots(manifest_path, wal_path)?;
 
+        let persisted_read_seq_floor = recovered.manifest.read_seq_floor;
+        let recovered_max_seq = recovered.max_seq.max(persisted_read_seq_floor);
         let initial_roots = StorageRoots {
             base_mmap: recovered.base_mmap,
             base_bloom: recovered.base_bloom,
@@ -1493,15 +1503,15 @@ impl OmniKV {
             manifest: recovered.manifest,
             heap_reader: recovered.heap_reader,
             heap_generation: 1,
-            read_seq_floor: 0,
+            read_seq_floor: persisted_read_seq_floor,
         };
 
         let ssi_history = std::sync::Arc::new(crate::transaction::SsiHistory::default());
-        ssi_history.advance_eviction_floor(recovered.max_seq);
+        ssi_history.advance_eviction_floor(recovered_max_seq);
 
         let db = Arc::new(Self {
             roots: ArcSwap::from_pointee(initial_roots),
-            global_seq: AtomicU64::new(recovered.max_seq.saturating_add(1)),
+            global_seq: AtomicU64::new(recovered_max_seq.saturating_add(1)),
             heap_file: Mutex::new(recovered.heap_file),
             heap_offset: AtomicU64::new(recovered.heap_offset),
             wal: Mutex::new(recovered.wal),
@@ -1684,6 +1694,7 @@ impl OmniKV {
                 l1_sstables: vec![],
                 max_seq: 0,
                 wal_checkpoint_seq: 0,
+                read_seq_floor: 0,
             };
             Self::init_empty_storage_files(&m.base_path, &m.heap_path)?;
             m.save(manifest_path)?;
@@ -3324,11 +3335,31 @@ impl OmniKV {
 
     /// Flushes the active memtable to disk as an L0 SSTable.
     pub fn compact_sstables(&self) -> Result<(), OmniError> {
-        let _topology_guard = self
-            .transition_guard
-            .read()
-            .map_err(|_| OmniError::LockPoisoned("transition_guard".into()))?;
-        self.compact_sstables_locked()
+        {
+            let _topology_guard = self
+                .transition_guard
+                .read()
+                .map_err(|_| OmniError::LockPoisoned("transition_guard".into()))?;
+            self.compact_sstables_locked()?;
+        }
+        // Only rotate (truncate) the WAL AFTER the flushed SSTable and manifest
+        // are durably published, and only when no concurrent writers or
+        // unflushed memtable entries exist. Otherwise keep the WAL intact so
+        // concurrent writes are never lost on crash.
+        if let Ok(_exclusive) = self.transition_guard.try_write()
+            && let Ok(_write_guard) = self.write_mutex.lock()
+        {
+            let roots = self.roots.load();
+            let active_empty = roots.memtable.iter().all(|shard| shard.is_empty());
+            let frozen_empty = roots.frozen_memtables.is_empty();
+            if active_empty
+                && frozen_empty
+                && let Ok(mut wal) = self.wal.lock()
+            {
+                let _ = wal.rotate_segment();
+            }
+        }
+        Ok(())
     }
 
     /// Compacts the active memtable while the caller already holds the
@@ -3343,7 +3374,9 @@ impl OmniKV {
                 .lock()
                 .map_err(|_| OmniError::LockPoisoned("compact".into()))?;
             let new_empty: SharedMemtable = Arc::new(std::array::from_fn(|_| SkipMap::new()));
-            // Atomically: swap memtable to empty and add old one to frozen list
+            // Atomically: swap memtable to empty and add old one to frozen list.
+            // Do NOT truncate the WAL here: the frozen memtable is not durable
+            // until the L0 SSTable and updated manifest are fsynced below.
             let old_memtable = {
                 let current = self.roots.load();
                 let old = current.memtable.clone();
@@ -3363,9 +3396,6 @@ impl OmniKV {
                 }));
                 (old, new_frozen.len() - 1)
             };
-            if let Ok(mut wal) = self.wal.lock() {
-                let _ = wal.rotate_segment();
-            }
             (old_memtable.1, old_memtable.0)
         };
 
@@ -3982,7 +4012,19 @@ impl OmniKV {
             .lock()
             .map_err(|_| OmniError::LockPoisoned("heap_file".into()))?;
         bloom.save(&bloom_path_for_base(&new_base_path))?;
-        manifest_for_roots.save(&self.manifest_path)?;
+        if let Err(err) = manifest_for_roots.save(&self.manifest_path) {
+            // `atomic_replace` can rename the new manifest into place and then
+            // fail while syncing its parent directory. Preserve the new heap
+            // and base unless we can confirm the live manifest still points to
+            // the previous generation.
+            let live_points_to_old = Manifest::load(&self.manifest_path).is_ok_and(|live| {
+                live.heap_path != new_heap_path && live.base_path != new_base_path
+            });
+            if !live_points_to_old {
+                output_guard.disarm();
+            }
+            return Err(err);
+        }
 
         // Writers and compactions are fenced by exclusive `transition_guard` +
         // `write_mutex`, and every memtable/frozen_memtable entry has been

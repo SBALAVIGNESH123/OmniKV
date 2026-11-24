@@ -1077,54 +1077,54 @@ async fn restore_handler(
         "/admin/restore",
         "restore_accepted",
     );
+    let audit_claims = claims.clone();
     let handle = tokio::spawn(async move {
         let _active_restore = active_restore;
         let result = tokio::task::spawn_blocking(move || {
             omni_engine::backup::restore_backup(&backup_path, &restore_dir)
         })
         .await;
-        if !matches!(result, Ok(Ok(()))) {
-            let _ = std::fs::remove_dir_all(&restore_dir_cleanup);
+        match &result {
+            Ok(Ok(())) => audit_claims_event(
+                "restore.completed",
+                AuditOutcome::Success,
+                &audit_claims,
+                "/admin/restore",
+                "restore_completed",
+            ),
+            Ok(Err(_)) => {
+                let _ = std::fs::remove_dir_all(&restore_dir_cleanup);
+                audit_claims_event(
+                    "restore.completed",
+                    AuditOutcome::Failure,
+                    &audit_claims,
+                    "/admin/restore",
+                    "restore_failed",
+                );
+            }
+            Err(_) => {
+                let _ = std::fs::remove_dir_all(&restore_dir_cleanup);
+                audit_claims_event(
+                    "restore.completed",
+                    AuditOutcome::Failure,
+                    &audit_claims,
+                    "/admin/restore",
+                    "restore_task_panicked",
+                );
+            }
         }
         result
     });
     match handle.await {
-        Ok(Ok(Ok(()))) => {
-            audit_claims_event(
-                "restore.completed",
-                AuditOutcome::Success,
-                &claims,
-                "/admin/restore",
-                "restore_completed",
-            );
-            (StatusCode::OK, ApiResponse::ok(restore_dir_name))
-        }
-        Ok(Ok(Err(error))) => {
-            audit_claims_event(
-                "restore.completed",
-                AuditOutcome::Failure,
-                &claims,
-                "/admin/restore",
-                "restore_failed",
-            );
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                ApiResponse::<String>::err(&sanitize_err(&error)),
-            )
-        }
-        Ok(Err(join_error)) | Err(join_error) => {
-            audit_claims_event(
-                "restore.completed",
-                AuditOutcome::Failure,
-                &claims,
-                "/admin/restore",
-                "restore_task_panicked",
-            );
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                ApiResponse::<String>::err(&format!("restore task failed: {join_error}")),
-            )
-        }
+        Ok(Ok(Ok(()))) => (StatusCode::OK, ApiResponse::ok(restore_dir_name)),
+        Ok(Ok(Err(error))) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            ApiResponse::<String>::err(&sanitize_err(&error)),
+        ),
+        Ok(Err(join_error)) | Err(join_error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            ApiResponse::<String>::err(&format!("restore task failed: {join_error}")),
+        ),
     }
 }
 
