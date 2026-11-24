@@ -406,9 +406,13 @@ fn storage_read_err(e: impl std::fmt::Display) -> openraft::StorageError<u64> {
 }
 
 /// Flush directory metadata so renames and unlinks inside `dir` survive power
-/// loss. On non-Unix targets (such as Windows), opening a directory handle with
-/// `File::open` is unsupported and this function is an explicit no-op; crash
-/// durability of directory renames there relies on OS filesystem semantics.
+/// loss.
+///
+/// Platform durability boundary: directory `fsync` is enforced on Unix/POSIX
+/// targets. On Windows, calling `FlushFileBuffers` on a directory handle
+/// requires write access that NTFS denies to standard unprivileged processes,
+/// so this function is an explicit no-op on non-Unix targets; snapshot
+/// directory-rename crash durability guarantees are Unix/POSIX-only.
 fn sync_dir(dir: &std::path::Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
@@ -1343,6 +1347,8 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
         let tmp_heap_path = tmp_dir.join("data_heap.bin").to_string_lossy().to_string();
         let tmp_base_path = tmp_dir.join("data_base.bin").to_string_lossy().to_string();
 
+        OmniKV::init_empty_storage_files(&tmp_base_path, &tmp_heap_path)
+            .map_err(|e| io_err(&format!("init tmp storage files: {}", e)))?;
         let tmp_manifest = crate::Manifest {
             format_version: crate::MANIFEST_FORMAT_VERSION,
             heap_path: tmp_heap_path.clone(),
@@ -1546,7 +1552,11 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
                     rollback_ok = false;
                 }
             }
-            if rollback_ok && sync_dir(&data_dir).is_err() {
+            if rollback_ok
+                && crate::failpoints::maybe_fail("snapshot::rollback_sync_data_dir")
+                    .and_then(|()| sync_dir(&data_dir))
+                    .is_err()
+            {
                 rollback_ok = false;
             }
             if !rollback_ok {
@@ -1601,6 +1611,32 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
                 )));
             }
             moved_to_old.push(name);
+            if let Err(e) = crate::failpoints::maybe_fail("snapshot::after_move_to_old") {
+                rollback_promotion(&moved_to_old, &promoted_from_tmp, &mut tmp_cleanup);
+                return Err(io_err(&format!(
+                    "injected failure after moving old snapshot file: {e}"
+                )));
+            }
+        }
+        // Durability barrier BEFORE promoting any new snapshot file:
+        // durably record both `old_dir` (backup filenames) and `data_dir`
+        // (removal of old live filenames) so a power loss during promotion
+        // can never lose the original database backup.
+        if let Err(e) = crate::failpoints::maybe_fail("snapshot::sync_old_dir")
+            .and_then(|()| sync_dir(&old_dir))
+        {
+            rollback_promotion(&moved_to_old, &promoted_from_tmp, &mut tmp_cleanup);
+            return Err(io_err(&format!(
+                "sync rollback snapshot directory before promotion: {e}"
+            )));
+        }
+        if let Err(e) = crate::failpoints::maybe_fail("snapshot::sync_data_dir_pre_promote")
+            .and_then(|()| sync_dir(&data_dir))
+        {
+            rollback_promotion(&moved_to_old, &promoted_from_tmp, &mut tmp_cleanup);
+            return Err(io_err(&format!(
+                "sync data directory before promotion: {e}"
+            )));
         }
 
         // Move tmp files to data_dir with the manifest promoted LAST so data
@@ -1643,10 +1679,18 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
                 )));
             }
             promoted_from_tmp.push(name);
+            if let Err(e) = crate::failpoints::maybe_fail("snapshot::after_promote_to_live") {
+                rollback_promotion(&moved_to_old, &promoted_from_tmp, &mut tmp_cleanup);
+                return Err(io_err(&format!(
+                    "injected failure after promoting snapshot file: {e}"
+                )));
+            }
         }
         // Durability barrier: require `data_dir` directory sync to succeed
         // before publishing live roots/metadata or retiring the rollback backup.
-        if let Err(e) = sync_dir(&data_dir) {
+        if let Err(e) = crate::failpoints::maybe_fail("snapshot::sync_data_dir_post_promote")
+            .and_then(|()| sync_dir(&data_dir))
+        {
             rollback_promotion(&moved_to_old, &promoted_from_tmp, &mut tmp_cleanup);
             return Err(io_err(&format!("sync promoted snapshot directory: {e}")));
         }
@@ -1743,7 +1787,9 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
         // rollback dir) before retiring backups. If persisting that marker
         // fails, preserve `old_dir` and surface an explicit recovery-required
         // error instead of reporting clean success.
-        if let Err(e) = write_durable_marker(&old_dir.join(INSTALL_COMPLETE_MARKER), b"ok") {
+        if let Err(e) = crate::failpoints::maybe_fail("snapshot::write_install_complete")
+            .and_then(|()| write_durable_marker(&old_dir.join(INSTALL_COMPLETE_MARKER), b"ok"))
+        {
             drop(_exclusive);
             return Err(io_err(&format!(
                 "snapshot promoted live, but persisting completion marker in '{}' failed ({e}); rollback directory preserved — operator recovery required before restart or next snapshot install",
@@ -2950,6 +2996,62 @@ mod tests {
                 .expect("read untouched key"),
             Some("original".into()),
             "failed snapshot install must leave live state untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn snapshot_install_rejects_2pc_write_targeting_wrong_participant() {
+        let dst_dir = tempfile::tempdir().expect("dst tempdir");
+        let dst_db = OmniKV::open(
+            dst_dir
+                .path()
+                .join("manifest.json")
+                .to_str()
+                .expect("dst manifest"),
+            dst_dir.path().join("wal.bin").to_str().expect("dst wal"),
+        )
+        .expect("open dst db");
+        let mut init = WriteBatch::new();
+        init.set("customer:42", "local_ok".into())
+            .expect("set local_ok");
+        dst_db.commit_batch_local(&init).expect("commit init");
+
+        let mut dst_storage = OmniRaftStorage::new(dst_db.clone());
+        let snap_log = LogId::new(CommittedLeaderId::new(1, 1), 12);
+        let bad_2pc_json = r#"{"txn_id":[1,9],"node_id":10,"state":"PREPARED","writes":[{"node_id":11,"key":"customer:42","value":"wrong_shard","ttl":0}],"prepare_seq":1,"commit_seq":null}"#;
+        let envelope = SnapshotEnvelope {
+            version: SNAPSHOT_VERSION,
+            last_log_id: Some(snap_log),
+            membership: StoredMembership::default(),
+            max_seq: 100,
+            entries: vec![
+                ("customer:42".into(), "replaced".into()),
+                ("__2PC_PREPARE__/10/1_9".into(), bad_2pc_json.into()),
+            ],
+            ssi_history: Vec::new(),
+            ssi_eviction_floor: 0,
+        };
+        let snap_meta = SnapshotMeta {
+            last_log_id: Some(snap_log),
+            last_membership: StoredMembership::default(),
+            snapshot_id: "wrong-target-2pc-snap".into(),
+        };
+        let bytes = serde_json::to_vec(&envelope).expect("encode envelope");
+        let err = dst_storage
+            .install_snapshot(&snap_meta, Box::new(Cursor::new(bytes)))
+            .await
+            .expect_err("snapshot with wrong-node DistWrite must fail before live promotion");
+        assert!(
+            err.to_string()
+                .contains("targets participant node 11 instead of node 10"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(
+            dst_db
+                .find_latest_internal("customer:42")
+                .expect("read preserved key"),
+            Some("local_ok".into()),
+            "live DB must remain untouched after rejected snapshot"
         );
     }
 }

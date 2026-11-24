@@ -552,3 +552,223 @@ fn coordinator_indoubt_txn_unmarks_live_in_flight_for_recovery() {
         .commit_batch(&plain)
         .expect("participant reservation must be released after InDoubt ABORT");
 }
+
+fn seed_db_with_base_heap_l0_and_l1(dir: &TempDir) -> (String, String, omni_engine::Manifest) {
+    let (manifest_path, wal_path) = fresh_db_paths(dir);
+    {
+        let db = OmniKV::open(&manifest_path, &wal_path).expect("open db");
+        let mut b1 = WriteBatch::new();
+        b1.set("account:balance", "100".into()).expect("set 100");
+        db.commit_batch(&b1).expect("commit b1");
+        db.compact_sstables().expect("flush first L0");
+        db.compact_l0_to_l1().expect("promote L0 to L1");
+
+        let mut b2 = WriteBatch::new();
+        b2.set("account:balance", "50".into()).expect("set 50");
+        db.commit_batch(&b2).expect("commit b2");
+        db.compact_sstables().expect("flush second L0");
+        assert_eq!(db.l1_sstable_count(), 1, "expected 1 L1 SSTable");
+        assert_eq!(db.sstable_count(), 1, "expected 1 L0 SSTable");
+    }
+    let manifest = omni_engine::Manifest::load(&manifest_path).expect("load manifest");
+    (manifest_path, wal_path, manifest)
+}
+
+#[test]
+fn reopen_fails_closed_when_base_heap_l0_or_l1_file_is_missing() {
+    let _lock = TEST_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    for (kind, select_target, expected_substr) in [
+        (
+            "base",
+            (|m: &omni_engine::Manifest| m.base_path.clone())
+                as fn(&omni_engine::Manifest) -> String,
+            "missing or unreadable base SSTable",
+        ),
+        (
+            "l0",
+            (|m: &omni_engine::Manifest| m.sstables[0].clone())
+                as fn(&omni_engine::Manifest) -> String,
+            "missing or unreadable L0 SSTable",
+        ),
+        (
+            "l1",
+            (|m: &omni_engine::Manifest| m.l1_sstables[0].clone())
+                as fn(&omni_engine::Manifest) -> String,
+            "missing or unreadable L1 SSTable",
+        ),
+        (
+            "heap",
+            (|m: &omni_engine::Manifest| m.heap_path.clone())
+                as fn(&omni_engine::Manifest) -> String,
+            "missing or unreadable heap file",
+        ),
+    ] {
+        let dir = TempDir::new().expect("tempdir");
+        let (manifest_path, wal_path, manifest) = seed_db_with_base_heap_l0_and_l1(&dir);
+        let target = select_target(&manifest);
+        fs::remove_file(&target).expect("remove referenced storage file");
+
+        let Err(err) = OmniKV::open(&manifest_path, &wal_path) else {
+            panic!("reopening with missing {kind} file '{target}' must fail closed");
+        };
+        assert!(
+            err.to_string().contains(expected_substr),
+            "missing {kind} file produced unexpected error: {err}"
+        );
+    }
+}
+
+#[cfg(feature = "failpoints")]
+async fn build_template_snapshot() -> (
+    openraft::SnapshotMeta<u64, omni_engine::raft_impl::OmniNode>,
+    Vec<u8>,
+) {
+    use omni_engine::raft_storage::OmniRaftStorage;
+    use openraft::{
+        CommittedLeaderId, Entry, EntryPayload, LogId, RaftSnapshotBuilder, RaftStorage,
+    };
+
+    let src_dir = TempDir::new().expect("src tempdir");
+    let (src_m, src_w) = fresh_db_paths(&src_dir);
+    let src_db = OmniKV::open(&src_m, &src_w).expect("open src db");
+    let mut src_storage = OmniRaftStorage::new(src_db);
+    src_storage
+        .apply_to_state_machine(&[Entry {
+            log_id: LogId::new(CommittedLeaderId::new(1, 1), 1),
+            payload: EntryPayload::Normal("SET k snap_new".into()),
+        }])
+        .await
+        .expect("apply src");
+    let template_snap = src_storage.build_snapshot().await.expect("build snapshot");
+    (template_snap.meta, template_snap.snapshot.into_inner())
+}
+
+#[cfg(feature = "failpoints")]
+#[test]
+fn snapshot_promotion_rollback_on_rename_and_directory_sync_failures() {
+    use omni_engine::raft_storage::OmniRaftStorage;
+    use openraft::RaftStorage;
+
+    let _lock = TEST_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+    rt.block_on(async {
+        let registry = FailRegistry::new();
+        registry.reset();
+        let (snap_meta, snap_bytes) = build_template_snapshot().await;
+
+        for fp in [
+            "snapshot::after_move_to_old",
+            "snapshot::sync_old_dir",
+            "snapshot::sync_data_dir_pre_promote",
+            "snapshot::after_promote_to_live",
+            "snapshot::sync_data_dir_post_promote",
+        ] {
+            let dst_dir = TempDir::new().expect("dst tempdir");
+            let (dst_m, dst_w) = fresh_db_paths(&dst_dir);
+            {
+                let dst_db = OmniKV::open(&dst_m, &dst_w).expect("open dst db");
+                let mut wb = WriteBatch::new();
+                wb.set("k", "original".into()).expect("set original");
+                dst_db.commit_batch(&wb).expect("commit original");
+                let mut dst_storage = OmniRaftStorage::new(dst_db);
+
+                registry.reset();
+                registry.arm(fp);
+                let res = dst_storage
+                    .install_snapshot(
+                        &snap_meta,
+                        Box::new(std::io::Cursor::new(snap_bytes.clone())),
+                    )
+                    .await;
+                registry.reset();
+                assert!(res.is_err(), "failpoint {fp} must fail install_snapshot");
+            }
+            let reopened = OmniKV::open(&dst_m, &dst_w)
+                .unwrap_or_else(|e| panic!("reopen after rollback at {fp} failed: {e}"));
+            assert_eq!(
+                reopened.find_latest_internal("k").expect("read k"),
+                Some("original".into()),
+                "rollback at {fp} must preserve original DB"
+            );
+        }
+    });
+}
+
+#[cfg(feature = "failpoints")]
+#[test]
+fn snapshot_promotion_fails_closed_when_rollback_sync_or_marker_fails() {
+    use omni_engine::raft_storage::OmniRaftStorage;
+    use openraft::RaftStorage;
+
+    let _lock = TEST_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+    rt.block_on(async {
+        let registry = FailRegistry::new();
+        registry.reset();
+        let (snap_meta, snap_bytes) = build_template_snapshot().await;
+
+        // Case 1: post-promote sync fails AND rollback directory sync fails.
+        let dir1 = TempDir::new().expect("dir1");
+        let (m1, w1) = fresh_db_paths(&dir1);
+        {
+            let db1 = OmniKV::open(&m1, &w1).expect("open db1");
+            let mut wb = WriteBatch::new();
+            wb.set("k", "original".into()).expect("set");
+            db1.commit_batch(&wb).expect("commit");
+            let mut storage1 = OmniRaftStorage::new(db1);
+            registry.arm("snapshot::sync_data_dir_post_promote");
+            registry.arm("snapshot::rollback_sync_data_dir");
+            let err = storage1
+                .install_snapshot(
+                    &snap_meta,
+                    Box::new(std::io::Cursor::new(snap_bytes.clone())),
+                )
+                .await;
+            registry.reset();
+            assert!(err.is_err());
+        }
+        assert!(
+            OmniKV::open(&m1, &w1).is_err(),
+            "failed rollback sync must leave .rollback_failed and fail reopen closed"
+        );
+
+        // Case 2: `.install_complete` marker persistence fails in Phase H.
+        let dir2 = TempDir::new().expect("dir2");
+        let (m2, w2) = fresh_db_paths(&dir2);
+        {
+            let db2 = OmniKV::open(&m2, &w2).expect("open db2");
+            let mut wb = WriteBatch::new();
+            wb.set("k", "original".into()).expect("set");
+            db2.commit_batch(&wb).expect("commit");
+            let mut storage2 = OmniRaftStorage::new(db2.clone());
+            registry.arm("snapshot::write_install_complete");
+            let err = storage2
+                .install_snapshot(&snap_meta, Box::new(std::io::Cursor::new(snap_bytes)))
+                .await
+                .expect_err("Phase H marker write failure must surface error");
+            registry.reset();
+            assert!(err.to_string().contains("operator recovery required"));
+            assert_eq!(
+                db2.find_latest_internal("k").expect("read live k"),
+                Some("snap_new".into())
+            );
+        }
+        assert!(
+            OmniKV::open(&m2, &w2).is_err(),
+            "preserved rollback dir without .install_complete must fail reopen closed"
+        );
+    });
+}

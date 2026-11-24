@@ -915,7 +915,7 @@ impl IndexManager {
         )
     }
 
-    fn create_index_locked_with_options(
+    pub(crate) fn create_index_locked_with_options(
         &self,
         name: &str,
         collection: &str,
@@ -1048,7 +1048,7 @@ impl IndexManager {
         let _guard = lock
             .lock()
             .map_err(|_| OmniError::LockPoisoned("index collection".into()))?;
-        self.drop_index_locked_inner(name, &target_collection, true, None)
+        self.drop_index_locked_inner(name, &target_collection, true, None, None)
     }
 
     /// Resumable `DROP INDEX` for schema migrations: tracks `dropping:<ids>`
@@ -1059,7 +1059,13 @@ impl IndexManager {
         &self,
         name: &str,
         receipt_key: &str,
+        expected_namespace: Option<IndexNamespace>,
     ) -> Result<(), OmniError> {
+        if expected_namespace == Some(IndexNamespace::Both) {
+            return Err(OmniError::IoError(
+                "schema migration explicit namespace must be Sql or Document, not Both".into(),
+            ));
+        }
         let seq = self.db.get_seq();
         if let Some(receipt) = self.db.find(receipt_key, seq)? {
             let (state, ids) = parse_drop_index_receipt(&receipt)?;
@@ -1077,7 +1083,13 @@ impl IndexManager {
                             let _guard = lock
                                 .lock()
                                 .map_err(|_| OmniError::LockPoisoned("index collection".into()))?;
-                            self.drop_index_locked_inner(&def.name, &def.collection, false, None)?;
+                            self.drop_index_locked_inner(
+                                &def.name,
+                                &def.collection,
+                                false,
+                                None,
+                                expected_namespace,
+                            )?;
                         }
                     }
                     let ids_csv = ids
@@ -1098,7 +1110,13 @@ impl IndexManager {
         let _guard = lock
             .lock()
             .map_err(|_| OmniError::LockPoisoned("index collection".into()))?;
-        self.drop_index_locked_inner(name, &target_collection, true, Some(receipt_key))
+        self.drop_index_locked_inner(
+            name,
+            &target_collection,
+            true,
+            Some(receipt_key),
+            expected_namespace,
+        )
     }
 
     fn resolve_drop_target_at(&self, name: &str, seq: u64) -> Result<String, OmniError> {
@@ -1167,7 +1185,7 @@ impl IndexManager {
         name: &str,
         expected_collection: &str,
     ) -> Result<(), OmniError> {
-        self.drop_index_locked_inner(name, expected_collection, false, None)
+        self.drop_index_locked_inner(name, expected_collection, false, None, None)
     }
 
     fn drop_index_locked_inner(
@@ -1176,6 +1194,7 @@ impl IndexManager {
         expected_collection: &str,
         revalidate_unambiguous: bool,
         receipt_key: Option<&str>,
+        expected_namespace: Option<IndexNamespace>,
     ) -> Result<(), OmniError> {
         let ddl_lock = self.db.sql_table_lock(DDL_LOCK_NAME)?;
         let _ddl_guard = ddl_lock
@@ -1216,11 +1235,26 @@ impl IndexManager {
                 )));
             }
         }
-        let mut ids_to_purge: Vec<IndexId> = self
-            .find_retired_indexes_at(name, Some(&target_collection), seq)?
-            .into_iter()
-            .map(|d| d.id)
-            .collect();
+        let retired_defs = self.find_retired_indexes_at(name, Some(&target_collection), seq)?;
+        if let Some(expected_ns) = expected_namespace {
+            if let Some(def) = catalog
+                .get_by_name(name)
+                .filter(|d| d.collection == target_collection)
+                && def.namespace != expected_ns
+            {
+                return Err(OmniError::IoError(format!(
+                    "Index '{name}' belongs to namespace {:?}, expected {expected_ns:?}",
+                    def.namespace
+                )));
+            }
+            if let Some(def) = retired_defs.iter().find(|d| d.namespace != expected_ns) {
+                return Err(OmniError::IoError(format!(
+                    "Retired index '{name}' belongs to namespace {:?}, expected {expected_ns:?}",
+                    def.namespace
+                )));
+            }
+        }
+        let mut ids_to_purge: Vec<IndexId> = retired_defs.into_iter().map(|d| d.id).collect();
 
         if let Some(def) = catalog
             .get_by_name(name)

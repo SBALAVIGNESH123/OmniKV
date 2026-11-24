@@ -87,6 +87,46 @@ pub enum SchemaOp {
         old_name: String,
         new_name: String,
     },
+    /// Explicitly scope a schema operation to [`IndexNamespace::Sql`] or
+    /// [`IndexNamespace::Document`] (never [`IndexNamespace::Both`]), allowing
+    /// migrations to disambiguate when a SQL table and a document collection
+    /// share the same name.
+    InNamespace {
+        namespace: IndexNamespace,
+        op: Box<SchemaOp>,
+    },
+}
+
+impl SchemaOp {
+    /// Wraps this schema operation with an explicit [`IndexNamespace::Sql`] or
+    /// [`IndexNamespace::Document`] target.
+    #[must_use]
+    pub fn in_namespace(self, namespace: IndexNamespace) -> Self {
+        Self::InNamespace {
+            namespace,
+            op: Box::new(self),
+        }
+    }
+
+    fn unwrap_namespace(&self) -> Result<(&SchemaOp, Option<IndexNamespace>), OmniError> {
+        match self {
+            SchemaOp::InNamespace { namespace, op } => {
+                if *namespace == IndexNamespace::Both {
+                    return Err(OmniError::IoError(
+                        "schema migration explicit namespace must be Sql or Document, not Both"
+                            .into(),
+                    ));
+                }
+                if matches!(op.as_ref(), SchemaOp::InNamespace { .. }) {
+                    return Err(OmniError::IoError(
+                        "nested SchemaOp::InNamespace wrappers are not supported".into(),
+                    ));
+                }
+                Ok((op.as_ref(), Some(*namespace)))
+            }
+            other => Ok((other, None)),
+        }
+    }
 }
 
 /// A versioned migration — defines what to do (up) and how to undo (down).
@@ -385,6 +425,40 @@ impl SchemaManager {
         Ok(())
     }
 
+    fn load_target_sql_table(
+        &self,
+        collection: &str,
+        explicit_namespace: Option<IndexNamespace>,
+        seq: u64,
+    ) -> Result<Option<(String, crate::catalog::TableDef)>, OmniError> {
+        match explicit_namespace {
+            Some(IndexNamespace::Document) => Ok(None),
+            Some(IndexNamespace::Both) => Err(OmniError::IoError(
+                "schema migration explicit namespace must be Sql or Document, not Both".into(),
+            )),
+            Some(IndexNamespace::Sql) => {
+                let catalog_key = format!("\x00CATALOG\x00{}", collection.to_lowercase());
+                let raw = self.db.find(&catalog_key, seq)?.ok_or_else(|| {
+                    OmniError::IoError(format!("SQL table '{collection}' not found"))
+                })?;
+                let table: crate::catalog::TableDef = serde_json::from_str(&raw).map_err(|e| {
+                    OmniError::IoError(format!("invalid SQL table definition: {e}"))
+                })?;
+                Ok(Some((catalog_key, table)))
+            }
+            None => {
+                let catalog_key = format!("\x00CATALOG\x00{}", collection.to_lowercase());
+                let Some(raw) = self.db.find(&catalog_key, seq)? else {
+                    return Ok(None);
+                };
+                let table: crate::catalog::TableDef = serde_json::from_str(&raw).map_err(|e| {
+                    OmniError::IoError(format!("invalid SQL table definition: {e}"))
+                })?;
+                Ok(Some((catalog_key, table)))
+            }
+        }
+    }
+
     fn execute_op(
         &self,
         op: &SchemaOp,
@@ -394,7 +468,8 @@ impl SchemaManager {
         attempt_id: &str,
         step_index: usize,
     ) -> Result<(), OmniError> {
-        match op {
+        let (inner_op, explicit_namespace) = op.unwrap_namespace()?;
+        match inner_op {
             SchemaOp::CreateIndex {
                 name,
                 collection,
@@ -402,9 +477,25 @@ impl SchemaManager {
                 unique,
             } => self.with_collection_lock(collection, || {
                 let seq = self.db.get_seq();
-                let (resolved_collection, expected_namespace) = self
-                    .index_manager
-                    .resolve_collection_and_namespace_at(collection, seq)?;
+                let (resolved_collection, expected_namespace) = match explicit_namespace {
+                    Some(IndexNamespace::Document) => {
+                        (collection.clone(), IndexNamespace::Document)
+                    }
+                    Some(IndexNamespace::Sql) => {
+                        let (_, table) = self
+                            .load_target_sql_table(collection, Some(IndexNamespace::Sql), seq)?
+                            .ok_or_else(|| {
+                                OmniError::IoError(format!("SQL table '{collection}' not found"))
+                            })?;
+                        (table.name, IndexNamespace::Sql)
+                    }
+                    None => self
+                        .index_manager
+                        .resolve_collection_and_namespace_at(collection, seq)?,
+                    Some(IndexNamespace::Both) => {
+                        unreachable!("rejected by unwrap_namespace")
+                    }
+                };
                 let receipt_key = Self::create_index_done_key(
                     version,
                     direction,
@@ -467,7 +558,8 @@ impl SchemaManager {
                         }
                         // Still owned by this attempt with matching definition,
                         // just not ready yet: rebuild to recover cleanly.
-                        self.index_manager.rebuild_index_locked(name, collection)?;
+                        self.index_manager
+                            .rebuild_index_locked(name, &resolved_collection)?;
                         return Ok(());
                     }
                     if self.was_index_dropped_by_later_step(
@@ -496,26 +588,32 @@ impl SchemaManager {
                         }
                         owned_id
                     } else {
-                        self.index_manager.create_index_locked_with_receipt(
+                        self.index_manager.create_index_locked_with_options(
                             name,
                             collection,
                             fields.clone(),
                             *unique,
                             Some(&receipt_key),
+                            explicit_namespace,
                         )?
                     }
                 } else {
-                    self.index_manager.create_index_locked_with_receipt(
+                    self.index_manager.create_index_locked_with_options(
                         name,
                         collection,
                         fields.clone(),
                         *unique,
                         Some(&receipt_key),
+                        explicit_namespace,
                     )?
                 };
-                if let Err(error) = self.index_manager.rebuild_index_locked(name, collection) {
-                    if let Err(cleanup_error) =
-                        self.index_manager.drop_index_locked(name, collection)
+                if let Err(error) = self
+                    .index_manager
+                    .rebuild_index_locked(name, &resolved_collection)
+                {
+                    if let Err(cleanup_error) = self
+                        .index_manager
+                        .drop_index_locked(name, &resolved_collection)
                     {
                         return Err(OmniError::IoError(format!(
                             "{error}; failed index cleanup also failed: {cleanup_error}"
@@ -535,7 +633,7 @@ impl SchemaManager {
                 let receipt_key =
                     Self::drop_index_done_key(version, direction, attempt_id, step_index, name);
                 self.index_manager
-                    .drop_index_with_receipt(name, &receipt_key)
+                    .drop_index_with_receipt(name, &receipt_key, explicit_namespace)
             }
             SchemaOp::AddField {
                 collection,
@@ -543,23 +641,18 @@ impl SchemaManager {
                 default_value,
             } => self.with_collection_lock(collection, || {
                 let seq = self.db.get_seq();
-                let catalog_key = format!("\x00CATALOG\x00{}", collection.to_lowercase());
-                let sql_table = self
-                    .db
-                    .find(&catalog_key, seq)?
-                    .as_deref()
-                    .and_then(|v| serde_json::from_str::<crate::catalog::TableDef>(v).ok());
-                let effective_field = sql_table
+                let sql_target = self.load_target_sql_table(collection, explicit_namespace, seq)?;
+                let effective_field = sql_target
                     .as_ref()
-                    .and_then(|t| {
+                    .and_then(|(_, t)| {
                         t.columns
                             .iter()
                             .find(|c| c.name.eq_ignore_ascii_case(field_name))
                             .map(|c| c.name.clone())
                     })
                     .unwrap_or_else(|| field_name.clone());
-                let (target_collection, target_namespace) = match sql_table.as_ref() {
-                    Some(t) => (t.name.as_str(), IndexNamespace::Sql),
+                let (target_collection, target_namespace) = match sql_target.as_ref() {
+                    Some((_, t)) => (t.name.as_str(), IndexNamespace::Sql),
                     None => (collection.as_str(), IndexNamespace::Document),
                 };
                 self.backfill_field(
@@ -568,7 +661,7 @@ impl SchemaManager {
                     &effective_field,
                     Some(default_value),
                 )?;
-                if let Some(mut table) = sql_table
+                if let Some((catalog_key, mut table)) = sql_target
                     && !table
                         .columns
                         .iter()
@@ -606,12 +699,8 @@ impl SchemaManager {
                 field_name,
             } => self.with_collection_lock(collection, || {
                 let seq = self.db.get_seq();
-                let catalog_key = format!("\x00CATALOG\x00{}", collection.to_lowercase());
-                if let Some(mut table) = self
-                    .db
-                    .find(&catalog_key, seq)?
-                    .as_deref()
-                    .and_then(|v| serde_json::from_str::<crate::catalog::TableDef>(v).ok())
+                if let Some((catalog_key, mut table)) =
+                    self.load_target_sql_table(collection, explicit_namespace, seq)?
                 {
                     let table_id = table.durable_identity();
                     let done_key = Self::remove_done_key(
@@ -694,12 +783,8 @@ impl SchemaManager {
                 new_name,
             } => self.with_collection_lock(collection, || {
                 let seq = self.db.get_seq();
-                let catalog_key = format!("\x00CATALOG\x00{}", collection.to_lowercase());
-                if let Some(mut table) = self
-                    .db
-                    .find(&catalog_key, seq)?
-                    .as_deref()
-                    .and_then(|v| serde_json::from_str::<crate::catalog::TableDef>(v).ok())
+                if let Some((catalog_key, mut table)) =
+                    self.load_target_sql_table(collection, explicit_namespace, seq)?
                 {
                     let table_id = table.durable_identity();
                     let done_key = Self::rename_done_key(
@@ -805,6 +890,7 @@ impl SchemaManager {
                 );
                 self.rename_field_online(collection, old_name, new_name, None, &done_key, "done")
             }),
+            SchemaOp::InNamespace { .. } => unreachable!("unwrapped above"),
         }
     }
 
@@ -988,7 +1074,9 @@ impl SchemaManager {
             // Only honor the later drop receipt if the current migration still
             // contains a matching `DropIndex` op at that exact step index.
             let still_has_drop_step = matches!(
-                exec_ops.get(drop_step),
+                exec_ops
+                    .get(drop_step)
+                    .and_then(|op| op.unwrap_namespace().ok().map(|(inner, _)| inner)),
                 Some(SchemaOp::DropIndex { name: drop_name })
                     if drop_name.eq_ignore_ascii_case(index_name)
             );

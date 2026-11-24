@@ -4764,3 +4764,182 @@ fn schema_drop_index_retry_rejects_malformed_and_empty_receipts() {
     schema.migrate_up(&retry_v1).unwrap();
     assert_eq!(schema.current_version().unwrap(), 1);
 }
+
+fn read_json_value(db: &OmniKV, key: &str) -> serde_json::Value {
+    serde_json::from_str(&db.find(key, db.get_seq()).unwrap().unwrap()).unwrap()
+}
+
+fn migrate_single(schema: &SchemaManager, version: u64, up: Vec<SchemaOp>) {
+    schema
+        .migrate_up(&Migration {
+            version,
+            description: format!("v{version}"),
+            up,
+            down: vec![],
+        })
+        .unwrap();
+}
+
+#[test]
+fn schema_explicit_namespace_migrations_isolate_same_name_sql_and_document() {
+    let (db, _dir, executor) = setup();
+    let idx_mgr = Arc::new(IndexManager::new(db.clone()));
+    let schema = SchemaManager::new(db.clone(), idx_mgr.clone());
+
+    execute(
+        &executor,
+        "CREATE TABLE users (id INTEGER PRIMARY KEY, email TEXT, tag TEXT)",
+    );
+    execute(
+        &executor,
+        "INSERT INTO users VALUES (1, 'sql@x.com', 's_old')",
+    );
+    let mut doc_seed = WriteBatch::new();
+    doc_seed
+        .set("users:1", r#"{"email":"doc@x.com","tag":"d_old"}"#.into())
+        .unwrap();
+    db.commit_batch(&doc_seed).unwrap();
+
+    // 1. Explicit Document migration leaves same-name SQL table & rows untouched.
+    let doc_ops = vec![
+        SchemaOp::AddField {
+            collection: "users".into(),
+            field_name: "doc_only".into(),
+            default_value: serde_json::json!("d_added"),
+        },
+        SchemaOp::RenameField {
+            collection: "users".into(),
+            old_name: "tag".into(),
+            new_name: "doc_tag".into(),
+        },
+        SchemaOp::RemoveField {
+            collection: "users".into(),
+            field_name: "doc_only".into(),
+        },
+        SchemaOp::CreateIndex {
+            name: "users_doc_tag_idx".into(),
+            collection: "users".into(),
+            fields: vec![("doc_tag".into(), IndexFieldType::String)],
+            unique: false,
+        },
+    ]
+    .into_iter()
+    .map(|op| op.in_namespace(IndexNamespace::Document))
+    .collect();
+    migrate_single(&schema, 1, doc_ops);
+
+    let doc_after = read_json_value(&db, "users:1");
+    assert_eq!(doc_after["doc_tag"], "d_old");
+    assert_eq!(doc_after.get("tag"), None);
+    assert_eq!(doc_after.get("doc_only"), None);
+    assert_eq!(
+        select_rows(&executor, "SELECT email, tag FROM users WHERE id = 1"),
+        vec![vec!["sql@x.com", "s_old"]]
+    );
+    assert_eq!(
+        idx_mgr.definition("users_doc_tag_idx").unwrap().namespace,
+        IndexNamespace::Document
+    );
+    assert_eq!(
+        idx_mgr
+            .lookup("users_doc_tag_idx", &[serde_json::json!("d_old")])
+            .unwrap(),
+        vec!["1".to_string()]
+    );
+
+    // 2. Explicit SQL migration modifies only SQL rows/schema and indexes SQL rows.
+    let sql_ops = vec![
+        SchemaOp::AddField {
+            collection: "users".into(),
+            field_name: "sql_only".into(),
+            default_value: serde_json::json!("s_added"),
+        },
+        SchemaOp::CreateIndex {
+            name: "users_sql_tag_idx".into(),
+            collection: "users".into(),
+            fields: vec![("tag".into(), IndexFieldType::String)],
+            unique: false,
+        },
+    ]
+    .into_iter()
+    .map(|op| op.in_namespace(IndexNamespace::Sql))
+    .collect();
+    migrate_single(&schema, 2, sql_ops);
+
+    assert_eq!(
+        select_rows(&executor, "SELECT sql_only, tag FROM users WHERE id = 1"),
+        vec![vec!["s_added", "s_old"]]
+    );
+    assert_eq!(read_json_value(&db, "users:1").get("sql_only"), None);
+    assert_eq!(
+        idx_mgr.definition("users_sql_tag_idx").unwrap().namespace,
+        IndexNamespace::Sql
+    );
+    assert_eq!(
+        idx_mgr
+            .lookup("users_sql_tag_idx", &[serde_json::json!("s_old")])
+            .unwrap(),
+        vec!["1".to_string()]
+    );
+}
+
+#[test]
+fn schema_explicit_namespace_migrations_reject_invalid_targets_and_enforce_drop() {
+    let (db, _dir, executor) = setup();
+    let idx_mgr = Arc::new(IndexManager::new(db.clone()));
+    let schema = SchemaManager::new(db, idx_mgr.clone());
+
+    execute(
+        &executor,
+        "CREATE TABLE scoped_tbl (id INTEGER PRIMARY KEY, tag TEXT)",
+    );
+    idx_mgr
+        .create_document_index(
+            "scoped_doc_idx",
+            "scoped_tbl",
+            vec![("tag".into(), IndexFieldType::String)],
+            false,
+        )
+        .unwrap();
+
+    for bad_op in [
+        SchemaOp::AddField {
+            collection: "scoped_tbl".into(),
+            field_name: "x".into(),
+            default_value: serde_json::json!("v"),
+        }
+        .in_namespace(IndexNamespace::Both),
+        SchemaOp::AddField {
+            collection: "doc_only_missing_sql".into(),
+            field_name: "x".into(),
+            default_value: serde_json::json!("v"),
+        }
+        .in_namespace(IndexNamespace::Sql),
+        SchemaOp::DropIndex {
+            name: "scoped_doc_idx".into(),
+        }
+        .in_namespace(IndexNamespace::Sql),
+    ] {
+        let bad_mig = Migration {
+            version: 1,
+            description: "invalid namespace op".into(),
+            up: vec![bad_op],
+            down: vec![],
+        };
+        assert!(schema.migrate_up(&bad_mig).is_err());
+    }
+
+    let valid_drop = Migration {
+        version: 1,
+        description: "drop doc index with matching Document namespace".into(),
+        up: vec![
+            SchemaOp::DropIndex {
+                name: "scoped_doc_idx".into(),
+            }
+            .in_namespace(IndexNamespace::Document),
+        ],
+        down: vec![],
+    };
+    schema.migrate_up(&valid_drop).unwrap();
+    assert!(idx_mgr.definition("scoped_doc_idx").is_err());
+}

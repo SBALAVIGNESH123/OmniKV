@@ -1639,6 +1639,33 @@ impl OmniKV {
         self.roots.store(Arc::new(new_roots));
     }
 
+    /// Creates and durably syncs an empty base SSTable (4096 bytes for mmap)
+    /// and empty heap file before an initial manifest referencing them is saved.
+    pub(crate) fn init_empty_storage_files(
+        base_path: &str,
+        heap_path: &str,
+    ) -> Result<(), OmniError> {
+        let base_file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(base_path)?;
+        if base_file.metadata()?.len() == 0 {
+            base_file.set_len(4096)?; // dummy length to allow mmap
+        }
+        base_file.sync_all()?;
+
+        let heap_file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(heap_path)?;
+        heap_file.sync_all()?;
+        Ok(())
+    }
+
     /// Pure storage recovery — no threads, no side effects.
     /// Returns raw storage handles that can be atomically installed.
     /// Used by install_snapshot to swap topology without restarting the engine.
@@ -1658,25 +1685,40 @@ impl OmniKV {
                 max_seq: 0,
                 wal_checkpoint_seq: 0,
             };
+            Self::init_empty_storage_files(&m.base_path, &m.heap_path)?;
             m.save(manifest_path)?;
             m
         };
 
+        // Every file referenced by an existing manifest must be present and
+        // readable; never fabricate an empty base/heap or silently skip missing
+        // L0/L1 SSTables on recovery.
         let base_file = OpenOptions::new()
-            .create(true)
-            .truncate(false)
             .read(true)
-            .write(true)
-            .open(&manifest.base_path)?;
+            .open(&manifest.base_path)
+            .map_err(|e| {
+                OmniError::IoError(format!(
+                    "missing or unreadable base SSTable '{}' referenced by manifest: {e}",
+                    manifest.base_path
+                ))
+            })?;
         if base_file.metadata()?.len() == 0 {
-            base_file.set_len(4096)?; // dummy length to allow mmap
+            return Err(OmniError::IoError(format!(
+                "corrupt empty base SSTable '{}' referenced by manifest",
+                manifest.base_path
+            )));
         }
         // SAFETY: The base SSTable file is mapped read-only after it is created
         // or opened. OmniKV holds the database LOCK before this point, so no
         // second engine instance can truncate or mutate the file while mapped.
         // Internal compaction never edits a mapped file in place; it writes a
         // new file, syncs it, maps it, and atomically publishes a new root.
-        let base_mmap = Arc::new(unsafe { MmapOptions::new().map(&base_file)? });
+        let base_mmap = Arc::new(unsafe { MmapOptions::new().map(&base_file) }.map_err(|e| {
+            OmniError::IoError(format!(
+                "failed to memory-map base SSTable '{}' referenced by manifest: {e}",
+                manifest.base_path
+            ))
+        })?);
 
         let reader = SSTableReader::from_mmap(base_mmap.clone());
         let base_bloom_path = bloom_path_for_base(&manifest.base_path);
@@ -1698,73 +1740,95 @@ impl OmniKV {
             }
         };
 
-        let mut loaded_sstables = Vec::new();
+        let mut loaded_sstables = Vec::with_capacity(manifest.sstables.len());
         for sst_path in &manifest.sstables {
-            if let Ok(file) = OpenOptions::new().read(true).open(sst_path)
-                // SAFETY: Recovered L0 SSTables are opened read-only and are
-                // immutable once published in the manifest. The database LOCK
-                // prevents concurrent OmniKV processes from mutating them.
-                && let Ok(mmap) = unsafe { MmapOptions::new().map(&file) }
-            {
-                let mmap = Arc::new(mmap);
-                let reader = SSTableReader::from_mmap(mmap.clone());
-                let bloom_path = sst_path.replace(".sst", ".bloom");
-                let bloom = match BloomFilter::load(&bloom_path) {
-                    Ok(b) => b,
-                    Err(_) => {
-                        let mut count = 0;
-                        for _ in reader.iter_from(b"") {
-                            count += 1;
-                        }
-                        let mut b = BloomFilter::new(count.max(100));
-                        for rec in reader.iter_from(b"") {
-                            if rec.is_valid() {
-                                let mut h = FnvHasher::default();
-                                rec.key.hash(&mut h);
-                                b.add(h.finish());
-                            }
-                        }
-                        let _ = b.save(&bloom_path);
-                        b
+            let file = OpenOptions::new().read(true).open(sst_path).map_err(|e| {
+                OmniError::IoError(format!(
+                    "missing or unreadable L0 SSTable '{sst_path}' referenced by manifest: {e}"
+                ))
+            })?;
+            // SAFETY: Recovered L0 SSTables are opened read-only and are
+            // immutable once published in the manifest. The database LOCK
+            // prevents concurrent OmniKV processes from mutating them.
+            let mmap = Arc::new(unsafe { MmapOptions::new().map(&file) }.map_err(|e| {
+                OmniError::IoError(format!(
+                    "failed to memory-map L0 SSTable '{sst_path}' referenced by manifest: {e}"
+                ))
+            })?);
+            let reader = SSTableReader::from_mmap(mmap.clone());
+            let bloom_path = sst_path.replace(".sst", ".bloom");
+            let bloom = match BloomFilter::load(&bloom_path) {
+                Ok(b) => b,
+                Err(_) => {
+                    let mut count = 0;
+                    for _ in reader.iter_from(b"") {
+                        count += 1;
                     }
-                };
-                loaded_sstables.push((mmap, Arc::new(bloom), sst_path.clone()));
-            }
+                    let mut b = BloomFilter::new(count.max(100));
+                    for rec in reader.iter_from(b"") {
+                        if rec.is_valid() {
+                            let mut h = FnvHasher::default();
+                            rec.key.hash(&mut h);
+                            b.add(h.finish());
+                        }
+                    }
+                    let _ = b.save(&bloom_path);
+                    b
+                }
+            };
+            loaded_sstables.push((mmap, Arc::new(bloom), sst_path.clone()));
         }
 
-        let mut loaded_l1_sstables = Vec::new();
+        let mut loaded_l1_sstables = Vec::with_capacity(manifest.l1_sstables.len());
         for sst_path in &manifest.l1_sstables {
-            if let Ok(file) = OpenOptions::new().read(true).open(sst_path)
-                // SAFETY: Recovered L1 SSTables are immutable read-only table
-                // files. They are replaced by publishing new root snapshots,
-                // never by in-place mutation while mapped.
-                && let Ok(mmap) = unsafe { MmapOptions::new().map(&file) }
-            {
-                let mmap = Arc::new(mmap);
-                let reader = SSTableReader::from_mmap(mmap.clone());
-                let bloom_path = sst_path.replace(".sst", ".bloom");
-                let bloom = match BloomFilter::load(&bloom_path) {
-                    Ok(b) => b,
-                    Err(_) => {
-                        let mut count = 0;
-                        for _ in reader.iter_from(b"") {
-                            count += 1;
-                        }
-                        let mut b = BloomFilter::new(count.max(100));
-                        for rec in reader.iter_from(b"") {
-                            if rec.is_valid() {
-                                let mut h = FnvHasher::default();
-                                rec.key.hash(&mut h);
-                                b.add(h.finish());
-                            }
-                        }
-                        let _ = b.save(&bloom_path);
-                        b
+            let file = OpenOptions::new().read(true).open(sst_path).map_err(|e| {
+                OmniError::IoError(format!(
+                    "missing or unreadable L1 SSTable '{sst_path}' referenced by manifest: {e}"
+                ))
+            })?;
+            // SAFETY: Recovered L1 SSTables are immutable read-only table
+            // files. They are replaced by publishing new root snapshots,
+            // never by in-place mutation while mapped.
+            let mmap = Arc::new(unsafe { MmapOptions::new().map(&file) }.map_err(|e| {
+                OmniError::IoError(format!(
+                    "failed to memory-map L1 SSTable '{sst_path}' referenced by manifest: {e}"
+                ))
+            })?);
+            let reader = SSTableReader::from_mmap(mmap.clone());
+            let bloom_path = sst_path.replace(".sst", ".bloom");
+            let bloom = match BloomFilter::load(&bloom_path) {
+                Ok(b) => b,
+                Err(_) => {
+                    let mut count = 0;
+                    for _ in reader.iter_from(b"") {
+                        count += 1;
                     }
-                };
-                loaded_l1_sstables.push((mmap, Arc::new(bloom), sst_path.clone()));
-            }
+                    let mut b = BloomFilter::new(count.max(100));
+                    for rec in reader.iter_from(b"") {
+                        if rec.is_valid() {
+                            let mut h = FnvHasher::default();
+                            rec.key.hash(&mut h);
+                            b.add(h.finish());
+                        }
+                    }
+                    let _ = b.save(&bloom_path);
+                    b
+                }
+            };
+            loaded_l1_sstables.push((mmap, Arc::new(bloom), sst_path.clone()));
         }
+
+        let heap_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&manifest.heap_path)
+            .map_err(|e| {
+                OmniError::IoError(format!(
+                    "missing or unreadable heap file '{}' referenced by manifest: {e}",
+                    manifest.heap_path
+                ))
+            })?;
+        let heap_offset = heap_file.metadata()?.len();
 
         let memtable = Arc::new(std::array::from_fn(|_| SkipMap::new()));
         let mut global_seq = manifest.max_seq;
@@ -1785,14 +1849,6 @@ impl OmniKV {
                 }
             }
         }
-
-        let heap_file = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(&manifest.heap_path)?;
-        let heap_offset = heap_file.metadata()?.len();
 
         let wal = wal::WriteAheadLog::new(wal_path)?;
 

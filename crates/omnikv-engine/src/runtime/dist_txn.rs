@@ -1072,6 +1072,21 @@ fn legacy_participant_prepare_key(txn_id: GlobalTxnId) -> String {
     format!("__2PC_PREPARE__/{}_{}", txn_id.0, txn_id.1)
 }
 
+fn validate_participant_writes(
+    participant_node_id: u64,
+    writes: &[DistWrite],
+) -> Result<(), String> {
+    for write in writes {
+        if write.node_id != participant_node_id {
+            return Err(format!(
+                "2PC write for key '{}' targets participant node {} instead of node {}",
+                write.key, write.node_id, participant_node_id
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn build_write_batch(writes: &[DistWrite]) -> Result<WriteBatch, String> {
     if writes.len().saturating_add(2) > WriteBatch::MAX_OPS {
         return Err("2PC batch exceeds maximum size after decision records".into());
@@ -1268,6 +1283,11 @@ fn check_2pc_participant_writes(
             return Ok(Some(format!(
                 "mismatched 2PC participant record key '{key}' for node {} txn {:?}",
                 entry.node_id, entry.txn_id
+            )));
+        }
+        if let Err(reason) = validate_participant_writes(entry.node_id, &entry.writes) {
+            return Ok(Some(format!(
+                "invalid 2PC participant record for key '{key}': {reason}"
             )));
         }
         let prev_entry = match seen_entries.get(key) {
@@ -1642,6 +1662,9 @@ pub(crate) fn collect_prepared_reservations(
                 entry.state
             )));
         }
+        validate_participant_writes(entry.node_id, &entry.writes).map_err(|reason| {
+            OmniError::IoError(format!("invalid 2PC participant record '{key}': {reason}"))
+        })?;
         if entry.state != "PREPARED" {
             continue;
         }
@@ -1760,6 +1783,7 @@ impl TwoPhaseParticipant {
                 .lock()
                 .map_err(|_| OmniError::LockPoisoned("2PC participant".into()))?;
             self.db.ensure_cluster_linearizable()?;
+            validate_participant_writes(self.node_id, writes).map_err(OmniError::IoError)?;
             self.recover_locked()?;
             if let Some(existing) = self.load_participant_log(txn_id)? {
                 if existing.writes != writes && existing.state != "ABORTED" {
@@ -1819,6 +1843,14 @@ impl TwoPhaseParticipant {
         writes: &[DistWrite],
         read_seq: u64,
     ) -> PrepareResult {
+        if let Err(reason) = validate_participant_writes(self.node_id, writes) {
+            return PrepareResult {
+                node_id: self.node_id,
+                txn_id,
+                vote: Vote::Abort(reason),
+                prepare_seq: 0,
+            };
+        }
         let write_keys: Vec<String> = writes.iter().map(|write| write.key.clone()).collect();
         {
             let mut key_locks = match self.key_locks.lock() {
@@ -2216,6 +2248,9 @@ impl TwoPhaseParticipant {
             if entry.node_id != self.node_id || entry.state != "PREPARED" {
                 continue;
             }
+            validate_participant_writes(self.node_id, &entry.writes).map_err(|reason| {
+                OmniError::IoError(format!("invalid prepared transaction log: {reason}"))
+            })?;
             if entry.unvalidated {
                 // An unvalidated PREPARED record never passed snapshot
                 // validation and never voted Commit. Reconcile it to ABORTED
@@ -2333,6 +2368,13 @@ impl TwoPhaseParticipant {
         let state = self
             .load_participant_log(txn_id)?
             .ok_or_else(|| OmniError::IoError(format!("No prepared transaction {txn_id:?}")))?;
+        if state.node_id != self.node_id || state.txn_id != txn_id {
+            return Err(OmniError::IoError(format!(
+                "mismatched 2PC participant record identity for node {} txn {:?}",
+                self.node_id, txn_id
+            )));
+        }
+        validate_participant_writes(self.node_id, &state.writes).map_err(OmniError::IoError)?;
         let write_keys: Vec<String> = state.writes.iter().map(|w| w.key.clone()).collect();
         match state.state.as_str() {
             "COMMITTED" => {
@@ -4008,5 +4050,83 @@ mod tests {
                 "for key '{bad_key}' expected '{expected_substr}', got: {err}"
             );
         }
+    }
+
+    #[test]
+    fn participant_rejects_writes_targeting_different_node_across_prepare_open_and_commit() {
+        // 1. Prepare request with a DistWrite addressed to node 11 on participant 10 must abort.
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = dir.path().join("manifest.json");
+        let wal = dir.path().join("wal.bin");
+        let db = OmniKV::open(manifest.to_str().unwrap(), wal.to_str().unwrap()).unwrap();
+        let participant = TwoPhaseParticipant::new(10, db.clone());
+        let bad_writes = vec![DistWrite {
+            node_id: 11,
+            key: "customer:42".into(),
+            value: Some("wrong_shard".into()),
+            ttl: 0,
+        }];
+        let res = participant.prepare((1, 1), &bad_writes);
+        assert!(
+            matches!(&res.vote, Vote::Abort(reason) if reason.contains("targets participant node 11 instead of node 10")),
+            "wrong-target prepare must abort, got: {:?}",
+            res.vote
+        );
+        assert!(
+            db.find_latest_internal(&participant_prepare_key(10, (1, 1)))
+                .unwrap()
+                .is_none(),
+            "rejected wrong-target prepare must not persist a prepared record"
+        );
+
+        // 2. A persisted mismatched record must be rejected by collect_prepared_reservations,
+        //    participant commit_outcome (without writing the key), AND OmniKV::open.
+        let persisted_bad = ParticipantLogEntry {
+            txn_id: (1, 2),
+            node_id: 10,
+            state: "PREPARED".into(),
+            writes: bad_writes,
+            prepare_seq: 1,
+            commit_seq: None,
+            snapshot_imported: false,
+            unvalidated: false,
+        };
+        let mut seed = WriteBatch::new();
+        seed.set(
+            &participant_prepare_key(10, (1, 2)),
+            serde_json::to_string(&persisted_bad).unwrap(),
+        )
+        .unwrap();
+        db.commit_batch_local(&seed).unwrap();
+
+        let collect_err = collect_prepared_reservations(&db)
+            .expect_err("collect_prepared_reservations must reject mismatched write.node_id");
+        assert!(
+            collect_err
+                .to_string()
+                .contains("targets participant node 11 instead of node 10")
+        );
+
+        let commit_err = participant
+            .commit_outcome((1, 2))
+            .expect_err("commit_outcome must refuse to apply a write targeting another node");
+        assert!(
+            commit_err
+                .to_string()
+                .contains("targets participant node 11 instead of node 10")
+        );
+        assert_eq!(
+            db.find_latest_internal("customer:42").unwrap(),
+            None,
+            "wrong-node write must never be applied locally"
+        );
+
+        drop(participant);
+        drop(db);
+        let reopen_res = OmniKV::open(manifest.to_str().unwrap(), wal.to_str().unwrap());
+        assert!(
+            reopen_res.is_err(),
+            "OmniKV::open must fail closed when a persisted 2PC record targets another participant"
+        );
     }
 }
