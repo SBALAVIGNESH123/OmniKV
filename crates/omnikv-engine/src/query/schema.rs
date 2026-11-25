@@ -39,6 +39,26 @@ const VERSION_KEY: &str = "\x00SCHEMA\x00__version__";
 /// Prefix for individual migration records.
 const MIGRATION_PREFIX: &str = "\x00SCHEMA\x00migration:";
 const MIGRATION_LOCK_NAME: &str = "\x00SCHEMA\x00__migration_lock__";
+/// Maximum convergence passes for lock-free online Document schema migrations
+/// when concurrent `db.commit_batch` writers race with field backfill/rename.
+const MAX_DOC_CONVERGENCE_ROUNDS: usize = 32;
+
+#[cfg(test)]
+type DocMigrationHookFn = Box<dyn FnMut(&str) + Send>;
+
+#[cfg(test)]
+static DOC_MIGRATION_HOOK: std::sync::Mutex<Option<DocMigrationHookFn>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+fn run_doc_migration_hook(point: &str) {
+    let mut guard = DOC_MIGRATION_HOOK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(hook) = guard.as_mut() {
+        hook(point);
+    }
+}
 
 /// Schema version number.
 pub type Version = u64;
@@ -638,8 +658,15 @@ impl SchemaManager {
                     explicit_namespace,
                     name,
                 );
-                self.index_manager
-                    .drop_index_with_receipt(name, &receipt_key, explicit_namespace)
+                let legacy_receipt_key = Self::legacy_drop_index_done_key(
+                    version, direction, attempt_id, step_index, name,
+                );
+                self.index_manager.drop_index_with_receipt(
+                    name,
+                    &receipt_key,
+                    Some(&legacy_receipt_key),
+                    explicit_namespace,
+                )
             }
             SchemaOp::AddField {
                 collection,
@@ -915,6 +942,7 @@ impl SchemaManager {
                                     &table.name,
                                     IndexNamespace::Sql,
                                     &staged_old,
+                                    resolved_new,
                                     &candidate_stage_key,
                                     &done_key,
                                     &expected_done,
@@ -1230,6 +1258,21 @@ impl SchemaManager {
         )
     }
 
+    fn legacy_drop_index_done_key(
+        version: Version,
+        direction: &str,
+        attempt_id: &str,
+        step_index: usize,
+        index_name: &str,
+    ) -> String {
+        let idx_lower = index_name.to_ascii_lowercase();
+        format!(
+            "{}{step_index:06}:{}:{idx_lower}",
+            Self::drop_index_done_prefix(version, direction, attempt_id),
+            idx_lower.len()
+        )
+    }
+
     fn drop_index_done_key(
         version: Version,
         direction: &str,
@@ -1295,7 +1338,8 @@ impl SchemaManager {
             let (_, stored_ns, dropped_ids) =
                 crate::secondary_index::parse_drop_index_receipt(&value)?;
             if let Some(expected_ns) = drop_step_ns
-                && stored_ns != Some(expected_ns)
+                && let Some(actual_ns) = stored_ns
+                && actual_ns != expected_ns
             {
                 continue;
             }
@@ -1592,6 +1636,14 @@ impl SchemaManager {
         done_receipt: Option<(&str, &str)>,
     ) -> Result<(), OmniError> {
         self.index_manager.refresh_catalog()?;
+        if namespace == IndexNamespace::Document {
+            return self.backfill_document_field_with_receipt(
+                collection,
+                field_name,
+                default_value,
+                done_receipt,
+            );
+        }
         let seq = self.db.get_seq();
         let catalog = self.index_manager.catalog_snapshot_at(seq)?;
         let sql_table_present = namespace == IndexNamespace::Sql
@@ -1729,6 +1781,162 @@ impl SchemaManager {
         Ok(())
     }
 
+    fn backfill_document_field_with_receipt(
+        &self,
+        collection: &str,
+        field_name: &str,
+        default_value: Option<&serde_json::Value>,
+        done_receipt: Option<(&str, &str)>,
+    ) -> Result<(), OmniError> {
+        let Some((doc_prefix, doc_end)) =
+            collection_row_ranges_for_namespace(collection, IndexNamespace::Document)
+                .into_iter()
+                .next()
+        else {
+            return Ok(());
+        };
+        let tail_ops = usize::from(done_receipt.is_some());
+
+        'rounds: for _ in 0..MAX_DOC_CONVERGENCE_ROUNDS {
+            let snap = self.db.consistent_snapshot_guard()?;
+            let round_seq = snap.sequence();
+            if let Some((done_key, done_val)) = done_receipt
+                && self.db.find(done_key, round_seq)?.as_deref() == Some(done_val)
+            {
+                return Ok(());
+            }
+            let catalog = self.index_manager.catalog_snapshot_at(round_seq)?;
+            let max_doc_ops = 1 + 2 * catalog.indexes_for_collection(collection).len();
+            let mut batch = WriteBatch::new();
+            let mut chunk_doc_keys = Vec::new();
+            let mut flushed_any = false;
+
+            for (key, value) in self
+                .db
+                .scan_exclusive(&doc_prefix, Some(&doc_end), round_seq)?
+            {
+                let Ok(mut doc) = serde_json::from_str::<serde_json::Value>(&value) else {
+                    continue;
+                };
+                let old_doc = doc.clone();
+                let Some(obj) = doc.as_object_mut() else {
+                    continue;
+                };
+                let changed = match default_value {
+                    Some(val) if !obj.contains_key(field_name) => {
+                        obj.insert(field_name.to_string(), val.clone());
+                        true
+                    }
+                    Some(_) => false,
+                    None => obj.remove(field_name).is_some(),
+                };
+                if !changed {
+                    continue;
+                }
+                if !batch.is_empty()
+                    && (batch.op_count() >= WriteBatch::MAX_OPS / 2
+                        || batch.op_count().saturating_add(max_doc_ops) > WriteBatch::MAX_OPS)
+                {
+                    match self.db.commit_batch_if_keys_unchanged(
+                        batch,
+                        &chunk_doc_keys,
+                        round_seq,
+                    )? {
+                        Ok(_) => {
+                            flushed_any = true;
+                            batch = WriteBatch::new();
+                            chunk_doc_keys.clear();
+                            if default_value.is_some() {
+                                crate::failpoints::maybe_fail(
+                                    "schema::add_field_after_partial_batch",
+                                )
+                                .map_err(|e| {
+                                    OmniError::IoError(format!(
+                                        "schema add_field failure point: {e}"
+                                    ))
+                                })?;
+                            }
+                        }
+                        Err(()) => continue 'rounds,
+                    }
+                }
+                self.stage_doc_update(
+                    &catalog,
+                    collection,
+                    &doc_prefix,
+                    false,
+                    crate::catalog::RowFormat::default(),
+                    &key,
+                    &value,
+                    old_doc,
+                    doc,
+                    &mut batch,
+                )?;
+                chunk_doc_keys.push(key);
+                if batch.op_count() >= WriteBatch::MAX_OPS / 2 && !batch.is_empty() {
+                    match self.db.commit_batch_if_keys_unchanged(
+                        batch,
+                        &chunk_doc_keys,
+                        round_seq,
+                    )? {
+                        Ok(_) => {
+                            flushed_any = true;
+                            batch = WriteBatch::new();
+                            chunk_doc_keys.clear();
+                            if default_value.is_some() {
+                                crate::failpoints::maybe_fail(
+                                    "schema::add_field_after_partial_batch",
+                                )
+                                .map_err(|e| {
+                                    OmniError::IoError(format!(
+                                        "schema add_field failure point: {e}"
+                                    ))
+                                })?;
+                            }
+                        }
+                        Err(()) => continue 'rounds,
+                    }
+                }
+            }
+
+            if flushed_any
+                || (!batch.is_empty()
+                    && batch.op_count().saturating_add(tail_ops) > WriteBatch::MAX_OPS)
+            {
+                if !batch.is_empty()
+                    && self
+                        .db
+                        .commit_batch_if_keys_unchanged(batch, &chunk_doc_keys, round_seq)?
+                        .is_ok()
+                    && default_value.is_some()
+                {
+                    crate::failpoints::maybe_fail("schema::add_field_after_partial_batch")
+                        .map_err(|e| {
+                            OmniError::IoError(format!("schema add_field failure point: {e}"))
+                        })?;
+                }
+                continue 'rounds;
+            }
+
+            if let Some((done_key, done_val)) = done_receipt {
+                batch.set(done_key, done_val.to_string())?;
+            }
+            #[cfg(test)]
+            run_doc_migration_hook("backfill_before_final_commit");
+            if self
+                .db
+                .commit_batch_if_range_unchanged(batch, &doc_prefix, &doc_end, round_seq)?
+                .is_ok()
+            {
+                return Ok(());
+            }
+        }
+
+        Err(OmniError::IoError(format!(
+            "document field migration for '{collection}.{field_name}' could not converge after {MAX_DOC_CONVERGENCE_ROUNDS} rounds due to concurrent writes; retry migration"
+        )))
+    }
+
     fn rename_field_online(
         &self,
         collection: &str,
@@ -1739,6 +1947,11 @@ impl SchemaManager {
         done_value: &str,
     ) -> Result<(), OmniError> {
         self.index_manager.refresh_catalog()?;
+        if sql_catalog_update.is_none() {
+            return self.rename_document_field_online(
+                collection, old_name, new_name, done_key, done_value,
+            );
+        }
         let seq = self.db.get_seq();
         let catalog = self.index_manager.catalog_snapshot_at(seq)?;
         let sql_row_format = self
@@ -1752,11 +1965,7 @@ impl SchemaManager {
             .map(|table| table.row_format)
             .unwrap_or_default();
 
-        let namespace = if sql_catalog_update.is_some() {
-            IndexNamespace::Sql
-        } else {
-            IndexNamespace::Document
-        };
+        let namespace = IndexNamespace::Sql;
         let ns_stage_key =
             Self::rename_stage_key_for_namespace(collection, namespace, old_name, new_name);
         let legacy_stage_key = Self::legacy_rename_stage_key(collection, old_name, new_name);
@@ -1775,12 +1984,6 @@ impl SchemaManager {
         } else {
             (ns_stage_key, false)
         };
-        if !is_staged_retry
-            && sql_catalog_update.is_none()
-            && self.db.find(done_key, seq)?.as_deref() == Some(done_value)
-        {
-            return Ok(());
-        }
 
         let row_ranges = collection_row_ranges_for_namespace(collection, namespace);
 
@@ -1920,20 +2123,271 @@ impl SchemaManager {
         }
 
         self.cleanup_staged_rename(
-            collection, namespace, old_name, &stage_key, done_key, done_value,
+            collection, namespace, old_name, new_name, &stage_key, done_key, done_value,
         )
     }
 
+    fn resolve_doc_rename_stage(
+        &self,
+        collection: &str,
+        old_name: &str,
+        new_name: &str,
+        seq: u64,
+    ) -> Result<(String, bool), OmniError> {
+        let ns_stage_key = Self::rename_stage_key_for_namespace(
+            collection,
+            IndexNamespace::Document,
+            old_name,
+            new_name,
+        );
+        let legacy_stage_key = Self::legacy_rename_stage_key(collection, old_name, new_name);
+        if self.db.find(&ns_stage_key, seq)?.is_some() {
+            Ok((ns_stage_key, true))
+        } else if self.db.find(&legacy_stage_key, seq)?.is_some()
+            && Self::legacy_rename_stage_matches_namespace(
+                &self.db,
+                collection,
+                &legacy_stage_key,
+                IndexNamespace::Document,
+                seq,
+            )?
+        {
+            Ok((legacy_stage_key, true))
+        } else {
+            Ok((ns_stage_key, false))
+        }
+    }
+
+    fn rename_document_field_online(
+        &self,
+        collection: &str,
+        old_name: &str,
+        new_name: &str,
+        done_key: &str,
+        done_value: &str,
+    ) -> Result<(), OmniError> {
+        let Some((doc_prefix, doc_end)) =
+            collection_row_ranges_for_namespace(collection, IndexNamespace::Document)
+                .into_iter()
+                .next()
+        else {
+            return Ok(());
+        };
+        let single_batch_budget = WriteBatch::MAX_OPS.saturating_sub(1);
+        let mut active_stage_key = None;
+
+        // Phase 1: Attempt single-batch atomic rename when not already staged.
+        for _ in 0..MAX_DOC_CONVERGENCE_ROUNDS {
+            let snap = self.db.consistent_snapshot_guard()?;
+            let round_seq = snap.sequence();
+            let (stage_key, is_staged_retry) =
+                self.resolve_doc_rename_stage(collection, old_name, new_name, round_seq)?;
+            if !is_staged_retry && self.db.find(done_key, round_seq)?.as_deref() == Some(done_value)
+            {
+                return Ok(());
+            }
+            if is_staged_retry {
+                active_stage_key = Some(stage_key);
+                break;
+            }
+            let catalog = self.index_manager.catalog_snapshot_at(round_seq)?;
+            let max_doc_ops = 1 + 2 * catalog.indexes_for_collection(collection).len();
+            let scanned = self
+                .db
+                .scan_exclusive(&doc_prefix, Some(&doc_end), round_seq)?;
+            for (_, value) in &scanned {
+                if let Ok(serde_json::Value::Object(obj)) = serde_json::from_str(value)
+                    && obj.contains_key(old_name)
+                    && obj.contains_key(new_name)
+                {
+                    return Err(OmniError::IoError(format!(
+                        "cannot rename field '{}' to '{}' because the destination exists",
+                        old_name, new_name
+                    )));
+                }
+            }
+            let mut single_batch = WriteBatch::new();
+            let mut fits_in_one_batch = true;
+            for (key, value) in scanned {
+                let Ok(mut doc) = serde_json::from_str::<serde_json::Value>(&value) else {
+                    continue;
+                };
+                let old_doc = doc.clone();
+                let Some(obj) = doc.as_object_mut() else {
+                    continue;
+                };
+                if let Some(val) = obj.remove(old_name) {
+                    if single_batch.op_count().saturating_add(max_doc_ops) > single_batch_budget {
+                        fits_in_one_batch = false;
+                        break;
+                    }
+                    obj.insert(new_name.to_string(), val);
+                    self.stage_doc_update(
+                        &catalog,
+                        collection,
+                        &doc_prefix,
+                        false,
+                        crate::catalog::RowFormat::default(),
+                        &key,
+                        &value,
+                        old_doc,
+                        doc,
+                        &mut single_batch,
+                    )?;
+                }
+            }
+            if !fits_in_one_batch {
+                active_stage_key = Some(stage_key);
+                break;
+            }
+            single_batch.set(done_key, done_value.to_string())?;
+            #[cfg(test)]
+            run_doc_migration_hook("rename_single_before_commit");
+            if self
+                .db
+                .commit_batch_if_range_unchanged(single_batch, &doc_prefix, &doc_end, round_seq)?
+                .is_ok()
+            {
+                return Ok(());
+            }
+        }
+
+        let Some(stage_key) = active_stage_key else {
+            return Err(OmniError::IoError(format!(
+                "document rename '{collection}.{old_name}->{new_name}' could not converge after {MAX_DOC_CONVERGENCE_ROUNDS} rounds due to concurrent writes; retry migration"
+            )));
+        };
+
+        // Phase 2: Staged multi-batch rename using per-key OCC guards so
+        // intermediate staging chunks never clobber concurrent doc updates.
+        let mut staged_cleanly = false;
+        'staging: for _ in 0..MAX_DOC_CONVERGENCE_ROUNDS {
+            let snap = self.db.consistent_snapshot_guard()?;
+            let round_seq = snap.sequence();
+            let stage_present = self.db.find(&stage_key, round_seq)?.is_some();
+            let catalog = self.index_manager.catalog_snapshot_at(round_seq)?;
+            let stage_doc_ops = 2 + 2 * catalog.indexes_for_collection(collection).len();
+            let mut batch = WriteBatch::new();
+            let mut chunk_doc_keys = Vec::new();
+            if !stage_present {
+                batch.set(&stage_key, old_name.to_string())?;
+            }
+
+            for (key, value) in self
+                .db
+                .scan_exclusive(&doc_prefix, Some(&doc_end), round_seq)?
+            {
+                let Ok(mut doc) = serde_json::from_str::<serde_json::Value>(&value) else {
+                    continue;
+                };
+                let old_doc = doc.clone();
+                let Some(obj) = doc.as_object_mut() else {
+                    continue;
+                };
+                let Some(val) = obj.get(old_name).cloned() else {
+                    continue;
+                };
+                let row_stage_key = Self::rename_row_stage_key(&stage_key, &key);
+                let has_row_marker = self.db.find(&row_stage_key, round_seq)?.is_some();
+                if let Some(existing_new) = obj.get(new_name) {
+                    let row_staged = has_row_marker || (stage_present && existing_new == &val);
+                    if !row_staged {
+                        return Err(OmniError::IoError(format!(
+                            "cannot rename field '{}' to '{}' because the destination exists",
+                            old_name, new_name
+                        )));
+                    }
+                    if has_row_marker {
+                        continue;
+                    }
+                }
+                if !batch.is_empty()
+                    && (batch.op_count() >= WriteBatch::MAX_OPS / 2
+                        || batch.op_count().saturating_add(stage_doc_ops) > WriteBatch::MAX_OPS)
+                {
+                    match self.db.commit_batch_if_keys_unchanged(
+                        batch,
+                        &chunk_doc_keys,
+                        round_seq,
+                    )? {
+                        Ok(_) => {
+                            batch = WriteBatch::new();
+                            chunk_doc_keys.clear();
+                        }
+                        Err(()) => continue 'staging,
+                    }
+                }
+                obj.insert(new_name.to_string(), val);
+                self.stage_doc_update(
+                    &catalog,
+                    collection,
+                    &doc_prefix,
+                    false,
+                    crate::catalog::RowFormat::default(),
+                    &key,
+                    &value,
+                    old_doc,
+                    doc,
+                    &mut batch,
+                )?;
+                batch.set(&row_stage_key, "1".into())?;
+                chunk_doc_keys.push(key);
+                if batch.op_count() >= WriteBatch::MAX_OPS / 2 && !batch.is_empty() {
+                    match self.db.commit_batch_if_keys_unchanged(
+                        batch,
+                        &chunk_doc_keys,
+                        round_seq,
+                    )? {
+                        Ok(_) => {
+                            batch = WriteBatch::new();
+                            chunk_doc_keys.clear();
+                        }
+                        Err(()) => continue 'staging,
+                    }
+                }
+            }
+
+            if !batch.is_empty()
+                && self
+                    .db
+                    .commit_batch_if_keys_unchanged(batch, &chunk_doc_keys, round_seq)?
+                    .is_err()
+            {
+                continue 'staging;
+            }
+            staged_cleanly = true;
+            break;
+        }
+        if !staged_cleanly {
+            return Err(OmniError::IoError(format!(
+                "document rename staging for '{collection}.{old_name}->{new_name}' could not converge after {MAX_DOC_CONVERGENCE_ROUNDS} rounds due to concurrent writes; retry migration"
+            )));
+        }
+
+        #[cfg(test)]
+        run_doc_migration_hook("rename_after_staging_before_cleanup");
+        self.cleanup_document_staged_rename(
+            collection, old_name, new_name, &stage_key, done_key, done_value,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn cleanup_staged_rename(
         &self,
         collection: &str,
         namespace: IndexNamespace,
         old_name: &str,
+        new_name: &str,
         stage_key: &str,
         done_key: &str,
         done_value: &str,
     ) -> Result<(), OmniError> {
         self.index_manager.refresh_catalog()?;
+        if namespace == IndexNamespace::Document {
+            return self.cleanup_document_staged_rename(
+                collection, old_name, new_name, stage_key, done_key, done_value,
+            );
+        }
         let seq = self.db.get_seq();
         let catalog = self.index_manager.catalog_snapshot_at(seq)?;
         let sql_row_format = self
@@ -1960,7 +2414,20 @@ impl SchemaManager {
                 let Some(obj) = doc.as_object_mut() else {
                     continue;
                 };
-                if obj.remove(old_name).is_some() {
+                if let Some(old_val) = obj.remove(old_name) {
+                    if !obj.contains_key(new_name) {
+                        obj.insert(new_name.to_string(), old_val);
+                    } else if obj.get(new_name) != Some(&old_val)
+                        && self
+                            .db
+                            .find(&Self::rename_row_stage_key(stage_key, &key), seq)?
+                            .is_none()
+                    {
+                        return Err(OmniError::IoError(format!(
+                            "cannot rename field '{}' to '{}' because the destination exists",
+                            old_name, new_name
+                        )));
+                    }
                     if !batch.is_empty()
                         && (batch.op_count() >= WriteBatch::MAX_OPS / 2
                             || batch.op_count().saturating_add(cleanup_doc_ops)
@@ -2015,6 +2482,159 @@ impl SchemaManager {
         batch.delete(stage_key)?;
         self.db.commit_batch(&batch)?;
         Ok(())
+    }
+
+    fn cleanup_document_staged_rename(
+        &self,
+        collection: &str,
+        old_name: &str,
+        new_name: &str,
+        stage_key: &str,
+        done_key: &str,
+        done_value: &str,
+    ) -> Result<(), OmniError> {
+        let Some((doc_prefix, doc_end)) =
+            collection_row_ranges_for_namespace(collection, IndexNamespace::Document)
+                .into_iter()
+                .next()
+        else {
+            return Ok(());
+        };
+        let row_marker_prefix = Self::rename_row_stage_prefix(stage_key);
+
+        'rounds: for _ in 0..MAX_DOC_CONVERGENCE_ROUNDS {
+            let snap = self.db.consistent_snapshot_guard()?;
+            let round_seq = snap.sequence();
+            let catalog = self.index_manager.catalog_snapshot_at(round_seq)?;
+            let cleanup_doc_ops = 2 + 2 * catalog.indexes_for_collection(collection).len();
+            let mut batch = WriteBatch::new();
+            let mut chunk_doc_keys = Vec::new();
+            let mut flushed_any = false;
+
+            for (key, value) in self
+                .db
+                .scan_exclusive(&doc_prefix, Some(&doc_end), round_seq)?
+            {
+                let Ok(mut doc) = serde_json::from_str::<serde_json::Value>(&value) else {
+                    continue;
+                };
+                let old_doc = doc.clone();
+                let Some(obj) = doc.as_object_mut() else {
+                    continue;
+                };
+                let Some(old_val) = obj.remove(old_name) else {
+                    continue;
+                };
+                let row_stage_key = Self::rename_row_stage_key(stage_key, &key);
+                if !obj.contains_key(new_name) {
+                    obj.insert(new_name.to_string(), old_val);
+                } else if obj.get(new_name) != Some(&old_val)
+                    && self.db.find(&row_stage_key, round_seq)?.is_none()
+                {
+                    return Err(OmniError::IoError(format!(
+                        "cannot rename field '{}' to '{}' because the destination exists",
+                        old_name, new_name
+                    )));
+                }
+                if !batch.is_empty()
+                    && (batch.op_count() >= WriteBatch::MAX_OPS / 2
+                        || batch.op_count().saturating_add(cleanup_doc_ops) > WriteBatch::MAX_OPS)
+                {
+                    match self.db.commit_batch_if_keys_unchanged(
+                        batch,
+                        &chunk_doc_keys,
+                        round_seq,
+                    )? {
+                        Ok(_) => {
+                            flushed_any = true;
+                            batch = WriteBatch::new();
+                            chunk_doc_keys.clear();
+                        }
+                        Err(()) => continue 'rounds,
+                    }
+                }
+                self.stage_doc_update(
+                    &catalog,
+                    collection,
+                    &doc_prefix,
+                    false,
+                    crate::catalog::RowFormat::default(),
+                    &key,
+                    &value,
+                    old_doc,
+                    doc,
+                    &mut batch,
+                )?;
+                batch.delete(&row_stage_key)?;
+                chunk_doc_keys.push(key);
+                if batch.op_count() >= WriteBatch::MAX_OPS / 2 && !batch.is_empty() {
+                    match self.db.commit_batch_if_keys_unchanged(
+                        batch,
+                        &chunk_doc_keys,
+                        round_seq,
+                    )? {
+                        Ok(_) => {
+                            flushed_any = true;
+                            batch = WriteBatch::new();
+                            chunk_doc_keys.clear();
+                        }
+                        Err(()) => continue 'rounds,
+                    }
+                }
+            }
+
+            for (marker_key, _) in self.db.scan_prefix(&row_marker_prefix, round_seq)? {
+                if batch
+                    .buffered_deletes
+                    .iter()
+                    .any(|k| k.as_slice() == marker_key.as_bytes())
+                {
+                    continue;
+                }
+                if batch.op_count() >= WriteBatch::MAX_OPS / 2 && !batch.is_empty() {
+                    match self.db.commit_batch_if_keys_unchanged(
+                        batch,
+                        &chunk_doc_keys,
+                        round_seq,
+                    )? {
+                        Ok(_) => {
+                            flushed_any = true;
+                            batch = WriteBatch::new();
+                            chunk_doc_keys.clear();
+                        }
+                        Err(()) => continue 'rounds,
+                    }
+                }
+                batch.delete(&marker_key)?;
+            }
+
+            if flushed_any || batch.op_count().saturating_add(2) > WriteBatch::MAX_OPS {
+                if !batch.is_empty() {
+                    let _ = self.db.commit_batch_if_keys_unchanged(
+                        batch,
+                        &chunk_doc_keys,
+                        round_seq,
+                    )?;
+                }
+                continue 'rounds;
+            }
+
+            batch.set(done_key, done_value.to_string())?;
+            batch.delete(stage_key)?;
+            #[cfg(test)]
+            run_doc_migration_hook("rename_cleanup_before_final_commit");
+            if self
+                .db
+                .commit_batch_if_range_unchanged(batch, &doc_prefix, &doc_end, round_seq)?
+                .is_ok()
+            {
+                return Ok(());
+            }
+        }
+
+        Err(OmniError::IoError(format!(
+            "document rename cleanup for '{collection}.{old_name}->{new_name}' could not converge after {MAX_DOC_CONVERGENCE_ROUNDS} rounds due to concurrent writes; retry migration"
+        )))
     }
 
     /// Persists a migration record.
@@ -2177,5 +2797,325 @@ pub fn rename_field_migration(
             old_name: new_name.to_string(),
             new_name: old_name.to_string(),
         }],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+    use tempfile::TempDir;
+
+    static DOC_MIGRATION_TEST_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct HookGuard {
+        _serial: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl HookGuard {
+        fn install(hook: impl FnMut(&str) + Send + 'static) -> Self {
+            let serial = DOC_MIGRATION_TEST_SERIAL
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut slot = DOC_MIGRATION_HOOK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *slot = Some(Box::new(hook));
+            drop(slot);
+            Self { _serial: serial }
+        }
+    }
+
+    impl Drop for HookGuard {
+        fn drop(&mut self) {
+            let mut slot = DOC_MIGRATION_HOOK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *slot = None;
+        }
+    }
+
+    fn open_test_db() -> (Arc<OmniKV>, TempDir, SchemaManager) {
+        let dir = TempDir::new().expect("tempdir");
+        let db = OmniKV::open(
+            dir.path().join("manifest.json").to_str().expect("manifest"),
+            dir.path().join("wal.bin").to_str().expect("wal"),
+        )
+        .expect("open db");
+        let schema = SchemaManager::new(db.clone(), Arc::new(IndexManager::new(db.clone())));
+        (db, dir, schema)
+    }
+
+    fn read_doc(db: &OmniKV, key: &str) -> serde_json::Value {
+        let raw = db
+            .find(key, db.get_seq())
+            .expect("find")
+            .unwrap_or_else(|| panic!("missing doc {key}"));
+        serde_json::from_str(&raw).expect("valid json")
+    }
+
+    #[test]
+    fn doc_rename_preserves_concurrent_insert_between_staging_and_cleanup_and_at_final_barrier() {
+        let (db, _dir, schema) = open_test_db();
+        let initial_count = WriteBatch::MAX_OPS + 10;
+        let mut seed = WriteBatch::new();
+        for i in 0..initial_count {
+            seed.set(
+                &format!("ren_doc:d{i:04}"),
+                format!(r#"{{"old_f":"v{i}"}}"#),
+            )
+            .expect("set");
+            if seed.op_count() >= 500 {
+                db.commit_batch(&seed).expect("commit seed");
+                seed = WriteBatch::new();
+            }
+        }
+        if !seed.is_empty() {
+            db.commit_batch(&seed).expect("commit tail seed");
+        }
+
+        let db_hook = db.clone();
+        let injected_mid = Arc::new(AtomicBool::new(false));
+        let injected_barrier = Arc::new(AtomicBool::new(false));
+        let mid_flag = injected_mid.clone();
+        let barrier_flag = injected_barrier.clone();
+        let _hook = HookGuard::install(move |point| {
+            if point == "rename_after_staging_before_cleanup"
+                && !mid_flag.swap(true, AtomicOrdering::SeqCst)
+            {
+                let mut wb = WriteBatch::new();
+                wb.set(
+                    "ren_doc:concurrent_mid",
+                    r#"{"old_f":"mid_val","keep":1}"#.into(),
+                )
+                .expect("set mid");
+                wb.set(
+                    "ren_doc:d0005",
+                    r#"{"old_f":"overwritten_mid","keep":2}"#.into(),
+                )
+                .expect("set overwrite");
+                db_hook.commit_batch(&wb).expect("commit mid");
+            } else if point == "rename_cleanup_before_final_commit"
+                && !barrier_flag.swap(true, AtomicOrdering::SeqCst)
+            {
+                let mut wb = WriteBatch::new();
+                wb.set(
+                    "ren_doc:concurrent_barrier",
+                    r#"{"old_f":"barrier_val","keep":3}"#.into(),
+                )
+                .expect("set barrier");
+                wb.set(
+                    "ren_doc:d0000",
+                    r#"{"new_f":"edited_at_barrier","extra":true}"#.into(),
+                )
+                .expect("set edit");
+                db_hook.commit_batch(&wb).expect("commit barrier");
+            }
+        });
+
+        let mig = rename_field_migration(1, "doc rename", "ren_doc", "old_f", "new_f");
+        schema.migrate_up(&mig).expect("migrate_up");
+
+        assert!(injected_mid.load(AtomicOrdering::SeqCst));
+        assert!(injected_barrier.load(AtomicOrdering::SeqCst));
+
+        let mid = read_doc(&db, "ren_doc:concurrent_mid");
+        assert_eq!(mid.get("old_f"), None);
+        assert_eq!(mid.get("new_f"), Some(&serde_json::json!("mid_val")));
+        assert_eq!(mid.get("keep"), Some(&serde_json::json!(1)));
+
+        let d5 = read_doc(&db, "ren_doc:d0005");
+        assert_eq!(d5.get("old_f"), None);
+        assert_eq!(d5.get("new_f"), Some(&serde_json::json!("overwritten_mid")));
+        assert_eq!(d5.get("keep"), Some(&serde_json::json!(2)));
+
+        let barrier = read_doc(&db, "ren_doc:concurrent_barrier");
+        assert_eq!(barrier.get("old_f"), None);
+        assert_eq!(
+            barrier.get("new_f"),
+            Some(&serde_json::json!("barrier_val"))
+        );
+        assert_eq!(barrier.get("keep"), Some(&serde_json::json!(3)));
+
+        let d0 = read_doc(&db, "ren_doc:d0000");
+        assert_eq!(d0.get("old_f"), None);
+        assert_eq!(
+            d0.get("new_f"),
+            Some(&serde_json::json!("edited_at_barrier"))
+        );
+        assert_eq!(d0.get("extra"), Some(&serde_json::json!(true)));
+
+        let seq = db.get_seq();
+        let remaining_docs = db
+            .scan_exclusive("ren_doc:", Some("ren_doc;"), seq)
+            .expect("scan");
+        assert_eq!(remaining_docs.len(), initial_count + 2);
+        for (k, raw) in remaining_docs {
+            let doc: serde_json::Value = serde_json::from_str(&raw).expect("json");
+            assert_eq!(doc.get("old_f"), None, "doc {k} still has old_f");
+            assert!(doc.get("new_f").is_some(), "doc {k} lost new_f");
+        }
+        assert_eq!(
+            db.scan_prefix("\x00SCHEMA\x00rename_stage:", seq)
+                .expect("stages")
+                .len(),
+            0
+        );
+        assert_eq!(
+            db.scan_prefix("\x00SCHEMA\x00rename_row:", seq)
+                .expect("markers")
+                .len(),
+            0
+        );
+    }
+
+    #[test]
+    fn doc_add_remove_and_small_rename_converge_across_final_commit_barrier() {
+        let (db, _dir, schema) = open_test_db();
+        let mut seed = WriteBatch::new();
+        seed.set("small_doc:d1", r#"{"note":"orig"}"#.into())
+            .expect("set d1");
+        db.commit_batch(&seed).expect("commit seed");
+
+        // 1. AddField interrupted right before final barrier by an insert + update.
+        let db_add = db.clone();
+        let add_fired = Arc::new(AtomicBool::new(false));
+        let add_flag = add_fired.clone();
+        {
+            let _hook = HookGuard::install(move |point| {
+                if point == "backfill_before_final_commit"
+                    && !add_flag.swap(true, AtomicOrdering::SeqCst)
+                {
+                    let mut wb = WriteBatch::new();
+                    wb.set("small_doc:late_add", r#"{"note":"new_doc"}"#.into())
+                        .expect("set late_add");
+                    wb.set("small_doc:d1", r#"{"note":"updated_during_add"}"#.into())
+                        .expect("set d1");
+                    db_add.commit_batch(&wb).expect("commit concurrent add");
+                }
+            });
+            let m1 = add_field_migration(1, "add old_f", "small_doc", "old_f", "def".into());
+            schema.migrate_up(&m1).expect("add migrate_up");
+        }
+        assert!(add_fired.load(AtomicOrdering::SeqCst));
+        assert_eq!(
+            read_doc(&db, "small_doc:d1"),
+            serde_json::json!({"note": "updated_during_add", "old_f": "def"})
+        );
+        assert_eq!(
+            read_doc(&db, "small_doc:late_add"),
+            serde_json::json!({"note": "new_doc", "old_f": "def"})
+        );
+
+        // 2. Small single-batch RenameField interrupted right before final barrier.
+        let db_ren = db.clone();
+        let ren_fired = Arc::new(AtomicBool::new(false));
+        let ren_flag = ren_fired.clone();
+        {
+            let _hook = HookGuard::install(move |point| {
+                if point == "rename_single_before_commit"
+                    && !ren_flag.swap(true, AtomicOrdering::SeqCst)
+                {
+                    let mut wb = WriteBatch::new();
+                    wb.set("small_doc:late_ren", r#"{"old_f":"late_v"}"#.into())
+                        .expect("set late_ren");
+                    db_ren.commit_batch(&wb).expect("commit concurrent ren");
+                }
+            });
+            let m2 = rename_field_migration(2, "rename small", "small_doc", "old_f", "new_f");
+            schema.migrate_up(&m2).expect("rename migrate_up");
+        }
+        assert!(ren_fired.load(AtomicOrdering::SeqCst));
+        assert_eq!(
+            read_doc(&db, "small_doc:late_ren"),
+            serde_json::json!({"new_f": "late_v"})
+        );
+        assert_eq!(read_doc(&db, "small_doc:d1").get("old_f"), None);
+
+        // 3. RemoveField interrupted right before final barrier.
+        let db_remove = db.clone();
+        let remove_fired = Arc::new(AtomicBool::new(false));
+        let remove_flag = remove_fired.clone();
+        {
+            let _hook = HookGuard::install(move |point| {
+                if point == "backfill_before_final_commit"
+                    && !remove_flag.swap(true, AtomicOrdering::SeqCst)
+                {
+                    let mut wb = WriteBatch::new();
+                    wb.set(
+                        "small_doc:late_rem",
+                        r#"{"new_f":"must_drop","keep":9}"#.into(),
+                    )
+                    .expect("set late_rem");
+                    db_remove.commit_batch(&wb).expect("commit concurrent rem");
+                }
+            });
+            let m3 = Migration {
+                version: 3,
+                description: "remove new_f".into(),
+                up: vec![SchemaOp::RemoveField {
+                    collection: "small_doc".into(),
+                    field_name: "new_f".into(),
+                }],
+                down: vec![],
+            };
+            schema.migrate_up(&m3).expect("remove migrate_up");
+        }
+        assert!(remove_fired.load(AtomicOrdering::SeqCst));
+        assert_eq!(
+            read_doc(&db, "small_doc:late_rem"),
+            serde_json::json!({"keep": 9})
+        );
+    }
+
+    #[test]
+    fn doc_rename_cleanup_rejects_unstaged_concurrent_destination_conflict() {
+        let (db, _dir, schema) = open_test_db();
+        let initial_count = WriteBatch::MAX_OPS + 5;
+        let mut seed = WriteBatch::new();
+        for i in 0..initial_count {
+            seed.set(
+                &format!("conf_doc:d{i:04}"),
+                format!(r#"{{"old_f":"v{i}"}}"#),
+            )
+            .expect("set");
+            if seed.op_count() >= 500 {
+                db.commit_batch(&seed).expect("commit seed");
+                seed = WriteBatch::new();
+            }
+        }
+        if !seed.is_empty() {
+            db.commit_batch(&seed).expect("commit tail seed");
+        }
+
+        let db_hook = db.clone();
+        let fired = Arc::new(AtomicBool::new(false));
+        let flag = fired.clone();
+        let _hook = HookGuard::install(move |point| {
+            if point == "rename_after_staging_before_cleanup"
+                && !flag.swap(true, AtomicOrdering::SeqCst)
+            {
+                let mut wb = WriteBatch::new();
+                wb.set(
+                    "conf_doc:conflict",
+                    r#"{"old_f":"src","new_f":"existing_dest"}"#.into(),
+                )
+                .expect("set conflict");
+                db_hook.commit_batch(&wb).expect("commit conflict");
+            }
+        });
+
+        let mig = rename_field_migration(1, "rename conflict", "conf_doc", "old_f", "new_f");
+        let err = schema
+            .migrate_up(&mig)
+            .expect_err("unstaged destination conflict must fail closed");
+        assert!(
+            err.to_string().contains("destination exists"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(
+            read_doc(&db, "conf_doc:conflict"),
+            serde_json::json!({"old_f": "src", "new_f": "existing_dest"})
+        );
     }
 }

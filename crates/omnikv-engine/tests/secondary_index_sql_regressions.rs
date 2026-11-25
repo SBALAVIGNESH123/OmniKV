@@ -5661,3 +5661,296 @@ fn rename_staging_keys_isolate_sql_and_document_and_recover_legacy_stages() {
     verify_sql_rename_stage_isolated_from_doc_rename(false);
     verify_sql_rename_stage_isolated_from_doc_rename(true);
 }
+
+#[test]
+fn concurrent_document_writers_converge_without_field_loss_during_add_and_rename() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::thread;
+    use std::time::Duration;
+
+    let (db, _dir, _executor) = setup();
+    let schema = SchemaManager::new(db.clone(), Arc::new(IndexManager::new(db.clone())));
+
+    let initial_count = WriteBatch::MAX_OPS + 20;
+    let mut seed = WriteBatch::new();
+    for i in 0..initial_count {
+        seed.set(
+            &format!("conc_doc:init_{i:04}"),
+            format!(r#"{{"old_f":"iv_{i}"}}"#),
+        )
+        .unwrap();
+        if seed.op_count() >= 500 {
+            db.commit_batch(&seed).unwrap();
+            seed = WriteBatch::new();
+        }
+    }
+    if !seed.is_empty() {
+        db.commit_batch(&seed).unwrap();
+    }
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_w = stop.clone();
+    let db_w = db.clone();
+    let writer = thread::spawn(move || {
+        let mut writes = Vec::new();
+        for i in 0..80usize {
+            if stop_w.load(Ordering::Acquire) {
+                break;
+            }
+            let key = format!("conc_doc:live_{i:04}");
+            let mut wb = WriteBatch::new();
+            wb.set(&key, format!(r#"{{"old_f":"lv_{i}"}}"#)).unwrap();
+            let seq = db_w.commit_batch(&wb).unwrap();
+            writes.push((key, format!("lv_{i}"), seq));
+            thread::sleep(Duration::from_millis(1));
+        }
+        writes
+    });
+
+    schema
+        .migrate_up(&Migration {
+            version: 1,
+            description: "concurrent doc add_field".into(),
+            up: vec![SchemaOp::AddField {
+                collection: "conc_doc".into(),
+                field_name: "added_f".into(),
+                default_value: serde_json::json!("yes"),
+            }],
+            down: vec![],
+        })
+        .unwrap();
+    let v1_seq = db.get_seq_for_key("\u{0}SCHEMA\u{0}__version__", u64::MAX);
+
+    schema
+        .migrate_up(&Migration {
+            version: 2,
+            description: "concurrent doc rename_field".into(),
+            up: vec![SchemaOp::RenameField {
+                collection: "conc_doc".into(),
+                old_name: "old_f".into(),
+                new_name: "new_f".into(),
+            }],
+            down: vec![],
+        })
+        .unwrap();
+    let v2_seq = db.get_seq_for_key("\u{0}SCHEMA\u{0}__version__", u64::MAX);
+
+    stop.store(true, Ordering::Release);
+    let live_writes = writer.join().unwrap();
+
+    for i in [0, initial_count / 2, initial_count - 1] {
+        let doc = read_json_value(&db, &format!("conc_doc:init_{i:04}"));
+        assert_eq!(doc.get("added_f"), Some(&serde_json::json!("yes")));
+        assert_eq!(doc.get("old_f"), None);
+        assert_eq!(
+            doc.get("new_f"),
+            Some(&serde_json::json!(format!("iv_{i}")))
+        );
+    }
+    for (key, expected_val, write_seq) in live_writes {
+        let doc = read_json_value(&db, &key);
+        if write_seq < v1_seq {
+            assert_eq!(
+                doc.get("added_f"),
+                Some(&serde_json::json!("yes")),
+                "live doc {key} committed before v1 must have added_f"
+            );
+        }
+        if write_seq < v2_seq {
+            assert_eq!(
+                doc.get("old_f"),
+                None,
+                "live doc {key} committed before v2 must not retain old_f"
+            );
+            assert_eq!(
+                doc.get("new_f"),
+                Some(&serde_json::json!(expected_val)),
+                "live doc {key} committed before v2 must preserve value in new_f"
+            );
+        }
+    }
+}
+
+fn seed_legacy_drop_receipt(
+    db: &OmniKV,
+    version: u64,
+    attempt: &str,
+    step: usize,
+    name: &str,
+    payload: &str,
+) -> String {
+    let attempt_key = format!("\u{0}SCHEMA\u{0}attempt:{version:06}:up");
+    let lower = name.to_ascii_lowercase();
+    let legacy_key = format!(
+        "\u{0}SCHEMA\u{0}drop_idx:{version:06}:up:{}:{attempt}:{step:06}:{}:{lower}",
+        attempt.len(),
+        lower.len()
+    );
+    let mut wb = WriteBatch::new();
+    wb.set(&attempt_key, attempt.into()).unwrap();
+    wb.set(&legacy_key, payload.into()).unwrap();
+    db.commit_batch(&wb).unwrap();
+    legacy_key
+}
+
+#[test]
+fn legacy_drop_index_receipt_recovers_done_and_dropping_across_upgrade() {
+    let (db, _dir, executor) = setup();
+    let idx_mgr = Arc::new(IndexManager::new(db.clone()));
+    let schema = SchemaManager::new(db.clone(), idx_mgr);
+
+    execute(
+        &executor,
+        "CREATE TABLE leg_drop_tbl (id INTEGER PRIMARY KEY, tag TEXT)",
+    );
+
+    // 1. Pre-upgrade legacy `done:77` receipt recovers explicit SQL DropIndex and cleans up.
+    let leg_k1 = seed_legacy_drop_receipt(&db, 1, "att1", 0, "idx_leg_done", "done:77");
+    schema
+        .migrate_up(&Migration {
+            version: 1,
+            description: "recover legacy done receipt".into(),
+            up: vec![
+                SchemaOp::DropIndex {
+                    name: "idx_leg_done".into(),
+                }
+                .in_namespace(IndexNamespace::Sql),
+            ],
+            down: vec![],
+        })
+        .unwrap();
+    assert_eq!(db.find(&leg_k1, db.get_seq()).unwrap(), None);
+    assert_eq!(
+        db.scan(
+            "\u{0}SCHEMA\u{0}drop_idx:",
+            "\u{0}SCHEMA\u{0}drop_idx;",
+            db.get_seq()
+        )
+        .unwrap()
+        .len(),
+        0
+    );
+
+    // 2. Pre-upgrade legacy `dropping:78` finishes purging retired SQL index 78 and cleans up.
+    let mut ret_sql = WriteBatch::new();
+    ret_sql
+        .set(
+            "\u{0}IDX_RETIRED\u{0}78",
+            r#"{"id":78,"name":"idx_leg_dropping","collection":"leg_drop_tbl","fields":[["tag","String"]],"unique":false,"encoding_version":1,"namespace":"Sql"}"#.into(),
+        )
+        .unwrap();
+    ret_sql
+        .set("\u{0}IDX\u{0}00000078\u{0}7631\u{0}1", "1".into())
+        .unwrap();
+    db.commit_batch(&ret_sql).unwrap();
+    let leg_k2 = seed_legacy_drop_receipt(&db, 2, "att2", 0, "idx_leg_dropping", "dropping:78");
+    schema
+        .migrate_up(&Migration {
+            version: 2,
+            description: "recover legacy dropping receipt".into(),
+            up: vec![
+                SchemaOp::DropIndex {
+                    name: "idx_leg_dropping".into(),
+                }
+                .in_namespace(IndexNamespace::Sql),
+            ],
+            down: vec![],
+        })
+        .unwrap();
+    let seq = db.get_seq();
+    assert_eq!(db.find(&leg_k2, seq).unwrap(), None);
+    assert_eq!(db.find("\u{0}IDX_RETIRED\u{0}78", seq).unwrap(), None);
+    assert_eq!(
+        db.find("\u{0}IDX\u{0}00000078\u{0}7631\u{0}1", seq)
+            .unwrap(),
+        None
+    );
+
+    // 3. Unqualified DropIndex also recovers pre-upgrade legacy `done:79` receipt.
+    let leg_k3 = seed_legacy_drop_receipt(&db, 3, "att3", 0, "idx_leg_any", "done:79");
+    schema
+        .migrate_up(&Migration {
+            version: 3,
+            description: "recover legacy unqualified done receipt".into(),
+            up: vec![SchemaOp::DropIndex {
+                name: "idx_leg_any".into(),
+            }],
+            down: vec![],
+        })
+        .unwrap();
+    assert_eq!(db.find(&leg_k3, db.get_seq()).unwrap(), None);
+}
+
+#[test]
+fn legacy_drop_index_receipt_blocks_active_and_cross_namespace_reuse() {
+    let (db, _dir, executor) = setup();
+    let idx_mgr = Arc::new(IndexManager::new(db.clone()));
+    let schema = SchemaManager::new(db.clone(), idx_mgr.clone());
+
+    execute(
+        &executor,
+        "CREATE TABLE leg_block_tbl (id INTEGER PRIMARY KEY, tag TEXT)",
+    );
+
+    // 1. Legacy `done:80` must NOT satisfy explicit SQL DropIndex while active SQL index exists.
+    idx_mgr
+        .create_sql_index(
+            "idx_active_block",
+            "leg_block_tbl",
+            vec![("tag".into(), IndexFieldType::String)],
+            false,
+        )
+        .unwrap();
+    seed_legacy_drop_receipt(&db, 1, "att1", 0, "idx_active_block", "done:80");
+    assert!(
+        schema
+            .migrate_up(&Migration {
+                version: 1,
+                description: "must reject legacy receipt while active SQL index exists".into(),
+                up: vec![
+                    SchemaOp::DropIndex {
+                        name: "idx_active_block".into(),
+                    }
+                    .in_namespace(IndexNamespace::Sql),
+                ],
+                down: vec![],
+            })
+            .is_err()
+    );
+    assert!(idx_mgr.definition("idx_active_block").is_ok());
+
+    // 2. Legacy `dropping:91` pointing to retired Document index must be rejected for SQL drop.
+    let mut ret_doc = WriteBatch::new();
+    ret_doc
+        .set(
+            "\u{0}IDX_RETIRED\u{0}91",
+            r#"{"id":91,"name":"idx_cross_ns","collection":"leg_block_tbl","fields":[["tag","String"]],"unique":false,"encoding_version":1,"namespace":"Document"}"#.into(),
+        )
+        .unwrap();
+    ret_doc
+        .set("\u{0}IDX\u{0}00000091\u{0}7631\u{0}doc1", "doc1".into())
+        .unwrap();
+    db.commit_batch(&ret_doc).unwrap();
+    seed_legacy_drop_receipt(&db, 1, "att1", 0, "idx_cross_ns", "dropping:91");
+    assert!(
+        schema
+            .migrate_up(&Migration {
+                version: 1,
+                description: "must reject legacy receipt referencing Document retired index".into(),
+                up: vec![
+                    SchemaOp::DropIndex {
+                        name: "idx_cross_ns".into(),
+                    }
+                    .in_namespace(IndexNamespace::Sql),
+                ],
+                down: vec![],
+            })
+            .is_err()
+    );
+    assert!(
+        db.find("\u{0}IDX_RETIRED\u{0}91", db.get_seq())
+            .unwrap()
+            .is_some(),
+        "retired Document index must remain untouched"
+    );
+}

@@ -1092,12 +1092,13 @@ impl IndexManager {
     /// Resumable `DROP INDEX` for schema migrations: tracks
     /// `dropping:[<ns>:]<ids>` atomically alongside retirement and
     /// `done:[<ns>:]<ids>` once all entries are purged, while validating any
-    /// requested namespace and failing on fresh drops of non-existent indexes
-    /// or malformed receipts.
+    /// requested namespace, recovering pre-upgrade legacy receipt keys safely,
+    /// and failing on fresh drops of non-existent indexes or malformed receipts.
     pub(crate) fn drop_index_with_receipt(
         &self,
         name: &str,
         receipt_key: &str,
+        legacy_receipt_key: Option<&str>,
         expected_namespace: Option<IndexNamespace>,
     ) -> Result<(), OmniError> {
         if expected_namespace == Some(IndexNamespace::Both) {
@@ -1106,17 +1107,95 @@ impl IndexManager {
             ));
         }
         let seq = self.db.get_seq();
-        if let Some(receipt) = self.db.find(receipt_key, seq)? {
+        let loaded_receipt = if let Some(receipt) = self.db.find(receipt_key, seq)? {
+            Some((receipt, false))
+        } else if let Some(legacy_key) = legacy_receipt_key
+            && let Some(receipt) = self.db.find(legacy_key, seq)?
+        {
+            Some((receipt, true))
+        } else {
+            None
+        };
+
+        if let Some((receipt, from_legacy_key)) = loaded_receipt {
             let (state, stored_ns, ids) = parse_drop_index_receipt(&receipt)?;
-            if let Some(expected_ns) = expected_namespace
-                && stored_ns != Some(expected_ns)
-            {
-                return Err(OmniError::IoError(format!(
-                    "drop receipt namespace mismatch for index '{name}': stored {stored_ns:?}, expected {expected_ns:?}"
-                )));
+            if let Some(expected_ns) = expected_namespace {
+                if let Some(actual_ns) = stored_ns {
+                    if actual_ns != expected_ns {
+                        return Err(OmniError::IoError(format!(
+                            "drop receipt namespace mismatch for index '{name}': stored {actual_ns:?}, expected {expected_ns:?}"
+                        )));
+                    }
+                } else if from_legacy_key {
+                    // Legacy pre-upgrade receipts had no namespace tag in the
+                    // key or payload. Validate safely before honoring: reject
+                    // if any tracked ID belongs to another namespace or if an
+                    // unrelated active/retired index in `expected_ns` remains.
+                    let catalog = IndexCatalog::load_checked_at(&self.db, seq)?;
+                    for &id in &ids {
+                        if let Some(def) = catalog.get(id)
+                            && def.namespace != expected_ns
+                        {
+                            return Err(OmniError::IoError(format!(
+                                "legacy drop receipt for index '{name}' references ID {id} in namespace {:?}, expected {expected_ns:?}",
+                                def.namespace
+                            )));
+                        }
+                        let retired_key = format!("{RETIRED_PREFIX}{id}");
+                        if let Some(raw) = self.db.find(&retired_key, seq)?
+                            && let Ok(def) = serde_json::from_str::<IndexDefinition>(&raw)
+                            && def.namespace != expected_ns
+                        {
+                            return Err(OmniError::IoError(format!(
+                                "legacy drop receipt for index '{name}' references retired ID {id} in namespace {:?}, expected {expected_ns:?}",
+                                def.namespace
+                            )));
+                        }
+                    }
+                    if let Some(active) = catalog.get_by_name(name)
+                        && active.namespace.matches(expected_ns)
+                        && !ids.contains(&active.id)
+                    {
+                        return Err(OmniError::IoError(format!(
+                            "legacy drop receipt for index '{name}' cannot satisfy explicit {expected_ns:?} drop while active index (id {}) still exists",
+                            active.id
+                        )));
+                    }
+                    let unmatched_retired = self
+                        .find_retired_indexes_at(name, None, None, seq)?
+                        .into_iter()
+                        .any(|def| def.namespace.matches(expected_ns) && !ids.contains(&def.id));
+                    if unmatched_retired {
+                        return Err(OmniError::IoError(format!(
+                            "legacy drop receipt for index '{name}' cannot satisfy explicit {expected_ns:?} drop while unrelated retired definitions remain"
+                        )));
+                    }
+                } else {
+                    return Err(OmniError::IoError(format!(
+                        "drop receipt namespace mismatch for index '{name}': stored None, expected {expected_ns:?}"
+                    )));
+                }
             }
+            let effective_ns = stored_ns.or(expected_namespace);
             match state {
-                DropIndexReceiptState::Done => return Ok(()),
+                DropIndexReceiptState::Done => {
+                    if from_legacy_key {
+                        let mut promote = WriteBatch::new();
+                        promote.set(
+                            receipt_key,
+                            format_drop_index_receipt(
+                                DropIndexReceiptState::Done,
+                                effective_ns,
+                                &ids,
+                            ),
+                        )?;
+                        if let Some(legacy_key) = legacy_receipt_key {
+                            promote.delete(legacy_key)?;
+                        }
+                        self.db.commit_batch(&promote)?;
+                    }
+                    return Ok(());
+                }
                 DropIndexReceiptState::Dropping => {
                     for &id in &ids {
                         self.purge_retired_index_if_present(id)?;
@@ -1141,12 +1220,11 @@ impl IndexManager {
                     let mut done = WriteBatch::new();
                     done.set(
                         receipt_key,
-                        format_drop_index_receipt(
-                            DropIndexReceiptState::Done,
-                            stored_ns.or(expected_namespace),
-                            &ids,
-                        ),
+                        format_drop_index_receipt(DropIndexReceiptState::Done, effective_ns, &ids),
                     )?;
+                    if from_legacy_key && let Some(legacy_key) = legacy_receipt_key {
+                        done.delete(legacy_key)?;
+                    }
                     self.db.commit_batch(&done)?;
                     return Ok(());
                 }

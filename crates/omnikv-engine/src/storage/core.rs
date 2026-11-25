@@ -2443,6 +2443,250 @@ impl OmniKV {
         self.commit_batch_local(tx)
     }
 
+    /// Captures a linearizable, pinned read snapshot after briefly quiescing
+    /// in-flight local writers so every write with `seq <= snapshot` is already
+    /// visible in the memtable, every subsequent write will receive
+    /// `seq > snapshot`, and compaction/GC will preserve versions and
+    /// tombstones above `snapshot` until the guard is dropped.
+    pub(crate) fn consistent_snapshot_guard(self: &Arc<Self>) -> Result<SnapshotGuard, OmniError> {
+        self.ensure_cluster_linearizable()?;
+        let _quiesce = self
+            .transition_guard
+            .write()
+            .map_err(|_| OmniError::LockPoisoned("transition_guard".into()))?;
+        let seq = self.global_seq.load(Ordering::SeqCst).saturating_sub(1);
+        let mut snaps = self
+            .active_snapshots
+            .lock()
+            .map_err(|_| OmniError::LockPoisoned("active_snapshots".into()))?;
+        *snaps.entry(seq).or_insert(0) += 1;
+        drop(snaps);
+        Ok(SnapshotGuard {
+            db: self.clone(),
+            sequence: seq,
+        })
+    }
+
+    /// Returns `true` if any record (put or tombstone) in `[range_start, range_end)`
+    /// has a sequence number `> after_seq` across memtables and persisted tables.
+    fn has_key_in_range_after_seq(
+        &self,
+        range_start: &str,
+        range_end: &str,
+        after_seq: u64,
+    ) -> bool {
+        if self.global_seq.load(Ordering::SeqCst).saturating_sub(1) <= after_seq {
+            return false;
+        }
+        let start_bytes = range_start.as_bytes().to_vec();
+        let end_bytes = range_end.as_bytes().to_vec();
+        if start_bytes >= end_bytes {
+            return false;
+        }
+        let roots = self.roots.load();
+        let mem_range_start = (start_bytes.clone(), Reverse(u64::MAX));
+        let mem_range_end = (end_bytes.clone(), Reverse(u64::MAX));
+
+        for shard in roots.memtable.iter() {
+            for entry in shard.range(mem_range_start.clone()..mem_range_end.clone()) {
+                if entry.key().1.0 > after_seq {
+                    return true;
+                }
+            }
+        }
+        for frozen in roots.frozen_memtables.iter() {
+            for shard in frozen.iter() {
+                for entry in shard.range(mem_range_start.clone()..mem_range_end.clone()) {
+                    if entry.key().1.0 > after_seq {
+                        return true;
+                    }
+                }
+            }
+        }
+        let scan_table = |mmap: &Arc<Mmap>| -> bool {
+            let reader = SSTableReader::from_mmap(mmap.clone());
+            for rec in reader.iter_from(&start_bytes) {
+                if rec.key >= end_bytes {
+                    break;
+                }
+                if rec.key >= start_bytes && rec.is_valid() && rec.seq > after_seq {
+                    return true;
+                }
+            }
+            false
+        };
+        for (mmap, _, _) in &**roots.sstables {
+            if scan_table(mmap) {
+                return true;
+            }
+        }
+        for (mmap, _, _) in &**roots.l1_sstables {
+            if scan_table(mmap) {
+                return true;
+            }
+        }
+        scan_table(&roots.base_mmap)
+    }
+
+    /// Returns `true` if any key in `keys` has a record (put or tombstone)
+    /// with a sequence number `> after_seq`.
+    fn has_any_key_after_seq(&self, keys: &[String], after_seq: u64) -> bool {
+        if keys.is_empty() || self.global_seq.load(Ordering::SeqCst).saturating_sub(1) <= after_seq
+        {
+            return false;
+        }
+        keys.iter()
+            .any(|key| self.get_seq_for_key(key, u64::MAX) > after_seq)
+    }
+
+    fn validate_conditional_batch(&self, tx: &WriteBatch) -> Result<(), OmniError> {
+        self.ensure_writes_not_fenced()?;
+        for key in tx
+            .buffered_writes
+            .iter()
+            .map(|(key, _, _)| key.as_slice())
+            .chain(tx.buffered_deletes.iter().map(Vec::as_slice))
+        {
+            Self::validate_client_key_bytes(key)?;
+            if let Ok(key_str) = std::str::from_utf8(key)
+                && let Some(conflict) = self.ssi_history.check_prepared_write_conflict(key_str)
+            {
+                return Err(OmniError::IoError(conflict));
+            }
+        }
+        Ok(())
+    }
+
+    /// Atomically verifies that no write (put or tombstone) landed on any key
+    /// in `watched_keys` after `read_seq`, and commits `tx` under that same
+    /// exclusion barrier. Used by multi-batch online document migrations so
+    /// intermediate chunks never clobber concurrent document updates or
+    /// resurrect concurrent deletes.
+    pub(crate) fn commit_batch_if_keys_unchanged(
+        &self,
+        tx: WriteBatch,
+        watched_keys: &[String],
+        read_seq: u64,
+    ) -> Result<Result<u64, ()>, OmniError> {
+        const KEYS_CHANGED_SENTINEL: &str = "__OMNIKV_KEYS_CHANGED__";
+        self.validate_conditional_batch(&tx)?;
+        if let Some(gateway) = self.cluster_gateway.get() {
+            let write_keys: Vec<String> = tx
+                .buffered_writes
+                .iter()
+                .map(|(k, _, _)| key_to_string(k))
+                .chain(tx.buffered_deletes.iter().map(|k| key_to_string(k)))
+                .collect();
+            let ssi = crate::transaction::SsiCommitRecord {
+                txn_id: 0,
+                write_keys,
+                read_keys: watched_keys.to_vec(),
+                read_ranges: Vec::new(),
+            };
+            let outcome = gateway.commit_ssi_blocking(ssi, move || {
+                {
+                    let _quiesce = self
+                        .transition_guard
+                        .write()
+                        .map_err(|_| "transition_guard poisoned".to_string())?;
+                    if self.has_any_key_after_seq(watched_keys, read_seq) {
+                        return Err(KEYS_CHANGED_SENTINEL.to_string());
+                    }
+                }
+                if let Some(conflict) = self.ssi_history.check_batch_prepared_conflicts(&tx) {
+                    return Err(conflict);
+                }
+                Ok(tx)
+            });
+            return match outcome {
+                Ok(seq) => Ok(Ok(seq)),
+                Err(msg) if msg == KEYS_CHANGED_SENTINEL => Ok(Err(())),
+                Err(msg) => Err(OmniError::IoError(msg)),
+            };
+        }
+
+        let _exclusive = self
+            .transition_guard
+            .write()
+            .map_err(|_| OmniError::LockPoisoned("transition_guard".into()))?;
+        self.ensure_writes_not_fenced()?;
+        if self.has_any_key_after_seq(watched_keys, read_seq) {
+            return Ok(Err(()));
+        }
+        if tx.is_empty() {
+            return Ok(Ok(read_seq));
+        }
+        let seq = self.commit_batch_local_locked(&tx)?;
+        Ok(Ok(seq))
+    }
+
+    /// Atomically verifies that no write (put or tombstone) landed in
+    /// `[range_start, range_end)` after `read_seq`, and commits `tx` under
+    /// that same exclusion barrier.
+    ///
+    /// Returns `Ok(Ok(commit_seq))` when committed, `Ok(Err(()))` when a
+    /// concurrent write modified `[range_start, range_end)` after `read_seq`
+    /// (signaling the caller to run another catch-up pass), or `Err(e)` on I/O
+    /// or validation error.
+    pub(crate) fn commit_batch_if_range_unchanged(
+        &self,
+        tx: WriteBatch,
+        range_start: &str,
+        range_end: &str,
+        read_seq: u64,
+    ) -> Result<Result<u64, ()>, OmniError> {
+        const RANGE_CHANGED_SENTINEL: &str = "__OMNIKV_RANGE_CHANGED__";
+        self.validate_conditional_batch(&tx)?;
+        if let Some(gateway) = self.cluster_gateway.get() {
+            let write_keys: Vec<String> = tx
+                .buffered_writes
+                .iter()
+                .map(|(k, _, _)| key_to_string(k))
+                .chain(tx.buffered_deletes.iter().map(|k| key_to_string(k)))
+                .collect();
+            let ssi = crate::transaction::SsiCommitRecord {
+                txn_id: 0,
+                write_keys,
+                read_keys: Vec::new(),
+                read_ranges: vec![(range_start.to_string(), range_end.to_string())],
+            };
+            let outcome = gateway.commit_ssi_blocking(ssi, move || {
+                {
+                    let _quiesce = self
+                        .transition_guard
+                        .write()
+                        .map_err(|_| "transition_guard poisoned".to_string())?;
+                    if self.has_key_in_range_after_seq(range_start, range_end, read_seq) {
+                        return Err(RANGE_CHANGED_SENTINEL.to_string());
+                    }
+                }
+                if let Some(conflict) = self.ssi_history.check_batch_prepared_conflicts(&tx) {
+                    return Err(conflict);
+                }
+                Ok(tx)
+            });
+            return match outcome {
+                Ok(seq) => Ok(Ok(seq)),
+                Err(msg) if msg == RANGE_CHANGED_SENTINEL => Ok(Err(())),
+                Err(msg) => Err(OmniError::IoError(msg)),
+            };
+        }
+
+        let _exclusive = self
+            .transition_guard
+            .write()
+            .map_err(|_| OmniError::LockPoisoned("transition_guard".into()))?;
+        self.ensure_writes_not_fenced()?;
+        if self.has_key_in_range_after_seq(range_start, range_end, read_seq) {
+            return Ok(Err(()));
+        }
+        if tx.is_empty() {
+            return Ok(Ok(read_seq));
+        }
+        let seq = self.commit_batch_local_locked(&tx)?;
+        Ok(Ok(seq))
+    }
+
     /// Commits engine-internal 2PC metadata, bypassing client key validation.
     pub(crate) fn commit_2pc_batch(&self, tx: &WriteBatch) -> Result<u64, OmniError> {
         self.ensure_writes_not_fenced()?;
