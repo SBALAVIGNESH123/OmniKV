@@ -195,6 +195,16 @@ impl Drop for TwoPhaseCoordinator {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         live.retain(|_, owner| *owner != self.instance_id);
+        drop(live);
+        let mut handles = self
+            .db
+            .live_2pc_coord_handles
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        handles.retain(|_, owners| {
+            owners.remove(&self.instance_id);
+            !owners.is_empty()
+        });
     }
 }
 
@@ -254,6 +264,43 @@ impl TwoPhaseCoordinator {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         live.contains_key(&txn_id)
+    }
+
+    fn mark_live_handle(&self, txn_id: GlobalTxnId) {
+        let mut handles = self
+            .db
+            .live_2pc_coord_handles
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        handles.entry(txn_id).or_default().insert(self.instance_id);
+    }
+
+    fn unmark_live_handle(&self, txn_id: GlobalTxnId) {
+        let mut handles = self
+            .db
+            .live_2pc_coord_handles
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(owners) = handles.get_mut(&txn_id) {
+            owners.remove(&self.instance_id);
+            if owners.is_empty() {
+                handles.remove(&txn_id);
+            }
+        }
+    }
+
+    fn has_live_coordinator_handle(&self, txn_id: GlobalTxnId) -> bool {
+        if self.has_live_in_flight(txn_id) {
+            return true;
+        }
+        let handles = self
+            .db
+            .live_2pc_coord_handles
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        handles
+            .get(&txn_id)
+            .is_some_and(|owners| !owners.is_empty())
     }
 
     fn read_persisted_hwm(node_id: u64, db: &OmniKV, seq: u64) -> Result<Option<u64>, OmniError> {
@@ -336,6 +383,7 @@ impl TwoPhaseCoordinator {
         };
 
         active.insert(txn_id, txn);
+        self.mark_live_handle(txn_id);
         Ok(txn_id)
     }
 
@@ -435,11 +483,23 @@ impl TwoPhaseCoordinator {
         }
         let durable_commit = self.has_durable_state(txn_id, "COMMIT")?;
         let durable_abort = self.has_durable_state(txn_id, "ABORT")?;
+        let durable_complete = self.has_durable_state(txn_id, "COMPLETE")?;
 
         let txn = active
             .get_mut(&txn_id)
             .ok_or_else(|| OmniError::IoError("Transaction not found".into()))?;
 
+        if durable_complete {
+            self.unmark_live_in_flight(txn_id);
+            if durable_abort {
+                txn.state = DistTxnState::Aborted;
+                return Err(OmniError::IoError(
+                    "Distributed transaction was already aborted".into(),
+                ));
+            }
+            txn.state = DistTxnState::Committed;
+            return Ok(DistTxnState::Committed);
+        }
         if durable_commit {
             txn.state = DistTxnState::Committing;
             self.unmark_live_in_flight(txn_id);
@@ -451,6 +511,16 @@ impl TwoPhaseCoordinator {
             return Err(OmniError::IoError(
                 "Distributed transaction was already aborted".into(),
             ));
+        }
+        if matches!(
+            txn.state,
+            DistTxnState::Committing | DistTxnState::Committed
+        ) {
+            // A prior commit decision was already recorded and subsequently
+            // completed/GC'd by another coordinator; never downgrade to ABORT.
+            txn.state = DistTxnState::Committed;
+            self.unmark_live_in_flight(txn_id);
+            return Ok(DistTxnState::Committed);
         }
 
         if !matches!(
@@ -557,6 +627,7 @@ impl TwoPhaseCoordinator {
             active.remove(&txn_id);
         }
         self.unmark_live_in_flight(txn_id);
+        self.unmark_live_handle(txn_id);
         Ok(())
     }
 
@@ -576,19 +647,47 @@ impl TwoPhaseCoordinator {
         ) {
             self.db.ensure_cluster_linearizable()?;
         }
-        if self.has_durable_state(txn_id, "COMMIT")? {
+        let durable_commit = self.has_durable_state(txn_id, "COMMIT")?;
+        let durable_complete = self.has_durable_state(txn_id, "COMPLETE")?;
+        let durable_abort = self.has_durable_state(txn_id, "ABORT")?;
+        let durable_prepare = self.has_durable_state(txn_id, "PREPARE")?;
+        if durable_commit {
             return Err(OmniError::IoError(
                 "cannot finalize abort after a durable commit decision".into(),
             ));
         }
+        if durable_complete && !durable_abort {
+            active.remove(&txn_id);
+            self.unmark_live_in_flight(txn_id);
+            self.unmark_live_handle(txn_id);
+            return Err(OmniError::IoError(
+                "cannot finalize abort for an already completed transaction".into(),
+            ));
+        }
         let participants = if let Some(txn) = active.get(&txn_id) {
-            if txn.state == DistTxnState::Committed {
+            if matches!(
+                txn.state,
+                DistTxnState::Committing | DistTxnState::Committed
+            ) {
                 return Err(OmniError::IoError(
                     "cannot finalize abort for a committed transaction".into(),
                 ));
             }
+            if matches!(
+                txn.state,
+                DistTxnState::WaitingForVotes | DistTxnState::InDoubt
+            ) && !durable_prepare
+                && !durable_abort
+            {
+                active.remove(&txn_id);
+                self.unmark_live_in_flight(txn_id);
+                self.unmark_live_handle(txn_id);
+                return Err(OmniError::IoError(
+                    "cannot finalize abort after durable coordinator records were already completed and garbage-collected".into(),
+                ));
+            }
             let list: Vec<u64> = txn.writes_by_node.keys().copied().collect();
-            if !self.has_durable_state(txn_id, "ABORT")? {
+            if !durable_abort {
                 self.log_state(txn_id, "ABORT", &list)?;
             }
             list
@@ -602,13 +701,17 @@ impl TwoPhaseCoordinator {
                     OmniError::IoError(format!("No durable ABORT decision for {txn_id:?}"))
                 })?
         };
-        self.log_state(txn_id, "COMPLETE", &participants)?;
+        if !durable_complete {
+            self.log_state(txn_id, "COMPLETE", &participants)?;
+        }
         active.remove(&txn_id);
         self.unmark_live_in_flight(txn_id);
+        self.unmark_live_handle(txn_id);
         Ok(())
     }
 
-    /// ABORT — aborts a transaction if no commit decision has been durably recorded.
+    /// ABORT — aborts a transaction if no commit or terminal completion decision
+    /// has been durably recorded.
     pub fn abort(&self, txn_id: GlobalTxnId) -> Result<Vec<u64>, OmniError> {
         let txn_lock = self.decision_lock(txn_id)?;
         let _txn_guard = txn_lock
@@ -625,27 +728,65 @@ impl TwoPhaseCoordinator {
             self.db.ensure_cluster_linearizable()?;
         }
         let durable_commit = self.has_durable_state(txn_id, "COMMIT")?;
+        let durable_complete = self.has_durable_state(txn_id, "COMPLETE")?;
+        let durable_abort = self.has_durable_state(txn_id, "ABORT")?;
+        let durable_prepare = self.has_durable_state(txn_id, "PREPARE")?;
 
         let txn = active
             .get_mut(&txn_id)
             .ok_or_else(|| OmniError::IoError("Transaction not found".into()))?;
-        if txn.state == DistTxnState::Committed || durable_commit {
-            if txn.state != DistTxnState::Committed {
-                txn.state = DistTxnState::Committing;
+        if matches!(
+            txn.state,
+            DistTxnState::Committing | DistTxnState::Committed
+        ) || durable_commit
+        {
+            if durable_complete || (txn.state == DistTxnState::Committing && !durable_commit) {
+                active.remove(&txn_id);
+                self.unmark_live_in_flight(txn_id);
+                self.unmark_live_handle(txn_id);
+            } else {
+                if txn.state != DistTxnState::Committed {
+                    txn.state = DistTxnState::Committing;
+                }
+                self.unmark_live_in_flight(txn_id);
             }
-            self.unmark_live_in_flight(txn_id);
             return Err(OmniError::IoError(
                 "cannot abort a transaction after its commit decision".into(),
             ));
         }
+        if durable_complete {
+            active.remove(&txn_id);
+            self.unmark_live_in_flight(txn_id);
+            self.unmark_live_handle(txn_id);
+            return Err(OmniError::IoError(
+                "cannot abort a transaction that is already COMPLETE".into(),
+            ));
+        }
+        if matches!(
+            txn.state,
+            DistTxnState::WaitingForVotes | DistTxnState::InDoubt
+        ) && !durable_prepare
+            && !durable_abort
+        {
+            // `PREPARE` was durably written before entering WaitingForVotes/InDoubt,
+            // so the absence of all coordinator logs means another coordinator
+            // already completed and garbage-collected the transaction.
+            active.remove(&txn_id);
+            self.unmark_live_in_flight(txn_id);
+            self.unmark_live_handle(txn_id);
+            return Err(OmniError::IoError(
+                "cannot abort a transaction whose durable coordinator logs were already completed and garbage-collected".into(),
+            ));
+        }
 
         let participants: Vec<u64> = txn.writes_by_node.keys().copied().collect();
-        if !self.has_durable_state(txn_id, "ABORT")? {
+        if !durable_abort {
             self.log_state(txn_id, "ABORT", &participants)?;
         }
         txn.state = DistTxnState::Aborted;
         active.remove(&txn_id);
         self.unmark_live_in_flight(txn_id);
+        self.unmark_live_handle(txn_id);
 
         Ok(participants)
     }
@@ -662,10 +803,12 @@ impl TwoPhaseCoordinator {
 
         for (id, txn) in active.iter() {
             let can_timeout = match txn.state {
-                DistTxnState::WaitingForVotes => true,
-                DistTxnState::InDoubt | DistTxnState::Committing => {
+                DistTxnState::WaitingForVotes | DistTxnState::InDoubt => {
                     !self.has_durable_state(*id, "COMMIT").unwrap_or(true)
+                        && !self.has_durable_state(*id, "COMPLETE").unwrap_or(true)
+                        && self.has_durable_state(*id, "PREPARE").unwrap_or(false)
                 }
+                // Never select `Committing`, `Committed`, or `Aborted` for timeout abort.
                 _ => false,
             };
             if can_timeout {
@@ -870,6 +1013,8 @@ impl TwoPhaseCoordinator {
                 if let Ok(mut active) = self.active_txns.lock() {
                     active.remove(&txn_id);
                 }
+                self.unmark_live_in_flight(txn_id);
+                self.unmark_live_handle(txn_id);
                 report.completed.push((txn_id, decision.to_string()));
             } else {
                 if let Ok(mut active) = self.active_txns.lock()
@@ -953,7 +1098,6 @@ impl TwoPhaseCoordinator {
             .db
             .scan("__2PC_LOG__/", "__2PC_LOG__/~", self.db.get_seq())?;
         let mut by_txn: HashMap<GlobalTxnId, Vec<(String, TwoPhaseLogEntry)>> = HashMap::new();
-        let mut keys_to_delete = Vec::new();
         for (key, value) in entries {
             if key.starts_with("__2PC_LOG__/NEXT_SEQ/") {
                 continue;
@@ -970,30 +1114,46 @@ impl TwoPhaseCoordinator {
                 }
             }
         }
-        for records in by_txn.into_values() {
+        let mut purged = 0usize;
+        for (txn_id, records) in by_txn {
             let terminal_entry = records
                 .iter()
                 .find(|(_, e)| e.state == "COMPLETE")
                 .map(|(_, e)| e);
-            if let Some(terminal) = terminal_entry
-                && now.saturating_sub(terminal.timestamp) > max_age_secs
-            {
-                keys_to_delete.push(records.into_iter().map(|(key, _)| key).collect::<Vec<_>>());
+            let Some(terminal) = terminal_entry else {
+                continue;
+            };
+            if now.saturating_sub(terminal.timestamp) <= max_age_secs {
+                continue;
             }
-        }
-        let purged = keys_to_delete.iter().map(Vec::len).sum();
-        let mut batch = WriteBatch::new();
-        for txn_keys in keys_to_delete {
-            if batch.op_count() + txn_keys.len() > 1000 && !batch.is_empty() {
+            // Serialize with any live coordinator handle acting on `txn_id` and
+            // retain durable decision/completion logs while any coordinator
+            // handle still holds an active entry for `txn_id`.
+            let txn_lock = self.decision_lock(txn_id)?;
+            let _txn_guard = txn_lock
+                .lock()
+                .map_err(|_| OmniError::LockPoisoned("coordinator txn".into()))?;
+            if self.has_live_coordinator_handle(txn_id) {
+                continue;
+            }
+            let txn_prefix = format!("__2PC_LOG__/{}_{}/", txn_id.0, txn_id.1);
+            let current_records = self.db.scan_prefix(&txn_prefix, self.db.get_seq())?;
+            let still_complete = current_records.iter().any(|(key, val)| {
+                key.strip_prefix(&txn_prefix) == Some("COMPLETE")
+                    || serde_json::from_str::<TwoPhaseLogEntry>(val)
+                        .is_ok_and(|e| e.state == "COMPLETE")
+            });
+            if !still_complete {
+                continue;
+            }
+            let mut batch = WriteBatch::new();
+            for (key, _) in &current_records {
+                batch.delete(key)?;
+            }
+            if !batch.is_empty() {
                 self.db.commit_2pc_batch(&batch)?;
-                batch.clear();
+                purged += current_records.len();
             }
-            for key in txn_keys {
-                batch.delete(&key)?;
-            }
-        }
-        if !batch.is_empty() {
-            self.db.commit_2pc_batch(&batch)?;
         }
         Ok(purged)
     }
@@ -4127,6 +4287,141 @@ mod tests {
         assert!(
             reopen_res.is_err(),
             "OmniKV::open must fail closed when a persisted 2PC record targets another participant"
+        );
+    }
+
+    #[test]
+    fn coordinator_cannot_abort_after_peer_completes_and_gc_runs() {
+        let (db, _dir) = test_db();
+        let participant = TwoPhaseParticipant::new(10, db.clone());
+        let coord_a = TwoPhaseCoordinator::new(1, db.clone(), 0);
+        let coord_b = TwoPhaseCoordinator::new(1, db.clone(), 0);
+
+        // 1. Coordinator A prepares, collects COMMIT vote, and enters Committing.
+        let txn_id = coord_a.begin().unwrap();
+        coord_a
+            .add_write(txn_id, 10, "acct:1".into(), Some("100".into()), 0)
+            .unwrap();
+        let parts = coord_a.prepare(txn_id).unwrap();
+        assert_eq!(parts, vec![10]);
+        let writes = coord_a.get_participant_writes(txn_id, 10).unwrap();
+        let vote = participant.prepare(txn_id, &writes);
+        assert_eq!(vote.vote, Vote::Commit);
+        assert_eq!(
+            coord_a.receive_vote(txn_id, vote).unwrap(),
+            DistTxnState::Committing
+        );
+
+        // 2. Peer Coordinator B delivers COMMIT and writes COMPLETE; A retains its entry.
+        participant.commit_outcome(txn_id).unwrap();
+        coord_b.finalize_commit(txn_id).unwrap();
+        assert_eq!(
+            db.find_latest_internal("acct:1").unwrap(),
+            Some("100".into())
+        );
+
+        // Backdate COMPLETE so max_age_secs=0 considers it old enough to GC.
+        let complete_key = format!("__2PC_LOG__/{}_{}/COMPLETE", txn_id.0, txn_id.1);
+        let mut entry: TwoPhaseLogEntry =
+            serde_json::from_str(&db.find_latest_internal(&complete_key).unwrap().unwrap())
+                .unwrap();
+        entry.timestamp = entry.timestamp.saturating_sub(120);
+        let mut backdate = WriteBatch::new();
+        backdate
+            .set(&complete_key, serde_json::to_string(&entry).unwrap())
+            .unwrap();
+        db.commit_2pc_batch(&backdate).unwrap();
+
+        // GC MUST retain durable decision logs while Coordinator A still holds `txn_id`.
+        assert_eq!(coord_b.gc_completed_logs(0).unwrap(), 0);
+        assert_eq!(
+            coord_a.check_timeouts().len(),
+            0,
+            "Committing txn must never be selected by check_timeouts"
+        );
+        assert!(
+            coord_a.abort(txn_id).is_err(),
+            "stale coordinator must not abort after peer COMMIT/COMPLETE"
+        );
+        let abort_key = format!("__2PC_LOG__/{}_{}/ABORT", txn_id.0, txn_id.1);
+        assert_eq!(db.find_latest_internal(&abort_key).unwrap(), None);
+
+        // Once Coordinator A has reconciled/dropped its stale entry, GC can purge.
+        assert!(coord_b.gc_completed_logs(0).unwrap() >= 3);
+    }
+
+    #[test]
+    fn coordinator_rejects_abort_when_complete_exists_or_logs_were_gced_but_allows_abandoned_prepare()
+     {
+        let (db, _dir) = test_db();
+        let coord = TwoPhaseCoordinator::new(1, db.clone(), 0);
+
+        // Case A: Transaction in Committing whose durable COMMIT/COMPLETE were
+        // externally purged must STILL never write ABORT or time out.
+        let txn_gc = coord.begin().unwrap();
+        coord
+            .add_write(txn_gc, 10, "k_gc".into(), Some("v".into()), 0)
+            .unwrap();
+        coord.prepare(txn_gc).unwrap();
+        coord
+            .receive_vote(
+                txn_gc,
+                PrepareResult {
+                    txn_id: txn_gc,
+                    node_id: 10,
+                    vote: Vote::Commit,
+                    prepare_seq: 1,
+                },
+            )
+            .unwrap();
+        let mut purge = WriteBatch::new();
+        for suffix in ["PREPARE", "COMMIT", "COMPLETE"] {
+            purge
+                .delete(&format!("__2PC_LOG__/{}_{}/{suffix}", txn_gc.0, txn_gc.1))
+                .unwrap();
+        }
+        db.commit_2pc_batch(&purge).unwrap();
+        assert_eq!(coord.check_timeouts().len(), 0);
+        assert!(coord.abort(txn_gc).is_err());
+        assert_eq!(
+            db.find_latest_internal(&format!("__2PC_LOG__/{}_{}/ABORT", txn_gc.0, txn_gc.1))
+                .unwrap(),
+            None
+        );
+
+        // Case B: Transaction in WaitingForVotes where COMPLETE already landed
+        // must treat COMPLETE as terminal and never write ABORT.
+        let txn_done = coord.begin().unwrap();
+        coord
+            .add_write(txn_done, 10, "k_done".into(), Some("v".into()), 0)
+            .unwrap();
+        coord.prepare(txn_done).unwrap();
+        coord.log_state(txn_done, "COMPLETE", &[10]).unwrap();
+        assert_eq!(coord.check_timeouts().len(), 0);
+        assert!(coord.abort(txn_done).is_err());
+        assert_eq!(
+            db.find_latest_internal(&format!("__2PC_LOG__/{}_{}/ABORT", txn_done.0, txn_done.1))
+                .unwrap(),
+            None
+        );
+
+        // Case C: Genuinely abandoned PREPARE with no decision must remain
+        // eligible for timeout selection and presumed abort.
+        let txn_abandoned = coord.begin().unwrap();
+        coord
+            .add_write(txn_abandoned, 10, "k_ab".into(), Some("v".into()), 0)
+            .unwrap();
+        coord.prepare(txn_abandoned).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        assert_eq!(coord.check_timeouts(), vec![txn_abandoned]);
+        assert_eq!(coord.abort(txn_abandoned).unwrap(), vec![10]);
+        assert!(
+            db.find_latest_internal(&format!(
+                "__2PC_LOG__/{}_{}/ABORT",
+                txn_abandoned.0, txn_abandoned.1
+            ))
+            .unwrap()
+            .is_some()
         );
     }
 }

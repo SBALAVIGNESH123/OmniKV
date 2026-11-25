@@ -1432,6 +1432,12 @@ pub struct OmniKV {
     /// another coordinator handle on the same database is actively collecting votes.
     pub(crate) active_2pc_coord_txns: Mutex<HashMap<(u64, u64), u64>>,
 
+    /// All live `TwoPhaseCoordinator` handles currently retaining a `txn_id` in
+    /// their local `active_txns` map (`txn_id -> set of coordinator instance ids`).
+    /// Prevents `gc_completed_logs` from deleting terminal `COMMIT`/`COMPLETE`
+    /// records while another live coordinator handle can still act on `txn_id`.
+    pub(crate) live_2pc_coord_handles: Mutex<HashMap<(u64, u64), HashSet<u64>>>,
+
     // Monotonic per-instance counter for compaction output filenames. The
     // wall clock alone is not unique: two flushes in the same millisecond
     // collide, and create_new(true) then fails with EEXIST.
@@ -1608,6 +1614,7 @@ impl OmniKV {
             cluster_gateway: std::sync::OnceLock::new(),
             ssi_history,
             active_2pc_coord_txns: Mutex::new(HashMap::new()),
+            live_2pc_coord_handles: Mutex::new(HashMap::new()),
             // Start from a process-unique seed so reopening a database does
             // not immediately reuse the previous instance's token sequence.
             file_seq: std::sync::atomic::AtomicU64::new(rand::random()),

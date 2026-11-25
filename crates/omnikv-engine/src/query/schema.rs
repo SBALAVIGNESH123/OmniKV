@@ -630,8 +630,14 @@ impl SchemaManager {
                 Ok(())
             }),
             SchemaOp::DropIndex { name } => {
-                let receipt_key =
-                    Self::drop_index_done_key(version, direction, attempt_id, step_index, name);
+                let receipt_key = Self::drop_index_done_key(
+                    version,
+                    direction,
+                    attempt_id,
+                    step_index,
+                    explicit_namespace,
+                    name,
+                );
                 self.index_manager
                     .drop_index_with_receipt(name, &receipt_key, explicit_namespace)
             }
@@ -882,18 +888,29 @@ impl SchemaManager {
                     if let Some(ref resolved_new) = canonical_new
                         && !has_old
                     {
-                        let stage_prefix = Self::rename_stage_prefix_for_table(&table.name);
                         for (candidate_stage_key, staged_old) in
-                            self.db.scan_prefix(&stage_prefix, seq)?
+                            Self::active_rename_stages_for_namespace(
+                                &self.db,
+                                &table.name,
+                                IndexNamespace::Sql,
+                                seq,
+                            )?
                         {
-                            if staged_old.eq_ignore_ascii_case(old_name)
-                                && candidate_stage_key
-                                    == Self::rename_stage_key(
+                            let matches_stage = staged_old.eq_ignore_ascii_case(old_name)
+                                && (candidate_stage_key
+                                    == Self::rename_stage_key_for_namespace(
                                         &table.name,
+                                        IndexNamespace::Sql,
                                         &staged_old,
                                         resolved_new,
                                     )
-                            {
+                                    || candidate_stage_key
+                                        == Self::legacy_rename_stage_key(
+                                            &table.name,
+                                            &staged_old,
+                                            resolved_new,
+                                        ));
+                            if matches_stage {
                                 return self.cleanup_staged_rename(
                                     &table.name,
                                     IndexNamespace::Sql,
@@ -996,7 +1013,7 @@ impl SchemaManager {
         (stored_id == expected_table_id).then_some(canonical_name)
     }
 
-    pub(crate) fn rename_stage_prefix_for_table(collection: &str) -> String {
+    pub(crate) fn legacy_rename_stage_prefix_for_table(collection: &str) -> String {
         format!(
             "\x00SCHEMA\x00rename_stage:{}:{}:",
             collection.len(),
@@ -1004,15 +1021,141 @@ impl SchemaManager {
         )
     }
 
-    pub(crate) fn rename_stage_key(collection: &str, old_name: &str, new_name: &str) -> String {
+    pub(crate) fn legacy_rename_stage_key(
+        collection: &str,
+        old_name: &str,
+        new_name: &str,
+    ) -> String {
         format!(
             "{}{}:{}:{}:{}",
-            Self::rename_stage_prefix_for_table(collection),
+            Self::legacy_rename_stage_prefix_for_table(collection),
             old_name.len(),
             old_name,
             new_name.len(),
             new_name
         )
+    }
+
+    pub(crate) fn rename_stage_prefix_for_namespace(
+        collection: &str,
+        namespace: IndexNamespace,
+    ) -> String {
+        match namespace {
+            IndexNamespace::Sql => format!(
+                "\x00SCHEMA\x00rename_stage:sql:{}:{}:",
+                collection.len(),
+                collection
+            ),
+            IndexNamespace::Document => format!(
+                "\x00SCHEMA\x00rename_stage:doc:{}:{}:",
+                collection.len(),
+                collection
+            ),
+            IndexNamespace::Both => Self::legacy_rename_stage_prefix_for_table(collection),
+        }
+    }
+
+    pub(crate) fn rename_stage_key_for_namespace(
+        collection: &str,
+        namespace: IndexNamespace,
+        old_name: &str,
+        new_name: &str,
+    ) -> String {
+        format!(
+            "{}{}:{}:{}:{}",
+            Self::rename_stage_prefix_for_namespace(collection, namespace),
+            old_name.len(),
+            old_name,
+            new_name.len(),
+            new_name
+        )
+    }
+
+    /// Determines whether a legacy un-namespaced rename stage belongs to
+    /// `namespace` by inspecting its row markers (`\x00T\x00<table>\x00` vs
+    /// `<collection>:`). Prevents cross-namespace reuse or marker sweeping
+    /// while preserving recovery of pending legacy stages.
+    pub(crate) fn legacy_rename_stage_matches_namespace(
+        db: &OmniKV,
+        collection: &str,
+        legacy_stage_key: &str,
+        namespace: IndexNamespace,
+        seq: u64,
+    ) -> Result<bool, OmniError> {
+        let marker_prefix = Self::rename_row_stage_prefix(legacy_stage_key);
+        let sql_row_prefix = format!("\x00T\x00{collection}\x00");
+        let doc_row_prefix = format!("{collection}:");
+        let mut has_sql_marker = false;
+        let mut has_doc_marker = false;
+        for (marker_key, _) in db.scan_prefix(&marker_prefix, seq)? {
+            let row_key = marker_key.strip_prefix(&marker_prefix).unwrap_or("");
+            if row_key.starts_with(&sql_row_prefix) {
+                has_sql_marker = true;
+            } else if row_key.starts_with(&doc_row_prefix) {
+                has_doc_marker = true;
+            }
+        }
+        match namespace {
+            IndexNamespace::Sql => {
+                if has_sql_marker {
+                    Ok(true)
+                } else if has_doc_marker {
+                    Ok(false)
+                } else {
+                    Ok(db
+                        .find(
+                            &format!("\x00CATALOG\x00{}", collection.to_lowercase()),
+                            seq,
+                        )?
+                        .is_some())
+                }
+            }
+            IndexNamespace::Document => {
+                if has_doc_marker {
+                    Ok(true)
+                } else if has_sql_marker {
+                    Ok(false)
+                } else {
+                    Ok(db
+                        .find(
+                            &format!("\x00CATALOG\x00{}", collection.to_lowercase()),
+                            seq,
+                        )?
+                        .is_none())
+                }
+            }
+            IndexNamespace::Both => Ok(true),
+        }
+    }
+
+    /// Lists all active rename stages owned by `(collection, namespace)`,
+    /// including both namespace-scoped keys and matching legacy keys.
+    pub(crate) fn active_rename_stages_for_namespace(
+        db: &OmniKV,
+        collection: &str,
+        namespace: IndexNamespace,
+        seq: u64,
+    ) -> Result<Vec<(String, String)>, OmniError> {
+        let mut stages = db.scan_prefix(
+            &Self::rename_stage_prefix_for_namespace(collection, namespace),
+            seq,
+        )?;
+        if namespace != IndexNamespace::Both {
+            for (legacy_key, val) in
+                db.scan_prefix(&Self::legacy_rename_stage_prefix_for_table(collection), seq)?
+            {
+                if Self::legacy_rename_stage_matches_namespace(
+                    db,
+                    collection,
+                    &legacy_key,
+                    namespace,
+                    seq,
+                )? {
+                    stages.push((legacy_key, val));
+                }
+            }
+        }
+        Ok(stages)
     }
 
     pub(crate) fn rename_row_stage_prefix(stage_key: &str) -> String {
@@ -1092,11 +1235,18 @@ impl SchemaManager {
         direction: &str,
         attempt_id: &str,
         step_index: usize,
+        explicit_namespace: Option<IndexNamespace>,
         index_name: &str,
     ) -> String {
+        let ns_tag = match explicit_namespace {
+            Some(IndexNamespace::Sql) => "sql",
+            Some(IndexNamespace::Document) => "doc",
+            Some(IndexNamespace::Both) => "both",
+            None => "any",
+        };
         let idx_lower = index_name.to_ascii_lowercase();
         format!(
-            "{}{step_index:06}:{}:{idx_lower}",
+            "{}{step_index:06}:{ns_tag}:{}:{idx_lower}",
             Self::drop_index_done_prefix(version, direction, attempt_id),
             idx_lower.len()
         )
@@ -1129,18 +1279,26 @@ impl SchemaManager {
                 continue;
             }
             // Only honor the later drop receipt if the current migration still
-            // contains a matching `DropIndex` op at that exact step index.
-            let still_has_drop_step = matches!(
-                exec_ops
-                    .get(drop_step)
-                    .and_then(|op| op.unwrap_namespace().ok().map(|(inner, _)| inner)),
-                Some(SchemaOp::DropIndex { name: drop_name })
-                    if drop_name.eq_ignore_ascii_case(index_name)
-            );
-            if !still_has_drop_step {
+            // contains a matching `DropIndex` op at that exact step index and
+            // its explicit namespace (if any) matches the stored receipt.
+            let drop_step_ns = match exec_ops
+                .get(drop_step)
+                .and_then(|op| op.unwrap_namespace().ok())
+            {
+                Some((SchemaOp::DropIndex { name: drop_name }, ns))
+                    if drop_name.eq_ignore_ascii_case(index_name) =>
+                {
+                    ns
+                }
+                _ => continue,
+            };
+            let (_, stored_ns, dropped_ids) =
+                crate::secondary_index::parse_drop_index_receipt(&value)?;
+            if let Some(expected_ns) = drop_step_ns
+                && stored_ns != Some(expected_ns)
+            {
                 continue;
             }
-            let (_, dropped_ids) = crate::secondary_index::parse_drop_index_receipt(&value)?;
             if dropped_ids.contains(&index_id) {
                 return Ok(true);
             }
@@ -1594,8 +1752,29 @@ impl SchemaManager {
             .map(|table| table.row_format)
             .unwrap_or_default();
 
-        let stage_key = Self::rename_stage_key(collection, old_name, new_name);
-        let is_staged_retry = self.db.find(&stage_key, seq)?.is_some();
+        let namespace = if sql_catalog_update.is_some() {
+            IndexNamespace::Sql
+        } else {
+            IndexNamespace::Document
+        };
+        let ns_stage_key =
+            Self::rename_stage_key_for_namespace(collection, namespace, old_name, new_name);
+        let legacy_stage_key = Self::legacy_rename_stage_key(collection, old_name, new_name);
+        let (stage_key, is_staged_retry) = if self.db.find(&ns_stage_key, seq)?.is_some() {
+            (ns_stage_key, true)
+        } else if self.db.find(&legacy_stage_key, seq)?.is_some()
+            && Self::legacy_rename_stage_matches_namespace(
+                &self.db,
+                collection,
+                &legacy_stage_key,
+                namespace,
+                seq,
+            )?
+        {
+            (legacy_stage_key, true)
+        } else {
+            (ns_stage_key, false)
+        };
         if !is_staged_retry
             && sql_catalog_update.is_none()
             && self.db.find(done_key, seq)?.as_deref() == Some(done_value)
@@ -1603,11 +1782,6 @@ impl SchemaManager {
             return Ok(());
         }
 
-        let namespace = if sql_catalog_update.is_some() {
-            IndexNamespace::Sql
-        } else {
-            IndexNamespace::Document
-        };
         let row_ranges = collection_row_ranges_for_namespace(collection, namespace);
 
         for (prefix, end) in &row_ranges {

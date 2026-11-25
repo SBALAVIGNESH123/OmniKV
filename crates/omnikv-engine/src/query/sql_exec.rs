@@ -3024,11 +3024,14 @@ impl SqlExecutor {
     }
 
     fn active_rename_stages(&self, table_name: &str, read_seq: u64) -> Result<Vec<String>, String> {
-        let prefix = crate::schema::SchemaManager::rename_stage_prefix_for_table(table_name);
-        self.db
-            .scan_prefix(&prefix, read_seq)
-            .map(|entries| entries.into_iter().map(|(k, _)| k).collect())
-            .map_err(|e| format!("{:?}", e))
+        crate::schema::SchemaManager::active_rename_stages_for_namespace(
+            &self.db,
+            table_name,
+            crate::secondary_index::IndexNamespace::Sql,
+            read_seq,
+        )
+        .map(|entries| entries.into_iter().map(|(k, _)| k).collect())
+        .map_err(|e| format!("{:?}", e))
     }
 
     fn move_rename_stage_markers(

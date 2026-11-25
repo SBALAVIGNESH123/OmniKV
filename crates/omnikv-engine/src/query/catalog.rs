@@ -251,11 +251,13 @@ impl Catalog {
             .index_manager
             .collect_drop_index_keys_for_collection_at(&table.name, seq)
             .map_err(|e| format!("{e:?}"))?;
-        let stage_prefix = crate::schema::SchemaManager::rename_stage_prefix_for_table(&table.name);
-        let stage_entries = self
-            .db
-            .scan_prefix(&stage_prefix, seq)
-            .map_err(|e| format!("{e:?}"))?;
+        let stage_entries = crate::schema::SchemaManager::active_rename_stages_for_namespace(
+            &self.db,
+            &table.name,
+            crate::secondary_index::IndexNamespace::Sql,
+            seq,
+        )
+        .map_err(|e| format!("{e:?}"))?;
         let mut rename_row_marker_keys = Vec::new();
         for (stage_key, _) in stage_entries {
             let row_marker_prefix =

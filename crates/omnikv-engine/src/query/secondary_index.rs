@@ -87,20 +87,52 @@ pub(crate) enum DropIndexReceiptState {
     Done,
 }
 
+fn format_drop_index_receipt(
+    state: DropIndexReceiptState,
+    namespace: Option<IndexNamespace>,
+    ids: &[IndexId],
+) -> String {
+    let prefix = match state {
+        DropIndexReceiptState::Dropping => "dropping",
+        DropIndexReceiptState::Done => "done",
+    };
+    let ids_csv = ids
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    match namespace {
+        Some(IndexNamespace::Sql) => format!("{prefix}:sql:{ids_csv}"),
+        Some(IndexNamespace::Document) => format!("{prefix}:doc:{ids_csv}"),
+        Some(IndexNamespace::Both) => format!("{prefix}:both:{ids_csv}"),
+        None => format!("{prefix}:{ids_csv}"),
+    }
+}
+
 /// Strictly validates a schema-migration `DropIndex` receipt.
-/// Accepts only `dropping:<id[,id...]>` or `done:<id[,id...]>`, requiring a
-/// non-empty comma-separated list where every token parses cleanly as `IndexId`.
+/// Accepts `dropping:[<ns>:]<id[,id...]>` or `done:[<ns>:]<id[,id...]>`,
+/// where optional `<ns>` is `sql`, `doc`, or `both`, and requires a non-empty
+/// comma-separated list where every token parses cleanly as `IndexId`.
 pub(crate) fn parse_drop_index_receipt(
     receipt: &str,
-) -> Result<(DropIndexReceiptState, Vec<IndexId>), OmniError> {
-    let (state, ids_csv) = if let Some(rest) = receipt.strip_prefix("done:") {
+) -> Result<(DropIndexReceiptState, Option<IndexNamespace>, Vec<IndexId>), OmniError> {
+    let (state, rest) = if let Some(rest) = receipt.strip_prefix("done:") {
         (DropIndexReceiptState::Done, rest)
     } else if let Some(rest) = receipt.strip_prefix("dropping:") {
         (DropIndexReceiptState::Dropping, rest)
     } else {
         return Err(OmniError::IoError(format!(
-            "invalid drop receipt '{receipt}': expected 'dropping:<ids>' or 'done:<ids>'"
+            "invalid drop receipt '{receipt}': expected 'dropping:[<ns>:]<ids>' or 'done:[<ns>:]<ids>'"
         )));
+    };
+    let (namespace, ids_csv) = if let Some(after) = rest.strip_prefix("sql:") {
+        (Some(IndexNamespace::Sql), after)
+    } else if let Some(after) = rest.strip_prefix("doc:") {
+        (Some(IndexNamespace::Document), after)
+    } else if let Some(after) = rest.strip_prefix("both:") {
+        (Some(IndexNamespace::Both), after)
+    } else {
+        (None, rest)
     };
     if ids_csv.is_empty() {
         return Err(OmniError::IoError(format!(
@@ -121,7 +153,7 @@ pub(crate) fn parse_drop_index_receipt(
         })?;
         ids.push(id);
     }
-    Ok((state, ids))
+    Ok((state, namespace, ids))
 }
 
 /// Resolves an unbound legacy `IndexNamespace::Both` definition to a single
@@ -1049,7 +1081,7 @@ impl IndexManager {
 
     /// DROP INDEX — removes an index definition and all its entries.
     pub fn drop_index(&self, name: &str) -> Result<(), OmniError> {
-        let target_collection = self.resolve_drop_target_at(name, self.db.get_seq())?;
+        let target_collection = self.resolve_drop_target_at(name, None, self.db.get_seq())?;
         let lock = self.db.sql_table_lock(&target_collection)?;
         let _guard = lock
             .lock()
@@ -1057,10 +1089,11 @@ impl IndexManager {
         self.drop_index_locked_inner(name, &target_collection, true, None, None)
     }
 
-    /// Resumable `DROP INDEX` for schema migrations: tracks `dropping:<ids>`
-    /// atomically alongside retirement and `done:<ids>` once all entries are
-    /// purged, while still failing a fresh drop of a non-existent index or any
-    /// malformed receipt.
+    /// Resumable `DROP INDEX` for schema migrations: tracks
+    /// `dropping:[<ns>:]<ids>` atomically alongside retirement and
+    /// `done:[<ns>:]<ids>` once all entries are purged, while validating any
+    /// requested namespace and failing on fresh drops of non-existent indexes
+    /// or malformed receipts.
     pub(crate) fn drop_index_with_receipt(
         &self,
         name: &str,
@@ -1074,7 +1107,14 @@ impl IndexManager {
         }
         let seq = self.db.get_seq();
         if let Some(receipt) = self.db.find(receipt_key, seq)? {
-            let (state, ids) = parse_drop_index_receipt(&receipt)?;
+            let (state, stored_ns, ids) = parse_drop_index_receipt(&receipt)?;
+            if let Some(expected_ns) = expected_namespace
+                && stored_ns != Some(expected_ns)
+            {
+                return Err(OmniError::IoError(format!(
+                    "drop receipt namespace mismatch for index '{name}': stored {stored_ns:?}, expected {expected_ns:?}"
+                )));
+            }
             match state {
                 DropIndexReceiptState::Done => return Ok(()),
                 DropIndexReceiptState::Dropping => {
@@ -1098,20 +1138,22 @@ impl IndexManager {
                             )?;
                         }
                     }
-                    let ids_csv = ids
-                        .iter()
-                        .map(ToString::to_string)
-                        .collect::<Vec<_>>()
-                        .join(",");
                     let mut done = WriteBatch::new();
-                    done.set(receipt_key, format!("done:{ids_csv}"))?;
+                    done.set(
+                        receipt_key,
+                        format_drop_index_receipt(
+                            DropIndexReceiptState::Done,
+                            stored_ns.or(expected_namespace),
+                            &ids,
+                        ),
+                    )?;
                     self.db.commit_batch(&done)?;
                     return Ok(());
                 }
             }
         }
 
-        let target_collection = self.resolve_drop_target_at(name, seq)?;
+        let target_collection = self.resolve_drop_target_at(name, expected_namespace, seq)?;
         let lock = self.db.sql_table_lock(&target_collection)?;
         let _guard = lock
             .lock()
@@ -1125,10 +1167,24 @@ impl IndexManager {
         )
     }
 
-    fn resolve_drop_target_at(&self, name: &str, seq: u64) -> Result<String, OmniError> {
+    fn resolve_drop_target_at(
+        &self,
+        name: &str,
+        expected_namespace: Option<IndexNamespace>,
+        seq: u64,
+    ) -> Result<String, OmniError> {
         let catalog = IndexCatalog::load_checked_at(&self.db, seq)?;
         let active = catalog.get_by_name(name).cloned();
-        let retired = self.find_retired_indexes_at(name, None, seq)?;
+        let retired = self.find_retired_indexes_at(name, None, expected_namespace, seq)?;
+        if let Some(expected_ns) = expected_namespace
+            && let Some(ref def) = active
+            && def.namespace != expected_ns
+        {
+            return Err(OmniError::IoError(format!(
+                "Index '{name}' belongs to namespace {:?}, expected {expected_ns:?}",
+                def.namespace
+            )));
+        }
         let mut collections: Vec<String> = Vec::new();
         for def in active.iter().chain(retired.iter()) {
             if !collections.iter().any(|c| c == &def.collection) {
@@ -1225,7 +1281,7 @@ impl IndexManager {
         {
             resolved_collection
         } else if !self
-            .find_retired_indexes_at(name, Some(expected_collection), seq)?
+            .find_retired_indexes_at(name, Some(expected_collection), expected_namespace, seq)?
             .is_empty()
         {
             expected_collection.to_string()
@@ -1233,7 +1289,7 @@ impl IndexManager {
             resolved_collection
         };
         if revalidate_unambiguous {
-            let current_target = self.resolve_drop_target_at(name, seq)?;
+            let current_target = self.resolve_drop_target_at(name, expected_namespace, seq)?;
             if current_target != target_collection {
                 return Err(OmniError::IoError(format!(
                     "Index '{}' target collection changed concurrently; retry drop_index",
@@ -1241,31 +1297,37 @@ impl IndexManager {
                 )));
             }
         }
-        let retired_defs = self.find_retired_indexes_at(name, Some(&target_collection), seq)?;
-        if let Some(expected_ns) = expected_namespace {
-            if let Some(def) = catalog
-                .get_by_name(name)
-                .filter(|d| d.collection == target_collection)
-                && def.namespace != expected_ns
-            {
-                return Err(OmniError::IoError(format!(
-                    "Index '{name}' belongs to namespace {:?}, expected {expected_ns:?}",
-                    def.namespace
-                )));
-            }
-            if let Some(def) = retired_defs.iter().find(|d| d.namespace != expected_ns) {
-                return Err(OmniError::IoError(format!(
-                    "Retired index '{name}' belongs to namespace {:?}, expected {expected_ns:?}",
-                    def.namespace
-                )));
-            }
+        // Filter retired definitions to the requested namespace so an unrelated
+        // retired index in another namespace neither blocks nor gets purged by
+        // an explicit-namespace DROP INDEX.
+        let retired_defs =
+            self.find_retired_indexes_at(name, Some(&target_collection), expected_namespace, seq)?;
+        let active_def = catalog
+            .get_by_name(name)
+            .filter(|d| d.collection == target_collection);
+        if let Some(expected_ns) = expected_namespace
+            && let Some(def) = active_def
+            && def.namespace != expected_ns
+        {
+            return Err(OmniError::IoError(format!(
+                "Index '{name}' belongs to namespace {:?}, expected {expected_ns:?}",
+                def.namespace
+            )));
         }
+        let receipt_namespace = if expected_namespace.is_some() {
+            expected_namespace
+        } else {
+            let mut ns_iter = active_def
+                .iter()
+                .map(|d| d.namespace)
+                .chain(retired_defs.iter().map(|d| d.namespace));
+            ns_iter
+                .next()
+                .filter(|first| ns_iter.all(|ns| ns == *first))
+        };
         let mut ids_to_purge: Vec<IndexId> = retired_defs.into_iter().map(|d| d.id).collect();
 
-        if let Some(def) = catalog
-            .get_by_name(name)
-            .filter(|d| d.collection == target_collection)
-        {
+        if let Some(def) = active_def {
             let id = def.id;
             if !ids_to_purge.contains(&id) {
                 ids_to_purge.push(id);
@@ -1280,12 +1342,14 @@ impl IndexManager {
             meta_batch.delete(&ready_key)?;
             meta_batch.set(&retired_key, retired_value)?;
             if let Some(receipt_key) = receipt_key {
-                let ids_csv = ids_to_purge
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>()
-                    .join(",");
-                meta_batch.set(receipt_key, format!("dropping:{ids_csv}"))?;
+                meta_batch.set(
+                    receipt_key,
+                    format_drop_index_receipt(
+                        DropIndexReceiptState::Dropping,
+                        receipt_namespace,
+                        &ids_to_purge,
+                    ),
+                )?;
             }
             let commit_seq = self.db.commit_batch(&meta_batch)?;
             self.db.ssi_history().record_committed(
@@ -1301,27 +1365,31 @@ impl IndexManager {
         } else if ids_to_purge.is_empty() {
             return Err(OmniError::IoError(format!("Index '{}' not found", name)));
         } else if let Some(receipt_key) = receipt_key {
-            let ids_csv = ids_to_purge
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join(",");
             let mut dropping = WriteBatch::new();
-            dropping.set(receipt_key, format!("dropping:{ids_csv}"))?;
+            dropping.set(
+                receipt_key,
+                format_drop_index_receipt(
+                    DropIndexReceiptState::Dropping,
+                    receipt_namespace,
+                    &ids_to_purge,
+                ),
+            )?;
             self.db.commit_batch(&dropping)?;
         }
 
-        let ids_csv = ids_to_purge
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
-            .join(",");
-        for id in ids_to_purge {
+        for &id in &ids_to_purge {
             self.purge_retired_index_entries(id)?;
         }
         if let Some(receipt_key) = receipt_key {
             let mut done = WriteBatch::new();
-            done.set(receipt_key, format!("done:{ids_csv}"))?;
+            done.set(
+                receipt_key,
+                format_drop_index_receipt(
+                    DropIndexReceiptState::Done,
+                    receipt_namespace,
+                    &ids_to_purge,
+                ),
+            )?;
             self.db.commit_batch(&done)?;
         }
         Ok(())
@@ -1331,6 +1399,7 @@ impl IndexManager {
         &self,
         name: &str,
         expected_collection: Option<&str>,
+        expected_namespace: Option<IndexNamespace>,
         seq: u64,
     ) -> Result<Vec<IndexDefinition>, OmniError> {
         let mut matches = Vec::new();
@@ -1340,6 +1409,7 @@ impl IndexManager {
             };
             if def.name.eq_ignore_ascii_case(name)
                 && expected_collection.is_none_or(|expected| def.collection == expected)
+                && expected_namespace.is_none_or(|expected| def.namespace == expected)
             {
                 matches.push(def);
             }

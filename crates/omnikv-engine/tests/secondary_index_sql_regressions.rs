@@ -5426,3 +5426,238 @@ fn schema_migration_add_field_receipt_is_bound_to_sql_table_identity() {
         vec![vec!["1", "v1"]]
     );
 }
+
+#[test]
+fn drop_index_completion_receipt_is_bound_to_namespace_on_retry() {
+    let (db, _dir, executor) = setup();
+    let idx_mgr = Arc::new(IndexManager::new(db.clone()));
+    let schema = SchemaManager::new(db, idx_mgr.clone());
+
+    execute(
+        &executor,
+        "CREATE TABLE drop_ns_tbl (id INTEGER PRIMARY KEY, tag TEXT)",
+    );
+    idx_mgr
+        .create_document_index(
+            "shared_drop_idx",
+            "drop_ns_tbl",
+            vec![("tag".into(), IndexFieldType::String)],
+            false,
+        )
+        .unwrap();
+
+    // Step 0 drops the Document index; Step 1 fails so the migration stays incomplete.
+    let fail_doc_drop = Migration {
+        version: 1,
+        description: "drop doc index then fail".into(),
+        up: vec![
+            SchemaOp::DropIndex {
+                name: "shared_drop_idx".into(),
+            }
+            .in_namespace(IndexNamespace::Document),
+            SchemaOp::RemoveField {
+                collection: "drop_ns_tbl".into(),
+                field_name: "missing_col".into(),
+            }
+            .in_namespace(IndexNamespace::Sql),
+        ],
+        down: vec![],
+    };
+    assert!(schema.migrate_up(&fail_doc_drop).is_err());
+    assert!(idx_mgr.definition("shared_drop_idx").is_err());
+
+    // Now create a SQL index with the same name and change step 0 to drop Sql.
+    idx_mgr
+        .create_sql_index(
+            "shared_drop_idx",
+            "drop_ns_tbl",
+            vec![("tag".into(), IndexFieldType::String)],
+            false,
+        )
+        .unwrap();
+    let retry_sql_drop = Migration {
+        version: 1,
+        description: "changed namespace to Sql on retry".into(),
+        up: vec![
+            SchemaOp::DropIndex {
+                name: "shared_drop_idx".into(),
+            }
+            .in_namespace(IndexNamespace::Sql),
+        ],
+        down: vec![],
+    };
+    schema.migrate_up(&retry_sql_drop).unwrap();
+    assert!(
+        idx_mgr.definition("shared_drop_idx").is_err(),
+        "SQL DropIndex must not reuse Document drop receipt and leave SQL index behind"
+    );
+}
+
+#[test]
+fn explicit_sql_drop_index_ignores_unrelated_retired_document_index() {
+    let (db, _dir, executor) = setup();
+    let idx_mgr = Arc::new(IndexManager::new(db.clone()));
+    let schema = SchemaManager::new(db.clone(), idx_mgr.clone());
+
+    execute(
+        &executor,
+        "CREATE TABLE ret_iso_tbl (id INTEGER PRIMARY KEY, tag TEXT)",
+    );
+    idx_mgr
+        .create_sql_index(
+            "iso_shared_idx",
+            "ret_iso_tbl",
+            vec![("tag".into(), IndexFieldType::String)],
+            false,
+        )
+        .unwrap();
+
+    // Seed an unrelated retired Document index with the same name & collection.
+    let retired_doc_key = "\u{0}IDX_RETIRED\u{0}91";
+    let retired_doc_entry = "\u{0}IDX\u{0}00000091\u{0}7631\u{0}doc1";
+    let mut seed = WriteBatch::new();
+    seed.set(
+        retired_doc_key,
+        r#"{"id":91,"name":"iso_shared_idx","collection":"ret_iso_tbl","fields":[["tag","String"]],"unique":false,"encoding_version":1,"namespace":"Document"}"#
+            .into(),
+    )
+    .unwrap();
+    seed.set(retired_doc_entry, "doc1".into()).unwrap();
+    db.commit_batch(&seed).unwrap();
+
+    let drop_sql = Migration {
+        version: 1,
+        description: "explicit SQL drop must ignore retired doc index".into(),
+        up: vec![
+            SchemaOp::DropIndex {
+                name: "iso_shared_idx".into(),
+            }
+            .in_namespace(IndexNamespace::Sql),
+        ],
+        down: vec![],
+    };
+    schema.migrate_up(&drop_sql).unwrap();
+
+    assert!(
+        idx_mgr.definition("iso_shared_idx").is_err(),
+        "active SQL index must be dropped"
+    );
+    assert!(
+        db.find(retired_doc_key, db.get_seq()).unwrap().is_some(),
+        "unrelated retired Document index metadata must stay untouched"
+    );
+    assert!(
+        db.find(retired_doc_entry, db.get_seq()).unwrap().is_some(),
+        "unrelated retired Document index entry must stay untouched"
+    );
+}
+
+fn verify_sql_rename_stage_isolated_from_doc_rename(use_legacy_sql_stage: bool) {
+    let (db, _dir, executor) = setup();
+    let idx_mgr = Arc::new(IndexManager::new(db.clone()));
+    let schema = SchemaManager::new(db.clone(), idx_mgr);
+
+    execute(
+        &executor,
+        "CREATE TABLE shared_ren (id TEXT PRIMARY KEY, old_f TEXT)",
+    );
+    execute(
+        &executor,
+        "INSERT INTO shared_ren (id, old_f) VALUES ('s1', 'sv1'), ('s2', 'sv2')",
+    );
+
+    // Seed large Document collection (> WriteBatch::MAX_OPS) so Document
+    // rename exercises the multi-batch staged + cleanup path.
+    let doc_count = WriteBatch::MAX_OPS + 10;
+    let mut docs = WriteBatch::new();
+    for i in 0..doc_count {
+        docs.set(
+            &format!("shared_ren:d{i:04}"),
+            format!(r#"{{"old_f":"dv{i}"}}"#),
+        )
+        .unwrap();
+        if docs.op_count() >= 500 {
+            db.commit_batch(&docs).unwrap();
+            docs = WriteBatch::new();
+        }
+    }
+    if !docs.is_empty() {
+        db.commit_batch(&docs).unwrap();
+    }
+
+    let sql_stage = if use_legacy_sql_stage {
+        test_rename_stage_key("shared_ren", "old_f", "new_f")
+    } else {
+        format!(
+            "\u{0}SCHEMA\u{0}rename_stage:sql:{}:shared_ren:5:old_f:5:new_f",
+            "shared_ren".len()
+        )
+    };
+    let sql_row_key = "\u{0}T\u{0}shared_ren\u{0}s1";
+    let sql_marker = test_rename_row_stage_key(&sql_stage, sql_row_key);
+    let mut stage = WriteBatch::new();
+    stage.set(&sql_stage, "old_f".into()).unwrap();
+    stage.set(&sql_marker, "1".into()).unwrap();
+    stage
+        .set(
+            sql_row_key,
+            r#"{"id":"s1","old_f":"sv1","new_f":"sv1"}"#.into(),
+        )
+        .unwrap();
+    db.commit_batch(&stage).unwrap();
+
+    schema
+        .migrate_up(&Migration {
+            version: 1,
+            description: "document rename only".into(),
+            up: vec![
+                SchemaOp::RenameField {
+                    collection: "shared_ren".into(),
+                    old_name: "old_f".into(),
+                    new_name: "new_f".into(),
+                }
+                .in_namespace(IndexNamespace::Document),
+            ],
+            down: vec![],
+        })
+        .unwrap();
+
+    let seq = db.get_seq();
+    assert_eq!(db.find(&sql_stage, seq).unwrap(), Some("old_f".into()));
+    assert_eq!(db.find(&sql_marker, seq).unwrap(), Some("1".into()));
+    assert_eq!(read_json_value(&db, "shared_ren:d0000").get("old_f"), None);
+    assert_eq!(
+        read_json_value(&db, "shared_ren:d0000").get("new_f"),
+        Some(&serde_json::json!("dv0"))
+    );
+
+    schema
+        .migrate_up(&Migration {
+            version: 2,
+            description: "resume sql rename".into(),
+            up: vec![
+                SchemaOp::RenameField {
+                    collection: "shared_ren".into(),
+                    old_name: "old_f".into(),
+                    new_name: "new_f".into(),
+                }
+                .in_namespace(IndexNamespace::Sql),
+            ],
+            down: vec![],
+        })
+        .unwrap();
+
+    assert_eq!(
+        select_rows(&executor, "SELECT id, new_f FROM shared_ren ORDER BY id"),
+        vec![vec!["s1", "sv1"], vec!["s2", "sv2"]]
+    );
+    let final_seq = db.get_seq();
+    assert_eq!(db.find(&sql_stage, final_seq).unwrap(), None);
+    assert_eq!(db.find(&sql_marker, final_seq).unwrap(), None);
+}
+
+#[test]
+fn rename_staging_keys_isolate_sql_and_document_and_recover_legacy_stages() {
+    verify_sql_rename_stage_isolated_from_doc_rename(false);
+    verify_sql_rename_stage_isolated_from_doc_rename(true);
+}
