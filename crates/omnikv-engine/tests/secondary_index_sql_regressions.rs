@@ -5771,6 +5771,86 @@ fn concurrent_document_writers_converge_without_field_loss_during_add_and_rename
     }
 }
 
+#[test]
+fn concurrent_same_row_old_field_updates_survive_document_rename() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::thread;
+    use std::time::Duration;
+
+    let (db, _dir, _executor) = setup();
+    let schema = SchemaManager::new(db.clone(), Arc::new(IndexManager::new(db.clone())));
+
+    let initial_count = WriteBatch::MAX_OPS + 20;
+    let mut seed = WriteBatch::new();
+    for i in 0..initial_count {
+        seed.set(&format!("upd_conc:d{i:04}"), format!(r#"{{"old_f":{i}}}"#))
+            .unwrap();
+        if seed.op_count() >= 500 {
+            db.commit_batch(&seed).unwrap();
+            seed = WriteBatch::new();
+        }
+    }
+    if !seed.is_empty() {
+        db.commit_batch(&seed).unwrap();
+    }
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_w = stop.clone();
+    let db_w = db.clone();
+    let writer = thread::spawn(move || {
+        let mut recorded = Vec::new();
+        for i in 0..40usize {
+            if stop_w.load(Ordering::Acquire) {
+                break;
+            }
+            let key = format!("upd_conc:d{i:04}");
+            let cur = read_json_value(&db_w, &key);
+            if cur.get("old_f").is_some() {
+                let mut next_doc = cur;
+                let new_val = i + 10_000;
+                if let Some(obj) = next_doc.as_object_mut() {
+                    obj.insert("old_f".into(), serde_json::json!(new_val));
+                }
+                let mut wb = WriteBatch::new();
+                wb.set(&key, next_doc.to_string()).unwrap();
+                let seq = db_w.commit_batch(&wb).unwrap();
+                recorded.push((key, new_val, seq));
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        recorded
+    });
+
+    schema
+        .migrate_up(&Migration {
+            version: 1,
+            description: "concurrent same-row update rename".into(),
+            up: vec![SchemaOp::RenameField {
+                collection: "upd_conc".into(),
+                old_name: "old_f".into(),
+                new_name: "new_f".into(),
+            }],
+            down: vec![],
+        })
+        .unwrap();
+    let v1_seq = db.get_seq_for_key("\u{0}SCHEMA\u{0}__version__", u64::MAX);
+
+    stop.store(true, Ordering::Release);
+    let updates = writer.join().unwrap();
+
+    for (key, expected_val, write_seq) in updates {
+        if write_seq < v1_seq {
+            let doc = read_json_value(&db, &key);
+            assert_eq!(doc.get("old_f"), None, "doc {key} must not retain old_f");
+            assert_eq!(
+                doc.get("new_f"),
+                Some(&serde_json::json!(expected_val)),
+                "same-row concurrent update on {key} must be preserved in new_f"
+            );
+        }
+    }
+}
+
 fn seed_legacy_drop_receipt(
     db: &OmniKV,
     version: u64,
@@ -5953,4 +6033,190 @@ fn legacy_drop_index_receipt_blocks_active_and_cross_namespace_reuse() {
             .is_some(),
         "retired Document index must remain untouched"
     );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn seed_create_and_drop_receipts(
+    db: &OmniKV,
+    version: u64,
+    attempt: &str,
+    collection: &str,
+    name: &str,
+    index_id: u32,
+    drop_ns_tag: Option<&str>,
+    drop_payload: &str,
+) {
+    let attempt_key = format!("\u{0}SCHEMA\u{0}attempt:{version:06}:up");
+    let lower = name.to_ascii_lowercase();
+    let create_key = format!(
+        "\u{0}SCHEMA\u{0}create_idx:{version:06}:up:{}:{attempt}:000000:{}:{collection}:{}:{lower}",
+        attempt.len(),
+        collection.len(),
+        lower.len()
+    );
+    let drop_key = drop_ns_tag.map_or_else(
+        || {
+            format!(
+                "\u{0}SCHEMA\u{0}drop_idx:{version:06}:up:{}:{attempt}:000001:{}:{lower}",
+                attempt.len(),
+                lower.len()
+            )
+        },
+        |tag| {
+            format!(
+                "\u{0}SCHEMA\u{0}drop_idx:{version:06}:up:{}:{attempt}:000001:{tag}:{}:{lower}",
+                attempt.len(),
+                lower.len()
+            )
+        },
+    );
+    let mut wb = WriteBatch::new();
+    wb.set(&attempt_key, attempt.into()).unwrap();
+    wb.set(&create_key, format!("done:{index_id}")).unwrap();
+    wb.set(&drop_key, drop_payload.into()).unwrap();
+    db.commit_batch(&wb).unwrap();
+}
+
+fn create_then_drop_migration(
+    version: u64,
+    collection: &str,
+    name: &str,
+    ns: IndexNamespace,
+) -> Migration {
+    Migration {
+        version,
+        description: format!("create->drop {name} ({ns:?})"),
+        up: vec![
+            SchemaOp::CreateIndex {
+                name: name.into(),
+                collection: collection.into(),
+                fields: vec![("tag".into(), IndexFieldType::String)],
+                unique: false,
+            }
+            .in_namespace(ns),
+            SchemaOp::DropIndex { name: name.into() }.in_namespace(ns),
+        ],
+        down: vec![],
+    }
+}
+
+#[test]
+fn create_then_drop_index_replay_recovers_attributable_legacy_drop_receipt() {
+    let (db, _dir, executor) = setup();
+    let idx_mgr = Arc::new(IndexManager::new(db.clone()));
+    let schema = SchemaManager::new(db.clone(), idx_mgr);
+
+    execute(
+        &executor,
+        "CREATE TABLE replay_sql_only (id INTEGER PRIMARY KEY, tag TEXT)",
+    );
+    seed_create_and_drop_receipts(
+        &db,
+        1,
+        "att_ok",
+        "replay_sql_only",
+        "idx_replay_ok",
+        77,
+        None,
+        "done:77",
+    );
+
+    schema
+        .migrate_up(&create_then_drop_migration(
+            1,
+            "replay_sql_only",
+            "idx_replay_ok",
+            IndexNamespace::Sql,
+        ))
+        .unwrap();
+    assert_eq!(schema.current_version().unwrap(), 1);
+    assert_eq!(
+        db.scan(
+            "\u{0}SCHEMA\u{0}drop_idx:",
+            "\u{0}SCHEMA\u{0}drop_idx;",
+            db.get_seq()
+        )
+        .unwrap()
+        .len(),
+        0
+    );
+}
+
+#[test]
+fn create_then_drop_index_replay_blocks_unattributable_or_mismatched_legacy_drop_receipts() {
+    let (db, _dir, executor) = setup();
+    let idx_mgr = Arc::new(IndexManager::new(db.clone()));
+    let schema = SchemaManager::new(db.clone(), idx_mgr.clone());
+
+    execute(
+        &executor,
+        "CREATE TABLE replay_ambig (id INTEGER PRIMARY KEY, tag TEXT)",
+    );
+    execute(
+        &executor,
+        "CREATE TABLE replay_sql_only2 (id INTEGER PRIMARY KEY, tag TEXT)",
+    );
+    let mut doc_wb = WriteBatch::new();
+    doc_wb
+        .set("replay_ambig:doc1", r#"{"tag":"v1"}"#.into())
+        .unwrap();
+    db.commit_batch(&doc_wb).unwrap();
+    idx_mgr
+        .create_sql_index(
+            "idx_live_replay",
+            "replay_sql_only2",
+            vec![("tag".into(), IndexFieldType::String)],
+            false,
+        )
+        .unwrap();
+
+    // 1. Ambiguous collection (SQL + Document), 2. SQL-only table with Document op,
+    // 3. Non-legacy `:any:` key with `stored_ns == None`, 4. Active SQL index still exists.
+    for (col, idx, id, ns_tag, op_ns, label) in [
+        (
+            "replay_ambig",
+            "idx_ambig",
+            77,
+            None,
+            IndexNamespace::Sql,
+            "ambiguous",
+        ),
+        (
+            "replay_sql_only2",
+            "idx_wrong_ns",
+            78,
+            None,
+            IndexNamespace::Document,
+            "wrong ns",
+        ),
+        (
+            "replay_sql_only2",
+            "idx_any_tag",
+            79,
+            Some("any"),
+            IndexNamespace::Sql,
+            "non-legacy any",
+        ),
+        (
+            "replay_sql_only2",
+            "idx_live_replay",
+            80,
+            None,
+            IndexNamespace::Sql,
+            "live index",
+        ),
+    ] {
+        seed_create_and_drop_receipts(
+            &db,
+            1,
+            "att_blk",
+            col,
+            idx,
+            id,
+            ns_tag,
+            &format!("done:{id}"),
+        );
+        let mig = create_then_drop_migration(1, col, idx, op_ns);
+        assert!(schema.migrate_up(&mig).is_err(), "{label} must fail closed");
+    }
 }

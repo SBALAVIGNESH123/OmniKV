@@ -710,6 +710,34 @@ impl ServerConfig {
                     .into(),
             ));
         }
+        // If the HTTP or QUIC listener is reachable off-loopback, the built-in
+        // dev secrets would let any network caller forge a JWT or mint an admin
+        // token via `/auth/token`. Production mode already rejects them; this
+        // closes the same exposure for a Development-mode node bound publicly.
+        for (name, addr) in [
+            ("http_addr", &self.http_addr),
+            ("quic_addr", &self.quic_addr),
+        ] {
+            if let Ok(sock) = addr.parse::<std::net::SocketAddr>()
+                && !sock.ip().is_loopback()
+            {
+                if self.jwt_secret == DEV_JWT_SECRET {
+                    return Err(ConfigError(format!(
+                        "{name} is bound to a non-loopback address but jwt_secret is the \
+                         built-in dev value, which is public — anyone can forge a token. \
+                         Set OMNIKV_JWT_SECRET to a strong 32+ character secret"
+                    )));
+                }
+                if self.bootstrap_admin_key == DEV_BOOTSTRAP_ADMIN_KEY {
+                    return Err(ConfigError(format!(
+                        "{name} is bound to a non-loopback address but bootstrap_admin_key \
+                         is the built-in dev value, which is public — anyone can mint an \
+                         admin token. Set OMNIKV_BOOTSTRAP_ADMIN_KEY to a strong 32+ \
+                         character key"
+                    )));
+                }
+            }
+        }
         // The opt-in says the operator accepts the exposure; the built-in
         // dev secret makes that exposure equivalent to no auth at all —
         // it is published in source, so anyone can mint a valid token.

@@ -1123,3 +1123,33 @@ fn test_pgwire_tls_env_switch() {
         );
     });
 }
+
+#[test]
+fn test_public_http_or_quic_bind_rejects_dev_bootstrap_key_and_jwt_secret() {
+    for (field, http_addr, quic_addr) in [
+        ("http_addr", "0.0.0.0:7070", "127.0.0.1:7071"),
+        ("quic_addr", "127.0.0.1:7070", "0.0.0.0:7071"),
+    ] {
+        let mut cfg = ServerConfig {
+            http_addr: http_addr.into(),
+            quic_addr: quic_addr.into(),
+            ..Default::default()
+        };
+        let err = cfg.validate_runtime().unwrap_err();
+        assert!(
+            err.0.contains(field) && err.0.contains("jwt_secret"),
+            "public {field} bind with dev jwt_secret must be rejected: {err}"
+        );
+
+        cfg.jwt_secret = "a-real-secret-not-the-dev-one-0123456789".into();
+        let err = cfg.validate_runtime().unwrap_err();
+        assert!(
+            err.0.contains(field) && err.0.contains("bootstrap_admin_key"),
+            "public {field} bind with dev bootstrap_admin_key must be rejected: {err}"
+        );
+
+        cfg.bootstrap_admin_key = "a-real-bootstrap-admin-key-0123456789abc".into();
+        cfg.validate_runtime()
+            .unwrap_or_else(|e| panic!("public {field} bind with real secrets must validate: {e}"));
+    }
+}
