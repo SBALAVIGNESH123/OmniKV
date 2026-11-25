@@ -1491,6 +1491,10 @@ pub fn compile_plan_with_scan(
             let base: Box<dyn RowIterator> = match access {
                 AccessMethod::PkLookup { key_value } => {
                     let key_value = canonicalize_pk_key(&table_def, key_value);
+                    // Defensive runtime guard for manually constructed plans:
+                    // `Optimizer::plan_table_scan` already plans `SeqScan` (or
+                    // an explicit secondary `IndexScan`) whenever
+                    // `pk_lookup_needs_scan_parts` is true.
                     if pk_lookup_needs_scan(&table_def, &key_value) {
                         // A legacy numeric key may be stored as "007", or a
                         // cross-format numeric literal like '1.0' on an INTEGER
@@ -1726,6 +1730,9 @@ pub(crate) fn canonicalize_join_key(value: &str, col_type: Option<&ColumnType>) 
 /// Whether an equality lookup on `table`'s primary key must fall back to a
 /// scan-and-filter so typed `smart_cmp` matches identically:
 /// - legacy numeric tables (may hold non-canonical keys like `"007"`),
+/// - unknown primary-key column types (`None`, when caller stats omitted the
+///   PK type — fail safe so the optimizer never advertises `PkLookup` without
+///   knowing whether exact key equality is valid),
 /// - `INTEGER` primary keys (storage permits non-`i128` numeric representations
 ///   such as `'1.0'` that still compare equal under `smart_cmp`),
 /// - `FLOAT` primary keys when looking up zero (legacy typed rows persisted
@@ -1740,7 +1747,7 @@ pub(crate) fn pk_lookup_needs_scan_parts(
         return true;
     }
     match pk_type {
-        Some(ColumnType::Integer) => true,
+        None | Some(ColumnType::Integer) => true,
         Some(ColumnType::Float) => !key_value
             .parse::<f64>()
             .is_ok_and(|f| f.is_finite() && f != 0.0),

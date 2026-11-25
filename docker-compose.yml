@@ -11,8 +11,12 @@ x-omnikv-common-env: &omnikv-common-env
   OMNIKV_BACKUP_DIR: "/data/backups"
   OMNIKV_MODE: "${OMNIKV_MODE:-production}"
   # Set true only for local demos with generated self-signed certificates.
-  # Production deployments should provide trusted client/server TLS material
-  # and OMNIKV_RAFT_TLS_CA_PATH in their deployment environment.
+  # Production deployments must set OMNIKV_TLS_INSECURE_SKIP=false,
+  # OMNIKV_RAFT_TLS=true, and mount operator TLS certs/keys + Raft CA bundle
+  # into /etc/omnikv/certs (host path configured via OMNIKV_TLS_CERT_DIR,
+  # default ./certs). Point the *_PATH variables below at container-visible
+  # paths under /etc/omnikv/certs (for example /etc/omnikv/certs/node1.crt,
+  # /etc/omnikv/certs/node1.key, and /etc/omnikv/certs/ca.crt).
   OMNIKV_TLS_INSECURE_SKIP: "${OMNIKV_TLS_INSECURE_SKIP:?set OMNIKV_TLS_INSECURE_SKIP=false for production, or true only for a local demo}"
   OMNIKV_TLS_CERT_PATH: "${OMNIKV_TLS_CERT_PATH:-}"
   OMNIKV_TLS_KEY_PATH: "${OMNIKV_TLS_KEY_PATH:-}"
@@ -51,8 +55,14 @@ services:
       - "5433:5433"   # PostgreSQL Wire Protocol
     volumes:
       - omni-data-1:/data
+      # Read-only TLS certificate, private key, and Raft CA bundle directory.
+      # Override host path with OMNIKV_TLS_CERT_DIR and reference files inside
+      # containers under /etc/omnikv/certs/ (e.g. /etc/omnikv/certs/ca.crt).
+      - "${OMNIKV_TLS_CERT_DIR:-./certs}:/etc/omnikv/certs:ro"
     environment:
       <<: *omnikv-common-env
+      OMNIKV_TLS_CERT_PATH: "${OMNIKV_NODE1_TLS_CERT_PATH:-${OMNIKV_TLS_CERT_PATH:-}}"
+      OMNIKV_TLS_KEY_PATH: "${OMNIKV_NODE1_TLS_KEY_PATH:-${OMNIKV_TLS_KEY_PATH:-}}"
       OMNIKV_NODE_ID: "1"
       OMNIKV_RAFT_ADDR: "0.0.0.0:9090"
       OMNIKV_RAFT_ADVERTISE_ADDR: "omni-node-1:9090"
@@ -73,8 +83,11 @@ services:
       - "5434:5433"
     volumes:
       - omni-data-2:/data
+      - "${OMNIKV_TLS_CERT_DIR:-./certs}:/etc/omnikv/certs:ro"
     environment:
       <<: *omnikv-common-env
+      OMNIKV_TLS_CERT_PATH: "${OMNIKV_NODE2_TLS_CERT_PATH:-${OMNIKV_TLS_CERT_PATH:-}}"
+      OMNIKV_TLS_KEY_PATH: "${OMNIKV_NODE2_TLS_KEY_PATH:-${OMNIKV_TLS_KEY_PATH:-}}"
       OMNIKV_NODE_ID: "2"
       OMNIKV_RAFT_ADDR: "0.0.0.0:9090"
       OMNIKV_RAFT_ADVERTISE_ADDR: "omni-node-2:9090"
@@ -97,8 +110,11 @@ services:
       - "5435:5433"
     volumes:
       - omni-data-3:/data
+      - "${OMNIKV_TLS_CERT_DIR:-./certs}:/etc/omnikv/certs:ro"
     environment:
       <<: *omnikv-common-env
+      OMNIKV_TLS_CERT_PATH: "${OMNIKV_NODE3_TLS_CERT_PATH:-${OMNIKV_TLS_CERT_PATH:-}}"
+      OMNIKV_TLS_KEY_PATH: "${OMNIKV_NODE3_TLS_KEY_PATH:-${OMNIKV_TLS_KEY_PATH:-}}"
       OMNIKV_NODE_ID: "3"
       OMNIKV_RAFT_ADDR: "0.0.0.0:9090"
       OMNIKV_RAFT_ADVERTISE_ADDR: "omni-node-3:9090"

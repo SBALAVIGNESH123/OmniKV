@@ -8,7 +8,7 @@ use arc_swap::ArcSwap;
 use crossbeam_skiplist::SkipMap;
 use memmap2::{Mmap, MmapOptions};
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::hash::{Hash, Hasher};
 use std::io::{BufWriter, ErrorKind, Read, Write};
@@ -954,6 +954,157 @@ struct ScanCandidate {
     length: u64,
     crc: u32,
     expiry: u64,
+}
+
+type MemShardRange<'a> = crossbeam_skiplist::map::Range<
+    'a,
+    (Vec<u8>, Reverse<u64>),
+    std::ops::RangeFrom<(Vec<u8>, Reverse<u64>)>,
+    (Vec<u8>, Reverse<u64>),
+    ValuePointer,
+>;
+
+enum MergeSource<'a> {
+    MemShard {
+        iter: MemShardRange<'a>,
+        last_key: Option<Vec<u8>>,
+        exhausted: bool,
+    },
+    Sst {
+        iter: SSTableIterator,
+        peeked: Option<OmniRecord>,
+        exhausted: bool,
+    },
+}
+
+impl MergeSource<'_> {
+    fn next_visible(
+        &mut self,
+        start_key: &[u8],
+        end_bound: ScanEnd<'_>,
+        read_seq: u64,
+    ) -> Option<ScanCandidate> {
+        match self {
+            Self::MemShard {
+                iter,
+                last_key,
+                exhausted,
+            } => {
+                if *exhausted {
+                    return None;
+                }
+                for entry in iter.by_ref() {
+                    let (key, rev_seq) = entry.key();
+                    if end_bound.is_past(key) {
+                        *exhausted = true;
+                        return None;
+                    }
+                    let seq = rev_seq.0;
+                    if seq > read_seq {
+                        continue;
+                    }
+                    if last_key.as_deref() == Some(key.as_slice()) {
+                        continue;
+                    }
+                    let owned_key = key.clone();
+                    *last_key = Some(owned_key.clone());
+                    let val = entry.value();
+                    return Some(ScanCandidate {
+                        key: owned_key,
+                        seq,
+                        offset: val.0,
+                        length: val.1,
+                        crc: val.2,
+                        expiry: val.3,
+                    });
+                }
+                *exhausted = true;
+                None
+            }
+            Self::Sst {
+                iter,
+                peeked,
+                exhausted,
+            } => {
+                if *exhausted {
+                    return None;
+                }
+                let mut best: Option<OmniRecord> = None;
+                loop {
+                    let rec = match peeked.take() {
+                        Some(rec) => rec,
+                        None => match iter.next() {
+                            Some(rec) => rec,
+                            None => {
+                                *exhausted = true;
+                                break;
+                            }
+                        },
+                    };
+                    if end_bound.is_past(&rec.key) {
+                        *exhausted = true;
+                        break;
+                    }
+                    if rec.key.as_slice() < start_key {
+                        continue;
+                    }
+                    if let Some(ref current) = best {
+                        if rec.key == current.key {
+                            if rec.is_valid() && rec.seq <= read_seq && rec.seq > current.seq {
+                                best = Some(rec);
+                            }
+                            continue;
+                        }
+                        *peeked = Some(rec);
+                        break;
+                    }
+                    if rec.is_valid() && rec.seq <= read_seq {
+                        best = Some(rec);
+                    }
+                }
+                best.map(|rec| ScanCandidate {
+                    key: rec.key,
+                    seq: rec.seq,
+                    offset: rec.offset,
+                    length: rec.length,
+                    crc: rec.payload_crc32,
+                    expiry: rec.expiry,
+                })
+            }
+        }
+    }
+}
+
+struct MergeHeapEntry {
+    candidate: ScanCandidate,
+    source_id: usize,
+}
+
+impl PartialEq for MergeHeapEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.candidate.key == other.candidate.key
+            && self.candidate.seq == other.candidate.seq
+            && self.source_id == other.source_id
+    }
+}
+
+impl Eq for MergeHeapEntry {}
+
+impl Ord for MergeHeapEntry {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        other
+            .candidate
+            .key
+            .cmp(&self.candidate.key)
+            .then_with(|| self.candidate.seq.cmp(&other.candidate.seq))
+            .then_with(|| other.source_id.cmp(&self.source_id))
+    }
+}
+
+impl PartialOrd for MergeHeapEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -2263,7 +2414,8 @@ impl OmniKV {
         Ok(results)
     }
 
-    /// Collects up to `limit` visible entries in `[start_key, end_exclusive)` at `read_seq`.
+    /// Collects up to `limit` visible entries in `[start_key, end_exclusive)` at `read_seq`
+    /// using a bounded k-way streaming merge across memtables and SSTables.
     pub(crate) fn scan_exclusive_limit(
         &self,
         start_key: &str,
@@ -2276,15 +2428,7 @@ impl OmniKV {
             Some(bytes) => ScanEnd::Exclusive(bytes),
             None => ScanEnd::Unbounded,
         };
-        let mut iter = self.scan_iter_bounds(string_to_key(start_key), end_bound, read_seq)?;
-        let mut results = Vec::with_capacity(limit.min(iter.candidates.len()));
-        while results.len() < limit {
-            let Some(entry) = iter.try_next()? else {
-                break;
-            };
-            results.push(entry);
-        }
-        Ok(results)
+        self.scan_bounds_limit(string_to_key(start_key), end_bound, read_seq, limit)
     }
 
     /// Collects up to `limit` visible entries whose keys begin with `prefix` at `read_seq`.
@@ -2298,7 +2442,8 @@ impl OmniKV {
         self.scan_exclusive_limit(prefix, end.as_deref(), read_seq, limit)
     }
 
-    /// Collects up to `limit` visible entries in the lexical range `[start_key, end_key]`.
+    /// Collects up to `limit` visible entries in the lexical range `[start_key, end_key]`
+    /// using a bounded k-way streaming merge across memtables and SSTables.
     pub fn scan_limit(
         &self,
         start_key: &str,
@@ -2306,14 +2451,136 @@ impl OmniKV {
         read_seq: u64,
         limit: usize,
     ) -> Result<Vec<(String, String)>, OmniError> {
-        let mut iter = self.scan_iter_inner(start_key, end_key, read_seq)?;
-        let mut results = Vec::with_capacity(limit.min(iter.candidates.len()));
+        let end_bytes = string_to_key(end_key);
+        self.scan_bounds_limit(
+            string_to_key(start_key),
+            ScanEnd::Inclusive(&end_bytes),
+            read_seq,
+            limit,
+        )
+    }
+
+    fn scan_bounds_limit(
+        &self,
+        start_key: Vec<u8>,
+        end_bound: ScanEnd<'_>,
+        read_seq: u64,
+        limit: usize,
+    ) -> Result<Vec<(String, String)>, OmniError> {
+        let roots = self.roots.load();
+        if read_seq < roots.read_seq_floor {
+            return Err(OmniError::StaleSnapshot {
+                read_seq,
+                floor: roots.read_seq_floor,
+            });
+        }
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let active_mem = roots.memtable.clone();
+        let frozen = roots.frozen_memtables.clone();
+        let mem_start = Reverse(read_seq.saturating_add(1));
+
+        let mut sources: Vec<MergeSource<'_>> = Vec::with_capacity(
+            active_mem.len()
+                + frozen.len().saturating_mul(NUM_SHARDS)
+                + roots.sstables.len()
+                + roots.l1_sstables.len()
+                + 1,
+        );
+        for shard in active_mem.iter() {
+            sources.push(MergeSource::MemShard {
+                iter: shard.range((start_key.clone(), mem_start)..),
+                last_key: None,
+                exhausted: false,
+            });
+        }
+        for f_mem in frozen.iter().rev() {
+            for shard in f_mem.iter() {
+                sources.push(MergeSource::MemShard {
+                    iter: shard.range((start_key.clone(), mem_start)..),
+                    last_key: None,
+                    exhausted: false,
+                });
+            }
+        }
+        for (mmap, _, _) in roots.sstables.iter().rev() {
+            let reader = SSTableReader::from_mmap(mmap.clone());
+            sources.push(MergeSource::Sst {
+                iter: reader.iter_from(&start_key),
+                peeked: None,
+                exhausted: false,
+            });
+        }
+        for (mmap, _, _) in &**roots.l1_sstables {
+            let reader = SSTableReader::from_mmap(mmap.clone());
+            sources.push(MergeSource::Sst {
+                iter: reader.iter_from(&start_key),
+                peeked: None,
+                exhausted: false,
+            });
+        }
+        let base_reader = SSTableReader::from_mmap(roots.base_mmap.clone());
+        sources.push(MergeSource::Sst {
+            iter: base_reader.iter_from(&start_key),
+            peeked: None,
+            exhausted: false,
+        });
+
+        let mut heap: BinaryHeap<MergeHeapEntry> = BinaryHeap::with_capacity(sources.len());
+        for (source_id, source) in sources.iter_mut().enumerate() {
+            if let Some(candidate) = source.next_visible(&start_key, end_bound, read_seq) {
+                heap.push(MergeHeapEntry {
+                    candidate,
+                    source_id,
+                });
+            }
+        }
+
+        let mut results = Vec::with_capacity(limit.min(1024));
+        let mut last_decided_key: Option<Vec<u8>> = None;
+        let mut read_buffer = self.scan_buffer_pool.acquire();
+
         while results.len() < limit {
-            let Some(entry) = iter.try_next()? else {
+            let Some(MergeHeapEntry {
+                candidate,
+                source_id,
+            }) = heap.pop()
+            else {
                 break;
             };
-            results.push(entry);
+            if let Some(next_candidate) =
+                sources[source_id].next_visible(&start_key, end_bound, read_seq)
+            {
+                heap.push(MergeHeapEntry {
+                    candidate: next_candidate,
+                    source_id,
+                });
+            }
+            if last_decided_key.as_deref() == Some(candidate.key.as_slice()) {
+                continue;
+            }
+            last_decided_key = Some(candidate.key.clone());
+            if candidate.length == 0 || (candidate.expiry > 0 && candidate.expiry <= now) {
+                continue;
+            }
+            let key = key_to_string(&candidate.key);
+            let value = self.read_from_heap_with_reader_into(
+                &roots.heap_reader,
+                roots.heap_generation,
+                candidate.offset,
+                candidate.length,
+                candidate.crc,
+                read_buffer.as_mut_vec(),
+            )?;
+            results.push((key, value));
         }
+
         Ok(results)
     }
 
@@ -5491,6 +5758,103 @@ mod tests {
         assert!(
             OmniKV::open(&manifest_str, &wal_str).is_err(),
             "rollback_failed marker must fail closed even when manifest exists"
+        );
+    }
+
+    #[test]
+    fn bounded_streaming_scans_match_full_scans_across_levels_mvcc_tombstones_and_ttl() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let manifest = dir
+            .path()
+            .join("manifest.json")
+            .to_str()
+            .expect("manifest path")
+            .to_string();
+        let wal = dir
+            .path()
+            .join("wal.bin")
+            .to_str()
+            .expect("wal path")
+            .to_string();
+        let db = OmniKV::open(&manifest, &wal).expect("open db");
+
+        // Layer 1 (compacted all the way to base): initial keys k00..k19.
+        let mut b1 = WriteBatch::new();
+        for i in 0..20 {
+            b1.set(&format!("k{i:02}"), format!("base-{i}"))
+                .expect("set base");
+        }
+        let seq_base = db.commit_batch(&b1).expect("commit base");
+        db.flush_memtable_to_disk(0).expect("flush base to l0");
+        db.compact_l0_to_l1().expect("compact to l1");
+        db.compact_l1_to_l2().expect("compact to base");
+
+        // Layer 2 (L1): overwrite multiples of 3, delete k02/k05, add expired k04.
+        let mut b2 = WriteBatch::new();
+        for i in (0..20).step_by(3) {
+            b2.set(&format!("k{i:02}"), format!("l1-{i}"))
+                .expect("set l1");
+        }
+        b2.delete("k02").expect("del k02");
+        b2.delete("k05").expect("del k05");
+        b2.set_with_expiry("k04", "expired".into(), 1)
+            .expect("set expired k04");
+        let seq_l1 = db.commit_batch(&b2).expect("commit l1");
+        db.flush_memtable_to_disk(0).expect("flush l1");
+        db.compact_l0_to_l1().expect("compact l0 to l1");
+
+        // Layer 3 (L0): multiple versions of k03 & k06, resurrect k05.
+        let mut b3 = WriteBatch::new();
+        b3.set("k03", "l0-a".into()).expect("set k03 a");
+        b3.set("k06", "l0-a".into()).expect("set k06 a");
+        b3.set("k05", "resurrected".into()).expect("resurrect k05");
+        db.commit_batch(&b3).expect("commit l0 a");
+        let mut b4 = WriteBatch::new();
+        b4.set("k03", "l0-b".into()).expect("set k03 b");
+        b4.delete("k06").expect("del k06");
+        let seq_l0 = db.commit_batch(&b4).expect("commit l0 b");
+        db.flush_memtable_to_disk(0).expect("flush l0");
+
+        // Layer 4 (active memtable): overwrite k00, delete k01, add k07-mem.
+        let mut b5 = WriteBatch::new();
+        b5.set("k00", "mem-0".into()).expect("set k00");
+        b5.delete("k01").expect("del k01");
+        b5.set("k07", "mem-7".into()).expect("set k07");
+        let seq_latest = db.commit_batch(&b5).expect("commit mem");
+
+        for snap_seq in [seq_base, seq_l1, seq_l0, seq_latest] {
+            let full_inc = db.scan("k00", "k19", snap_seq).expect("full scan");
+            let full_exc = db.scan_prefix("k", snap_seq).expect("full prefix scan");
+            for lim in [0, 1, 2, 5, 11, 50] {
+                let got_inc = db
+                    .scan_limit("k00", "k19", snap_seq, lim)
+                    .expect("scan_limit");
+                assert_eq!(got_inc, full_inc[..lim.min(full_inc.len())]);
+
+                let got_exc = db
+                    .scan_exclusive_limit("k00", Some("k15"), snap_seq, lim)
+                    .expect("scan_exclusive_limit");
+                let expected_exc: Vec<_> = full_exc
+                    .iter()
+                    .filter(|(k, _)| k.as_str() >= "k00" && k.as_str() < "k15")
+                    .take(lim)
+                    .cloned()
+                    .collect();
+                assert_eq!(got_exc, expected_exc);
+            }
+        }
+        // Empty inverted range and stale snapshot floor checks.
+        assert_eq!(
+            db.scan_limit("k10", "k05", seq_latest, 5)
+                .expect("inverted range")
+                .len(),
+            0
+        );
+        assert_eq!(
+            db.scan_exclusive_limit("k05", Some("k05"), seq_latest, 5)
+                .expect("empty exclusive range")
+                .len(),
+            0
         );
     }
 }

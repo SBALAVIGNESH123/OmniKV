@@ -1180,11 +1180,40 @@ impl IndexManager {
         let catalog = IndexCatalog::load_checked_at(&self.db, seq)?;
         let mut proved_expected_ns = false;
         for &id in &ids {
-            if let Some(def) = catalog.get(id) {
+            let active_def = catalog.get(id);
+            let retired_key = format!("{RETIRED_PREFIX}{id}");
+            let retired_def = match self.db.find(&retired_key, seq)? {
+                Some(raw) => Some(serde_json::from_str::<IndexDefinition>(&raw).map_err(|e| {
+                    OmniError::IoError(format!(
+                        "drop receipt for index '{name}' references malformed retired metadata for ID {id}: {e}"
+                    ))
+                })?),
+                None => None,
+            };
+            if let (Some(active), Some(retired)) = (active_def, retired_def.as_ref()) {
+                return Err(OmniError::IoError(format!(
+                    "drop receipt for index '{name}' references ID {id} with contradictory active ('{}' on '{}', {:?}) and retired ('{}' on '{}', {:?}) definitions",
+                    active.name,
+                    active.collection,
+                    active.namespace,
+                    retired.name,
+                    retired.collection,
+                    retired.namespace
+                )));
+            }
+            if let Some(def) = active_def {
                 if !def.name.eq_ignore_ascii_case(name) {
                     return Err(OmniError::IoError(format!(
                         "drop receipt for index '{name}' references active ID {id} belonging to different index '{}'",
                         def.name
+                    )));
+                }
+                if let Some(expected_col) = known_collection
+                    && def.collection != expected_col
+                {
+                    return Err(OmniError::IoError(format!(
+                        "drop receipt for index '{name}' references active ID {id} belonging to collection '{}', expected '{expected_col}'",
+                        def.collection
                     )));
                 }
                 if let Some(expected_ns) = expected_namespace {
@@ -1197,14 +1226,19 @@ impl IndexManager {
                     proved_expected_ns = true;
                 }
             }
-            let retired_key = format!("{RETIRED_PREFIX}{id}");
-            if let Some(raw) = self.db.find(&retired_key, seq)?
-                && let Ok(def) = serde_json::from_str::<IndexDefinition>(&raw)
-            {
+            if let Some(def) = retired_def {
                 if !def.name.eq_ignore_ascii_case(name) {
                     return Err(OmniError::IoError(format!(
                         "drop receipt for index '{name}' references retired ID {id} belonging to different index '{}'",
                         def.name
+                    )));
+                }
+                if let Some(expected_col) = known_collection
+                    && def.collection != expected_col
+                {
+                    return Err(OmniError::IoError(format!(
+                        "drop receipt for index '{name}' references retired ID {id} belonging to collection '{}', expected '{expected_col}'",
+                        def.collection
                     )));
                 }
                 if let Some(expected_ns) = expected_namespace {
@@ -1326,7 +1360,7 @@ impl IndexManager {
                 }
                 DropIndexReceiptState::Dropping => {
                     for &id in &ids {
-                        self.purge_retired_index_if_present(id, Some(name))?;
+                        self.purge_retired_index_if_present(id, Some(name), expected_namespace)?;
                         if let Some(def) =
                             IndexCatalog::load_checked_at(&self.db, self.db.get_seq())?
                                 .get(id)
@@ -1336,6 +1370,14 @@ impl IndexManager {
                                 return Err(OmniError::IoError(format!(
                                     "drop receipt for index '{name}' references active ID {id} belonging to different index '{}'",
                                     def.name
+                                )));
+                            }
+                            if let Some(expected_ns) = expected_namespace
+                                && def.namespace != expected_ns
+                            {
+                                return Err(OmniError::IoError(format!(
+                                    "drop receipt for index '{name}' references active ID {id} in namespace {:?}, expected {expected_ns:?}",
+                                    def.namespace
                                 )));
                             }
                             let lock = self.db.sql_table_lock(&def.collection)?;
@@ -1437,19 +1479,43 @@ impl IndexManager {
         &self,
         id: IndexId,
         expected_name: Option<&str>,
+        expected_namespace: Option<IndexNamespace>,
     ) -> Result<(), OmniError> {
         let retired_key = format!("{RETIRED_PREFIX}{id}");
-        let Some(raw) = self.db.find(&retired_key, self.db.get_seq())? else {
+        let seq = self.db.get_seq();
+        let Some(raw) = self.db.find(&retired_key, seq)? else {
             return Ok(());
         };
-        let def: IndexDefinition =
-            serde_json::from_str(&raw).map_err(|e| OmniError::IoError(e.to_string()))?;
+        let def: IndexDefinition = serde_json::from_str(&raw).map_err(|e| {
+            OmniError::IoError(format!(
+                "malformed retired index metadata at '{retired_key}': {e}"
+            ))
+        })?;
+        if let Some(active) = IndexCatalog::load_checked_at(&self.db, seq)?.get(id) {
+            return Err(OmniError::IoError(format!(
+                "contradictory active ('{}' on '{}', {:?}) and retired ('{}' on '{}', {:?}) definitions for index ID {id}",
+                active.name,
+                active.collection,
+                active.namespace,
+                def.name,
+                def.collection,
+                def.namespace
+            )));
+        }
         if let Some(expected) = expected_name
             && !def.name.eq_ignore_ascii_case(expected)
         {
             return Err(OmniError::IoError(format!(
                 "drop receipt for index '{expected}' references retired ID {id} belonging to different index '{}'",
                 def.name
+            )));
+        }
+        if let Some(expected_ns) = expected_namespace
+            && def.namespace != expected_ns
+        {
+            return Err(OmniError::IoError(format!(
+                "drop receipt for index '{}' references retired ID {id} in namespace {:?}, expected {expected_ns:?}",
+                def.name, def.namespace
             )));
         }
         let lock = self.db.sql_table_lock(&def.collection)?;
@@ -1460,8 +1526,20 @@ impl IndexManager {
         let _ddl_guard = ddl_lock
             .lock()
             .map_err(|_| OmniError::LockPoisoned("index DDL".into()))?;
-        if self.db.find(&retired_key, self.db.get_seq())?.is_none() {
+        let recheck_seq = self.db.get_seq();
+        if self.db.find(&retired_key, recheck_seq)?.is_none() {
             return Ok(());
+        }
+        if let Some(active) = IndexCatalog::load_checked_at(&self.db, recheck_seq)?.get(id) {
+            return Err(OmniError::IoError(format!(
+                "contradictory active ('{}' on '{}', {:?}) and retired ('{}' on '{}', {:?}) definitions for index ID {id}",
+                active.name,
+                active.collection,
+                active.namespace,
+                def.name,
+                def.collection,
+                def.namespace
+            )));
         }
         self.purge_retired_index_entries(id)
     }
@@ -1627,10 +1705,12 @@ impl IndexManager {
         seq: u64,
     ) -> Result<Vec<IndexDefinition>, OmniError> {
         let mut matches = Vec::new();
-        for (_, value) in self.db.scan_prefix(RETIRED_PREFIX, seq)? {
-            let Ok(def) = serde_json::from_str::<IndexDefinition>(&value) else {
-                continue;
-            };
+        for (ret_key, value) in self.db.scan_prefix(RETIRED_PREFIX, seq)? {
+            let def: IndexDefinition = serde_json::from_str(&value).map_err(|e| {
+                OmniError::IoError(format!(
+                    "malformed retired index metadata at '{ret_key}': {e}"
+                ))
+            })?;
             if def.name.eq_ignore_ascii_case(name)
                 && expected_collection.is_none_or(|expected| def.collection == expected)
                 && expected_namespace.is_none_or(|expected| def.namespace == expected)
@@ -1641,17 +1721,19 @@ impl IndexManager {
         Ok(matches)
     }
 
-    fn cleanup_retired_indexes_for_collection(
+    pub(crate) fn cleanup_retired_indexes_for_collection(
         &self,
         collection: &str,
         namespace: IndexNamespace,
     ) -> Result<(), OmniError> {
         let seq = self.db.get_seq();
-        for (_, value) in self.db.scan_prefix(RETIRED_PREFIX, seq)? {
-            if let Ok(def) = serde_json::from_str::<IndexDefinition>(&value)
-                && def.collection == collection
-                && def.namespace.matches(namespace)
-            {
+        for (ret_key, value) in self.db.scan_prefix(RETIRED_PREFIX, seq)? {
+            let def: IndexDefinition = serde_json::from_str(&value).map_err(|e| {
+                OmniError::IoError(format!(
+                    "malformed retired index metadata at '{ret_key}': {e}"
+                ))
+            })?;
+            if def.collection == collection && def.namespace.matches(namespace) {
                 self.purge_retired_index_entries(def.id)?;
             }
         }
@@ -1693,12 +1775,19 @@ impl IndexManager {
             .ok()
             .and_then(|catalog| catalog.get_by_name(name).map(|idx| idx.collection.clone()))
     }
+}
 
-    pub fn collect_drop_index_keys_for_collection_at(
+pub(crate) struct CollectionIndexDropPlan {
+    pub(crate) active: Vec<IndexDefinition>,
+    pub(crate) retired: Vec<(String, IndexDefinition)>,
+}
+
+impl IndexManager {
+    pub(crate) fn plan_drop_indexes_for_collection_at(
         &self,
         collection: &str,
         seq: u64,
-    ) -> Result<(Vec<String>, Vec<String>), OmniError> {
+    ) -> Result<CollectionIndexDropPlan, OmniError> {
         let canonical = self.resolve_collection_name_at(collection, seq)?;
         let catalog = IndexCatalog::load_checked_at(&self.db, seq)?;
         for def in catalog.indexes_for_collection(&canonical) {
@@ -1711,9 +1800,65 @@ impl IndexManager {
                 )));
             }
         }
+        let active: Vec<IndexDefinition> = catalog
+            .indexes_for_namespace(&canonical, IndexNamespace::Sql)
+            .into_iter()
+            .cloned()
+            .collect();
+        let mut retired = Vec::new();
+        for (ret_key, value) in self.db.scan_prefix(RETIRED_PREFIX, seq)? {
+            let def: IndexDefinition = serde_json::from_str(&value).map_err(|e| {
+                OmniError::IoError(format!(
+                    "malformed retired index metadata at '{ret_key}': {e}"
+                ))
+            })?;
+            if def.collection == canonical && def.namespace.matches(IndexNamespace::Sql) {
+                retired.push((ret_key, def));
+            }
+        }
+        Ok(CollectionIndexDropPlan { active, retired })
+    }
+
+    pub(crate) fn append_retire_sql_indexes_to_batch(
+        active_defs: &[IndexDefinition],
+        batch: &mut WriteBatch,
+    ) -> Result<Vec<String>, OmniError> {
+        let mut catalog_keys = Vec::with_capacity(active_defs.len());
+        for def in active_defs {
+            let catalog_key = format!("{CATALOG_PREFIX}{}", def.id);
+            let ready_key = format!("{READY_PREFIX}{}", def.id);
+            let retired_key = format!("{RETIRED_PREFIX}{}", def.id);
+            let retired_value =
+                serde_json::to_string(def).map_err(|e| OmniError::IoError(e.to_string()))?;
+            batch.delete(&catalog_key)?;
+            batch.delete(&ready_key)?;
+            batch.set(&retired_key, retired_value)?;
+            catalog_keys.push(catalog_key);
+        }
+        Ok(catalog_keys)
+    }
+
+    pub(crate) fn index_meta_keys_for_def(def: &IndexDefinition) -> (String, String) {
+        (
+            format!("{CATALOG_PREFIX}{}", def.id),
+            format!("{READY_PREFIX}{}", def.id),
+        )
+    }
+
+    pub(crate) fn index_entry_prefix_for_id(id: IndexId) -> String {
+        build_index_scan_prefix(id)
+    }
+
+    pub fn collect_drop_index_keys_for_collection_at(
+        &self,
+        collection: &str,
+        seq: u64,
+    ) -> Result<(Vec<String>, Vec<String>), OmniError> {
+        let CollectionIndexDropPlan { active, retired } =
+            self.plan_drop_indexes_for_collection_at(collection, seq)?;
         let mut entry_keys = Vec::new();
         let mut meta_keys = Vec::new();
-        for def in catalog.indexes_for_namespace(&canonical, IndexNamespace::Sql) {
+        for def in active {
             meta_keys.push(format!("{}{}", CATALOG_PREFIX, def.id));
             meta_keys.push(format!("{READY_PREFIX}{}", def.id));
             let prefix = build_index_scan_prefix(def.id);
@@ -1721,16 +1866,11 @@ impl IndexManager {
                 entry_keys.push(key);
             }
         }
-        for (ret_key, value) in self.db.scan_prefix(RETIRED_PREFIX, seq)? {
-            if let Ok(def) = serde_json::from_str::<IndexDefinition>(&value)
-                && def.collection == canonical
-                && def.namespace.matches(IndexNamespace::Sql)
-            {
-                meta_keys.push(ret_key);
-                let prefix = build_index_scan_prefix(def.id);
-                for (key, _) in self.db.scan_prefix(&prefix, seq)? {
-                    entry_keys.push(key);
-                }
+        for (ret_key, def) in retired {
+            meta_keys.push(ret_key);
+            let prefix = build_index_scan_prefix(def.id);
+            for (key, _) in self.db.scan_prefix(&prefix, seq)? {
+                entry_keys.push(key);
             }
         }
         Ok((entry_keys, meta_keys))
@@ -1798,10 +1938,12 @@ impl IndexManager {
             }
         }
         for (ret_key, value) in self.db.scan_prefix(RETIRED_PREFIX, seq)? {
-            if let Ok(def) = serde_json::from_str::<IndexDefinition>(&value)
-                && def.collection == canonical
-                && def.namespace.matches(IndexNamespace::Sql)
-            {
+            let def: IndexDefinition = serde_json::from_str(&value).map_err(|e| {
+                OmniError::IoError(format!(
+                    "malformed retired index metadata at '{ret_key}': {e}"
+                ))
+            })?;
+            if def.collection == canonical && def.namespace.matches(IndexNamespace::Sql) {
                 let prefix = build_index_scan_prefix(def.id);
                 let staged_keys: Vec<String> = batch
                     .buffered_writes

@@ -1345,22 +1345,37 @@ impl SchemaManager {
             };
             // Always propagate malformed receipts fail-closed.
             crate::secondary_index::parse_drop_index_receipt(&receipt)?;
-            // Enforce the exact same namespace and legacy-attribution rules as
-            // `drop_index_with_receipt`, plus collection-level attribution so a
-            // namespace-less legacy receipt cannot satisfy replay unless safely
-            // attributable to `create_namespace`.
-            let Ok((_, _, dropped_ids)) = self.index_manager.validate_drop_index_receipt_at(
+            // Enforce the exact same namespace, collection, malformed-retired,
+            // and active/retired contradiction checks as `drop_index_with_receipt`.
+            match self.index_manager.validate_drop_index_receipt_at(
                 index_name,
                 &receipt,
                 from_legacy_key,
                 Some(create_namespace),
                 Some(resolved_collection),
                 seq,
-            ) else {
-                continue;
-            };
-            if dropped_ids.contains(&index_id) {
-                return Ok(true);
+            ) {
+                Ok((_, _, dropped_ids)) => {
+                    if dropped_ids.contains(&index_id) {
+                        return Ok(true);
+                    }
+                }
+                Err(err) => {
+                    // Fail closed immediately on metadata corruption,
+                    // contradictory active/retired ownership, or any failure on
+                    // an explicitly matching namespace receipt. Only an
+                    // untagged/legacy receipt that cleanly belongs to a
+                    // different namespace/collection is skipped as non-matching.
+                    let msg = err.to_string();
+                    let is_corruption_or_contradiction = msg.contains("malformed retired metadata")
+                        || msg.contains("malformed retired index metadata")
+                        || msg.contains("contradictory active");
+                    if is_corruption_or_contradiction
+                        || (!from_legacy_key && drop_step_ns == Some(create_namespace))
+                    {
+                        return Err(err);
+                    }
+                }
             }
         }
         Ok(false)

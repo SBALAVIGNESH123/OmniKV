@@ -1227,3 +1227,103 @@ fn partial_add_field_failpoint_defers_catalog_and_recovers_on_retry() {
     assert!(!final_cat.contains("old_tag"));
     assert!(final_cat.contains("new_tag"));
 }
+
+#[cfg(feature = "failpoints")]
+#[test]
+fn interrupted_large_drop_table_hides_table_and_recovers_without_resurrection() {
+    use omni_engine::catalog::Catalog;
+    use omni_engine::secondary_index::{IndexFieldType, IndexManager};
+    use omni_engine::sql::parse_sql;
+    use omni_engine::sql_exec::{ExecResult, SqlExecutor};
+    use std::sync::Arc;
+
+    let _lock = TEST_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let registry = FailRegistry::new();
+    registry.reset();
+
+    let dir = TempDir::new().expect("tempdir");
+    let (m, w) = fresh_db_paths(&dir);
+    let total_rows = WriteBatch::MAX_OPS + 120;
+    let idx_id = {
+        let db = OmniKV::open(&m, &w).expect("open db");
+        let _executor = seed_fp_uq_table(&db, "fp_big_drop", total_rows);
+        let idx_mgr = IndexManager::new(db.clone());
+        let id = idx_mgr
+            .create_sql_index(
+                "fp_big_drop_code_idx",
+                "fp_big_drop",
+                vec![("code".into(), IndexFieldType::String)],
+                false,
+            )
+            .expect("create index");
+        idx_mgr
+            .rebuild_index("fp_big_drop_code_idx")
+            .expect("rebuild");
+
+        let catalog = Catalog::new(db);
+        registry.arm("catalog::drop_table_after_partial_chunk");
+        let drop_err = catalog
+            .drop_table("fp_big_drop")
+            .expect_err("armed failpoint must interrupt large drop_table mid-chunk");
+        registry.reset();
+        assert!(
+            drop_err.contains("catalog::drop_table_after_partial_chunk"),
+            "unexpected drop_err: {drop_err}"
+        );
+        id
+    };
+
+    // Reopen after simulated crash: table and index MUST ALREADY BE HIDDEN
+    // (never exposed half-deleted), while the durable DROPPING_TABLE marker
+    // tracks the remaining orphaned rows/index entries.
+    let db2 = OmniKV::open(&m, &w).expect("reopen db");
+    let catalog2 = Arc::new(Catalog::new(db2.clone()));
+    assert!(
+        catalog2.get_table("fp_big_drop").is_none(),
+        "table must stay hidden after interrupted large DROP TABLE"
+    );
+    assert!(
+        db2.find(&Catalog::catalog_key("fp_big_drop"), db2.get_seq())
+            .expect("find catalog key")
+            .is_none()
+    );
+    assert!(
+        db2.find(&Catalog::dropping_table_key("fp_big_drop"), db2.get_seq())
+            .expect("find dropping marker")
+            .is_some(),
+        "durable DROPPING_TABLE marker must persist across crash"
+    );
+    assert!(
+        IndexManager::new(db2.clone())
+            .definition("fp_big_drop_code_idx")
+            .is_err(),
+        "active SQL index must already be retired at cutover"
+    );
+
+    // Recreating the same table name automatically finishes the pending drop
+    // first so ZERO orphaned rows or index entries can resurrect.
+    let exec2 = SqlExecutor::new(db2.clone(), catalog2.clone());
+    exec2
+        .execute(&parse_sql("CREATE TABLE fp_big_drop (id TEXT PRIMARY KEY, code TEXT)").unwrap())
+        .expect("recreate table after interrupted drop");
+    assert!(
+        db2.find(&Catalog::dropping_table_key("fp_big_drop"), db2.get_seq())
+            .expect("dropping marker cleared")
+            .is_none()
+    );
+    assert!(
+        db2.find(&format!("\u{0}IDX_RETIRED\u{0}{idx_id}"), db2.get_seq())
+            .expect("retired index cleared")
+            .is_none()
+    );
+    let ExecResult::Rows { rows, .. } = exec2
+        .execute(&parse_sql("SELECT id FROM fp_big_drop").unwrap())
+        .expect("select recreated table")
+    else {
+        panic!("expected rows");
+    };
+    assert_eq!(rows.len(), 0, "no old rows may resurrect after recreate");
+    assert_eq!(catalog2.recover_pending_drops().expect("recover idle"), 0);
+}

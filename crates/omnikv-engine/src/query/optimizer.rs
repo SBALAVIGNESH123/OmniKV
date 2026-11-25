@@ -790,7 +790,7 @@ impl Optimizer {
                     Some(pk_type) => pk_type.canonicalize(&pk_val),
                     None => pk_val.clone(),
                 };
-                let needs_scan = stats.is_some_and(|s| {
+                let needs_scan = stats.is_none_or(|s| {
                     crate::volcano::pk_lookup_needs_scan_parts(
                         s.row_format,
                         s.pk_type.as_ref(),
@@ -1083,7 +1083,7 @@ mod tests {
                 indexes: vec![],
                 histograms: vec![],
                 primary_key: "id".into(),
-                pk_type: None,
+                pk_type: Some(ColumnType::Text),
                 row_format: RowFormat::Typed,
             },
         );
@@ -1096,7 +1096,7 @@ mod tests {
                 indexes: vec![],
                 histograms: vec![],
                 primary_key: "id".into(),
-                pk_type: None,
+                pk_type: Some(ColumnType::Text),
                 row_format: RowFormat::Typed,
             },
         );
@@ -1150,7 +1150,7 @@ mod tests {
                 indexes: vec![],
                 histograms: vec![],
                 primary_key: "order_no".into(),
-                pk_type: None,
+                pk_type: Some(ColumnType::Text),
                 row_format: RowFormat::Typed,
             },
         );
@@ -1241,5 +1241,71 @@ mod tests {
         let plan = opt.optimize(&stmt).unwrap();
         let display = format!("{}", plan);
         assert!(display.contains("Aggregate"));
+    }
+
+    #[test]
+    fn test_integer_and_unknown_pk_types_plan_seq_scan_with_scan_cost() {
+        for pk_type in [Some(ColumnType::Integer), None] {
+            let mut stats = std::collections::HashMap::new();
+            stats.insert(
+                "users".into(),
+                TableStats {
+                    table_name: "users".into(),
+                    row_count: 10_000,
+                    avg_row_bytes: 256,
+                    indexes: vec![],
+                    histograms: vec![],
+                    primary_key: "id".into(),
+                    pk_type: pk_type.clone(),
+                    row_format: RowFormat::Typed,
+                },
+            );
+            let opt = Optimizer::new(stats);
+            let stmt = parse_sql("SELECT * FROM users WHERE id = 42").unwrap();
+            let plan = opt.optimize(&stmt).unwrap();
+            let display = format!("{plan}");
+            assert!(
+                display.contains("Seq Scan") && !display.contains("PK Lookup"),
+                "pk_type={pk_type:?} must not advertise PK Lookup: {display}"
+            );
+            assert!(
+                plan.estimated_cost() >= 10_000.0 * SEQ_SCAN_COST_PER_ROW,
+                "pk_type={pk_type:?} must carry Seq Scan cost, got {}",
+                plan.estimated_cost()
+            );
+        }
+    }
+
+    #[test]
+    fn test_float_pk_plans_pk_lookup_for_nonzero_and_seq_scan_for_zero() {
+        let mut stats = std::collections::HashMap::new();
+        stats.insert(
+            "coords".into(),
+            TableStats {
+                table_name: "coords".into(),
+                row_count: 1_000,
+                avg_row_bytes: 64,
+                indexes: vec![],
+                histograms: vec![],
+                primary_key: "x".into(),
+                pk_type: Some(ColumnType::Float),
+                row_format: RowFormat::Typed,
+            },
+        );
+        let opt = Optimizer::new(stats);
+        let nonzero = opt
+            .optimize(&parse_sql("SELECT * FROM coords WHERE x = 1.5").unwrap())
+            .unwrap();
+        assert!(
+            format!("{nonzero}").contains("PK Lookup"),
+            "non-zero finite FLOAT PK should plan PK Lookup: {nonzero}"
+        );
+        let zero = opt
+            .optimize(&parse_sql("SELECT * FROM coords WHERE x = 0.0").unwrap())
+            .unwrap();
+        assert!(
+            format!("{zero}").contains("Seq Scan") && !format!("{zero}").contains("PK Lookup"),
+            "zero FLOAT PK must plan Seq Scan: {zero}"
+        );
     }
 }

@@ -780,6 +780,9 @@ impl SqlExecutor {
         // later statements in the block see it. Outside one, the
         // catalog's own autocommit path (which also updates its cache).
         if self.is_transactional() {
+            // Drain any interrupted large drop for this name before staging a
+            // replacement table so orphaned rows/indexes cannot resurrect on commit.
+            self.catalog.finish_pending_drop(name)?;
             // The staging path must reject a duplicate exactly like the
             // autocommit path (Catalog::create_table checks the cache):
             // staging would silently overwrite the existing definition
@@ -813,6 +816,9 @@ impl SqlExecutor {
         let table = self.effective_table(name, seq)?;
         let Some(table) = table else {
             if if_exists {
+                if !self.is_transactional() {
+                    self.catalog.finish_pending_drop(name)?;
+                }
                 return Ok(ExecResult::Ok("Table does not exist".into()));
             }
             return Err(format!("Table '{}' does not exist", name));

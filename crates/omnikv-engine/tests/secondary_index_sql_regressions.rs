@@ -6357,3 +6357,208 @@ fn public_index_lookup_and_range_scan_fail_closed_when_unready_or_ambiguous() {
             .is_err()
     );
 }
+
+fn seed_drop_receipt_replay_fixture(
+    db: &Arc<OmniKV>,
+    executor: &SqlExecutor,
+    attempt: &str,
+) -> (SchemaManager, Migration, u32) {
+    let idx_mgr = Arc::new(IndexManager::new(db.clone()));
+    let schema = SchemaManager::new(db.clone(), idx_mgr.clone());
+    execute(
+        executor,
+        "CREATE TABLE rec_col_a (id INTEGER PRIMARY KEY, tag TEXT)",
+    );
+    execute(
+        executor,
+        "CREATE TABLE rec_col_b (id INTEGER PRIMARY KEY, tag TEXT)",
+    );
+    let active_b_id = idx_mgr
+        .create_sql_index(
+            "rec_shared_idx",
+            "rec_col_b",
+            vec![("tag".into(), IndexFieldType::String)],
+            false,
+        )
+        .unwrap();
+    // Seed a CreateIndex(rec_col_a, done:999) + DropIndex(done:sql:999,<active_b_id>)
+    // replay so `was_index_dropped_by_later_step` directly invokes
+    // `validate_drop_index_receipt_at` with `known_collection = Some("rec_col_a")`.
+    seed_create_and_drop_receipts(
+        db,
+        1,
+        attempt,
+        "rec_col_a",
+        "rec_shared_idx",
+        999,
+        Some("sql"),
+        &format!("done:sql:999,{active_b_id}"),
+    );
+    let migration =
+        create_then_drop_migration(1, "rec_col_a", "rec_shared_idx", IndexNamespace::Sql);
+    (schema, migration, active_b_id)
+}
+
+#[test]
+fn drop_index_receipt_rejects_wrong_collection_active_and_retired_ids() {
+    let (db, _dir, executor) = setup();
+    let (schema, mig, active_b_id) = seed_drop_receipt_replay_fixture(&db, &executor, "att_col");
+
+    // 1. Active ID on wrong collection (`rec_col_b` instead of `rec_col_a`) fails closed.
+    let err = schema
+        .migrate_up(&mig)
+        .expect_err("wrong-collection active ID in drop receipt must fail closed");
+    assert!(
+        err.to_string().contains("belonging to collection"),
+        "unexpected wrong-collection active error: {err}"
+    );
+
+    // 2. Retired ID on wrong collection also fails closed.
+    let mut ret_wrong = WriteBatch::new();
+    ret_wrong
+        .delete(&format!("\u{0}IDX_CATALOG\u{0}{active_b_id}"))
+        .unwrap();
+    ret_wrong
+        .delete(&format!("\u{0}IDX_READY\u{0}{active_b_id}"))
+        .unwrap();
+    ret_wrong
+        .set(
+            &format!("\u{0}IDX_RETIRED\u{0}{active_b_id}"),
+            format!(
+                r#"{{"id":{active_b_id},"name":"rec_shared_idx","collection":"rec_col_b","fields":[["tag","String"]],"unique":false,"encoding_version":1,"namespace":"Sql"}}"#
+            ),
+        )
+        .unwrap();
+    db.commit_batch(&ret_wrong).unwrap();
+    let err_ret = schema
+        .migrate_up(&mig)
+        .expect_err("wrong-collection retired ID in drop receipt must fail closed");
+    assert!(
+        err_ret.to_string().contains("belonging to collection"),
+        "unexpected wrong-collection retired error: {err_ret}"
+    );
+}
+
+#[test]
+fn drop_index_receipt_rejects_malformed_retired_and_contradictory_active_retired_ids() {
+    let (db, _dir, executor) = setup();
+    let (schema, mig, active_b_id) = seed_drop_receipt_replay_fixture(&db, &executor, "att_meta");
+
+    // 1. Malformed retired metadata must fail closed instead of being skipped.
+    let mut bad_ret = WriteBatch::new();
+    bad_ret
+        .delete(&format!("\u{0}IDX_CATALOG\u{0}{active_b_id}"))
+        .unwrap();
+    bad_ret
+        .delete(&format!("\u{0}IDX_READY\u{0}{active_b_id}"))
+        .unwrap();
+    bad_ret
+        .set(
+            &format!("\u{0}IDX_RETIRED\u{0}{active_b_id}"),
+            "{not-valid-json".into(),
+        )
+        .unwrap();
+    db.commit_batch(&bad_ret).unwrap();
+    let err_bad = schema
+        .migrate_up(&mig)
+        .expect_err("malformed retired metadata must fail closed");
+    assert!(
+        err_bad.to_string().contains("malformed retired"),
+        "unexpected malformed retired error: {err_bad}"
+    );
+
+    // 2. Contradictory active + retired definitions for the same ID must fail closed.
+    let mut both = WriteBatch::new();
+    both.set(
+        &format!("\u{0}IDX_CATALOG\u{0}{active_b_id}"),
+        format!(
+            r#"{{"id":{active_b_id},"name":"rec_shared_idx","collection":"rec_col_a","fields":[["tag","String"]],"unique":false,"encoding_version":1,"namespace":"Sql"}}"#
+        ),
+    )
+    .unwrap();
+    both.set(
+        &format!("\u{0}IDX_RETIRED\u{0}{active_b_id}"),
+        format!(
+            r#"{{"id":{active_b_id},"name":"rec_shared_idx","collection":"rec_col_b","fields":[["tag","String"]],"unique":false,"encoding_version":1,"namespace":"Sql"}}"#
+        ),
+    )
+    .unwrap();
+    db.commit_batch(&both).unwrap();
+    let err_both = schema
+        .migrate_up(&mig)
+        .expect_err("contradictory active + retired ID must fail closed");
+    assert!(
+        err_both.to_string().contains("contradictory active"),
+        "unexpected contradictory error: {err_both}"
+    );
+}
+
+#[test]
+fn integer_pk_explain_and_explain_analyze_match_execution_access_method() {
+    use omni_engine::optimizer::{AccessMethod, PlanNode};
+    use omni_engine::plan_exec::PlanExecutor;
+
+    let (db, _dir, executor) = setup();
+    execute(
+        &executor,
+        "CREATE TABLE int_pk_tbl (id INTEGER PRIMARY KEY, label TEXT)",
+    );
+    execute(
+        &executor,
+        "INSERT INTO int_pk_tbl (id, label) VALUES (1, 'one'), (2, 'two')",
+    );
+    execute(
+        &executor,
+        "CREATE TABLE txt_pk_tbl (code TEXT PRIMARY KEY, label TEXT)",
+    );
+    execute(
+        &executor,
+        "INSERT INTO txt_pk_tbl (code, label) VALUES ('k1', 'one')",
+    );
+
+    // Optimizer EXPLAIN and EXPLAIN ANALYZE both report Seq Scan for INTEGER PK.
+    let int_explain = explain_plan(&executor, "EXPLAIN SELECT * FROM int_pk_tbl WHERE id = 1");
+    assert!(
+        int_explain.contains("Seq Scan") && !int_explain.contains("PK Lookup"),
+        "INTEGER PK EXPLAIN must match real Seq Scan access: {int_explain}"
+    );
+    let int_analyze = explain_plan(
+        &executor,
+        "EXPLAIN ANALYZE SELECT * FROM int_pk_tbl WHERE id = 1",
+    );
+    assert!(
+        int_analyze.contains("Seq Scan") && !int_analyze.contains("PK Lookup"),
+        "INTEGER PK EXPLAIN ANALYZE must match real Seq Scan access: {int_analyze}"
+    );
+
+    // TEXT PK uses genuine O(1) PK Lookup in both EXPLAIN and EXPLAIN ANALYZE.
+    let txt_analyze = explain_plan(
+        &executor,
+        "EXPLAIN ANALYZE SELECT * FROM txt_pk_tbl WHERE code = 'k1'",
+    );
+    assert!(
+        txt_analyze.contains("PK Lookup"),
+        "TEXT PK EXPLAIN ANALYZE must report PK Lookup: {txt_analyze}"
+    );
+
+    // Even if a caller manually builds a PkLookup plan node for an INTEGER PK,
+    // PlanExecutor::explain_analyze reports the compatibility Seq Scan fallback
+    // rather than misreporting "PK Lookup".
+    let manual_plan = PlanNode::Scan {
+        table: "int_pk_tbl".into(),
+        access: AccessMethod::PkLookup {
+            key_value: "1".into(),
+        },
+        filter: None,
+        estimated_rows: 1,
+        estimated_cost: 1.0,
+    };
+    let plan_exec = PlanExecutor::for_plan(db.clone(), Arc::new(Catalog::new(db)), &manual_plan);
+    let (matched_rows, stats) = plan_exec.explain_analyze(&manual_plan).unwrap();
+    assert_eq!(matched_rows.len(), 1);
+    assert!(
+        stats[0].0.contains("Seq Scan") && stats[0].0.contains("PK compatibility fallback"),
+        "manual PkLookup fallback must report Seq Scan in EXPLAIN ANALYZE, got: {}",
+        stats[0].0
+    );
+}

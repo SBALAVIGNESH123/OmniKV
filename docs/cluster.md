@@ -79,6 +79,34 @@ published to the host — nothing off the compose network needs them
 (Prometheus scrapes the client HTTPS port); keeping them private adds a
 network boundary around consensus traffic (see "Known limitations").
 
+### Docker Compose TLS / mTLS certificate mounts
+
+Each `omni-node-N` service in `docker-compose.yml` mounts the host directory
+`${OMNIKV_TLS_CERT_DIR:-./certs}` read-only into `/etc/omnikv/certs:ro`.
+For production Compose deployments (`OMNIKV_MODE=production`), place the CA
+bundle and node certificates/keys in that host directory and configure the
+container-visible paths under `/etc/omnikv/certs`:
+
+```bash
+export OMNIKV_TLS_CERT_DIR=/etc/omnikv-host/certs
+export OMNIKV_MODE=production
+export OMNIKV_TLS_INSECURE_SKIP=false
+export OMNIKV_RAFT_TLS=true
+export OMNIKV_RAFT_TLS_CA_PATH=/etc/omnikv/certs/ca.crt
+# Per-node certificates (SANs matching omni-node-1, omni-node-2, omni-node-3):
+export OMNIKV_NODE1_TLS_CERT_PATH=/etc/omnikv/certs/node1.crt
+export OMNIKV_NODE1_TLS_KEY_PATH=/etc/omnikv/certs/node1.key
+export OMNIKV_NODE2_TLS_CERT_PATH=/etc/omnikv/certs/node2.crt
+export OMNIKV_NODE2_TLS_KEY_PATH=/etc/omnikv/certs/node2.key
+export OMNIKV_NODE3_TLS_CERT_PATH=/etc/omnikv/certs/node3.crt
+export OMNIKV_NODE3_TLS_KEY_PATH=/etc/omnikv/certs/node3.key
+# Or use a shared multi-SAN certificate via OMNIKV_TLS_CERT_PATH / OMNIKV_TLS_KEY_PATH.
+```
+
+Because the validator checks that `OMNIKV_TLS_CERT_PATH`, `OMNIKV_TLS_KEY_PATH`,
+and `OMNIKV_RAFT_TLS_CA_PATH` exist inside each container at startup, always set
+them to `/etc/omnikv/certs/...` paths (never unmounted host paths).
+
 ## Bind vs advertised address
 
 `OMNIKV_RAFT_ADDR` is what the listener **binds** to; a wildcard

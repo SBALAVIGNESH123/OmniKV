@@ -162,11 +162,41 @@ impl PlanExecutor {
             PlanNode::Scan { table, access, .. } => {
                 let label = match access {
                     AccessMethod::SeqScan => format!("Seq Scan on {}", table),
-                    AccessMethod::IndexScan { index_name, .. } => {
-                        format!("Index Scan ({}) on {}", index_name, table)
+                    AccessMethod::IndexScan {
+                        index_name,
+                        index_id,
+                    } => {
+                        let seq = self.read_seq();
+                        let ready = self
+                            .catalog
+                            .get_table(table)
+                            .and_then(|t| {
+                                self.catalog
+                                    .index_manager()
+                                    .catalog_snapshot_at(seq)
+                                    .ok()
+                                    .map(|ic| ic.is_ready_for_plan(*index_id, index_name, &t.name))
+                            })
+                            .unwrap_or(false);
+                        if ready {
+                            format!("Index Scan ({}) on {}", index_name, table)
+                        } else {
+                            format!("Seq Scan on {} (index '{}' fallback)", table, index_name)
+                        }
                     }
                     AccessMethod::PkLookup { key_value } => {
-                        format!("PK Lookup on {} (key={})", table, key_value)
+                        let needs_scan = self.catalog.get_table(table).is_some_and(|t| {
+                            let canonical = crate::volcano::canonicalize_pk_key(&t, key_value);
+                            pk_lookup_needs_scan(&t, &canonical)
+                        });
+                        if needs_scan {
+                            format!(
+                                "Seq Scan on {} (PK compatibility fallback, key={})",
+                                table, key_value
+                            )
+                        } else {
+                            format!("PK Lookup on {} (key={})", table, key_value)
+                        }
                     }
                 };
                 (label, self.execute_plan(plan)?)
