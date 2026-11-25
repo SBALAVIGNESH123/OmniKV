@@ -192,6 +192,8 @@ impl WriteAheadLog {
         // sync_data() pushes kernel page cache → stable storage (disk/SSD)
         // Without this, a power loss after flush() can lose committed data.
         // fdatasync is sufficient here — we don't need metadata (sync_all).
+        crate::failpoints::maybe_fail("wal::sync")
+            .map_err(|e| OmniError::IoError(format!("WAL failure point: {e}")))?;
         self.writer
             .get_ref()
             .sync_data()
@@ -245,6 +247,8 @@ impl WriteAheadLog {
     /// Called by group commit leader after all writers in the group have
     /// appended their batches.
     pub fn sync(&mut self) -> Result<(), OmniError> {
+        crate::failpoints::maybe_fail("wal::sync")
+            .map_err(|e| OmniError::IoError(format!("WAL failure point: {e}")))?;
         match self.writer.get_ref().sync_data() {
             Ok(()) => {
                 self.mark_pending_durable();
@@ -280,7 +284,8 @@ impl WriteAheadLog {
     }
 
     /// Rotate the WAL — truncate the current segment.
-    /// Called after a successful flush to SSTable.
+    /// Must only be called after every record in the WAL has been durably
+    /// flushed and published in the manifest.
     pub fn rotate_segment(&mut self) -> Result<(), OmniError> {
         let file = OpenOptions::new()
             .create(true)
@@ -288,10 +293,16 @@ impl WriteAheadLog {
             .truncate(true)
             .open(&self.path)
             .map_err(|e| OmniError::IoError(format!("WAL rotate: {}", e)))?;
-
+        // Once open(truncate=true) succeeds, the on-disk file length is 0.
+        // Reconcile the handle and durability offsets BEFORE calling sync_all
+        // so a failed sync never leaves a stale non-zero durable_offset behind.
         self.writer = BufWriter::new(file);
         self.durable_offset = 0;
         self.pending = 0;
+        self.writer
+            .get_ref()
+            .sync_all()
+            .map_err(|e| OmniError::IoError(format!("WAL rotate fsync: {}", e)))?;
         Ok(())
     }
 

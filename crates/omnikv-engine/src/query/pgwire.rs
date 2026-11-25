@@ -2390,7 +2390,7 @@ fn enforce_pgwire_statement_limits(
 /// Build scan range from WHERE conditions.
 fn build_scan_range(conditions: &[query::Condition]) -> (String, String) {
     let mut start = String::new();
-    let mut end = String::from("\x7F"); // High ASCII
+    let mut end = String::from("\u{10ffff}");
 
     for cond in conditions {
         match cond {

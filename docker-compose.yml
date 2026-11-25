@@ -9,12 +9,23 @@ x-omnikv-common-env: &omnikv-common-env
   # inside the container, reachable via `docker exec` for debugging.
   OMNIKV_TCP_ADDR: "127.0.0.1:7072"
   OMNIKV_BACKUP_DIR: "/data/backups"
+  OMNIKV_MODE: "${OMNIKV_MODE:-production}"
   # Set true only for local demos with generated self-signed certificates.
-  # Production deployments should provide trusted TLS material in omnikv.toml.
+  # Production deployments must set OMNIKV_TLS_INSECURE_SKIP=false,
+  # OMNIKV_RAFT_TLS=true, and mount operator TLS certs/keys + Raft CA bundle
+  # into /etc/omnikv/certs (host path configured via OMNIKV_TLS_CERT_DIR,
+  # default ./certs). Point the *_PATH variables below at container-visible
+  # paths under /etc/omnikv/certs (for example /etc/omnikv/certs/node1.crt,
+  # /etc/omnikv/certs/node1.key, and /etc/omnikv/certs/ca.crt).
   OMNIKV_TLS_INSECURE_SKIP: "${OMNIKV_TLS_INSECURE_SKIP:?set OMNIKV_TLS_INSECURE_SKIP=false for production, or true only for a local demo}"
+  OMNIKV_TLS_CERT_PATH: "${OMNIKV_TLS_CERT_PATH:-}"
+  OMNIKV_TLS_KEY_PATH: "${OMNIKV_TLS_KEY_PATH:-}"
+  OMNIKV_RAFT_TLS: "${OMNIKV_RAFT_TLS:-false}"
+  OMNIKV_RAFT_TLS_CA_PATH: "${OMNIKV_RAFT_TLS_CA_PATH:-}"
   # Compose validates presence only; OmniKV validates minimum length and uniqueness at startup.
   OMNIKV_JWT_SECRET: "${OMNIKV_JWT_SECRET:?set OMNIKV_JWT_SECRET to a strong 32+ character value}"
   OMNIKV_BOOTSTRAP_ADMIN_KEY: "${OMNIKV_BOOTSTRAP_ADMIN_KEY:?set OMNIKV_BOOTSTRAP_ADMIN_KEY to a different strong 32+ character value}"
+  OMNIKV_RAFT_AUTH_TOKEN: "${OMNIKV_RAFT_AUTH_TOKEN:?set OMNIKV_RAFT_AUTH_TOKEN to a strong shared 32+ character value}"
 
 # Cluster notes:
 # - Each node is a Raft member: OMNIKV_NODE_ID + OMNIKV_RAFT_ADDR must
@@ -30,8 +41,10 @@ x-omnikv-common-env: &omnikv-common-env
 # - Node 1 initializes the cluster with the full initial membership
 #   (itself + OMNIKV_RAFT_PEERS in order → node ids 2..); nodes 2/3
 #   start blank and join as the leader's replication reaches them.
-# - Consensus traffic is plaintext HTTP on the dedicated raft port
-#   (etcd's peer-port model) — mTLS for peer traffic is not implemented yet.
+# - The local demo keeps the Raft HTTP compatibility mode unless
+#   OMNIKV_RAFT_TLS=true and a trusted CA bundle are supplied. Production
+#   deployments must use encrypted peer traffic; OMNIKV_RAFT_AUTH_TOKEN must
+#   be identical on every node and the consensus port should remain private.
 services:
   omni-node-1:
     build: .
@@ -42,8 +55,14 @@ services:
       - "5433:5433"   # PostgreSQL Wire Protocol
     volumes:
       - omni-data-1:/data
+      # Read-only TLS certificate, private key, and Raft CA bundle directory.
+      # Override host path with OMNIKV_TLS_CERT_DIR and reference files inside
+      # containers under /etc/omnikv/certs/ (e.g. /etc/omnikv/certs/ca.crt).
+      - "${OMNIKV_TLS_CERT_DIR:-./certs}:/etc/omnikv/certs:ro"
     environment:
       <<: *omnikv-common-env
+      OMNIKV_TLS_CERT_PATH: "${OMNIKV_NODE1_TLS_CERT_PATH:-${OMNIKV_TLS_CERT_PATH:-}}"
+      OMNIKV_TLS_KEY_PATH: "${OMNIKV_NODE1_TLS_KEY_PATH:-${OMNIKV_TLS_KEY_PATH:-}}"
       OMNIKV_NODE_ID: "1"
       OMNIKV_RAFT_ADDR: "0.0.0.0:9090"
       OMNIKV_RAFT_ADVERTISE_ADDR: "omni-node-1:9090"
@@ -64,8 +83,11 @@ services:
       - "5434:5433"
     volumes:
       - omni-data-2:/data
+      - "${OMNIKV_TLS_CERT_DIR:-./certs}:/etc/omnikv/certs:ro"
     environment:
       <<: *omnikv-common-env
+      OMNIKV_TLS_CERT_PATH: "${OMNIKV_NODE2_TLS_CERT_PATH:-${OMNIKV_TLS_CERT_PATH:-}}"
+      OMNIKV_TLS_KEY_PATH: "${OMNIKV_NODE2_TLS_KEY_PATH:-${OMNIKV_TLS_KEY_PATH:-}}"
       OMNIKV_NODE_ID: "2"
       OMNIKV_RAFT_ADDR: "0.0.0.0:9090"
       OMNIKV_RAFT_ADVERTISE_ADDR: "omni-node-2:9090"
@@ -88,8 +110,11 @@ services:
       - "5435:5433"
     volumes:
       - omni-data-3:/data
+      - "${OMNIKV_TLS_CERT_DIR:-./certs}:/etc/omnikv/certs:ro"
     environment:
       <<: *omnikv-common-env
+      OMNIKV_TLS_CERT_PATH: "${OMNIKV_NODE3_TLS_CERT_PATH:-${OMNIKV_TLS_CERT_PATH:-}}"
+      OMNIKV_TLS_KEY_PATH: "${OMNIKV_NODE3_TLS_KEY_PATH:-${OMNIKV_TLS_KEY_PATH:-}}"
       OMNIKV_NODE_ID: "3"
       OMNIKV_RAFT_ADDR: "0.0.0.0:9090"
       OMNIKV_RAFT_ADVERTISE_ADDR: "omni-node-3:9090"

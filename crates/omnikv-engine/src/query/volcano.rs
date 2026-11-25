@@ -169,10 +169,11 @@ impl SeqScanIter {
         let prefix = table.row_prefix();
         if let Some(reads) = reads
             && let Ok(mut collector) = reads.lock()
+            && let (_, Some(end)) = OmniKV::prefix_range_exclusive(&prefix)
         {
-            collector.record_range(&prefix, &format!("{}\x7F", prefix));
+            collector.record_range(&prefix, &end);
         }
-        let stored = match db.scan(&prefix, &format!("{}\x7F", prefix), scan_seq) {
+        let stored = match db.scan_prefix(&prefix, scan_seq) {
             Ok(stored) => stored,
             Err(error) => {
                 return Self {
@@ -276,6 +277,399 @@ impl RowIterator for SeqScanIter {
     }
 }
 
+/// Index-backed point/range scan resolving index keys to table rows.
+pub struct IndexScanIter {
+    rows: Vec<Row>,
+    pos: usize,
+    error: Option<String>,
+}
+
+impl IndexScanIter {
+    pub fn with_scan(
+        db: &Arc<OmniKV>,
+        catalog: &Arc<Catalog>,
+        table: &TableDef,
+        index_name: &str,
+        predicate: Option<&WhereExpr>,
+        scan_seq: u64,
+        reads: Option<&Arc<std::sync::Mutex<ReadCollector>>>,
+    ) -> Self {
+        Self::with_scan_optional_id(
+            db, catalog, table, index_name, None, predicate, scan_seq, reads,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn with_scan_id(
+        db: &Arc<OmniKV>,
+        catalog: &Arc<Catalog>,
+        table: &TableDef,
+        index_name: &str,
+        expected_index_id: crate::secondary_index::IndexId,
+        predicate: Option<&WhereExpr>,
+        scan_seq: u64,
+        reads: Option<&Arc<std::sync::Mutex<ReadCollector>>>,
+    ) -> Self {
+        Self::with_scan_optional_id(
+            db,
+            catalog,
+            table,
+            index_name,
+            Some(expected_index_id),
+            predicate,
+            scan_seq,
+            reads,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn with_scan_optional_id(
+        db: &Arc<OmniKV>,
+        catalog: &Arc<Catalog>,
+        table: &TableDef,
+        index_name: &str,
+        expected_index_id: Option<crate::secondary_index::IndexId>,
+        predicate: Option<&WhereExpr>,
+        scan_seq: u64,
+        reads: Option<&Arc<std::sync::Mutex<ReadCollector>>>,
+    ) -> Self {
+        let Some(reads) = reads else {
+            return Self::build(
+                db,
+                catalog,
+                table,
+                index_name,
+                expected_index_id,
+                predicate,
+                scan_seq,
+                None,
+            );
+        };
+        if let Ok(mut collector) = reads.lock()
+            && let (start, Some(end)) = OmniKV::prefix_range_exclusive(&table.row_prefix())
+        {
+            collector.record_range(&start, &end);
+        }
+        Self::build(
+            db,
+            catalog,
+            table,
+            index_name,
+            expected_index_id,
+            predicate,
+            scan_seq,
+            Some(reads),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build(
+        db: &Arc<OmniKV>,
+        catalog: &Arc<Catalog>,
+        table: &TableDef,
+        index_name: &str,
+        expected_index_id: Option<crate::secondary_index::IndexId>,
+        predicate: Option<&WhereExpr>,
+        scan_seq: u64,
+        _reads: Option<&Arc<std::sync::Mutex<ReadCollector>>>,
+    ) -> Self {
+        let manager = catalog.index_manager();
+        let definition = match manager.catalog_snapshot_at(scan_seq).and_then(|idx_cat| {
+            let def = idx_cat.get_by_name(index_name).cloned().ok_or_else(|| {
+                crate::OmniError::IoError(format!("Index '{}' not found", index_name))
+            })?;
+            let is_sql = idx_cat.effective_namespace(&def)
+                == Some(crate::secondary_index::IndexNamespace::Sql);
+            Ok((def, is_sql))
+        }) {
+            Ok((definition, is_sql))
+                if !definition.fields.is_empty()
+                    && expected_index_id.is_none_or(|id| definition.id == id)
+                    && is_sql
+                    && definition.collection.eq_ignore_ascii_case(&table.name) =>
+            {
+                definition
+            }
+            Ok((definition, _)) if definition.fields.is_empty() => {
+                return Self {
+                    rows: Vec::new(),
+                    pos: 0,
+                    error: Some(format!("index '{}' has no fields", index_name)),
+                };
+            }
+            Ok(_) => {
+                return Self {
+                    rows: Vec::new(),
+                    pos: 0,
+                    error: Some(format!(
+                        "index '{}' no longer matches planned index for table '{}'",
+                        index_name, table.name
+                    )),
+                };
+            }
+            Err(error) => {
+                return Self {
+                    rows: Vec::new(),
+                    pos: 0,
+                    error: Some(error.to_string()),
+                };
+            }
+        };
+        let (field, field_type) = &definition.fields[0];
+        let (lower, upper) = index_bounds(
+            predicate,
+            &table.name,
+            field,
+            field_type,
+            definition.encoding_version,
+        );
+        let primary_keys = match manager.range_scan_bounds_at(
+            index_name,
+            lower.as_ref(),
+            upper.as_ref(),
+            scan_seq,
+        ) {
+            Ok(keys) => keys,
+            Err(error) => {
+                return Self {
+                    rows: Vec::new(),
+                    pos: 0,
+                    error: Some(format!("index scan failed: {error}")),
+                };
+            }
+        };
+
+        let mut rows = Vec::with_capacity(primary_keys.len());
+        let mut seen = std::collections::HashSet::new();
+        for primary_key in primary_keys {
+            if !seen.insert(primary_key.clone()) {
+                continue;
+            }
+            let key = format!("{}{}", table.row_prefix(), primary_key);
+            let stored = match db.find(&key, scan_seq) {
+                Ok(stored) => stored,
+                Err(error) => {
+                    return Self {
+                        rows,
+                        pos: 0,
+                        error: Some(format!("indexed row lookup failed: {error}")),
+                    };
+                }
+            };
+            if let Some(value) = stored {
+                match crate::plan_exec::PlanExecutor::deserialize_row_checked(
+                    &value,
+                    table.row_format,
+                ) {
+                    Ok(row) => rows.push(row),
+                    Err(error) => {
+                        return Self {
+                            rows,
+                            pos: 0,
+                            error: Some(format!(
+                                "table '{}' row decode failed: {error}",
+                                table.name
+                            )),
+                        };
+                    }
+                }
+            }
+        }
+        Self {
+            rows,
+            pos: 0,
+            error: None,
+        }
+    }
+
+    pub(crate) fn from_error(error: String) -> Self {
+        Self {
+            rows: Vec::new(),
+            pos: 0,
+            error: Some(error),
+        }
+    }
+}
+
+impl RowIterator for IndexScanIter {
+    fn next_row(&mut self) -> Option<Row> {
+        if self.pos < self.rows.len() {
+            let row = self.rows[self.pos].clone();
+            self.pos += 1;
+            Some(row)
+        } else {
+            None
+        }
+    }
+
+    fn try_next_row(&mut self) -> Result<Option<Row>, String> {
+        if let Some(error) = &self.error {
+            return Err(error.clone());
+        }
+        Ok(self.next_row())
+    }
+
+    fn check_error(&self) -> Result<(), String> {
+        self.error.clone().map_or(Ok(()), Err)
+    }
+
+    fn next_chunk(&mut self, max_rows: usize, out: &mut Vec<Row>) -> usize {
+        let remaining = self.rows.len().saturating_sub(self.pos);
+        let take = remaining.min(max_rows);
+        if take == 0 {
+            return 0;
+        }
+        out.extend(self.rows[self.pos..self.pos + take].iter().cloned());
+        self.pos += take;
+        take
+    }
+
+    fn reset(&mut self) {
+        self.pos = 0;
+    }
+}
+
+fn index_bounds(
+    predicate: Option<&WhereExpr>,
+    table_name: &str,
+    field: &str,
+    field_type: &crate::secondary_index::IndexFieldType,
+    encoding_version: u8,
+) -> (Option<serde_json::Value>, Option<serde_json::Value>) {
+    let mut lower: Option<(Vec<u8>, serde_json::Value)> = None;
+    let mut upper: Option<(Vec<u8>, serde_json::Value)> = None;
+    fn tighten_lower(
+        lower: &mut Option<(Vec<u8>, serde_json::Value)>,
+        encoded: Vec<u8>,
+        value: serde_json::Value,
+    ) {
+        if lower
+            .as_ref()
+            .is_none_or(|(existing, _)| encoded > *existing)
+        {
+            *lower = Some((encoded, value));
+        }
+    }
+    fn tighten_upper(
+        upper: &mut Option<(Vec<u8>, serde_json::Value)>,
+        encoded: Vec<u8>,
+        value: serde_json::Value,
+    ) {
+        if upper
+            .as_ref()
+            .is_none_or(|(existing, _)| encoded < *existing)
+        {
+            *upper = Some((encoded, value));
+        }
+    }
+    fn visit(
+        expr: &WhereExpr,
+        table_name: &str,
+        field: &str,
+        field_type: &crate::secondary_index::IndexFieldType,
+        encoding_version: u8,
+        lower: &mut Option<(Vec<u8>, serde_json::Value)>,
+        upper: &mut Option<(Vec<u8>, serde_json::Value)>,
+    ) {
+        match expr {
+            WhereExpr::And(left, right) => {
+                visit(
+                    left,
+                    table_name,
+                    field,
+                    field_type,
+                    encoding_version,
+                    lower,
+                    upper,
+                );
+                visit(
+                    right,
+                    table_name,
+                    field,
+                    field_type,
+                    encoding_version,
+                    lower,
+                    upper,
+                );
+            }
+            WhereExpr::Comparison { column, op, value } => {
+                let (qualifies, bare_col) = match column.split_once('.') {
+                    Some((qual, name)) => (qual.eq_ignore_ascii_case(table_name), name),
+                    None => (true, column.as_str()),
+                };
+                if !qualifies || !bare_col.eq_ignore_ascii_case(field) {
+                    return;
+                }
+                let Some(value) = crate::secondary_index::sql_index_bound_for_version(
+                    value,
+                    field_type,
+                    encoding_version,
+                ) else {
+                    return;
+                };
+                let Some(encoded) = crate::secondary_index::try_encode_index_value_for_version(
+                    &value,
+                    field_type,
+                    encoding_version,
+                ) else {
+                    return;
+                };
+                // Pre-rebuild v0 float indexes stored -0.0 and +0.0 at adjacent
+                // keys (7fffffffffffffff and 8000000000000000). Widen zero
+                // bounds across both signed zeros so SQL scans match both.
+                let is_v0_zero_float = encoding_version
+                    < crate::secondary_index::CURRENT_INDEX_ENCODING_VERSION
+                    && *field_type == crate::secondary_index::IndexFieldType::Float
+                    && value
+                        .as_f64()
+                        .or_else(|| value.as_str().and_then(|s| s.parse::<f64>().ok()))
+                        .is_some_and(|f| f == 0.0);
+                let (low_val, low_enc, high_val, high_enc) = if is_v0_zero_float {
+                    let neg_val = serde_json::Value::String("-0.0".into());
+                    let pos_val = serde_json::Value::String("0.0".into());
+                    let neg_enc = crate::secondary_index::try_encode_index_value_for_version(
+                        &neg_val,
+                        field_type,
+                        encoding_version,
+                    )
+                    .unwrap_or_else(|| encoded.clone());
+                    let pos_enc = crate::secondary_index::try_encode_index_value_for_version(
+                        &pos_val,
+                        field_type,
+                        encoding_version,
+                    )
+                    .unwrap_or_else(|| encoded.clone());
+                    (neg_val, neg_enc, pos_val, pos_enc)
+                } else {
+                    (value.clone(), encoded.clone(), value, encoded)
+                };
+                match op {
+                    CmpOp::Eq => {
+                        tighten_lower(lower, low_enc, low_val);
+                        tighten_upper(upper, high_enc, high_val);
+                    }
+                    CmpOp::Gt | CmpOp::Gte => tighten_lower(lower, low_enc, low_val),
+                    CmpOp::Lt | CmpOp::Lte => tighten_upper(upper, high_enc, high_val),
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+    if let Some(predicate) = predicate {
+        visit(
+            predicate,
+            table_name,
+            field,
+            field_type,
+            encoding_version,
+            &mut lower,
+            &mut upper,
+        );
+    }
+    (lower.map(|(_, v)| v), upper.map(|(_, v)| v))
+}
+
 // ─── PK Lookup Iterator ────────────────────────────────────────────────────
 
 /// Single-row lookup by primary key. O(1).
@@ -302,7 +696,6 @@ impl PkLookupIter {
         reads: Option<&std::sync::Arc<std::sync::Mutex<ReadCollector>>>,
     ) -> Self {
         let key = format!("{}{}", table.row_prefix(), key_value);
-        let end = format!("{}{}\x7F", table.row_prefix(), key_value);
         if let Some(ov) = overlay {
             match ov.get(key.as_str()) {
                 // Buffered write: read our own uncommitted row.
@@ -336,20 +729,18 @@ impl PkLookupIter {
         {
             collector.record_point(&key);
         }
-        let (row, error) = match db.scan(&key, &end, scan_seq) {
-            Ok(rows) => match rows.into_iter().next() {
-                Some((_, value)) => match crate::plan_exec::PlanExecutor::deserialize_row_checked(
-                    &value,
-                    table.row_format,
-                ) {
-                    Ok(row) => (Some(row), None),
-                    Err(error) => (
-                        None,
-                        Some(format!("table '{}' row decode failed: {error}", table.name)),
-                    ),
-                },
-                None => (None, None),
+        let (row, error) = match db.find(&key, scan_seq) {
+            Ok(Some(value)) => match crate::plan_exec::PlanExecutor::deserialize_row_checked(
+                &value,
+                table.row_format,
+            ) {
+                Ok(row) => (Some(row), None),
+                Err(error) => (
+                    None,
+                    Some(format!("table '{}' row decode failed: {error}", table.name)),
+                ),
             },
+            Ok(None) => (None, None),
             Err(error) => (
                 None,
                 Some(format!(
@@ -1100,9 +1491,15 @@ pub fn compile_plan_with_scan(
             let base: Box<dyn RowIterator> = match access {
                 AccessMethod::PkLookup { key_value } => {
                     let key_value = canonicalize_pk_key(&table_def, key_value);
-                    if legacy_pk_needs_scan(&table_def) {
-                        // A legacy numeric key may be stored as "007", which
-                        // the canonical key range can never reach.
+                    // Defensive runtime guard for manually constructed plans:
+                    // `Optimizer::plan_table_scan` already plans `SeqScan` (or
+                    // an explicit secondary `IndexScan`) whenever
+                    // `pk_lookup_needs_scan_parts` is true.
+                    if pk_lookup_needs_scan(&table_def, &key_value) {
+                        // A legacy numeric key may be stored as "007", or a
+                        // cross-format numeric literal like '1.0' on an INTEGER
+                        // PK may still match via `smart_cmp`; scan + filter keeps
+                        // equality semantics identical to SeqScan.
                         let base: Box<dyn RowIterator> = match scan {
                             Some(ctx) => Box::new(SeqScanIter::with_scan(
                                 db,
@@ -1132,7 +1529,7 @@ pub fn compile_plan_with_scan(
                         }
                     }
                 }
-                AccessMethod::SeqScan | AccessMethod::IndexScan { .. } => match scan {
+                AccessMethod::SeqScan => match scan {
                     Some(ctx) => Box::new(SeqScanIter::with_scan(
                         db,
                         &table_def,
@@ -1141,6 +1538,78 @@ pub fn compile_plan_with_scan(
                         ctx.reads.as_ref(),
                     )),
                     None => Box::new(SeqScanIter::new(db, &table_def)),
+                },
+                AccessMethod::IndexScan {
+                    index_name,
+                    index_id,
+                } => match scan {
+                    // Staged rows aren't in the persisted index; fall back to overlay scan.
+                    Some(ctx) if !ctx.overlay.is_empty() => Box::new(SeqScanIter::with_scan(
+                        db,
+                        &table_def,
+                        ctx.scan_seq,
+                        Some(&ctx.overlay),
+                        ctx.reads.as_ref(),
+                    )),
+                    Some(ctx) => match catalog.index_manager().catalog_snapshot_at(ctx.scan_seq) {
+                        Ok(idx_catalog)
+                            if idx_catalog.is_ready_for_plan(
+                                *index_id,
+                                index_name,
+                                &table_def.name,
+                            ) =>
+                        {
+                            Box::new(IndexScanIter::with_scan_id(
+                                db,
+                                catalog,
+                                &table_def,
+                                index_name,
+                                *index_id,
+                                filter.as_ref(),
+                                ctx.scan_seq,
+                                ctx.reads.as_ref(),
+                            ))
+                        }
+                        Ok(_) => Box::new(SeqScanIter::with_scan(
+                            db,
+                            &table_def,
+                            ctx.scan_seq,
+                            Some(&ctx.overlay),
+                            ctx.reads.as_ref(),
+                        )),
+                        Err(error) => Box::new(IndexScanIter::from_error(format!(
+                            "index catalog read failed: {error}"
+                        ))),
+                    },
+                    None => {
+                        let seq = db.get_seq();
+                        match catalog.index_manager().catalog_snapshot_at(seq) {
+                            Ok(idx_catalog)
+                                if idx_catalog.is_ready_for_plan(
+                                    *index_id,
+                                    index_name,
+                                    &table_def.name,
+                                ) =>
+                            {
+                                Box::new(IndexScanIter::with_scan_id(
+                                    db,
+                                    catalog,
+                                    &table_def,
+                                    index_name,
+                                    *index_id,
+                                    filter.as_ref(),
+                                    seq,
+                                    None,
+                                ))
+                            }
+                            Ok(_) => {
+                                Box::new(SeqScanIter::with_scan(db, &table_def, seq, None, None))
+                            }
+                            Err(error) => Box::new(IndexScanIter::from_error(format!(
+                                "index catalog read failed: {error}"
+                            ))),
+                        }
+                    }
                 },
             };
             match filter {
@@ -1258,15 +1727,41 @@ pub(crate) fn canonicalize_join_key(value: &str, col_type: Option<&ColumnType>) 
     }
 }
 
-/// A legacy numeric primary key may be stored as "007"; the canonical
-/// key-range lookup cannot reach it.
-pub(crate) fn legacy_pk_needs_scan(table: &TableDef) -> bool {
-    table.row_format == RowFormat::Legacy
-        && table
-            .columns
-            .iter()
-            .find(|c| c.name.eq_ignore_ascii_case(&table.primary_key))
-            .is_some_and(|c| c.col_type.is_numeric())
+/// Whether an equality lookup on `table`'s primary key must fall back to a
+/// scan-and-filter so typed `smart_cmp` matches identically:
+/// - legacy numeric tables (may hold non-canonical keys like `"007"`),
+/// - unknown primary-key column types (`None`, when caller stats omitted the
+///   PK type — fail safe so the optimizer never advertises `PkLookup` without
+///   knowing whether exact key equality is valid),
+/// - `INTEGER` primary keys (storage permits non-`i128` numeric representations
+///   such as `'1.0'` that still compare equal under `smart_cmp`),
+/// - `FLOAT` primary keys when looking up zero (legacy typed rows persisted
+///   before `-0.0 -> "0"` normalization may live under suffix `"-0"`) or any
+///   non-finite value.
+pub(crate) fn pk_lookup_needs_scan_parts(
+    row_format: RowFormat,
+    pk_type: Option<&ColumnType>,
+    key_value: &str,
+) -> bool {
+    if row_format == RowFormat::Legacy && pk_type.is_some_and(|t| t.is_numeric()) {
+        return true;
+    }
+    match pk_type {
+        None | Some(ColumnType::Integer) => true,
+        Some(ColumnType::Float) => !key_value
+            .parse::<f64>()
+            .is_ok_and(|f| f.is_finite() && f != 0.0),
+        _ => false,
+    }
+}
+
+pub(crate) fn pk_lookup_needs_scan(table: &TableDef, key_value: &str) -> bool {
+    let pk_type = table
+        .columns
+        .iter()
+        .find(|c| c.name.eq_ignore_ascii_case(&table.primary_key))
+        .map(|c| &c.col_type);
+    pk_lookup_needs_scan_parts(table.row_format, pk_type, key_value)
 }
 
 /// `pk = value` for the scan-and-filter fallback, so the comparison runs

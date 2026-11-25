@@ -9,7 +9,8 @@ use crate::optimizer::{AccessMethod, PlanNode};
 use crate::sql::{AggFunc, JoinType, SelectColumn, WhereExpr};
 use crate::sql_exec::Row;
 use crate::volcano::{
-    ColumnTypeMap, eval_where_typed, legacy_pk_needs_scan, qualify_row, row_lookup, type_lookup,
+    ColumnTypeMap, RowIterator, eval_where_typed, pk_lookup_needs_scan, qualify_row, row_lookup,
+    type_lookup,
 };
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -105,7 +106,12 @@ impl PlanExecutor {
                 child, predicate, ..
             } => {
                 let mut rows = self.execute_plan(child)?;
-                rows.retain(|row| eval_where_typed(row, predicate, &self.types));
+                let types = if self.types.is_empty() {
+                    child.output_types(&self.catalog)
+                } else {
+                    self.types.clone()
+                };
+                rows.retain(|row| eval_where_typed(row, predicate, &types));
                 Ok(rows)
             }
             PlanNode::Project { child, columns } => {
@@ -156,11 +162,41 @@ impl PlanExecutor {
             PlanNode::Scan { table, access, .. } => {
                 let label = match access {
                     AccessMethod::SeqScan => format!("Seq Scan on {}", table),
-                    AccessMethod::IndexScan { index_name, .. } => {
-                        format!("Index Scan ({}) on {}", index_name, table)
+                    AccessMethod::IndexScan {
+                        index_name,
+                        index_id,
+                    } => {
+                        let seq = self.read_seq();
+                        let ready = self
+                            .catalog
+                            .get_table(table)
+                            .and_then(|t| {
+                                self.catalog
+                                    .index_manager()
+                                    .catalog_snapshot_at(seq)
+                                    .ok()
+                                    .map(|ic| ic.is_ready_for_plan(*index_id, index_name, &t.name))
+                            })
+                            .unwrap_or(false);
+                        if ready {
+                            format!("Index Scan ({}) on {}", index_name, table)
+                        } else {
+                            format!("Seq Scan on {} (index '{}' fallback)", table, index_name)
+                        }
                     }
                     AccessMethod::PkLookup { key_value } => {
-                        format!("PK Lookup on {} (key={})", table, key_value)
+                        let needs_scan = self.catalog.get_table(table).is_some_and(|t| {
+                            let canonical = crate::volcano::canonicalize_pk_key(&t, key_value);
+                            pk_lookup_needs_scan(&t, &canonical)
+                        });
+                        if needs_scan {
+                            format!(
+                                "Seq Scan on {} (PK compatibility fallback, key={})",
+                                table, key_value
+                            )
+                        } else {
+                            format!("PK Lookup on {} (key={})", table, key_value)
+                        }
                     }
                 };
                 (label, self.execute_plan(plan)?)
@@ -236,44 +272,77 @@ impl PlanExecutor {
             .get_table(table_name)
             .ok_or_else(|| format!("Table '{}' does not exist", table_name))?;
 
+        let table_types: ColumnTypeMap = table
+            .columns
+            .iter()
+            .map(|c| (c.name.clone(), c.col_type.clone()))
+            .collect();
+
         let mut rows = match access {
-            AccessMethod::PkLookup { key_value } if legacy_pk_needs_scan(&table) => {
-                // A legacy numeric key may be stored as "007", which the
-                // canonical key range can never reach.
+            AccessMethod::PkLookup { key_value }
+                if pk_lookup_needs_scan(
+                    &table,
+                    &crate::volcano::canonicalize_pk_key(&table, key_value),
+                ) =>
+            {
+                // A legacy numeric key may be stored as "007", or a cross-format
+                // numeric literal like '1.0' on an INTEGER PK may match via
+                // `smart_cmp`; scan and filter identically to SeqScan.
                 let key_value = crate::volcano::canonicalize_pk_key(&table, key_value);
                 let predicate = crate::volcano::pk_equality(&table, &key_value);
                 let mut scanned = self.load_table_rows(&table)?;
-                scanned.retain(|row| eval_where_typed(row, &predicate, &self.types));
+                scanned.retain(|row| eval_where_typed(row, &predicate, &table_types));
                 scanned
             }
             AccessMethod::PkLookup { key_value } => {
                 let key_value = crate::volcano::canonicalize_pk_key(&table, key_value);
                 let key = format!("{}{}", table.row_prefix(), key_value);
-                let end = format!("{}{}\x7F", table.row_prefix(), key_value);
                 let seq = self.read_seq();
-                self.db
-                    .scan(&key, &end, seq)
-                    .map_err(|error| {
-                        format!(
-                            "storage PK lookup failed for table '{}': {error}",
-                            table.name
-                        )
-                    })?
-                    .into_iter()
-                    .map(|(_, value)| {
-                        Self::deserialize_row_checked(&value, table.row_format).map_err(|error| {
-                            format!("table '{}' row decode failed: {error}", table.name)
-                        })
-                    })
-                    .collect::<Result<Vec<_>, _>>()?
+                match self.db.find(&key, seq).map_err(|error| {
+                    format!(
+                        "storage PK lookup failed for table '{}': {error}",
+                        table.name
+                    )
+                })? {
+                    Some(value) => vec![
+                        Self::deserialize_row_checked(&value, table.row_format).map_err(
+                            |error| format!("table '{}' row decode failed: {error}", table.name),
+                        )?,
+                    ],
+                    None => Vec::new(),
+                }
             }
-            AccessMethod::IndexScan { .. } | AccessMethod::SeqScan => {
-                self.load_table_rows(&table)?
+            AccessMethod::IndexScan {
+                index_name,
+                index_id,
+            } => {
+                let seq = self.read_seq();
+                let idx_catalog = self
+                    .catalog
+                    .index_manager()
+                    .catalog_snapshot_at(seq)
+                    .map_err(|error| format!("index catalog read failed: {error}"))?;
+                if idx_catalog.is_ready_for_plan(*index_id, index_name, &table.name) {
+                    let mut iter = crate::volcano::IndexScanIter::with_scan_id(
+                        &self.db,
+                        &self.catalog,
+                        &table,
+                        index_name,
+                        *index_id,
+                        filter,
+                        seq,
+                        None,
+                    );
+                    iter.try_collect_all()?
+                } else {
+                    self.load_table_rows_at(&table, seq)?
+                }
             }
+            AccessMethod::SeqScan => self.load_table_rows(&table)?,
         };
 
         if let Some(expr) = filter {
-            rows.retain(|row| eval_where_typed(row, expr, &self.types));
+            rows.retain(|row| eval_where_typed(row, expr, &table_types));
         }
 
         Ok(rows)
@@ -305,11 +374,14 @@ impl PlanExecutor {
     }
 
     fn load_table_rows(&self, table: &TableDef) -> Result<Vec<Row>, String> {
+        self.load_table_rows_at(table, self.read_seq())
+    }
+
+    fn load_table_rows_at(&self, table: &TableDef, seq: u64) -> Result<Vec<Row>, String> {
         let prefix = table.row_prefix();
-        let seq = self.read_seq();
         let stored = self
             .db
-            .scan(&prefix, &format!("{}\x7F", prefix), seq)
+            .scan_prefix(&prefix, seq)
             .map_err(|error| format!("storage scan failed for table '{}': {error}", table.name))?;
         stored
             .into_iter()
@@ -321,11 +393,6 @@ impl PlanExecutor {
     }
 
     /// Load only specific columns (column pruning).
-    ///
-    /// This compatibility wrapper preserves the original infallible public
-    /// API. New SQL execution paths should use
-    /// [`Self::load_table_rows_pruned_checked`] so storage and decode errors
-    /// remain visible to callers.
     pub fn load_table_rows_pruned(&self, table: &TableDef, needed_cols: &[String]) -> Vec<Row> {
         self.load_table_rows_pruned_checked(table, needed_cols)
             .unwrap_or_default()
@@ -341,7 +408,7 @@ impl PlanExecutor {
         let seq = self.read_seq();
         let stored = self
             .db
-            .scan(&prefix, &format!("{}\x7F", prefix), seq)
+            .scan_prefix(&prefix, seq)
             .map_err(|error| format!("storage scan failed for table '{}': {error}", table.name))?;
         stored
             .into_iter()

@@ -719,6 +719,68 @@ fn test_raft_loopback_bind_without_advertise_is_accepted() {
 }
 
 #[test]
+fn production_raft_requires_verified_mutual_tls() {
+    let directory = tempfile::tempdir().unwrap();
+    let key = rcgen::KeyPair::generate().unwrap();
+    let certificate = rcgen::CertificateParams::new(vec!["localhost".into()])
+        .unwrap()
+        .self_signed(&key)
+        .unwrap();
+    let cert_path = directory.path().join("peer-cert.pem");
+    let key_path = directory.path().join("peer-key.pem");
+    std::fs::write(&cert_path, certificate.pem()).unwrap();
+    std::fs::write(&key_path, key.serialize_pem()).unwrap();
+    let mut cfg = ServerConfig {
+        mode: ServerMode::Production,
+        jwt_secret: "test-production-jwt-secret-0123456789abcdef".into(),
+        bootstrap_admin_key: "test-production-bootstrap-key-0123456789".into(),
+        tls_cert_path: Some(cert_path.to_string_lossy().into_owned()),
+        tls_key_path: Some(key_path.to_string_lossy().into_owned()),
+        raft: omni_engine::config::RaftConfig {
+            node_id: Some(1),
+            raft_addr: Some("127.0.0.1:9090".into()),
+            auth_token: "test-production-raft-token-0123456789abcdef".into(),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let error = cfg.validate_runtime().unwrap_err();
+    assert!(error.0.contains("OMNIKV_RAFT_TLS=true"), "{error}");
+    cfg.raft.tls = true;
+    let error = cfg.validate_runtime().unwrap_err();
+    assert!(error.0.contains("OMNIKV_RAFT_TLS_CA_PATH"), "{error}");
+    cfg.raft.tls_ca_path = cfg.tls_cert_path.clone();
+    cfg.validate_runtime()
+        .expect("complete verified peer configuration");
+    cfg.tls_insecure_skip = true;
+    let error = cfg.validate_runtime().unwrap_err();
+    assert!(
+        error.0.contains("forbids OMNIKV_TLS_INSECURE_SKIP"),
+        "{error}"
+    );
+}
+
+#[test]
+fn raft_tls_environment_overrides_are_strict() {
+    with_env(
+        &[
+            ("OMNIKV_RAFT_TLS", "true"),
+            ("OMNIKV_RAFT_TLS_CA_PATH", "peer-ca.pem"),
+        ],
+        || {
+            let mut cfg = ServerConfig::default();
+            cfg.apply_env().unwrap();
+            assert!(cfg.raft.tls);
+            assert_eq!(cfg.raft.tls_ca_path.as_deref(), Some("peer-ca.pem"));
+        },
+    );
+    with_env(&[("OMNIKV_RAFT_TLS", "invalid")], || {
+        let error = ServerConfig::default().apply_env().unwrap_err();
+        assert!(error.0.contains("OMNIKV_RAFT_TLS"), "{error}");
+    });
+}
+
+#[test]
 fn test_raft_advertise_env_var_sets_field() {
     with_env(
         &[("OMNIKV_RAFT_ADVERTISE_ADDR", "omni-node-2:9090")],
@@ -1060,4 +1122,34 @@ fn test_pgwire_tls_env_switch() {
             "OMNIKV_PGWIRE_TLS=false must switch it off"
         );
     });
+}
+
+#[test]
+fn test_public_http_or_quic_bind_rejects_dev_bootstrap_key_and_jwt_secret() {
+    for (field, http_addr, quic_addr) in [
+        ("http_addr", "0.0.0.0:7070", "127.0.0.1:7071"),
+        ("quic_addr", "127.0.0.1:7070", "0.0.0.0:7071"),
+    ] {
+        let mut cfg = ServerConfig {
+            http_addr: http_addr.into(),
+            quic_addr: quic_addr.into(),
+            ..Default::default()
+        };
+        let err = cfg.validate_runtime().unwrap_err();
+        assert!(
+            err.0.contains(field) && err.0.contains("jwt_secret"),
+            "public {field} bind with dev jwt_secret must be rejected: {err}"
+        );
+
+        cfg.jwt_secret = "a-real-secret-not-the-dev-one-0123456789".into();
+        let err = cfg.validate_runtime().unwrap_err();
+        assert!(
+            err.0.contains(field) && err.0.contains("bootstrap_admin_key"),
+            "public {field} bind with dev bootstrap_admin_key must be rejected: {err}"
+        );
+
+        cfg.bootstrap_admin_key = "a-real-bootstrap-admin-key-0123456789abc".into();
+        cfg.validate_runtime()
+            .unwrap_or_else(|e| panic!("public {field} bind with real secrets must validate: {e}"));
+    }
 }

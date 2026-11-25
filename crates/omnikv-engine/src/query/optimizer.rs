@@ -9,7 +9,7 @@
 //!
 //! The optimizer produces a `QueryPlan` tree that the executor walks.
 
-use crate::catalog::{Catalog, ColumnType};
+use crate::catalog::{Catalog, ColumnType, RowFormat};
 use crate::secondary_index::{IndexCatalog, IndexDefinition};
 use crate::sql::{
     AggFunc, CmpOp, FromClause, JoinType, OrderByItem, SelectColumn, SqlStatement, SqlValue,
@@ -41,6 +41,10 @@ pub struct TableStats {
     /// Declared primary key; decides whether an equality predicate can be
     /// answered by a single-row key lookup.
     pub primary_key: String,
+    /// Declared primary key column type (when known from catalog).
+    pub pk_type: Option<ColumnType>,
+    /// Table NULL/key row format (when known from catalog).
+    pub row_format: RowFormat,
 }
 
 impl TableStats {
@@ -94,14 +98,12 @@ pub fn gather_stats_at_checked(
     for table_name in catalog.list_tables() {
         if let Some(table) = catalog.get_table(&table_name) {
             let prefix = table.row_prefix();
-            let sample = db
-                .scan(&prefix, &format!("{}\x7F", prefix), seq)
-                .map_err(|error| {
-                    format!(
-                        "storage statistics scan failed for table '{}': {error}",
-                        table.name
-                    )
-                })?;
+            let sample = db.scan_prefix(&prefix, seq).map_err(|error| {
+                format!(
+                    "storage statistics scan failed for table '{}': {error}",
+                    table.name
+                )
+            })?;
             let row_count = sample.len() as u64;
 
             let avg_row_bytes = if row_count > 0 {
@@ -113,8 +115,38 @@ pub fn gather_stats_at_checked(
             };
 
             let indexes: Vec<IndexDefinition> = if let Some(ic) = index_catalog {
-                ic.indexes_for_collection(&table_name)
+                ic.indexes_for_namespace(
+                    &table.name,
+                    crate::secondary_index::IndexNamespace::Sql,
+                )
                     .into_iter()
+                    .filter(|definition| {
+                        ic.is_ready(definition.id)
+                            && table.row_format == crate::catalog::RowFormat::Typed
+                            && definition
+                                .fields
+                                .first()
+                                .is_some_and(|(field, field_type)| {
+                                    table
+                                        .columns
+                                        .iter()
+                                        .find(|col| col.name.eq_ignore_ascii_case(field))
+                                        .is_some_and(|col| {
+                                            matches!(
+                                                (&col.col_type, field_type),
+                                                (
+                                                    crate::catalog::ColumnType::Integer,
+                                                    crate::secondary_index::IndexFieldType::Integer,
+                                                ) | (
+                                                    crate::catalog::ColumnType::Float,
+                                                    crate::secondary_index::IndexFieldType::Float,
+                                                )
+                                            ) || (!col.col_type.is_numeric()
+                                                && *field_type
+                                                    == crate::secondary_index::IndexFieldType::String)
+                                        })
+                                })
+                    })
                     .cloned()
                     .collect()
             } else {
@@ -168,6 +200,11 @@ pub fn gather_stats_at_checked(
                 }
             }
 
+            let pk_type = table
+                .columns
+                .iter()
+                .find(|col| col.name.eq_ignore_ascii_case(&table.primary_key))
+                .map(|col| col.col_type.clone());
             stats.insert(
                 table_name.clone(),
                 TableStats {
@@ -177,6 +214,8 @@ pub fn gather_stats_at_checked(
                     indexes,
                     histograms,
                     primary_key: table.primary_key.clone(),
+                    pk_type,
+                    row_format: table.row_format,
                 },
             );
         }
@@ -729,27 +768,46 @@ impl Optimizer {
         }
     }
 
+    fn table_stats(&self, table_name: &str) -> Option<&TableStats> {
+        self.stats
+            .get(table_name)
+            .or_else(|| self.stats.get(&table_name.to_lowercase()))
+    }
+
     /// Choose access method for a single table.
     fn plan_table_scan(
         &self,
         table_name: &str,
         where_clause: Option<&WhereExpr>,
     ) -> Result<PlanNode, String> {
-        let stats = self.stats.get(table_name);
+        let stats = self.table_stats(table_name);
         let row_count = stats.map(|s| s.row_count).unwrap_or(1000); // default estimate
 
         // Check for primary key equality lookup
         if let Some(expr) = where_clause {
             if let Some(pk_val) = self.extract_pk_lookup(table_name, expr) {
-                // The fetched row still has to satisfy the rest of the
-                // predicate.
-                return Ok(PlanNode::Scan {
-                    table: table_name.to_string(),
-                    access: AccessMethod::PkLookup { key_value: pk_val },
-                    filter: Some(expr.clone()),
-                    estimated_rows: 1,
-                    estimated_cost: PK_LOOKUP_COST,
+                let canonical_pk = match stats.and_then(|s| s.pk_type.as_ref()) {
+                    Some(pk_type) => pk_type.canonicalize(&pk_val),
+                    None => pk_val.clone(),
+                };
+                let needs_scan = stats.is_none_or(|s| {
+                    crate::volcano::pk_lookup_needs_scan_parts(
+                        s.row_format,
+                        s.pk_type.as_ref(),
+                        &canonical_pk,
+                    )
                 });
+                if !needs_scan {
+                    // The fetched row still has to satisfy the rest of the
+                    // predicate.
+                    return Ok(PlanNode::Scan {
+                        table: table_name.to_string(),
+                        access: AccessMethod::PkLookup { key_value: pk_val },
+                        filter: Some(expr.clone()),
+                        estimated_rows: 1,
+                        estimated_cost: PK_LOOKUP_COST,
+                    });
+                }
             }
 
             // Check for index scan opportunity
@@ -792,7 +850,7 @@ impl Optimizer {
     ///
     /// Only the declared key qualifies — a column named `id` need not be it.
     fn extract_pk_lookup(&self, table_name: &str, expr: &WhereExpr) -> Option<String> {
-        let pk = self.stats.get(table_name)?.primary_key.clone();
+        let pk = self.table_stats(table_name)?.primary_key.clone();
         match expr {
             WhereExpr::Comparison {
                 column,
@@ -804,7 +862,13 @@ impl Optimizer {
                     Some((qual, _)) => qual.eq_ignore_ascii_case(table_name),
                     None => true,
                 };
-                if qualifies && bare_name(column).eq_ignore_ascii_case(&pk) {
+                if qualifies
+                    && bare_name(column).eq_ignore_ascii_case(&pk)
+                    && !matches!(
+                        value,
+                        crate::sql::SqlValue::Null | crate::sql::SqlValue::Placeholder(_)
+                    )
+                {
                     Some(value.as_string())
                 } else {
                     None
@@ -819,27 +883,38 @@ impl Optimizer {
 
     /// Find the best index for a WHERE predicate.
     fn find_best_index(&self, table_name: &str, expr: &WhereExpr) -> Option<IndexDefinition> {
-        let stats = self.stats.get(table_name)?;
-        // Index fields are bare column names, so match the predicate's bare
-        // components whether or not they are qualified.
-        let columns_used = extract_where_columns(Some(expr))
-            .into_iter()
-            .map(|c| bare_name(&c).to_string())
-            .collect::<Vec<_>>();
-
-        // Score each index by how many of its fields match the WHERE columns
-        let mut best: Option<(IndexDefinition, usize)> = None;
-        for idx in &stats.indexes {
-            let matched = idx
-                .fields
-                .iter()
-                .take_while(|(f, _)| columns_used.contains(f))
-                .count();
-            if matched > 0 && best.as_ref().map(|(_, s)| matched > *s).unwrap_or(true) {
-                best = Some((idx.clone(), matched));
-            }
-        }
-        best.map(|(idx, _)| idx)
+        let stats = self.table_stats(table_name)?;
+        let conjuncts = split_conjuncts(expr);
+        let mut candidates: Vec<&IndexDefinition> = stats
+            .indexes
+            .iter()
+            .filter(|index| {
+                index.fields.len() == 1
+                    && conjuncts.iter().any(|conjunct| {
+                        let WhereExpr::Comparison { column, op, value } = conjunct else {
+                            return false;
+                        };
+                        let (field, field_type) = &index.fields[0];
+                        let qualified = column
+                            .split_once('.')
+                            .is_none_or(|(table, _)| table.eq_ignore_ascii_case(table_name));
+                        qualified
+                            && bare_name(column).eq_ignore_ascii_case(field)
+                            && matches!(
+                                op,
+                                CmpOp::Eq | CmpOp::Gt | CmpOp::Gte | CmpOp::Lt | CmpOp::Lte
+                            )
+                            && crate::secondary_index::sql_index_bound_for_version(
+                                value,
+                                field_type,
+                                index.encoding_version,
+                            )
+                            .is_some()
+                    })
+            })
+            .collect();
+        candidates.sort_by_key(|idx| &idx.name);
+        candidates.first().copied().cloned()
     }
 
     /// Check if filter was already pushed into scan node.
@@ -1008,6 +1083,8 @@ mod tests {
                 indexes: vec![],
                 histograms: vec![],
                 primary_key: "id".into(),
+                pk_type: Some(ColumnType::Text),
+                row_format: RowFormat::Typed,
             },
         );
         m.insert(
@@ -1019,6 +1096,8 @@ mod tests {
                 indexes: vec![],
                 histograms: vec![],
                 primary_key: "id".into(),
+                pk_type: Some(ColumnType::Text),
+                row_format: RowFormat::Typed,
             },
         );
         m
@@ -1071,6 +1150,8 @@ mod tests {
                 indexes: vec![],
                 histograms: vec![],
                 primary_key: "order_no".into(),
+                pk_type: Some(ColumnType::Text),
+                row_format: RowFormat::Typed,
             },
         );
         let opt = Optimizer::new(stats);
@@ -1160,5 +1241,71 @@ mod tests {
         let plan = opt.optimize(&stmt).unwrap();
         let display = format!("{}", plan);
         assert!(display.contains("Aggregate"));
+    }
+
+    #[test]
+    fn test_integer_and_unknown_pk_types_plan_seq_scan_with_scan_cost() {
+        for pk_type in [Some(ColumnType::Integer), None] {
+            let mut stats = std::collections::HashMap::new();
+            stats.insert(
+                "users".into(),
+                TableStats {
+                    table_name: "users".into(),
+                    row_count: 10_000,
+                    avg_row_bytes: 256,
+                    indexes: vec![],
+                    histograms: vec![],
+                    primary_key: "id".into(),
+                    pk_type: pk_type.clone(),
+                    row_format: RowFormat::Typed,
+                },
+            );
+            let opt = Optimizer::new(stats);
+            let stmt = parse_sql("SELECT * FROM users WHERE id = 42").unwrap();
+            let plan = opt.optimize(&stmt).unwrap();
+            let display = format!("{plan}");
+            assert!(
+                display.contains("Seq Scan") && !display.contains("PK Lookup"),
+                "pk_type={pk_type:?} must not advertise PK Lookup: {display}"
+            );
+            assert!(
+                plan.estimated_cost() >= 10_000.0 * SEQ_SCAN_COST_PER_ROW,
+                "pk_type={pk_type:?} must carry Seq Scan cost, got {}",
+                plan.estimated_cost()
+            );
+        }
+    }
+
+    #[test]
+    fn test_float_pk_plans_pk_lookup_for_nonzero_and_seq_scan_for_zero() {
+        let mut stats = std::collections::HashMap::new();
+        stats.insert(
+            "coords".into(),
+            TableStats {
+                table_name: "coords".into(),
+                row_count: 1_000,
+                avg_row_bytes: 64,
+                indexes: vec![],
+                histograms: vec![],
+                primary_key: "x".into(),
+                pk_type: Some(ColumnType::Float),
+                row_format: RowFormat::Typed,
+            },
+        );
+        let opt = Optimizer::new(stats);
+        let nonzero = opt
+            .optimize(&parse_sql("SELECT * FROM coords WHERE x = 1.5").unwrap())
+            .unwrap();
+        assert!(
+            format!("{nonzero}").contains("PK Lookup"),
+            "non-zero finite FLOAT PK should plan PK Lookup: {nonzero}"
+        );
+        let zero = opt
+            .optimize(&parse_sql("SELECT * FROM coords WHERE x = 0.0").unwrap())
+            .unwrap();
+        assert!(
+            format!("{zero}").contains("Seq Scan") && !format!("{zero}").contains("PK Lookup"),
+            "zero FLOAT PK must plan Seq Scan: {zero}"
+        );
     }
 }

@@ -2122,7 +2122,7 @@ fn test_2pc_happy_path_commit() {
     let participant3 = TwoPhaseParticipant::new(30, db_p3.clone());
 
     // BEGIN distributed transaction
-    let txn_id = coordinator.begin();
+    let txn_id = coordinator.begin().unwrap();
     assert_eq!(coordinator.get_state(txn_id), Some(DistTxnState::Preparing));
 
     // Add writes for each participant
@@ -2215,7 +2215,7 @@ fn test_2pc_abort_on_single_abort_vote() {
     let participant2 = TwoPhaseParticipant::new(20, db_p2.clone());
 
     // BEGIN
-    let txn_id = coordinator.begin();
+    let txn_id = coordinator.begin().unwrap();
 
     coordinator
         .add_write(txn_id, 10, "abort_key1".into(), Some("val1".into()), 0)
@@ -2296,7 +2296,7 @@ fn test_2pc_coordinator_wal_persistence() {
         let participant = TwoPhaseParticipant::new(10, db);
 
         // Run a full 2PC
-        txn_id = coordinator.begin();
+        txn_id = coordinator.begin().unwrap();
         coordinator
             .add_write(
                 txn_id,
@@ -2398,7 +2398,7 @@ fn test_2pc_cross_shard_with_raft_replication() {
     let p3 = TwoPhaseParticipant::new(30, db_s3_primary.clone());
 
     // Create a multi-shard transaction: transfer money across 3 accounts
-    let txn_id = coordinator.begin();
+    let txn_id = coordinator.begin().unwrap();
     coordinator
         .add_write(
             txn_id,
@@ -2537,7 +2537,7 @@ fn test_2pc_concurrent_independent_transactions() {
     let participant2 = TwoPhaseParticipant::new(20, db_p2.clone());
 
     // === Txn1: will COMMIT ===
-    let txn1 = coordinator.begin();
+    let txn1 = coordinator.begin().unwrap();
     coordinator
         .add_write(txn1, 10, "conc_committed_1".into(), Some("yes1".into()), 0)
         .unwrap();
@@ -2546,7 +2546,7 @@ fn test_2pc_concurrent_independent_transactions() {
         .unwrap();
 
     // === Txn2: will ABORT ===
-    let txn2 = coordinator.begin();
+    let txn2 = coordinator.begin().unwrap();
     coordinator
         .add_write(txn2, 10, "conc_aborted_1".into(), Some("no1".into()), 0)
         .unwrap();
@@ -2735,14 +2735,6 @@ fn test_ssi_no_false_positive() {
 }
 
 /// Gap #9d: Overlapping txns — T2 reads a key that T1 writes concurrently.
-///
-/// This is the rw-antidependency conflict (and the shape of the classic
-/// write-skew): T2 snapshotted `chain_y` before T1 committed a new value
-/// for it, so T2's commit must abort. NOTE: despite an earlier name, this
-/// never exercised the "dangerous structure" pivot check — that check was
-/// unreachable dead code and has been removed; the abort here comes from
-/// the plain RW branch, which is what catches the crossing read/write
-/// pair.
 #[test]
 fn test_ssi_rw_antidependency_chain() {
     let (db, _, _d) = create_node("ssi_chain");
@@ -2787,7 +2779,7 @@ fn test_deadlock_across_2pc_participants() {
     db.commit_batch(&batch).unwrap();
 
     // Txn1: write to conflict_key via 2PC
-    let txn1 = coordinator.begin();
+    let txn1 = coordinator.begin().unwrap();
     coordinator
         .add_write(txn1, 10, "conflict_key".into(), Some("txn1_val".into()), 0)
         .unwrap();
@@ -2802,7 +2794,7 @@ fn test_deadlock_across_2pc_participants() {
     coordinator.finalize_commit(txn1).unwrap();
 
     // Txn2: also writes conflict_key — should succeed (no in-memory SSI conflict for 2PC)
-    let txn2 = coordinator.begin();
+    let txn2 = coordinator.begin().unwrap();
     coordinator
         .add_write(txn2, 10, "conflict_key".into(), Some("txn2_val".into()), 0)
         .unwrap();
@@ -4039,41 +4031,47 @@ async fn test_apply_to_state_machine_chunks_past_batch_cap() {
 #[tokio::test]
 async fn test_apply_response_is_the_commit_marker() {
     let (db, storage, _dir) = create_node("apply_marker");
-    let entries = vec![bulk_entry(1, 10, "m")];
+    // Two entries that touch an overlapping key force two atomic flushes in one
+    // apply call (each flushing user data + `last_applied` together), so
+    // `get_seq()` advances strictly past `marker1 + 1` by the time apply returns.
+    let mut second = bulk_entry(1, 10, "m");
+    second.log_id.index = 2;
+    let entries = vec![bulk_entry(1, 10, "m"), second];
 
     let res =
         openraft::storage::RaftStorage::apply_to_state_machine(&mut storage.clone(), &entries)
             .await
             .expect("apply must succeed");
 
-    assert_eq!(res.len(), 1, "one entry → one response");
+    assert_eq!(res.len(), 2, "two entries → two responses");
     let marker: u64 = res[0]
         .parse()
         .expect("apply response must be the commit marker, not a constant");
+    let marker2: u64 = res[1]
+        .parse()
+        .expect("second apply response must also carry its commit marker");
+    assert!(
+        marker2 > marker,
+        "second flush must land at a strictly higher commit marker"
+    );
 
-    // WHY the marker is carried rather than reconstructed: after the
-    // data lands, the apply writes its last_applied meta record, and
-    // that commit reserves sequences too (the meta op PLUS its own
-    // marker). So get_seq() ends up MORE than one past the data marker —
-    // marker+2 here — with no concurrency at all. get_seq()-1 would
-    // return the meta op's sequence, not the data marker. Only the
-    // carried marker is correct.
+    // WHY the marker is carried rather than reconstructed: once the second
+    // flush lands, `get_seq()` is strictly past `marker + 1`. Reconstructing
+    // from `get_seq() - 1` would return the later flush's marker, not entry 1's.
     assert!(
         db.get_seq() > marker + 1,
-        "the apply's own meta commit must advance the counter past marker+1; \
-         got {} for marker {} — if this ever equals marker+1, reconstructing \
-         from the counter would silently become correct and this guard is stale",
+        "subsequent flush must advance the counter past marker+1; got {} for marker {}",
         db.get_seq(),
         marker
     );
     assert_ne!(
         db.get_seq().saturating_sub(1),
         marker,
-        "get_seq()-1 must NOT equal the data marker — the meta commit shifts it"
+        "get_seq()-1 must NOT equal entry 1's commit marker"
     );
 
-    // The write is nevertheless visible to a snapshot taken AT the
-    // marker — the visibility property the SSI engine depends on.
+    // Both the data AND `last_applied` meta committed atomically at `marker` —
+    // visible to a snapshot taken AT `marker`.
     assert_eq!(
         db.find("m:bulk:1:0", marker).unwrap(),
         Some("v".into()),
@@ -4083,6 +4081,10 @@ async fn test_apply_response_is_the_commit_marker() {
         db.find("m:bulk:1:9", marker).unwrap(),
         Some("v".into()),
         "the last op of the entry must be visible at read_seq == marker"
+    );
+    assert!(
+        db.find("__sys__/raft/meta", marker).unwrap().is_some(),
+        "raft last_applied meta must commit atomically at the same marker as user data"
     );
     println!("✅ APPLY MARKER: response carried commit seq {marker}");
 }
@@ -4218,10 +4220,27 @@ async fn test_apply_single_entry_at_batch_cap_keeps_room_for_meta() {
 #[tokio::test]
 async fn test_purge_chunks_past_batch_cap() {
     let (db, storage, _dir) = create_node("bulk_purge");
-    // Stage a long log via the sync helper (raw text entries).
+    // Stage a long log of real JSON OpenRaft entries so intermediate purge
+    // boundaries can be verified against their exact committed `LogId`.
+    let leader = openraft::CommittedLeaderId::new(1, 1);
+    let mut entries = Vec::with_capacity(2_000);
     for idx in 1..=12_000u64 {
-        storage
-            .append_log(idx, &format!("SET purge_k{idx} v"))
+        entries.push(openraft::Entry {
+            log_id: openraft::LogId::new(leader, idx),
+            payload: openraft::EntryPayload::Normal(format!("SET purge_k{idx} v")),
+        });
+        if entries.len() == 2_000 {
+            openraft::storage::RaftStorage::append_to_log(
+                &mut storage.clone(),
+                std::mem::take(&mut entries),
+            )
+            .await
+            .unwrap();
+        }
+    }
+    if !entries.is_empty() {
+        openraft::storage::RaftStorage::append_to_log(&mut storage.clone(), entries)
+            .await
             .unwrap();
     }
     openraft::storage::RaftStorage::purge_logs_upto(
@@ -4784,7 +4803,7 @@ async fn test_v2_snapshot_missing_history_field_is_rejected() {
     let snapshot = builder.build_snapshot().await.unwrap();
     let mut json: serde_json::Value =
         serde_json::from_slice(&snapshot.snapshot.into_inner()).unwrap();
-    assert_eq!(json["version"], 2, "a current snapshot is version 2");
+    assert_eq!(json["version"], 3, "a current snapshot is version 3");
     json.as_object_mut()
         .expect("snapshot envelope is a JSON object")
         .remove("ssi_history");
@@ -4808,4 +4827,832 @@ async fn test_v2_snapshot_missing_history_field_is_rejected() {
     );
 
     println!("✅ Malformed v2 snapshot (missing history) rejected");
+}
+
+#[tokio::test]
+async fn test_snapshot_install_blocks_pre_install_2pc_prepare_against_plain_writes() {
+    use omni_engine::dist_txn::{DistWrite, TwoPhaseParticipant, Vote};
+    use openraft::storage::RaftSnapshotBuilder;
+
+    let (leader_db, leader, _leader_dir) = create_node("ssi_2pc_snap_leader");
+    let (follower_db, follower, follower_dir) = create_node("ssi_2pc_snap_follower");
+
+    // Seed follower with higher local sequences than the rebuilt temp DB will
+    // assign during snapshot install, ensuring the fallback get_seq_for_key
+    // check alone would NOT catch a snapshot-carried plain write.
+    for i in 1..=20 {
+        let mut local = omni_engine::WriteBatch::new();
+        local.set(&format!("local_k{i}"), "v".into()).unwrap();
+        follower_db.commit_batch(&local).unwrap();
+    }
+    let pre_install_read_seq = follower_db.get_seq().saturating_sub(1);
+
+    // Leader applies a PLAIN write (not an SSI transaction, so it does not
+    // appear in envelope.ssi_history).
+    leader
+        .append_log(1, "SET snap_plain_k from_leader_plain")
+        .unwrap();
+    apply_range(&leader, 1, 2);
+    let leader_max_seq = leader_db.get_seq();
+
+    let mut builder = leader.clone();
+    let snapshot = builder.build_snapshot().await.unwrap();
+    let mut installer = follower.clone();
+    installer
+        .install_snapshot(&snapshot.meta, snapshot.snapshot)
+        .await
+        .unwrap();
+
+    assert!(
+        follower_db.ssi_history().eviction_floor() >= leader_max_seq,
+        "installed SSI eviction floor must be at least the snapshot's max_seq"
+    );
+    assert_eq!(
+        follower_db
+            .find("snap_plain_k", follower_db.get_seq())
+            .unwrap(),
+        Some("from_leader_plain".into()),
+        "installed snapshot must deliver the leader's plain write"
+    );
+    assert!(
+        follower_db.get_seq_for_key("snap_plain_k", u64::MAX) <= pre_install_read_seq,
+        "rebuilt snapshot key sequence must not exceed pre_install_read_seq, proving the eviction floor is what catches the conflict"
+    );
+
+    let participant = TwoPhaseParticipant::new(2, follower_db.clone());
+    let writes = vec![DistWrite {
+        node_id: 2,
+        key: "snap_plain_k".into(),
+        value: Some("from_2pc".into()),
+        ttl: 0,
+    }];
+    let stale_vote = participant.prepare_with_snapshot((1, 1), &writes, pre_install_read_seq);
+    match stale_vote.vote {
+        Vote::Abort(reason) => assert!(
+            reason.contains("SSI CONFLICT"),
+            "expected SSI conflict on pre-install 2PC prepare, got: {reason}"
+        ),
+        Vote::Commit => panic!(
+            "pre-install 2PC prepare must not vote COMMIT across a snapshot carrying plain writes"
+        ),
+    }
+
+    // Drop and reopen IMMEDIATELY after install_snapshot (before any post-install
+    // WAL writes) so WAL replay cannot mask missing `installed_manifest.max_seq`.
+    drop(participant);
+    drop(installer);
+    drop(follower);
+    drop(follower_db);
+
+    let (reopened_db, _reopened_follower) =
+        create_node_in_dir(follower_dir.path(), "ssi_2pc_snap_follower");
+    assert_eq!(
+        reopened_db
+            .find("snap_plain_k", reopened_db.get_seq())
+            .unwrap(),
+        Some("from_leader_plain".into()),
+        "reopened follower must still hold the installed snapshot key"
+    );
+    assert!(
+        reopened_db.ssi_history().eviction_floor() >= pre_install_read_seq,
+        "reopened follower must restore persisted snapshot eviction floor without post-install WAL writes"
+    );
+    let reopened_participant = TwoPhaseParticipant::new(2, reopened_db);
+    let reopened_stale =
+        reopened_participant.prepare_with_snapshot((1, 3), &writes, pre_install_read_seq);
+    match reopened_stale.vote {
+        Vote::Abort(reason) => assert!(
+            reason.contains("SSI CONFLICT"),
+            "expected SSI conflict after reopen on pre-install 2PC prepare, got: {reason}"
+        ),
+        Vote::Commit => {
+            panic!("pre-install 2PC prepare must remain rejected after restarting the follower")
+        }
+    }
+    let reopened_fresh = reopened_participant.prepare((1, 4), &writes);
+    assert_eq!(
+        reopened_fresh.vote,
+        Vote::Commit,
+        "fresh post-restart 2PC prepare must succeed"
+    );
+    reopened_participant.abort((1, 4)).unwrap();
+}
+
+#[tokio::test]
+async fn test_grouped_raft_apply_preserves_delete_before_2pc_commit_order() {
+    use omni_engine::WriteBatch;
+    use omni_engine::raft_command::RaftCommand;
+    use openraft::{CommittedLeaderId, Entry, EntryPayload, LogId, RaftStorage};
+
+    let (grouped_db, mut grouped_storage, _g_dir) = create_node("grouped_del_2pc");
+    let (separate_db, mut separate_storage, _s_dir) = create_node("separate_del_2pc");
+
+    // Seed both replicas with initial key K.
+    for db in [&grouped_db, &separate_db] {
+        let mut init = WriteBatch::new();
+        init.set("k_order", "initial".into()).unwrap();
+        db.commit_batch(&init).unwrap();
+    }
+
+    let mut del_batch = WriteBatch::new();
+    del_batch.delete("k_order").unwrap();
+    let del_cmd = RaftCommand::from_batch(&del_batch);
+
+    let prepare_key = "__2PC_PREPARE__/2/1_1";
+    let prepare_json = serde_json::json!({
+        "txn_id": [1, 1],
+        "node_id": 2,
+        "state": "PREPARED",
+        "writes": [{"node_id": 2, "key": "k_order", "value": "committed_val", "ttl": 0}],
+        "prepare_seq": 1,
+        "commit_seq": null
+    })
+    .to_string();
+    let mut prep_batch = WriteBatch::new();
+    prep_batch.set(prepare_key, prepare_json).unwrap();
+    let prep_cmd = RaftCommand::from_batch(&prep_batch);
+
+    let commit_json = serde_json::json!({
+        "txn_id": [1, 1],
+        "node_id": 2,
+        "state": "COMMITTED",
+        "writes": [{"node_id": 2, "key": "k_order", "value": "committed_val", "ttl": 0}],
+        "prepare_seq": 1,
+        "commit_seq": null
+    })
+    .to_string();
+    let mut commit_batch = WriteBatch::new();
+    commit_batch.set("k_order", "committed_val".into()).unwrap();
+    commit_batch.set(prepare_key, commit_json).unwrap();
+    let commit_cmd = RaftCommand::from_batch(&commit_batch);
+
+    let leader = CommittedLeaderId::new(1, 1);
+    let entries = [
+        Entry {
+            log_id: LogId::new(leader, 1),
+            payload: EntryPayload::Normal(del_cmd.encode()),
+        },
+        Entry {
+            log_id: LogId::new(leader, 2),
+            payload: EntryPayload::Normal(prep_cmd.encode()),
+        },
+        Entry {
+            log_id: LogId::new(leader, 3),
+            payload: EntryPayload::Normal(commit_cmd.encode()),
+        },
+    ];
+
+    grouped_storage
+        .apply_to_state_machine(&entries)
+        .await
+        .unwrap();
+    for entry in &entries {
+        separate_storage
+            .apply_to_state_machine(std::slice::from_ref(entry))
+            .await
+            .unwrap();
+    }
+
+    assert_eq!(
+        grouped_db.find("k_order", grouped_db.get_seq()).unwrap(),
+        Some("committed_val".into()),
+        "grouped Raft apply must not let an earlier DELETE overwrite a later 2PC COMMIT set"
+    );
+    assert_eq!(
+        grouped_db.find("k_order", grouped_db.get_seq()).unwrap(),
+        separate_db.find("k_order", separate_db.get_seq()).unwrap(),
+        "grouped and separate Raft applies must converge to identical state"
+    );
+}
+
+fn build_2pc_isolation_raft_entries() -> Vec<openraft::Entry<omni_engine::raft_impl::TypeConfig>> {
+    use omni_engine::WriteBatch;
+    use omni_engine::raft_command::RaftCommand;
+    use openraft::{CommittedLeaderId, Entry, EntryPayload, LogId};
+
+    let prepare_key = "__2PC_PREPARE__/2/1_77";
+    let make_record = |state: &str| {
+        serde_json::json!({
+            "txn_id": [1, 77],
+            "node_id": 2,
+            "state": state,
+            "writes": [{"node_id": 2, "key": "k_iso", "value": "v_2pc", "ttl": 0}],
+            "prepare_seq": 1,
+            "commit_seq": null
+        })
+        .to_string()
+    };
+
+    let mut prep = WriteBatch::new();
+    prep.set(prepare_key, make_record("PREPARED")).unwrap();
+
+    let mut smuggle_abort = WriteBatch::new();
+    smuggle_abort
+        .set("k_iso", "smuggled_on_abort".into())
+        .unwrap();
+    smuggle_abort
+        .set(prepare_key, make_record("ABORTED"))
+        .unwrap();
+
+    let mut rogue = WriteBatch::new();
+    rogue.set("k_iso", "rogue_overwrite".into()).unwrap();
+
+    let mut commit = WriteBatch::new();
+    commit.set("k_iso", "v_2pc".into()).unwrap();
+    commit.set(prepare_key, make_record("COMMITTED")).unwrap();
+
+    let mut del = WriteBatch::new();
+    del.delete("k_iso").unwrap();
+
+    let mut after = WriteBatch::new();
+    after.set("k_iso", "after_del".into()).unwrap();
+
+    let leader = CommittedLeaderId::new(1, 1);
+    [prep, smuggle_abort, rogue, commit, del, after]
+        .into_iter()
+        .enumerate()
+        .map(|(i, b)| Entry {
+            log_id: LogId::new(leader, (i + 1) as u64),
+            payload: EntryPayload::Normal(RaftCommand::from_batch(&b).encode()),
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn test_grouped_raft_apply_2pc_commit_seq_isolation_and_abort_smuggle_rejection() {
+    let (grouped_db, mut grouped_storage, _g_dir) = create_node("grouped_2pc_isolation");
+    let (separate_db, mut separate_storage, _s_dir) = create_node("separate_2pc_isolation");
+    let entries = build_2pc_isolation_raft_entries();
+
+    let grouped_res = grouped_storage
+        .apply_to_state_machine(&entries)
+        .await
+        .unwrap();
+    let mut separate_res = Vec::new();
+    for entry in &entries {
+        separate_res.extend(
+            separate_storage
+                .apply_to_state_machine(std::slice::from_ref(entry))
+                .await
+                .unwrap(),
+        );
+    }
+
+    for (label, res, db) in [
+        ("grouped", &grouped_res, &grouped_db),
+        ("separate", &separate_res, &separate_db),
+    ] {
+        assert_eq!(
+            res[1], "ERR",
+            "{label}: ABORT entry smuggling user write must be rejected"
+        );
+        assert_eq!(
+            res[2], "ERR",
+            "{label}: non-owner write to PREPARED key must be rejected"
+        );
+        let commit_seq: u64 = res[3].parse().expect("2PC COMMIT must return commit_seq");
+        let del_seq: u64 = res[4].parse().expect("DELETE must return seq");
+        let after_seq: u64 = res[5].parse().expect("final SET must return seq");
+        assert!(
+            commit_seq < del_seq && del_seq < after_seq,
+            "{label}: 2PC COMMIT, DELETE, and final SET must land at distinct ordered sequences ({commit_seq}, {del_seq}, {after_seq})"
+        );
+        assert_eq!(
+            db.find("k_iso", commit_seq).unwrap(),
+            Some("v_2pc".into()),
+            "{label}: k_iso must equal v_2pc at the 2PC transaction's own commit_seq"
+        );
+        assert_eq!(
+            db.find("k_iso", del_seq).unwrap(),
+            None,
+            "{label}: k_iso must be deleted at del_seq"
+        );
+        assert_eq!(
+            db.find("k_iso", after_seq).unwrap(),
+            Some("after_del".into()),
+            "{label}: k_iso must hold final value after_del"
+        );
+    }
+}
+
+fn boot_single_node_live_raft(name: &str) -> (Arc<OmniKV>, tempfile::TempDir) {
+    use omni_engine::raft_gateway::ClusterGateway;
+    use omni_engine::raft_impl::OmniRaft;
+    use omni_engine::raft_network::OmniNetwork;
+    use std::collections::BTreeMap;
+    use std::time::{Duration, Instant};
+
+    let (db, storage, dir) = create_node(name);
+    let rt = ClusterGateway::consensus_runtime();
+    let config = Arc::new(
+        openraft::Config {
+            heartbeat_interval: 50,
+            election_timeout_min: 150,
+            election_timeout_max: 300,
+            ..Default::default()
+        }
+        .validate()
+        .unwrap(),
+    );
+    let (log_store, state_machine) = openraft::storage::Adaptor::new(storage);
+    let raft = rt
+        .block_on(OmniRaft::new(
+            1,
+            config,
+            OmniNetwork::default(),
+            log_store,
+            state_machine,
+        ))
+        .unwrap();
+    let mut members = BTreeMap::new();
+    members.insert(
+        1u64,
+        openraft::BasicNode {
+            addr: "127.0.0.1:0".into(),
+        },
+    );
+    rt.block_on(raft.initialize(members)).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while rt.block_on(raft.current_leader()) != Some(1) {
+        assert!(
+            Instant::now() < deadline,
+            "single-node Raft failed to elect leader"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    db.set_cluster_gateway(Arc::new(ClusterGateway::with_runtime(rt, raft)));
+    (db, dir)
+}
+
+struct Contending2pcWorkers {
+    paused: Arc<std::sync::atomic::AtomicBool>,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    handles: Vec<std::thread::JoinHandle<()>>,
+}
+
+impl Contending2pcWorkers {
+    fn spawn(
+        db: &Arc<OmniKV>,
+        paused: Arc<std::sync::atomic::AtomicBool>,
+        plain_2pc_rejected: &Arc<std::sync::atomic::AtomicUsize>,
+        ssi_2pc_rejected: &Arc<std::sync::atomic::AtomicUsize>,
+    ) -> Self {
+        use omni_engine::WriteBatch;
+        use omni_engine::transaction::TransactionManager;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::Duration;
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut handles = Vec::new();
+        for worker in 0..4usize {
+            let db = db.clone();
+            let paused = paused.clone();
+            let stop = stop.clone();
+            let plain_2pc_rejected = plain_2pc_rejected.clone();
+            let ssi_2pc_rejected = ssi_2pc_rejected.clone();
+            handles.push(std::thread::spawn(move || {
+                let tm = TransactionManager::new(db.clone());
+                let mut iter = 0usize;
+                while !stop.load(Ordering::Relaxed) {
+                    if paused.load(Ordering::Acquire) {
+                        std::thread::sleep(Duration::from_millis(2));
+                        continue;
+                    }
+                    iter = iter.wrapping_add(1);
+                    if (worker + iter).is_multiple_of(2) {
+                        let mut b = WriteBatch::new();
+                        b.set("hot_2pc_key", format!("plain_{worker}_{iter}"))
+                            .unwrap();
+                        if let Err(err) = db.commit_batch(&b)
+                            && err.to_string().contains("SSI CONFLICT (2PC)")
+                        {
+                            plain_2pc_rejected.fetch_add(1, Ordering::Relaxed);
+                        }
+                    } else {
+                        let mut txn = tm.begin();
+                        let _ = tm.get(&mut txn, "hot_2pc_key");
+                        tm.set(&mut txn, "hot_2pc_key", format!("ssi_{worker}_{iter}"))
+                            .unwrap();
+                        if let Err(err) = tm.commit(&mut txn)
+                            && err.to_string().contains("SSI CONFLICT (2PC)")
+                        {
+                            ssi_2pc_rejected.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                }
+            }));
+        }
+        Self {
+            paused,
+            stop,
+            handles,
+        }
+    }
+
+    fn stop_and_join(mut self) {
+        use std::sync::atomic::Ordering;
+        self.paused.store(false, Ordering::SeqCst);
+        self.stop.store(true, Ordering::SeqCst);
+        for handle in self.handles.drain(..) {
+            handle.join().expect("competing writer thread panicked");
+        }
+    }
+}
+
+impl Drop for Contending2pcWorkers {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering;
+        self.paused.store(false, Ordering::SeqCst);
+        self.stop.store(true, Ordering::SeqCst);
+        for handle in self.handles.drain(..) {
+            let _ = handle.join();
+        }
+    }
+}
+
+#[test]
+fn test_clustered_live_raft_concurrent_2pc_vs_plain_and_ssi_isolation() {
+    use omni_engine::WriteBatch;
+    use omni_engine::dist_txn::{DistWrite, TwoPhaseParticipant, Vote};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
+
+    let (db, _dir) = boot_single_node_live_raft("live_raft_2pc_isolation");
+    let participant = Arc::new(TwoPhaseParticipant::new(1, db.clone()));
+    // Start competing workers paused so Round 1 deterministically reserves
+    // `hot_2pc_key` before releasing workers into the prepared window;
+    // Rounds 2..=12 then run completely unsynchronized for stress coverage.
+    let paused = Arc::new(AtomicBool::new(true));
+    let plain_2pc_rejected = Arc::new(AtomicUsize::new(0));
+    let ssi_2pc_rejected = Arc::new(AtomicUsize::new(0));
+    let guard =
+        Contending2pcWorkers::spawn(&db, paused.clone(), &plain_2pc_rejected, &ssi_2pc_rejected);
+
+    let round1_val = "2pc_round_1".to_string();
+    let round1_writes = vec![DistWrite {
+        node_id: 1,
+        key: "hot_2pc_key".into(),
+        value: Some(round1_val.clone()),
+        ttl: 0,
+    }];
+    assert_eq!(
+        participant.prepare((1, 1), &round1_writes).vote,
+        Vote::Commit,
+        "deterministic Round 1 prepare must vote Commit while competing workers are paused"
+    );
+    let val_at_prepare = db.find("hot_2pc_key", db.get_seq()).unwrap();
+    let seq_at_prepare = db.get_seq_for_key("hot_2pc_key", u64::MAX);
+    paused.store(false, Ordering::Release);
+    let reject_deadline = Instant::now() + Duration::from_secs(5);
+    while (plain_2pc_rejected.load(Ordering::Relaxed) == 0
+        || ssi_2pc_rejected.load(Ordering::Relaxed) == 0)
+        && Instant::now() < reject_deadline
+    {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        plain_2pc_rejected.load(Ordering::Relaxed) > 0,
+        "competing clustered plain writers must observe SSI CONFLICT (2PC) during Round 1 prepared window"
+    );
+    assert!(
+        ssi_2pc_rejected.load(Ordering::Relaxed) > 0,
+        "competing clustered SSI transactions must observe SSI CONFLICT (2PC) during Round 1 prepared window"
+    );
+    std::thread::sleep(Duration::from_millis(15));
+    assert_eq!(
+        db.find("hot_2pc_key", db.get_seq()).unwrap(),
+        val_at_prepare
+    );
+    assert_eq!(db.get_seq_for_key("hot_2pc_key", u64::MAX), seq_at_prepare);
+    let round1_commit_seq = participant
+        .commit((1, 1))
+        .expect("prepared Round 1 2PC txn must commit through live Raft");
+    assert_eq!(
+        db.find("hot_2pc_key", round1_commit_seq).unwrap(),
+        Some(round1_val)
+    );
+
+    let mut committed_rounds = 1u64;
+    for round in 2..=12u64 {
+        let expected_val = format!("2pc_round_{round}");
+        let writes = vec![DistWrite {
+            node_id: 1,
+            key: "hot_2pc_key".into(),
+            value: Some(expected_val.clone()),
+            ttl: 0,
+        }];
+        if participant.prepare((1, round), &writes).vote == Vote::Commit {
+            let val_at_prepare = db.find("hot_2pc_key", db.get_seq()).unwrap();
+            let seq_at_prepare = db.get_seq_for_key("hot_2pc_key", u64::MAX);
+            std::thread::sleep(Duration::from_millis(15));
+            assert_eq!(
+                db.find("hot_2pc_key", db.get_seq()).unwrap(),
+                val_at_prepare
+            );
+            assert_eq!(db.get_seq_for_key("hot_2pc_key", u64::MAX), seq_at_prepare);
+            let commit_seq = participant
+                .commit((1, round))
+                .expect("prepared 2PC txn must commit through live Raft");
+            assert_eq!(
+                db.find("hot_2pc_key", commit_seq).unwrap(),
+                Some(expected_val)
+            );
+            committed_rounds += 1;
+        }
+    }
+
+    guard.stop_and_join();
+
+    assert!(committed_rounds > 0, "expected >= 1 committed 2PC round");
+    assert!(plain_2pc_rejected.load(Ordering::Relaxed) > 0);
+    let mut final_batch = WriteBatch::new();
+    final_batch
+        .set("hot_2pc_key", "post_2pc_ok".into())
+        .unwrap();
+    db.commit_batch(&final_batch)
+        .expect("clustered plain write must succeed once 2PC commits");
+    assert_eq!(
+        db.find("hot_2pc_key", db.get_seq()).unwrap(),
+        Some("post_2pc_ok".into())
+    );
+}
+
+#[tokio::test]
+async fn test_delete_conflict_logs_since_preserves_index_zero_and_purged_floor() {
+    use openraft::{CommittedLeaderId, Entry, EntryPayload, LogId, RaftStorage};
+
+    let (_db, mut storage, _dir) = create_node("delete_conflict_logs");
+    let leader0 = CommittedLeaderId::new(0, 0);
+    let leader1 = CommittedLeaderId::new(1, 1);
+
+    let entries = vec![
+        Entry {
+            log_id: LogId::new(leader0, 0),
+            payload: EntryPayload::Blank,
+        },
+        Entry {
+            log_id: LogId::new(leader1, 1),
+            payload: EntryPayload::Normal("SET k1 v1".into()),
+        },
+        Entry {
+            log_id: LogId::new(leader1, 2),
+            payload: EntryPayload::Normal("SET k2 v2".into()),
+        },
+        Entry {
+            log_id: LogId::new(leader1, 3),
+            payload: EntryPayload::Normal("SET k3 v3".into()),
+        },
+    ];
+    storage.append_to_log(entries).await.unwrap();
+
+    // Truncating from index 1 must preserve OpenRaft's index-0 membership entry.
+    storage
+        .delete_conflict_logs_since(LogId::new(leader1, 1))
+        .await
+        .unwrap();
+    let state = storage.get_log_state().await.unwrap();
+    assert_eq!(
+        state.last_log_id,
+        Some(LogId::new(leader0, 0)),
+        "truncating at index 1 must keep index 0 as last_log_id"
+    );
+
+    // Re-append 1..=3, purge through index 1, then truncate from index 2:
+    // last_log_id must fall back to last_purged_log_id (index 1).
+    storage
+        .append_to_log(vec![
+            Entry {
+                log_id: LogId::new(leader1, 1),
+                payload: EntryPayload::Normal("SET k1 v1b".into()),
+            },
+            Entry {
+                log_id: LogId::new(leader1, 2),
+                payload: EntryPayload::Normal("SET k2 v2b".into()),
+            },
+        ])
+        .await
+        .unwrap();
+    storage
+        .purge_logs_upto(LogId::new(leader1, 1))
+        .await
+        .unwrap();
+    storage
+        .delete_conflict_logs_since(LogId::new(leader1, 2))
+        .await
+        .unwrap();
+    let state = storage.get_log_state().await.unwrap();
+    assert_eq!(
+        state.last_log_id,
+        Some(LogId::new(leader1, 1)),
+        "truncating immediately after purged floor must set last_log_id = last_purged_log_id"
+    );
+
+    // Truncating from index 0 on a fresh node resets last_log_id to None.
+    let (_db2, mut storage2, _dir2) = create_node("delete_conflict_logs_zero");
+    storage2
+        .append_to_log(vec![Entry {
+            log_id: LogId::new(leader0, 0),
+            payload: EntryPayload::Blank,
+        }])
+        .await
+        .unwrap();
+    storage2
+        .delete_conflict_logs_since(LogId::new(leader0, 0))
+        .await
+        .unwrap();
+    assert_eq!(storage2.get_log_state().await.unwrap().last_log_id, None);
+}
+
+#[tokio::test]
+async fn test_delete_conflict_logs_since_errors_on_missing_predecessor() {
+    use openraft::{CommittedLeaderId, Entry, EntryPayload, LogId, RaftStorage};
+
+    // Missing predecessor ABOVE the purge floor (index 3 absent while purge
+    // floor is 1) must return Err rather than falling back to last_purged_log_id.
+    let leader1 = CommittedLeaderId::new(1, 1);
+    let (_db3, mut storage3, _dir3) = create_node("delete_conflict_logs_missing_pred");
+    storage3
+        .append_to_log(vec![
+            Entry {
+                log_id: LogId::new(leader1, 1),
+                payload: EntryPayload::Normal("SET k1 v1".into()),
+            },
+            Entry {
+                log_id: LogId::new(leader1, 2),
+                payload: EntryPayload::Normal("SET k2 v2".into()),
+            },
+            Entry {
+                log_id: LogId::new(leader1, 4),
+                payload: EntryPayload::Normal("SET k4 v4".into()),
+            },
+        ])
+        .await
+        .unwrap();
+    storage3
+        .purge_logs_upto(LogId::new(leader1, 1))
+        .await
+        .unwrap();
+
+    assert!(
+        storage3
+            .delete_conflict_logs_since(LogId::new(leader1, 4))
+            .await
+            .is_err(),
+        "missing predecessor above purge floor must return StorageError"
+    );
+    assert_eq!(
+        storage3.get_log_state().await.unwrap().last_log_id,
+        Some(LogId::new(leader1, 4)),
+        "failed truncation must not corrupt last_log_id to purge floor"
+    );
+}
+
+#[tokio::test]
+async fn test_snapshot_install_does_not_return_source_commit_seq_for_2pc_retry() {
+    use omni_engine::WriteBatch;
+    use omni_engine::dist_txn::{CommitOutcome, DistWrite, TwoPhaseParticipant, Vote};
+    use openraft::{RaftSnapshotBuilder, RaftStorage};
+
+    let (source_db, source_storage, _source_dir) = create_node("snap_2pc_commit_seq_src");
+    let (dest_db, dest_storage, _dest_dir) = create_node("snap_2pc_commit_seq_dst");
+
+    // Commit a 2PC transaction writing "z_key" at a low source sequence first.
+    let source_participant = TwoPhaseParticipant::new(2, source_db.clone());
+    let txn_id = (1, 1);
+    let writes = vec![DistWrite {
+        node_id: 2,
+        key: "z_key".into(),
+        value: Some("committed_v1".into()),
+        ttl: 0,
+    }];
+    assert_eq!(
+        source_participant.prepare(txn_id, &writes).vote,
+        Vote::Commit
+    );
+    let source_commit_seq = source_participant.commit(txn_id).unwrap();
+    assert_eq!(
+        source_db.find("z_key", source_commit_seq).unwrap(),
+        Some("committed_v1".into())
+    );
+
+    // Populate many keys that sort lexicographically BEFORE "z_key" so snapshot
+    // installation assigns "z_key" a local storage sequence strictly greater than
+    // `source_commit_seq`.
+    let mut pad = WriteBatch::new();
+    for i in 0..80usize {
+        pad.set(&format!("a_pad_{i:03}"), format!("pad_{i}"))
+            .unwrap();
+    }
+    source_db.commit_batch(&pad).unwrap();
+
+    // Advance Raft applied metadata on source and snapshot -> install on dest.
+    source_storage
+        .append_log(1, "SET snap_marker ready")
+        .unwrap();
+    apply_range(&source_storage, 1, 2);
+
+    let mut builder = source_storage.clone();
+    let snapshot = builder.build_snapshot().await.unwrap();
+    let mut installer = dest_storage.clone();
+    installer
+        .install_snapshot(&snapshot.meta, snapshot.snapshot)
+        .await
+        .unwrap();
+
+    // Destination holds the committed value at its rebuilt local sequence (> source_commit_seq).
+    assert_eq!(
+        dest_db.find("z_key", dest_db.get_seq()).unwrap(),
+        Some("committed_v1".into())
+    );
+    assert!(
+        dest_db.get_seq_for_key("z_key", u64::MAX) > source_commit_seq,
+        "precondition: rebuilt z_key seq ({}) must exceed source commit_seq ({source_commit_seq})",
+        dest_db.get_seq_for_key("z_key", u64::MAX)
+    );
+    assert!(
+        matches!(
+            dest_db.find("z_key", source_commit_seq),
+            Err(omni_engine::OmniError::StaleSnapshot { read_seq, floor })
+                if read_seq == source_commit_seq && floor > source_commit_seq
+        ),
+        "precondition: reading at source_commit_seq ({source_commit_seq}) on destination must fail closed with StaleSnapshot"
+    );
+
+    // Retry on the destination MUST NOT return the invalid source commit_seq;
+    // commit_outcome explicitly reports AlreadyCommittedViaSnapshot.
+    let dest_participant = TwoPhaseParticipant::new(2, dest_db.clone());
+    assert!(
+        dest_participant.commit(txn_id).is_err(),
+        "destination commit() retry after snapshot install must not return stale source commit_seq"
+    );
+    assert_eq!(
+        dest_participant.commit_outcome(txn_id).unwrap(),
+        CommitOutcome::AlreadyCommittedViaSnapshot
+    );
+
+    // Original storage history on source still returns the exact commit_seq on retry.
+    assert_eq!(
+        source_participant.commit(txn_id).unwrap(),
+        source_commit_seq
+    );
+    assert_eq!(
+        source_participant.commit_outcome(txn_id).unwrap(),
+        CommitOutcome::CommittedAt(source_commit_seq)
+    );
+}
+
+#[test]
+fn test_clustered_2pc_prepare_rechecks_read_seq_and_aborts_stale_writes() {
+    use omni_engine::WriteBatch;
+    use omni_engine::dist_txn::{DistWrite, TwoPhaseParticipant, Vote};
+
+    let (db, _dir) = boot_single_node_live_raft("clustered_2pc_prepare_recheck");
+    let participant = TwoPhaseParticipant::new(1, db.clone());
+    let stale_read_seq = db.get_seq().saturating_sub(1);
+
+    // Advance key through live Raft after stale_read_seq was captured.
+    let mut wb = WriteBatch::new();
+    wb.set("guarded_2pc_key", "written_after_snapshot".into())
+        .unwrap();
+    db.commit_batch(&wb).unwrap();
+
+    let writes = vec![DistWrite {
+        node_id: 1,
+        key: "guarded_2pc_key".into(),
+        value: Some("stale_2pc_write".into()),
+        ttl: 0,
+    }];
+    let res = participant.prepare_with_snapshot((1, 1), &writes, stale_read_seq);
+    match res.vote {
+        Vote::Abort(reason) => assert!(
+            reason.contains("SSI CONFLICT"),
+            "expected SSI CONFLICT abort on stale clustered prepare, got: {reason}"
+        ),
+        Vote::Commit => panic!("stale clustered 2PC prepare must not vote Commit"),
+    }
+
+    // Replacing SSI history with a raised eviction floor (as snapshot install
+    // does) also rejects prepare_with_snapshot below that floor.
+    let pre_floor_seq = db.get_seq();
+    db.ssi_history()
+        .install_from(Vec::new(), pre_floor_seq.saturating_add(10));
+    let floor_res = participant.prepare_with_snapshot((1, 2), &writes, pre_floor_seq);
+    match floor_res.vote {
+        Vote::Abort(reason) => assert!(
+            reason.contains("SSI CONFLICT"),
+            "expected SSI CONFLICT abort when eviction floor passed read_seq, got: {reason}"
+        ),
+        Vote::Commit => panic!("prepare below eviction floor must not vote Commit"),
+    }
+
+    // Key must remain unlocked so a subsequent plain write succeeds.
+    let mut after = WriteBatch::new();
+    after
+        .set("guarded_2pc_key", "still_writable".into())
+        .unwrap();
+    db.commit_batch(&after).unwrap();
+    assert_eq!(
+        db.find("guarded_2pc_key", db.get_seq()).unwrap(),
+        Some("still_writable".into())
+    );
 }

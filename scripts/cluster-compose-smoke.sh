@@ -17,6 +17,7 @@ export OMNIKV_IMAGE="$IMAGE"
 export OMNIKV_TLS_INSECURE_SKIP="${OMNIKV_TLS_INSECURE_SKIP:-true}"
 export OMNIKV_JWT_SECRET="${OMNIKV_JWT_SECRET:-omnikv-smoke-jwt-secret-0123456789abcdef}"
 export OMNIKV_BOOTSTRAP_ADMIN_KEY="${OMNIKV_BOOTSTRAP_ADMIN_KEY:-omnikv-smoke-admin-key-0123456789abcdef}"
+export OMNIKV_RAFT_AUTH_TOKEN="${OMNIKV_RAFT_AUTH_TOKEN:-omnikv-smoke-raft-token-0123456789abcdef}"
 
 # Host TCP ports the compose file maps for the three nodes.
 TCP_PORTS=(18080 18081 18082)

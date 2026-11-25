@@ -53,14 +53,17 @@ Tokens contain a `role` claim. Current valid roles are:
 | `read` | `GET /kv/:key`, `GET /scan` | Read-only data-plane access. |
 | `write` | Read routes plus `POST /kv`, `DELETE /kv/:key`, `POST /batch` | Data-plane mutation. Does not allow backup or admin operations. |
 | `backup` | `POST /admin/backup` | Backup-only operational access. Does not allow compaction or metrics. |
-| `restore` | Reserved for future restore endpoints | Restore endpoints must require `restore` or `admin` and emit restore audit events before release. |
-| `cluster` | Reserved for future cluster-management endpoints | Cluster endpoints must require `cluster` or `admin` and emit cluster audit events before release. |
+| `restore` | `POST /admin/restore` | Restore-only operational access. The request accepts a backup filename relative to the configured backup directory and a restore directory relative to the data directory. |
+| `cluster` | `GET /cluster/status` | Cluster-topology access. Does not permit data writes, backup, restore, or compaction. |
 | `admin` | All REST roles plus admin endpoints | Full administrative access. Keep TTLs short. |
 
 Admin-only endpoints currently include:
 
 - `GET /metrics`
 - `POST /admin/compact`
+
+`POST /admin/restore` is intentionally not admin-only: it requires `restore`
+or `admin` and writes only into a new restore directory.
 
 Backup is intentionally separate from admin. A backup token can create a backup
 but cannot compact the database or access unrelated admin endpoints.
@@ -81,13 +84,16 @@ Audited events include:
 | `auth.token.created` | Bootstrap key successfully minted a JWT. |
 | `auth.token.denied` | Bootstrap token request rejected. |
 | `backup.created` | Backup request succeeds or fails. |
+| `restore.started` | Restore request is accepted or denied during path validation. |
+| `restore.completed` | Restore succeeds or fails after the archive operation. |
+| `cluster.status` | A caller reads protected cluster topology. |
 | `admin.compact` | Compaction request succeeds or fails. |
 | `data.delete` | Direct REST delete succeeds or fails. |
 | `data.batch_delete` | Batch containing deletes succeeds or fails. |
 
-Future restore/config endpoints must add audit events before they are exposed.
-Use event names such as `restore.started`, `restore.completed`,
-`restore.failed`, and `config.changed`.
+Future configuration endpoints must add audit events before they are exposed;
+use an event such as `config.changed` and never log bearer tokens, bootstrap
+keys, request bodies, or user data values.
 
 ## Abuse controls
 
@@ -122,4 +128,3 @@ and tune `OMNIKV_RATE_LIMIT_PER_SEC`, `OMNIKV_RATE_LIMIT_BURST`, and
   logs.
 - Test backup creation and restore drills before relying on backups.
 - Keep rate limits enabled and monitor rejection counters.
-

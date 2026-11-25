@@ -3,13 +3,17 @@
 //! Stores table definitions (columns, types) inside OmniKV itself
 //! using the key prefix `\x00CATALOG\x00`.
 
+use crate::secondary_index::IndexManager;
 use crate::{OmniError, OmniKV, WriteBatch};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::str::FromStr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 const CATALOG_PREFIX: &str = "\x00CATALOG\x00";
+const DROPPING_TABLE_PREFIX: &str = "\x00DROPPING_TABLE\x00";
+static NEXT_TABLE_UID_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum ColumnType {
@@ -67,7 +71,10 @@ impl ColumnType {
                 .unwrap_or_else(|_| value.to_string()),
             Self::Float => value
                 .parse::<f64>()
-                .map(|f| f.to_string())
+                .map(|f| {
+                    let normalized = if f == 0.0 { 0.0 } else { f };
+                    normalized.to_string()
+                })
                 .unwrap_or_else(|_| value.to_string()),
             _ => value.to_string(),
         }
@@ -108,9 +115,26 @@ pub struct TableDef {
     /// deserialized from a manifest written before the field existed.
     #[serde(default)]
     pub row_format: RowFormat,
+    /// Durable per-creation table identity so drop-and-recreate with the same
+    /// table name produces a distinct identity for schema migration receipts.
+    #[serde(default)]
+    pub table_uid: String,
 }
 
 impl TableDef {
+    pub(crate) fn generate_uid() -> String {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let seq = NEXT_TABLE_UID_COUNTER.fetch_add(1, Ordering::Relaxed);
+        format!("{nanos:x}_{seq:x}")
+    }
+
+    pub(crate) fn durable_identity(&self) -> String {
+        format!("{}:{}:{}", self.table_uid, self.created_at, self.name)
+    }
+
     pub fn row_prefix(&self) -> String {
         format!("\x00T\x00{}\x00", self.name)
     }
@@ -126,17 +150,29 @@ impl TableDef {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PendingTableDrop {
+    table: TableDef,
+    #[serde(default)]
+    rename_stage_keys: Vec<String>,
+}
+
 /// The table catalog — stored inside OmniKV itself.
 pub struct Catalog {
     db: Arc<OmniKV>,
     cache: std::sync::RwLock<HashMap<String, TableDef>>,
+    pending_drop_lock: std::sync::Mutex<()>,
+    index_manager: Arc<IndexManager>,
 }
 
 impl Catalog {
     pub fn new(db: Arc<OmniKV>) -> Self {
+        let index_manager = Arc::new(IndexManager::new(db.clone()));
         let cat = Self {
             db,
             cache: std::sync::RwLock::new(HashMap::new()),
+            pending_drop_lock: std::sync::Mutex::new(()),
+            index_manager,
         };
         cat.load_all(None);
         cat
@@ -147,9 +183,12 @@ impl Catalog {
     /// connection migrated in the meantime would otherwise decode this
     /// transaction's rows under the wrong NULL encoding.
     pub fn at_snapshot(db: Arc<OmniKV>, seq: u64) -> Self {
+        let index_manager = Arc::new(IndexManager::new(db.clone()));
         let cat = Self {
             db,
             cache: std::sync::RwLock::new(HashMap::new()),
+            pending_drop_lock: std::sync::Mutex::new(()),
+            index_manager,
         };
         cat.load_all(Some(seq));
         cat
@@ -157,10 +196,7 @@ impl Catalog {
 
     fn load_all(&self, seq: Option<u64>) {
         let seq = seq.unwrap_or_else(|| self.db.get_seq());
-        if let Ok(results) = self
-            .db
-            .scan(CATALOG_PREFIX, &format!("{}\x7F", CATALOG_PREFIX), seq)
-        {
+        if let Ok(results) = self.db.scan_prefix(CATALOG_PREFIX, seq) {
             let mut cache = self
                 .cache
                 .write()
@@ -173,8 +209,167 @@ impl Catalog {
         }
     }
 
-    pub fn create_table(&self, table: TableDef) -> Result<(), String> {
+    /// Storage key for a durable large-table `DROP-IN-PROGRESS` marker.
+    pub fn dropping_table_key(name: &str) -> String {
+        format!("{}{}", DROPPING_TABLE_PREFIX, name.to_lowercase())
+    }
+
+    /// Drains any interrupted large-table drop for `name` before the name can
+    /// be recreated or reused. Safe and idempotent to call when no drop is pending.
+    pub fn finish_pending_drop(&self, name: &str) -> Result<(), String> {
+        let _drop_guard = self
+            .pending_drop_lock
+            .lock()
+            .map_err(|_| "catalog pending-drop lock poisoned".to_string())?;
+        self.finish_pending_drop_locked(name)
+    }
+
+    fn parse_pending_table_drop(dropping_key: &str, raw: &str) -> Result<PendingTableDrop, String> {
+        if let Ok(pending) = serde_json::from_str::<PendingTableDrop>(raw) {
+            return Ok(pending);
+        }
+        let table: TableDef = serde_json::from_str(raw)
+            .map_err(|e| format!("Invalid pending DROP TABLE record '{dropping_key}': {e}"))?;
+        Ok(PendingTableDrop {
+            table,
+            rename_stage_keys: Vec::new(),
+        })
+    }
+
+    fn finish_pending_drop_locked(&self, name: &str) -> Result<(), String> {
+        let dropping_key = Self::dropping_table_key(name);
+        let Some(raw) = self
+            .db
+            .find(&dropping_key, self.db.get_seq())
+            .map_err(|e| format!("{e:?}"))?
+        else {
+            return Ok(());
+        };
+        let pending = Self::parse_pending_table_drop(&dropping_key, &raw)?;
+        self.drain_dropping_table_entry(&dropping_key, &pending)
+    }
+
+    /// Completes all interrupted large-table drops recorded under
+    /// `\x00DROPPING_TABLE\x00`, returning the number of pending drops finalized.
+    pub fn recover_pending_drops(&self) -> Result<usize, String> {
+        let _drop_guard = self
+            .pending_drop_lock
+            .lock()
+            .map_err(|_| "catalog pending-drop lock poisoned".to_string())?;
+        let seq = self.db.get_seq();
+        let pending = self
+            .db
+            .scan_prefix(DROPPING_TABLE_PREFIX, seq)
+            .map_err(|e| format!("{e:?}"))?;
+        let mut recovered = 0usize;
+        for (dropping_key, raw) in pending {
+            let record = Self::parse_pending_table_drop(&dropping_key, &raw)?;
+            self.drain_dropping_table_entry(&dropping_key, &record)?;
+            recovered += 1;
+        }
+        Ok(recovered)
+    }
+
+    fn drain_dropping_table_entry(
+        &self,
+        dropping_key: &str,
+        pending: &PendingTableDrop,
+    ) -> Result<(), String> {
+        let table = &pending.table;
+        let chunk_cap = WriteBatch::MAX_OPS.saturating_sub(4).max(1);
+        let row_prefix = table.row_prefix();
+        loop {
+            let seq = self.db.get_seq();
+            let chunk = self
+                .db
+                .scan_prefix_limit(&row_prefix, seq, chunk_cap.saturating_add(1))
+                .map_err(|e| format!("{e:?}"))?;
+            if chunk.is_empty() {
+                break;
+            }
+            let has_more = chunk.len() > chunk_cap;
+            let mut batch = WriteBatch::new();
+            for (key, _) in chunk.into_iter().take(chunk_cap) {
+                batch.delete(&key).map_err(|e| format!("{e:?}"))?;
+            }
+            self.db.commit_batch(&batch).map_err(|e| format!("{e:?}"))?;
+            if has_more {
+                crate::failpoints::maybe_fail("catalog::drop_table_after_partial_chunk")
+                    .map_err(|e| format!("catalog drop_table failure point: {e}"))?;
+            }
+        }
+
+        self.index_manager
+            .cleanup_retired_indexes_for_collection(
+                &table.name,
+                crate::secondary_index::IndexNamespace::Sql,
+            )
+            .map_err(|e| format!("{e:?}"))?;
+
+        let mut stage_keys: std::collections::BTreeSet<String> =
+            pending.rename_stage_keys.iter().cloned().collect();
+        for (stage_key, _) in crate::schema::SchemaManager::active_rename_stages_for_namespace(
+            &self.db,
+            &table.name,
+            crate::secondary_index::IndexNamespace::Sql,
+            self.db.get_seq(),
+        )
+        .map_err(|e| format!("{e:?}"))?
+        {
+            stage_keys.insert(stage_key);
+        }
+        for stage_key in stage_keys {
+            let row_marker_prefix =
+                crate::schema::SchemaManager::rename_row_stage_prefix(&stage_key);
+            loop {
+                let marker_seq = self.db.get_seq();
+                let markers = self
+                    .db
+                    .scan_prefix_limit(&row_marker_prefix, marker_seq, chunk_cap.saturating_add(1))
+                    .map_err(|e| format!("{e:?}"))?;
+                if markers.is_empty() {
+                    let mut clear_stage = WriteBatch::new();
+                    clear_stage
+                        .delete(&stage_key)
+                        .map_err(|e| format!("{e:?}"))?;
+                    self.db
+                        .commit_batch(&clear_stage)
+                        .map_err(|e| format!("{e:?}"))?;
+                    break;
+                }
+                let has_more = markers.len() > chunk_cap;
+                let mut batch = WriteBatch::new();
+                for (marker_key, _) in markers.into_iter().take(chunk_cap) {
+                    batch.delete(&marker_key).map_err(|e| format!("{e:?}"))?;
+                }
+                if !has_more {
+                    batch.delete(&stage_key).map_err(|e| format!("{e:?}"))?;
+                    self.db.commit_batch(&batch).map_err(|e| format!("{e:?}"))?;
+                    break;
+                }
+                self.db.commit_batch(&batch).map_err(|e| format!("{e:?}"))?;
+            }
+        }
+
+        let mut finalize = WriteBatch::new();
+        finalize
+            .delete(dropping_key)
+            .map_err(|e| format!("{e:?}"))?;
+        self.db
+            .commit_batch(&finalize)
+            .map_err(|e| format!("{e:?}"))?;
+        Ok(())
+    }
+
+    pub fn create_table(&self, mut table: TableDef) -> Result<(), String> {
+        let _drop_guard = self
+            .pending_drop_lock
+            .lock()
+            .map_err(|_| "catalog pending-drop lock poisoned".to_string())?;
         let name_lower = table.name.to_lowercase();
+        if table.table_uid.is_empty() {
+            table.table_uid = TableDef::generate_uid();
+        }
         {
             let cache = self
                 .cache
@@ -184,6 +379,9 @@ impl Catalog {
                 return Err(format!("Table '{}' already exists", table.name));
             }
         }
+        // Finish any interrupted large drop for this table name before writing
+        // a new catalog entry so orphaned rows/indexes can never resurrect.
+        self.finish_pending_drop_locked(&table.name)?;
 
         let key = format!("{}{}", CATALOG_PREFIX, name_lower);
         let value = serde_json::to_string(&table).map_err(|e| format!("Serialize: {}", e))?;
@@ -203,6 +401,10 @@ impl Catalog {
     }
 
     pub fn drop_table(&self, name: &str) -> Result<(), String> {
+        let _drop_guard = self
+            .pending_drop_lock
+            .lock()
+            .map_err(|_| "catalog pending-drop lock poisoned".to_string())?;
         let name_lower = name.to_lowercase();
         let table = {
             let cache = self
@@ -215,34 +417,175 @@ impl Catalog {
                 .ok_or_else(|| format!("Table '{}' does not exist", name))?
         };
 
-        // Delete all rows
-        let prefix = table.row_prefix();
         let seq = self.db.get_seq();
-        let rows = self
-            .db
-            .scan(&prefix, &format!("{}\x7F", prefix), seq)
-            .map_err(|e| format!("{:?}", e))?;
+        let crate::secondary_index::CollectionIndexDropPlan {
+            active: active_indexes,
+            retired: retired_indexes,
+        } = self
+            .index_manager
+            .plan_drop_indexes_for_collection_at(&table.name, seq)
+            .map_err(|e| format!("{e:?}"))?;
+        let stage_entries = crate::schema::SchemaManager::active_rename_stages_for_namespace(
+            &self.db,
+            &table.name,
+            crate::secondary_index::IndexNamespace::Sql,
+            seq,
+        )
+        .map_err(|e| format!("{e:?}"))?;
 
-        // Delete the table rows and catalog entry in one atomic batch. The
-        // scan above must succeed before we build the batch, so corruption
-        // cannot turn DROP into a schema-only delete; one commit also avoids
-        // leaving orphaned rows if the second of two commits would fail.
-        let mut batch = WriteBatch::new();
-        for (key, _) in &rows {
-            batch.delete(key).map_err(|e| format!("{:?}", e))?;
-        }
         let cat_key = format!("{}{}", CATALOG_PREFIX, name_lower);
-        batch.delete(&cat_key).map_err(|e| format!("{:?}", e))?;
-        self.db
-            .commit_batch(&batch)
-            .map_err(|e| format!("{:?}", e))?;
+        let fixed_meta_ops = 1usize
+            .saturating_add(active_indexes.len().saturating_mul(2))
+            .saturating_add(retired_indexes.len())
+            .saturating_add(stage_entries.len());
 
-        let mut cache = self
-            .cache
-            .write()
-            .expect("catalog cache RwLock poisoned: fatal invariant");
-        cache.remove(&name_lower);
-        Ok(())
+        // Fast path: if all rows, index entries, rename markers, and metadata
+        // fit in a single WriteBatch, delete everything atomically in one commit.
+        let mut fits_single_batch = fixed_meta_ops <= WriteBatch::MAX_OPS;
+        let mut single_batch_data_keys: Vec<String> = Vec::new();
+        if fits_single_batch {
+            let mut remaining = WriteBatch::MAX_OPS.saturating_sub(fixed_meta_ops);
+            let row_chunk = self
+                .db
+                .scan_prefix_limit(&table.row_prefix(), seq, remaining.saturating_add(1))
+                .map_err(|e| format!("{e:?}"))?;
+            if row_chunk.len() > remaining {
+                fits_single_batch = false;
+            } else {
+                remaining = remaining.saturating_sub(row_chunk.len());
+                single_batch_data_keys.extend(row_chunk.into_iter().map(|(k, _)| k));
+            }
+
+            if fits_single_batch {
+                for id in active_indexes
+                    .iter()
+                    .map(|d| d.id)
+                    .chain(retired_indexes.iter().map(|(_, d)| d.id))
+                {
+                    let idx_prefix = IndexManager::index_entry_prefix_for_id(id);
+                    let chunk = self
+                        .db
+                        .scan_prefix_limit(&idx_prefix, seq, remaining.saturating_add(1))
+                        .map_err(|e| format!("{e:?}"))?;
+                    if chunk.len() > remaining {
+                        fits_single_batch = false;
+                        break;
+                    }
+                    remaining = remaining.saturating_sub(chunk.len());
+                    single_batch_data_keys.extend(chunk.into_iter().map(|(k, _)| k));
+                }
+            }
+
+            if fits_single_batch {
+                for (stage_key, _) in &stage_entries {
+                    let row_marker_prefix =
+                        crate::schema::SchemaManager::rename_row_stage_prefix(stage_key);
+                    let chunk = self
+                        .db
+                        .scan_prefix_limit(&row_marker_prefix, seq, remaining.saturating_add(1))
+                        .map_err(|e| format!("{e:?}"))?;
+                    if chunk.len() > remaining {
+                        fits_single_batch = false;
+                        break;
+                    }
+                    remaining = remaining.saturating_sub(chunk.len());
+                    single_batch_data_keys.extend(chunk.into_iter().map(|(k, _)| k));
+                }
+            }
+        }
+
+        if fits_single_batch {
+            let mut batch = WriteBatch::new();
+            let mut ssi_write_keys = Vec::with_capacity(active_indexes.len().saturating_add(1));
+            for key in &single_batch_data_keys {
+                batch.delete(key).map_err(|e| format!("{e:?}"))?;
+            }
+            for def in &active_indexes {
+                let (idx_cat_key, idx_ready_key) = IndexManager::index_meta_keys_for_def(def);
+                batch.delete(&idx_cat_key).map_err(|e| format!("{e:?}"))?;
+                batch.delete(&idx_ready_key).map_err(|e| format!("{e:?}"))?;
+                ssi_write_keys.push(idx_cat_key);
+            }
+            for (ret_key, _) in &retired_indexes {
+                batch.delete(ret_key).map_err(|e| format!("{e:?}"))?;
+            }
+            for (stage_key, _) in &stage_entries {
+                batch.delete(stage_key).map_err(|e| format!("{e:?}"))?;
+            }
+            batch.delete(&cat_key).map_err(|e| format!("{e:?}"))?;
+            ssi_write_keys.push(cat_key);
+            let commit_seq = self.db.commit_batch(&batch).map_err(|e| format!("{e:?}"))?;
+            self.db.ssi_history().record_committed(
+                0,
+                commit_seq,
+                &crate::transaction::SsiCommitRecord {
+                    txn_id: 0,
+                    write_keys: ssi_write_keys,
+                    read_keys: Vec::new(),
+                    read_ranges: Vec::new(),
+                },
+            );
+            let mut cache = self
+                .cache
+                .write()
+                .expect("catalog cache RwLock poisoned: fatal invariant");
+            cache.remove(&name_lower);
+            return Ok(());
+        }
+
+        // Large-table path: atomically remove the table from the catalog,
+        // retire its active SQL indexes, and persist a durable DROP-IN-PROGRESS
+        // marker BEFORE deleting any row chunks. A crash at any subsequent point
+        // leaves the table hidden and recoverable via `recover_pending_drops`,
+        // `DROP TABLE IF EXISTS`, or `CREATE TABLE` with the same name.
+        let cutover_ops = 2usize.saturating_add(active_indexes.len().saturating_mul(3));
+        if cutover_ops > WriteBatch::MAX_OPS {
+            return Err(format!(
+                "DROP TABLE '{}' has too many active SQL indexes ({}) for an atomic cutover batch; drop indexes first",
+                table.name,
+                active_indexes.len()
+            ));
+        }
+        let dropping_key = Self::dropping_table_key(&table.name);
+        let pending_drop = PendingTableDrop {
+            table,
+            rename_stage_keys: stage_entries.into_iter().map(|(k, _)| k).collect(),
+        };
+        let dropping_value = serde_json::to_string(&pending_drop)
+            .map_err(|e| format!("Serialize pending drop table: {e}"))?;
+        let mut cutover = WriteBatch::new();
+        cutover.delete(&cat_key).map_err(|e| format!("{e:?}"))?;
+        let mut write_keys = vec![cat_key];
+        let retired_cat_keys =
+            IndexManager::append_retire_sql_indexes_to_batch(&active_indexes, &mut cutover)
+                .map_err(|e| format!("{e:?}"))?;
+        write_keys.extend(retired_cat_keys);
+        cutover
+            .set(&dropping_key, dropping_value)
+            .map_err(|e| format!("{e:?}"))?;
+        let cutover_seq = self
+            .db
+            .commit_batch(&cutover)
+            .map_err(|e| format!("{e:?}"))?;
+        self.db.ssi_history().record_committed(
+            0,
+            cutover_seq,
+            &crate::transaction::SsiCommitRecord {
+                txn_id: 0,
+                write_keys,
+                read_keys: Vec::new(),
+                read_ranges: Vec::new(),
+            },
+        );
+        {
+            let mut cache = self
+                .cache
+                .write()
+                .expect("catalog cache RwLock poisoned: fatal invariant");
+            cache.remove(&name_lower);
+        }
+
+        self.drain_dropping_table_entry(&dropping_key, &pending_drop)
     }
 
     /// The storage key and serialized TableDef a CREATE TABLE writes —
@@ -323,6 +666,11 @@ impl Catalog {
         cache.get(&name.to_lowercase()).cloned()
     }
 
+    /// Shared index maintenance/catalog view for SQL planning and DML.
+    pub fn index_manager(&self) -> Arc<IndexManager> {
+        self.index_manager.clone()
+    }
+
     pub fn list_tables(&self) -> Vec<String> {
         let cache = self
             .cache
@@ -350,7 +698,7 @@ impl Catalog {
     ) -> Result<Vec<String>, String> {
         let mut entries: BTreeMap<_, _> = self
             .db
-            .scan(CATALOG_PREFIX, &format!("{}\x7F", CATALOG_PREFIX), seq)
+            .scan_prefix(CATALOG_PREFIX, seq)
             .map_err(|e| format!("Catalog scan failed: {e:?}"))?
             .into_iter()
             .collect();

@@ -14,6 +14,8 @@ fn test_manifest(dir: &TempDir) -> Manifest {
         sstables: vec![],
         l1_sstables: vec![],
         max_seq: 0,
+        wal_checkpoint_seq: 0,
+        read_seq_floor: 0,
         format_version: MANIFEST_FORMAT_VERSION,
     }
 }
@@ -98,6 +100,8 @@ fn test_manifest_round_trip() {
         sstables: vec!["a.sst".into(), "b.sst".into()],
         l1_sstables: vec!["c.sst".into()],
         max_seq: 12345,
+        wal_checkpoint_seq: 42,
+        read_seq_floor: 17,
         format_version: MANIFEST_FORMAT_VERSION,
     };
     original.save(&path).expect("save");
@@ -105,6 +109,8 @@ fn test_manifest_round_trip() {
     assert_eq!(loaded.heap_path, original.heap_path);
     assert_eq!(loaded.sstables, original.sstables);
     assert_eq!(loaded.max_seq, original.max_seq);
+    assert_eq!(loaded.wal_checkpoint_seq, 42);
+    assert_eq!(loaded.read_seq_floor, 17);
     assert_eq!(loaded.format_version, MANIFEST_FORMAT_VERSION);
 }
 

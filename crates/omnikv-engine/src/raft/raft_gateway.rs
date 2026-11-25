@@ -160,6 +160,10 @@ impl ClusterGateway {
     /// lock; this is what makes the leader's committed view gap-free.
     async fn propose_locked(&self, cmd: RaftCommand) -> Result<WriteAck, RaftWriteError> {
         cmd.protects_system_keys().map_err(RaftWriteError::other)?;
+        self.apply_proposal_locked(cmd).await
+    }
+
+    async fn apply_proposal_locked(&self, cmd: RaftCommand) -> Result<WriteAck, RaftWriteError> {
         if cmd.is_empty() {
             // Nothing to replicate — nothing to ack either. Callers that
             // need read-only round-trip semantics use `probe()`.
@@ -255,11 +259,17 @@ impl ClusterGateway {
         self.block_on_ctx(async { self.probe().await })
     }
 
+    /// Blocking fence that waits for any in-flight consensus proposal to
+    /// complete and apply locally.
+    pub(crate) fn fence_blocking(&self) {
+        let _flight = self.flight_blocking();
+    }
+
     /// The `commit_batch` facade for sync-thread callers when clustered:
     /// serializes the batch into one [`RaftCommand`], proposes, waits for
-    /// local apply. Reached through the [`crate::OmniKV::commit_batch`]
-    /// engine hook — pgwire threads and SQL autocommit land here with no
-    /// code changes of their own.
+    /// local apply. (`crate::OmniKV::commit_batch` calls
+    /// [`Self::commit_batch_checked`] to also enforce 2PC prepared-key checks
+    /// under the flight lock.)
     pub fn commit_batch(&self, batch: &crate::WriteBatch) -> Result<u64, crate::OmniError> {
         let _flight = self.flight_blocking();
         let cmd = RaftCommand::from_batch(batch);
@@ -270,6 +280,168 @@ impl ClusterGateway {
             .block_on_ctx(async { self.propose_locked(cmd).await })
             .map_err(RaftWriteError::into_omni_error)?;
         Ok(ack.index)
+    }
+
+    pub(crate) fn commit_batch_checked(
+        &self,
+        batch: &crate::WriteBatch,
+        ssi_history: &crate::transaction::SsiHistory,
+    ) -> Result<u64, crate::OmniError> {
+        let _flight = self.flight_blocking();
+        if let Some(conflict) = ssi_history.check_batch_prepared_conflicts(batch) {
+            return Err(crate::OmniError::IoError(conflict));
+        }
+        let cmd = RaftCommand::from_batch(batch);
+        if cmd.is_empty() {
+            return Ok(0);
+        }
+        let ack = self
+            .block_on_ctx(async { self.propose_locked(cmd).await })
+            .map_err(RaftWriteError::into_omni_error)?;
+        Ok(ack.index)
+    }
+
+    /// Internal 2PC commit through consensus. Public APIs reject these namespaces.
+    pub(crate) fn commit_2pc_batch(
+        &self,
+        batch: &crate::WriteBatch,
+    ) -> Result<u64, crate::OmniError> {
+        let _flight = self.flight_blocking();
+        let command = RaftCommand::from_batch(batch);
+        command
+            .protects_raft_keys()
+            .map_err(crate::OmniError::IoError)?;
+        let ack = self
+            .block_on_ctx(self.apply_proposal_locked(command))
+            .map_err(RaftWriteError::into_omni_error)?;
+        Ok(ack.commit_seq)
+    }
+
+    pub(crate) fn commit_2pc_prepare_checked<F>(
+        &self,
+        db: &crate::OmniKV,
+        batch: &crate::WriteBatch,
+        read_seq: u64,
+        write_keys: &[String],
+        build_validated: F,
+    ) -> Result<u64, crate::dist_txn::PrepareCommitError>
+    where
+        F: FnOnce(u64) -> Result<crate::WriteBatch, crate::OmniError>,
+    {
+        use crate::dist_txn::PrepareCommitError;
+        let _flight = self.flight_blocking();
+        let epoch_before = {
+            let _topology_guard = db.transition_guard.read().map_err(|_| {
+                PrepareCommitError::PreProposal(crate::OmniError::LockPoisoned(
+                    "transition_guard".into(),
+                ))
+            })?;
+            let epoch = db.snapshot_install_epoch();
+            crate::dist_txn::validate_2pc_decision_writes(db, None, batch)
+                .map_err(PrepareCommitError::PreProposal)?;
+            if let Some(conflict) = db.check_2pc_prepare_conflicts(read_seq, write_keys) {
+                return Err(PrepareCommitError::PreProposal(crate::OmniError::IoError(
+                    conflict,
+                )));
+            }
+            epoch
+        };
+        let command = RaftCommand::from_batch(batch);
+        command
+            .protects_raft_keys()
+            .map_err(|e| PrepareCommitError::PreProposal(crate::OmniError::IoError(e)))?;
+        let ack = self
+            .block_on_ctx(self.apply_proposal_locked(command))
+            .map_err(|e| PrepareCommitError::PostProposal(e.into_omni_error()))?;
+        // Re-check under transition_guard after local Raft apply (still
+        // holding `flight`) so any snapshot install or earlier-term Raft apply
+        // that invalidated `read_seq` before our PREPARED record landed forces
+        // Vote::Abort (and durable ABORTED cleanup) before proposing the
+        // validated (`unvalidated: false`) transition.
+        {
+            let _topology_guard = db.transition_guard.read().map_err(|_| {
+                PrepareCommitError::PostProposal(crate::OmniError::LockPoisoned(
+                    "transition_guard".into(),
+                ))
+            })?;
+            if db.snapshot_install_epoch() != epoch_before {
+                return Err(PrepareCommitError::PostProposal(crate::OmniError::IoError(
+                    "snapshot installed concurrently during 2PC prepare validation".into(),
+                )));
+            }
+            if let Some(conflict) = db.check_2pc_prepare_conflicts(read_seq, write_keys) {
+                return Err(PrepareCommitError::PostProposal(crate::OmniError::IoError(
+                    conflict,
+                )));
+            }
+        }
+        // Propose the validated (`unvalidated: false`) transition under the
+        // SAME `_flight` lock. The state machine's deterministic 2PC write
+        // validator additionally rejects transitioning any `snapshot_imported`
+        // or missing unvalidated record, closing the snapshot-install race.
+        let validated_batch =
+            build_validated(ack.commit_seq).map_err(PrepareCommitError::PostProposal)?;
+        {
+            let _topology_guard = db.transition_guard.read().map_err(|_| {
+                PrepareCommitError::PostProposal(crate::OmniError::LockPoisoned(
+                    "transition_guard".into(),
+                ))
+            })?;
+            if db.snapshot_install_epoch() != epoch_before {
+                return Err(PrepareCommitError::PostProposal(crate::OmniError::IoError(
+                    "snapshot installed concurrently before 2PC validate commit".into(),
+                )));
+            }
+            crate::dist_txn::validate_2pc_decision_writes(db, None, &validated_batch)
+                .map_err(PrepareCommitError::PostProposal)?;
+            if let Some(conflict) = db.check_2pc_prepare_conflicts(read_seq, write_keys) {
+                return Err(PrepareCommitError::PostProposal(crate::OmniError::IoError(
+                    conflict,
+                )));
+            }
+        }
+        let validated_cmd = RaftCommand::from_batch(&validated_batch);
+        validated_cmd
+            .protects_raft_keys()
+            .map_err(|e| PrepareCommitError::PostProposal(crate::OmniError::IoError(e)))?;
+        self.block_on_ctx(self.apply_proposal_locked(validated_cmd))
+            .map_err(|e| PrepareCommitError::PostProposal(e.into_omni_error()))?;
+        // Final post-validate check under transition_guard before returning Ok
+        // so even an intervening snapshot install forces Vote::Abort + cleanup.
+        {
+            let _topology_guard = db.transition_guard.read().map_err(|_| {
+                PrepareCommitError::PostProposal(crate::OmniError::LockPoisoned(
+                    "transition_guard".into(),
+                ))
+            })?;
+            if db.snapshot_install_epoch() != epoch_before {
+                return Err(PrepareCommitError::PostProposal(crate::OmniError::IoError(
+                    "snapshot installed concurrently during 2PC validate commit".into(),
+                )));
+            }
+            if let Some(conflict) = db.check_2pc_prepare_conflicts(read_seq, write_keys) {
+                return Err(PrepareCommitError::PostProposal(crate::OmniError::IoError(
+                    conflict,
+                )));
+            }
+        }
+        Ok(ack.commit_seq)
+    }
+
+    pub(crate) fn commit_2pc_batch_with_ssi(
+        &self,
+        batch: &crate::WriteBatch,
+        ssi: crate::transaction::SsiCommitRecord,
+    ) -> Result<u64, crate::OmniError> {
+        let _flight = self.flight_blocking();
+        let command = RaftCommand::from_batch_with_ssi(batch, ssi);
+        command
+            .protects_raft_keys()
+            .map_err(crate::OmniError::IoError)?;
+        let ack = self
+            .block_on_ctx(self.apply_proposal_locked(command))
+            .map_err(RaftWriteError::into_omni_error)?;
+        Ok(ack.commit_seq)
     }
 
     /// The clustered SSI COMMIT: runs the transaction's validation

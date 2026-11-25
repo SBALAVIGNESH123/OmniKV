@@ -107,15 +107,34 @@ impl RaftCommand {
     /// rejected up front with a clear error instead of an "ERR" apply
     /// result the client can't distinguish from success.
     pub fn protects_system_keys(&self) -> Result<(), String> {
-        const SYS: &str = "__sys__/raft/";
+        self.reject_reserved(&["__COMMIT_MARKER__"], &["__sys__/raft/", "__2PC_"])
+    }
+
+    pub(crate) fn protects_raft_keys(&self) -> Result<(), String> {
+        self.reject_reserved(&["__COMMIT_MARKER__"], &["__sys__/raft/"])
+    }
+
+    fn reject_reserved(&self, exact: &[&str], prefixes: &[&str]) -> Result<(), String> {
+        let match_reserved = |key: &str| {
+            exact
+                .iter()
+                .copied()
+                .find(|exact_key| key == *exact_key)
+                .or_else(|| {
+                    prefixes
+                        .iter()
+                        .copied()
+                        .find(|prefix| key.starts_with(prefix))
+                })
+        };
         for op in &self.sets {
-            if op.key.starts_with(SYS) {
-                return Err(format!("key prefix '{SYS}' is reserved"));
+            if let Some(reserved) = match_reserved(&op.key) {
+                return Err(format!("key prefix '{reserved}' is reserved"));
             }
         }
         for key in &self.dels {
-            if key.starts_with(SYS) {
-                return Err(format!("key prefix '{SYS}' is reserved"));
+            if let Some(reserved) = match_reserved(key) {
+                return Err(format!("key prefix '{reserved}' is reserved"));
             }
         }
         Ok(())
@@ -183,6 +202,55 @@ mod tests {
             ttl: 0,
         });
         assert!(cmd.protects_system_keys().is_err());
+    }
+
+    #[test]
+    fn distributed_transaction_keys_are_rejected_at_proposal_time() {
+        for key in [
+            "__COMMIT_MARKER__",
+            "__2PC_LOG__/1_1/COMMIT",
+            "__2PC_PREPARE__/2/1_1",
+            "__2PC_custom",
+        ] {
+            let mut cmd = RaftCommand::default();
+            cmd.sets.push(SetOp {
+                key: key.into(),
+                value: "forged".into(),
+                ttl: 0,
+            });
+            assert!(
+                cmd.protects_system_keys().is_err(),
+                "{key} must be reserved"
+            );
+        }
+
+        // Exact match for __COMMIT_MARKER__: a user key sharing the prefix is allowed.
+        let mut suffix_cmd = RaftCommand::default();
+        suffix_cmd.sets.push(SetOp {
+            key: "__COMMIT_MARKER__backup".into(),
+            value: "ok".into(),
+            ttl: 0,
+        });
+        assert!(suffix_cmd.protects_system_keys().is_ok());
+        assert!(suffix_cmd.protects_raft_keys().is_ok());
+
+        // protects_raft_keys rejects exact __COMMIT_MARKER__ and __sys__/raft/
+        // while permitting internal 2PC metadata keys.
+        let mut marker_cmd = RaftCommand::default();
+        marker_cmd.sets.push(SetOp {
+            key: "__COMMIT_MARKER__".into(),
+            value: "forged".into(),
+            ttl: 0,
+        });
+        assert!(marker_cmd.protects_raft_keys().is_err());
+
+        let mut internal_2pc = RaftCommand::default();
+        internal_2pc.sets.push(SetOp {
+            key: "__2PC_PREPARE__/2/1_1".into(),
+            value: "{}".into(),
+            ttl: 0,
+        });
+        assert!(internal_2pc.protects_raft_keys().is_ok());
     }
 
     #[test]

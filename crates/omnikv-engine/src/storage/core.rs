@@ -8,7 +8,7 @@ use arc_swap::ArcSwap;
 use crossbeam_skiplist::SkipMap;
 use memmap2::{Mmap, MmapOptions};
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::hash::{Hash, Hasher};
 use std::io::{BufWriter, ErrorKind, Read, Write};
@@ -17,7 +17,7 @@ use std::os::unix::fs::FileExt;
 #[cfg(windows)]
 use std::os::windows::fs::FileExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock, Weak};
 
 pub struct FnvHasher(u64);
@@ -64,6 +64,12 @@ pub enum OmniError {
         found: u32,
         supported: u32,
     },
+    /// A read or read-only commit attempted to use an MVCC `read_seq` older
+    /// than the currently installed snapshot's minimum readable sequence floor.
+    StaleSnapshot {
+        read_seq: u64,
+        floor: u64,
+    },
 }
 
 impl std::fmt::Display for OmniError {
@@ -75,6 +81,10 @@ impl std::fmt::Display for OmniError {
             OmniError::UnsupportedVersion { found, supported } => write!(
                 f,
                 "unsupported manifest version {found}: this build supports up to {supported}"
+            ),
+            OmniError::StaleSnapshot { read_seq, floor } => write!(
+                f,
+                "stale MVCC snapshot: read_seq {read_seq} precedes installed snapshot floor {floor}"
             ),
             OmniError::InvalidCompactionPolicy(reason) => {
                 write!(f, "invalid compaction policy: {reason}")
@@ -461,12 +471,31 @@ pub struct BloomFilter {
     num_hashes: usize,
 }
 
+#[derive(Debug)]
+enum AtomicReplaceError {
+    BeforeRename(OmniError),
+    AfterRenameSyncFailed(OmniError),
+}
+
+impl AtomicReplaceError {
+    fn into_omni_error(self) -> OmniError {
+        match self {
+            Self::BeforeRename(err) | Self::AfterRenameSyncFailed(err) => err,
+        }
+    }
+}
+
 /// Atomically publish a small metadata file after its contents have reached
-/// stable storage. Readers either see the previous complete file or the new
-/// complete file; they never observe a partially-written JSON sidecar.
-fn atomic_replace(path: &str, content: &[u8]) -> Result<(), OmniError> {
+/// stable storage, distinguishing failures before `rename()` from failures in
+/// post-rename directory durability.
+fn atomic_replace_checked(
+    path: &str,
+    content: &[u8],
+    before_rename_failpoint: Option<&str>,
+    after_rename_failpoint: Option<&str>,
+) -> Result<(), AtomicReplaceError> {
     let tmp_path = format!("{path}.tmp");
-    let result = (|| {
+    let before_rename = (|| {
         let mut file = OpenOptions::new()
             .create(true)
             .truncate(true)
@@ -475,25 +504,60 @@ fn atomic_replace(path: &str, content: &[u8]) -> Result<(), OmniError> {
         file.write_all(content)?;
         file.sync_all()?;
         drop(file);
-        std::fs::rename(&tmp_path, path)?;
-
-        // On Unix, syncing the directory makes the rename durable across a
-        // sudden power loss as well as making the file contents durable.
-        #[cfg(unix)]
-        if let Some(parent) = Path::new(path)
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-        {
-            File::open(parent)?.sync_all()?;
+        if let Some(fp) = before_rename_failpoint {
+            crate::failpoints::maybe_fail(fp)?;
         }
-
+        std::fs::rename(&tmp_path, path)?;
         Ok::<(), OmniError>(())
     })();
 
-    if result.is_err() {
+    if let Err(err) = before_rename {
         let _ = std::fs::remove_file(&tmp_path);
+        return Err(AtomicReplaceError::BeforeRename(err));
     }
-    result
+
+    // `rename()` has already made the new file visible at `path`. Any failure
+    // from this point on leaves publication durability uncertain, so callers
+    // must preserve newly referenced files and stop accepting writes under a
+    // superseded in-memory topology.
+    if let Some(fp) = after_rename_failpoint
+        && let Err(err) = crate::failpoints::maybe_fail(fp)
+    {
+        return Err(AtomicReplaceError::AfterRenameSyncFailed(
+            OmniError::IoError(format!("post-rename directory sync failed: {err}")),
+        ));
+    }
+
+    // On Unix, syncing the directory makes the rename durable across a
+    // sudden power loss as well as making the file contents durable.
+    #[cfg(unix)]
+    {
+        let parent = Path::new(path)
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let sync_res: Result<(), std::io::Error> = (|| {
+            let dir = File::open(parent)?;
+            dir.sync_all()
+        })();
+        if let Err(err) = sync_res {
+            return Err(AtomicReplaceError::AfterRenameSyncFailed(
+                OmniError::IoError(format!(
+                    "post-rename directory sync failed for '{}': {err}",
+                    parent.display()
+                )),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+/// Atomically publish a small metadata file after its contents have reached
+/// stable storage. Readers either see the previous complete file or the new
+/// complete file; they never observe a partially-written JSON sidecar.
+fn atomic_replace(path: &str, content: &[u8]) -> Result<(), OmniError> {
+    atomic_replace_checked(path, content, None, None).map_err(AtomicReplaceError::into_omni_error)
 }
 
 impl BloomFilter {
@@ -568,7 +632,7 @@ impl BloomFilter {
 /// install can carry far more ops than a client batch, so they commit
 /// in chunks of this size (`WriteBatch::MAX_OPS`).
 pub const MAX_BATCH_SIZE: usize = 10_000;
-const MAX_VALUE_SIZE: usize = 10 * 1024 * 1024; // 10 MB
+pub(crate) const MAX_VALUE_SIZE: usize = 10 * 1024 * 1024; // 10 MB
 const UNCOMPRESSED_FLAG: u64 = 1 << 63;
 const NUM_SHARDS: usize = 16;
 
@@ -672,6 +736,18 @@ impl WriteBatch {
         Ok(())
     }
 
+    /// Appends an internal metadata write (such as Raft's `last_applied`
+    /// bookmark) that must commit atomically with a full user batch, even when
+    /// the user entry already reached [`MAX_OPS`](Self::MAX_OPS). Still
+    /// enforces [`MAX_VALUE_SIZE`].
+    pub(crate) fn set_internal_meta(&mut self, key: &str, value: String) -> Result<(), OmniError> {
+        if value.len() > MAX_VALUE_SIZE {
+            return Err(OmniError::ValueTooLarge(MAX_VALUE_SIZE));
+        }
+        self.buffered_writes.push((string_to_key(key), value, 0));
+        Ok(())
+    }
+
     pub fn delete(&mut self, key: &str) -> Result<(), OmniError> {
         if self.buffered_writes.len() + self.buffered_deletes.len() >= MAX_BATCH_SIZE {
             return Err(OmniError::BatchTooLarge(MAX_BATCH_SIZE));
@@ -717,6 +793,17 @@ pub struct Manifest {
     pub l1_sstables: Vec<String>,
     #[serde(default)]
     pub max_seq: u64,
+    /// Highest MVCC sequence already rewritten into the current base/heap files
+    /// by heap GC. WAL replay skips records with `seq <= wal_checkpoint_seq` so
+    /// a crash before `wal.clear()` can never replay old-heap offsets into a
+    /// replacement heap.
+    #[serde(default)]
+    pub wal_checkpoint_seq: u64,
+    /// Minimum MVCC `read_seq` valid against the persisted storage topology,
+    /// advanced by Raft snapshot installation so stale pre-install snapshots
+    /// stay rejected even after restart.
+    #[serde(default)]
+    pub read_seq_floor: u64,
     /// Format version. Missing in old manifests → treated as v1.
     #[serde(default = "default_manifest_format_version")]
     pub format_version: u32,
@@ -735,13 +822,27 @@ impl Manifest {
         }
         Ok(m)
     }
-    pub fn save(&self, path: &str) -> Result<(), OmniError> {
+    fn save_checked(&self, path: &str) -> Result<(), AtomicReplaceError> {
         // Always write current format version.
         let mut to_save = self.clone();
         to_save.format_version = MANIFEST_FORMAT_VERSION;
-        let content = serde_json::to_string(&to_save)
-            .map_err(|e| OmniError::IoError(format!("Manifest serialize: {}", e)))?;
-        atomic_replace(path, content.as_bytes())
+        let content = serde_json::to_string(&to_save).map_err(|e| {
+            AtomicReplaceError::BeforeRename(OmniError::IoError(format!(
+                "Manifest serialize: {}",
+                e
+            )))
+        })?;
+        atomic_replace_checked(
+            path,
+            content.as_bytes(),
+            Some("manifest::before_rename"),
+            Some("manifest::sync_dir_after_rename"),
+        )
+    }
+
+    pub fn save(&self, path: &str) -> Result<(), OmniError> {
+        self.save_checked(path)
+            .map_err(AtomicReplaceError::into_omni_error)
     }
 }
 
@@ -809,6 +910,12 @@ impl ScanBufferPool {
             .unwrap_or_default()
     }
 
+    fn clear(&self) {
+        if let Ok(mut buffers) = self.buffers.lock() {
+            buffers.clear();
+        }
+    }
+
     fn release(&self, mut buffer: Vec<u8>) {
         buffer.clear();
         if let Ok(mut buffers) = self.buffers.lock()
@@ -849,21 +956,203 @@ struct ScanCandidate {
     expiry: u64,
 }
 
+type MemShardRange<'a> = crossbeam_skiplist::map::Range<
+    'a,
+    (Vec<u8>, Reverse<u64>),
+    std::ops::RangeFrom<(Vec<u8>, Reverse<u64>)>,
+    (Vec<u8>, Reverse<u64>),
+    ValuePointer,
+>;
+
+enum MergeSource<'a> {
+    MemShard {
+        iter: MemShardRange<'a>,
+        last_key: Option<Vec<u8>>,
+        exhausted: bool,
+    },
+    Sst {
+        iter: SSTableIterator,
+        peeked: Option<OmniRecord>,
+        exhausted: bool,
+    },
+}
+
+impl MergeSource<'_> {
+    fn next_visible(
+        &mut self,
+        start_key: &[u8],
+        end_bound: ScanEnd<'_>,
+        read_seq: u64,
+    ) -> Option<ScanCandidate> {
+        match self {
+            Self::MemShard {
+                iter,
+                last_key,
+                exhausted,
+            } => {
+                if *exhausted {
+                    return None;
+                }
+                for entry in iter.by_ref() {
+                    let (key, rev_seq) = entry.key();
+                    if end_bound.is_past(key) {
+                        *exhausted = true;
+                        return None;
+                    }
+                    let seq = rev_seq.0;
+                    if seq > read_seq {
+                        continue;
+                    }
+                    if last_key.as_deref() == Some(key.as_slice()) {
+                        continue;
+                    }
+                    let owned_key = key.clone();
+                    *last_key = Some(owned_key.clone());
+                    let val = entry.value();
+                    return Some(ScanCandidate {
+                        key: owned_key,
+                        seq,
+                        offset: val.0,
+                        length: val.1,
+                        crc: val.2,
+                        expiry: val.3,
+                    });
+                }
+                *exhausted = true;
+                None
+            }
+            Self::Sst {
+                iter,
+                peeked,
+                exhausted,
+            } => {
+                if *exhausted {
+                    return None;
+                }
+                let mut best: Option<OmniRecord> = None;
+                loop {
+                    let rec = match peeked.take() {
+                        Some(rec) => rec,
+                        None => match iter.next() {
+                            Some(rec) => rec,
+                            None => {
+                                *exhausted = true;
+                                break;
+                            }
+                        },
+                    };
+                    if end_bound.is_past(&rec.key) {
+                        *exhausted = true;
+                        break;
+                    }
+                    if rec.key.as_slice() < start_key {
+                        continue;
+                    }
+                    if let Some(ref current) = best {
+                        if rec.key == current.key {
+                            if rec.is_valid() && rec.seq <= read_seq && rec.seq > current.seq {
+                                best = Some(rec);
+                            }
+                            continue;
+                        }
+                        *peeked = Some(rec);
+                        break;
+                    }
+                    if rec.is_valid() && rec.seq <= read_seq {
+                        best = Some(rec);
+                    }
+                }
+                best.map(|rec| ScanCandidate {
+                    key: rec.key,
+                    seq: rec.seq,
+                    offset: rec.offset,
+                    length: rec.length,
+                    crc: rec.payload_crc32,
+                    expiry: rec.expiry,
+                })
+            }
+        }
+    }
+}
+
+struct MergeHeapEntry {
+    candidate: ScanCandidate,
+    source_id: usize,
+}
+
+impl PartialEq for MergeHeapEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.candidate.key == other.candidate.key
+            && self.candidate.seq == other.candidate.seq
+            && self.source_id == other.source_id
+    }
+}
+
+impl Eq for MergeHeapEntry {}
+
+impl Ord for MergeHeapEntry {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        other
+            .candidate
+            .key
+            .cmp(&self.candidate.key)
+            .then_with(|| self.candidate.seq.cmp(&other.candidate.seq))
+            .then_with(|| other.source_id.cmp(&self.source_id))
+    }
+}
+
+impl PartialOrd for MergeHeapEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ScanEnd<'a> {
+    Inclusive(&'a [u8]),
+    Exclusive(&'a [u8]),
+    Unbounded,
+}
+
+impl ScanEnd<'_> {
+    #[inline]
+    fn is_past(&self, key: &[u8]) -> bool {
+        match *self {
+            Self::Inclusive(end) => key > end,
+            Self::Exclusive(end) => key >= end,
+            Self::Unbounded => false,
+        }
+    }
+}
+
+fn next_unicode_scalar(ch: char) -> Option<char> {
+    let code = ch as u32;
+    if code == char::MAX as u32 {
+        return None;
+    }
+    let next = if code == 0xD7FF { 0xE000 } else { code + 1 };
+    char::from_u32(next)
+}
+
 pub struct ScanIterator<'a> {
     db: &'a OmniKV,
+    heap_reader: Arc<File>,
+    heap_generation: u64,
     candidates: std::vec::IntoIter<ScanCandidate>,
     now: u64,
     read_buffer: PooledScanBuffer,
 }
 
 impl ScanIterator<'_> {
-    fn try_next(&mut self) -> Result<Option<(String, String)>, OmniError> {
+    pub(crate) fn try_next(&mut self) -> Result<Option<(String, String)>, OmniError> {
         for candidate in self.candidates.by_ref() {
             if candidate.length == 0 || (candidate.expiry > 0 && candidate.expiry <= self.now) {
                 continue;
             }
             let key = key_to_string(&candidate.key);
-            let value = self.db.read_from_heap_into(
+            let value = self.db.read_from_heap_with_reader_into(
+                &self.heap_reader,
+                self.heap_generation,
                 candidate.offset,
                 candidate.length,
                 candidate.crc,
@@ -1135,6 +1424,15 @@ pub struct StorageRoots {
     pub frozen_memtables: Arc<Vec<SharedMemtable>>,
     pub manifest: Arc<Manifest>,
     pub heap_reader: Arc<File>,
+    /// Monotonic identifier for the underlying heap file (`heap_reader`),
+    /// incremented whenever GC or Raft snapshot installation replaces the heap.
+    /// Pairs with byte offsets in `block_cache` so reads captured from an older
+    /// root snapshot never read or hit cache entries from a different heap.
+    pub heap_generation: u64,
+    /// Minimum MVCC `read_seq` valid against this topology. Advanced to the
+    /// installed snapshot's floor by Raft `install_snapshot` so pre-install
+    /// transactions cannot silently read records from the replacement snapshot.
+    pub read_seq_floor: u64,
 }
 
 /// Pure storage recovery result — returned by recover_storage_from_path().
@@ -1243,9 +1541,17 @@ pub struct OmniKV {
     pub metrics: Arc<Metrics>,
     pub(crate) active_snapshots: Mutex<std::collections::BTreeMap<u64, usize>>,
     pub(crate) replica_retention_floors: Mutex<BTreeMap<String, u64>>,
-    pub(crate) block_cache: moka::sync::Cache<u64, String>,
+    pub(crate) block_cache: moka::sync::Cache<(u64, u64), String>,
+    pub(crate) next_heap_generation: AtomicU64,
+    /// Monotonically incremented under `transition_guard.write()` on every
+    /// Raft snapshot installation so in-flight 2PC prepares detect any
+    /// intervening snapshot replacement before voting `Commit`.
+    pub(crate) snapshot_install_epoch: AtomicU64,
     scan_buffer_pool: Arc<ScanBufferPool>,
     compaction_policy: RwLock<CompactionPolicy>,
+
+    // Wakes writers stalled on L0 compaction backlog.
+    compaction_cv: (std::sync::Mutex<()>, std::sync::Condvar),
 
     // ── Group commit engine ──
     // Batches concurrent fsyncs: N writers → 1 fsync instead of N fsyncs.
@@ -1275,10 +1581,28 @@ pub struct OmniKV {
     /// [`crate::transaction::SsiHistory`].
     pub(crate) ssi_history: std::sync::Arc<crate::transaction::SsiHistory>,
 
+    /// Live in-flight 2PC coordinator transactions (`txn_id -> owner coordinator instance id`)
+    /// shared across `TwoPhaseCoordinator` handles on this `OmniKV` instance so
+    /// concurrent `recover_with` calls cannot presumed-abort a transaction while
+    /// another coordinator handle on the same database is actively collecting votes.
+    pub(crate) active_2pc_coord_txns: Mutex<HashMap<(u64, u64), u64>>,
+
+    /// All live `TwoPhaseCoordinator` handles currently retaining a `txn_id` in
+    /// their local `active_txns` map (`txn_id -> set of coordinator instance ids`).
+    /// Prevents `gc_completed_logs` from deleting terminal `COMMIT`/`COMPLETE`
+    /// records while another live coordinator handle can still act on `txn_id`.
+    pub(crate) live_2pc_coord_handles: Mutex<HashMap<(u64, u64), HashSet<u64>>>,
+
     // Monotonic per-instance counter for compaction output filenames. The
     // wall clock alone is not unique: two flushes in the same millisecond
     // collide, and create_new(true) then fails with EEXIST.
     file_seq: std::sync::atomic::AtomicU64,
+
+    // Fail-stop write fence tripped whenever manifest `rename()` succeeded but
+    // post-rename directory durability failed, leaving the on-disk manifest and
+    // in-memory topology potentially diverged until reopen/recovery.
+    write_fenced: AtomicBool,
+    write_fence_reason: Mutex<Option<String>>,
 
     // Must be declared last: Rust drops struct fields in declaration order, so
     // all mmap-bearing roots and files are released before the database LOCK
@@ -1340,12 +1664,70 @@ impl OmniKV {
         self.ssi_history.clone()
     }
 
+    /// Fails closed if `manifest_path`'s directory contains an unfinished
+    /// snapshot promotion or failed rollback directory, preventing `open()`
+    /// from silently initializing an empty database over preserved recovery data.
+    fn check_no_unfinished_snapshot_promotion(manifest_path: &str) -> Result<(), OmniError> {
+        const LEGACY_OLD_SNAPSHOT_DIR: &str = "old_snapshot";
+        const OLD_SNAPSHOT_DIR_PREFIX: &str = "old_snapshot_";
+        const INSTALL_COMPLETE_MARKER: &str = ".install_complete";
+        const ROLLBACK_FAILED_MARKER: &str = ".rollback_failed";
+
+        let manifest_exists = Path::new(manifest_path).exists();
+        let data_dir = Path::new(manifest_path)
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let entries = match std::fs::read_dir(data_dir) {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == ErrorKind::NotFound => return Ok(()),
+            Err(err) => return Err(err.into()),
+        };
+
+        for entry in entries {
+            let entry = entry?;
+            let name = entry.file_name();
+            let is_rollback_dir = name == LEGACY_OLD_SNAPSHOT_DIR
+                || name
+                    .to_str()
+                    .is_some_and(|s| s.starts_with(OLD_SNAPSHOT_DIR_PREFIX));
+            if !is_rollback_dir {
+                continue;
+            }
+            let path = entry.path();
+            if manifest_exists && path.is_dir() && std::fs::read_dir(&path)?.next().is_none() {
+                // Empty rollback directory left by a clean rollback or crash
+                // right before removing the empty dir while the live manifest
+                // is present; safe to clean up.
+                let _ = std::fs::remove_dir(&path);
+                continue;
+            }
+            let has_complete = std::fs::read(path.join(INSTALL_COMPLETE_MARKER))
+                .ok()
+                .as_deref()
+                .is_some_and(|b| b == b"ok" || b == b"rolled_back");
+            let has_failed = path.join(ROLLBACK_FAILED_MARKER).exists();
+            if has_complete && !has_failed && manifest_exists {
+                continue;
+            }
+            return Err(OmniError::IoError(format!(
+                "cannot open database '{}': unfinished snapshot promotion/rollback directory '{}' exists; restore from the rollback directory or explicitly set it aside before reopening",
+                manifest_path,
+                path.display()
+            )));
+        }
+        Ok(())
+    }
+
     /// Opens an OmniKV database from the given manifest and WAL paths.
     /// Recovers state from WAL and initializes the storage engine.
     pub fn open(manifest_path: &str, wal_path: &str) -> Result<Arc<Self>, OmniError> {
         let db_lock = DatabaseLock::acquire(manifest_path)?;
+        Self::check_no_unfinished_snapshot_promotion(manifest_path)?;
         let recovered = Self::recover_storage_roots(manifest_path, wal_path)?;
 
+        let persisted_read_seq_floor = recovered.manifest.read_seq_floor;
+        let recovered_max_seq = recovered.max_seq.max(persisted_read_seq_floor);
         let initial_roots = StorageRoots {
             base_mmap: recovered.base_mmap,
             base_bloom: recovered.base_bloom,
@@ -1355,11 +1737,16 @@ impl OmniKV {
             frozen_memtables: Arc::new(Vec::new()),
             manifest: recovered.manifest,
             heap_reader: recovered.heap_reader,
+            heap_generation: 1,
+            read_seq_floor: persisted_read_seq_floor,
         };
 
-        Ok(Arc::new(Self {
+        let ssi_history = std::sync::Arc::new(crate::transaction::SsiHistory::default());
+        ssi_history.advance_eviction_floor(recovered_max_seq);
+
+        let db = Arc::new(Self {
             roots: ArcSwap::from_pointee(initial_roots),
-            global_seq: AtomicU64::new(recovered.max_seq + 1),
+            global_seq: AtomicU64::new(recovered_max_seq.saturating_add(1)),
             heap_file: Mutex::new(recovered.heap_file),
             heap_offset: AtomicU64::new(recovered.heap_offset),
             wal: Mutex::new(recovered.wal),
@@ -1371,19 +1758,29 @@ impl OmniKV {
             active_snapshots: Mutex::new(std::collections::BTreeMap::new()),
             replica_retention_floors: Mutex::new(BTreeMap::new()),
             block_cache: moka::sync::Cache::builder().max_capacity(100_000).build(),
+            next_heap_generation: AtomicU64::new(2),
+            snapshot_install_epoch: AtomicU64::new(0),
             scan_buffer_pool: Arc::new(ScanBufferPool::default()),
             compaction_policy: RwLock::new(CompactionPolicy::default()),
+            compaction_cv: (std::sync::Mutex::new(()), std::sync::Condvar::new()),
             // Group commit: wait up to 200µs for more writers to join each batch.
             // On SSDs, this batches 5-50 concurrent writes into a single fsync.
             group_commit: crate::hardening::GroupCommitEngine::new(200),
             transition_guard: RwLock::new(()),
             cluster_gateway: std::sync::OnceLock::new(),
-            ssi_history: std::sync::Arc::new(crate::transaction::SsiHistory::default()),
+            ssi_history,
+            active_2pc_coord_txns: Mutex::new(HashMap::new()),
+            live_2pc_coord_handles: Mutex::new(HashMap::new()),
             // Start from a process-unique seed so reopening a database does
             // not immediately reuse the previous instance's token sequence.
             file_seq: std::sync::atomic::AtomicU64::new(rand::random()),
+            write_fenced: AtomicBool::new(false),
+            write_fence_reason: Mutex::new(None),
             db_lock,
-        }))
+        });
+        db.sync_prepared_2pc_reservations()?;
+        db.scan_buffer_pool.clear();
+        Ok(db)
     }
 
     // ── Topology accessor helpers ─────────────────────────────────────────────
@@ -1466,14 +1863,70 @@ impl OmniKV {
         self.sstable_count() + self.l1_sstable_count()
     }
 
-    fn remove_frozen_memtable(&self, frozen_idx: usize) -> Result<(), OmniError> {
+    /// Returns `true` when this database instance has entered fail-stop
+    /// read-only mode after an uncertain post-rename manifest publication.
+    pub fn is_write_fenced(&self) -> bool {
+        self.write_fenced.load(Ordering::Acquire)
+    }
+
+    fn trip_write_fence(&self, reason: String) {
+        if let Ok(mut guard) = self.write_fence_reason.lock()
+            && guard.is_none()
+        {
+            *guard = Some(reason);
+        }
+        self.write_fenced.store(true, Ordering::Release);
+        self.notify_compaction_waiters();
+    }
+
+    fn ensure_writes_not_fenced(&self) -> Result<(), OmniError> {
+        if !self.write_fenced.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let reason = self
+            .write_fence_reason
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone())
+            .unwrap_or_else(|| {
+                "storage writes fenced after uncertain manifest publication; reopen required".into()
+            });
+        Err(OmniError::IoError(reason))
+    }
+
+    fn publish_manifest_or_fence(
+        &self,
+        manifest: &Manifest,
+        output_guard: Option<&mut CompactionOutputGuard>,
+    ) -> Result<(), OmniError> {
+        match manifest.save_checked(&self.manifest_path) {
+            Ok(()) => Ok(()),
+            Err(AtomicReplaceError::BeforeRename(err)) => Err(err),
+            Err(AtomicReplaceError::AfterRenameSyncFailed(err)) => {
+                // `rename()` already made the replacement manifest visible on
+                // disk. Never delete newly referenced compaction/GC outputs,
+                // keep prior files intact for live readers, and fail-stop all
+                // further writes until the database is reopened and recovered.
+                if let Some(guard) = output_guard {
+                    guard.disarm();
+                }
+                let reason = format!(
+                    "manifest publication durability uncertain after rename ({err}); writes halted until database reopen"
+                );
+                self.trip_write_fence(reason.clone());
+                Err(OmniError::IoError(reason))
+            }
+        }
+    }
+
+    fn remove_frozen_memtable(&self, target: &SharedMemtable) -> Result<(), OmniError> {
         let _guard = self
             .write_mutex
             .lock()
             .map_err(|_| OmniError::LockPoisoned("compact".into()))?;
         let mut frozen = self.roots.load().frozen_memtables.clone().as_ref().clone();
-        if frozen_idx < frozen.len() {
-            frozen.remove(frozen_idx);
+        if let Some(pos) = frozen.iter().position(|entry| Arc::ptr_eq(entry, target)) {
+            frozen.remove(pos);
             self.update_roots(|r| StorageRoots {
                 frozen_memtables: Arc::new(frozen),
                 ..r.clone()
@@ -1489,6 +1942,33 @@ impl OmniKV {
         let current = self.roots.load();
         let new_roots = f(&current);
         self.roots.store(Arc::new(new_roots));
+    }
+
+    /// Creates and durably syncs an empty base SSTable (4096 bytes for mmap)
+    /// and empty heap file before an initial manifest referencing them is saved.
+    pub(crate) fn init_empty_storage_files(
+        base_path: &str,
+        heap_path: &str,
+    ) -> Result<(), OmniError> {
+        let base_file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(base_path)?;
+        if base_file.metadata()?.len() == 0 {
+            base_file.set_len(4096)?; // dummy length to allow mmap
+        }
+        base_file.sync_all()?;
+
+        let heap_file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(heap_path)?;
+        heap_file.sync_all()?;
+        Ok(())
     }
 
     /// Pure storage recovery — no threads, no side effects.
@@ -1508,26 +1988,43 @@ impl OmniKV {
                 sstables: vec![],
                 l1_sstables: vec![],
                 max_seq: 0,
+                wal_checkpoint_seq: 0,
+                read_seq_floor: 0,
             };
+            Self::init_empty_storage_files(&m.base_path, &m.heap_path)?;
             m.save(manifest_path)?;
             m
         };
 
+        // Every file referenced by an existing manifest must be present and
+        // readable; never fabricate an empty base/heap or silently skip missing
+        // L0/L1 SSTables on recovery.
         let base_file = OpenOptions::new()
-            .create(true)
-            .truncate(false)
             .read(true)
-            .write(true)
-            .open(&manifest.base_path)?;
+            .open(&manifest.base_path)
+            .map_err(|e| {
+                OmniError::IoError(format!(
+                    "missing or unreadable base SSTable '{}' referenced by manifest: {e}",
+                    manifest.base_path
+                ))
+            })?;
         if base_file.metadata()?.len() == 0 {
-            base_file.set_len(4096)?; // dummy length to allow mmap
+            return Err(OmniError::IoError(format!(
+                "corrupt empty base SSTable '{}' referenced by manifest",
+                manifest.base_path
+            )));
         }
         // SAFETY: The base SSTable file is mapped read-only after it is created
         // or opened. OmniKV holds the database LOCK before this point, so no
         // second engine instance can truncate or mutate the file while mapped.
         // Internal compaction never edits a mapped file in place; it writes a
         // new file, syncs it, maps it, and atomically publishes a new root.
-        let base_mmap = Arc::new(unsafe { MmapOptions::new().map(&base_file)? });
+        let base_mmap = Arc::new(unsafe { MmapOptions::new().map(&base_file) }.map_err(|e| {
+            OmniError::IoError(format!(
+                "failed to memory-map base SSTable '{}' referenced by manifest: {e}",
+                manifest.base_path
+            ))
+        })?);
 
         let reader = SSTableReader::from_mmap(base_mmap.clone());
         let base_bloom_path = bloom_path_for_base(&manifest.base_path);
@@ -1549,73 +2046,95 @@ impl OmniKV {
             }
         };
 
-        let mut loaded_sstables = Vec::new();
+        let mut loaded_sstables = Vec::with_capacity(manifest.sstables.len());
         for sst_path in &manifest.sstables {
-            if let Ok(file) = OpenOptions::new().read(true).open(sst_path)
-                // SAFETY: Recovered L0 SSTables are opened read-only and are
-                // immutable once published in the manifest. The database LOCK
-                // prevents concurrent OmniKV processes from mutating them.
-                && let Ok(mmap) = unsafe { MmapOptions::new().map(&file) }
-            {
-                let mmap = Arc::new(mmap);
-                let reader = SSTableReader::from_mmap(mmap.clone());
-                let bloom_path = sst_path.replace(".sst", ".bloom");
-                let bloom = match BloomFilter::load(&bloom_path) {
-                    Ok(b) => b,
-                    Err(_) => {
-                        let mut count = 0;
-                        for _ in reader.iter_from(b"") {
-                            count += 1;
-                        }
-                        let mut b = BloomFilter::new(count.max(100));
-                        for rec in reader.iter_from(b"") {
-                            if rec.is_valid() {
-                                let mut h = FnvHasher::default();
-                                rec.key.hash(&mut h);
-                                b.add(h.finish());
-                            }
-                        }
-                        let _ = b.save(&bloom_path);
-                        b
+            let file = OpenOptions::new().read(true).open(sst_path).map_err(|e| {
+                OmniError::IoError(format!(
+                    "missing or unreadable L0 SSTable '{sst_path}' referenced by manifest: {e}"
+                ))
+            })?;
+            // SAFETY: Recovered L0 SSTables are opened read-only and are
+            // immutable once published in the manifest. The database LOCK
+            // prevents concurrent OmniKV processes from mutating them.
+            let mmap = Arc::new(unsafe { MmapOptions::new().map(&file) }.map_err(|e| {
+                OmniError::IoError(format!(
+                    "failed to memory-map L0 SSTable '{sst_path}' referenced by manifest: {e}"
+                ))
+            })?);
+            let reader = SSTableReader::from_mmap(mmap.clone());
+            let bloom_path = sst_path.replace(".sst", ".bloom");
+            let bloom = match BloomFilter::load(&bloom_path) {
+                Ok(b) => b,
+                Err(_) => {
+                    let mut count = 0;
+                    for _ in reader.iter_from(b"") {
+                        count += 1;
                     }
-                };
-                loaded_sstables.push((mmap, Arc::new(bloom), sst_path.clone()));
-            }
+                    let mut b = BloomFilter::new(count.max(100));
+                    for rec in reader.iter_from(b"") {
+                        if rec.is_valid() {
+                            let mut h = FnvHasher::default();
+                            rec.key.hash(&mut h);
+                            b.add(h.finish());
+                        }
+                    }
+                    let _ = b.save(&bloom_path);
+                    b
+                }
+            };
+            loaded_sstables.push((mmap, Arc::new(bloom), sst_path.clone()));
         }
 
-        let mut loaded_l1_sstables = Vec::new();
+        let mut loaded_l1_sstables = Vec::with_capacity(manifest.l1_sstables.len());
         for sst_path in &manifest.l1_sstables {
-            if let Ok(file) = OpenOptions::new().read(true).open(sst_path)
-                // SAFETY: Recovered L1 SSTables are immutable read-only table
-                // files. They are replaced by publishing new root snapshots,
-                // never by in-place mutation while mapped.
-                && let Ok(mmap) = unsafe { MmapOptions::new().map(&file) }
-            {
-                let mmap = Arc::new(mmap);
-                let reader = SSTableReader::from_mmap(mmap.clone());
-                let bloom_path = sst_path.replace(".sst", ".bloom");
-                let bloom = match BloomFilter::load(&bloom_path) {
-                    Ok(b) => b,
-                    Err(_) => {
-                        let mut count = 0;
-                        for _ in reader.iter_from(b"") {
-                            count += 1;
-                        }
-                        let mut b = BloomFilter::new(count.max(100));
-                        for rec in reader.iter_from(b"") {
-                            if rec.is_valid() {
-                                let mut h = FnvHasher::default();
-                                rec.key.hash(&mut h);
-                                b.add(h.finish());
-                            }
-                        }
-                        let _ = b.save(&bloom_path);
-                        b
+            let file = OpenOptions::new().read(true).open(sst_path).map_err(|e| {
+                OmniError::IoError(format!(
+                    "missing or unreadable L1 SSTable '{sst_path}' referenced by manifest: {e}"
+                ))
+            })?;
+            // SAFETY: Recovered L1 SSTables are immutable read-only table
+            // files. They are replaced by publishing new root snapshots,
+            // never by in-place mutation while mapped.
+            let mmap = Arc::new(unsafe { MmapOptions::new().map(&file) }.map_err(|e| {
+                OmniError::IoError(format!(
+                    "failed to memory-map L1 SSTable '{sst_path}' referenced by manifest: {e}"
+                ))
+            })?);
+            let reader = SSTableReader::from_mmap(mmap.clone());
+            let bloom_path = sst_path.replace(".sst", ".bloom");
+            let bloom = match BloomFilter::load(&bloom_path) {
+                Ok(b) => b,
+                Err(_) => {
+                    let mut count = 0;
+                    for _ in reader.iter_from(b"") {
+                        count += 1;
                     }
-                };
-                loaded_l1_sstables.push((mmap, Arc::new(bloom), sst_path.clone()));
-            }
+                    let mut b = BloomFilter::new(count.max(100));
+                    for rec in reader.iter_from(b"") {
+                        if rec.is_valid() {
+                            let mut h = FnvHasher::default();
+                            rec.key.hash(&mut h);
+                            b.add(h.finish());
+                        }
+                    }
+                    let _ = b.save(&bloom_path);
+                    b
+                }
+            };
+            loaded_l1_sstables.push((mmap, Arc::new(bloom), sst_path.clone()));
         }
+
+        let heap_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&manifest.heap_path)
+            .map_err(|e| {
+                OmniError::IoError(format!(
+                    "missing or unreadable heap file '{}' referenced by manifest: {e}",
+                    manifest.heap_path
+                ))
+            })?;
+        let heap_offset = heap_file.metadata()?.len();
 
         let memtable = Arc::new(std::array::from_fn(|_| SkipMap::new()));
         let mut global_seq = manifest.max_seq;
@@ -1623,6 +2142,9 @@ impl OmniKV {
         let recovered_records = wal::WriteAheadLog::replay(wal_path, &manifest.heap_path)?;
         if !recovered_records.is_empty() {
             for rec in recovered_records {
+                if rec.seq <= manifest.wal_checkpoint_seq {
+                    continue;
+                }
                 let shard = shard_idx(&rec.key);
                 memtable[shard].insert(
                     (rec.key, Reverse(rec.seq)),
@@ -1633,14 +2155,6 @@ impl OmniKV {
                 }
             }
         }
-
-        let heap_file = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(&manifest.heap_path)?;
-        let heap_offset = heap_file.metadata()?.len();
 
         let wal = wal::WriteAheadLog::new(wal_path)?;
 
@@ -1826,6 +2340,65 @@ impl OmniKV {
     }
 
     /// Collects the complete visible range, or returns the first heap read error.
+    /// Computes the smallest valid UTF-8 string strictly greater than every
+    /// UTF-8 string beginning with `prefix`, or `None` if `prefix` is empty or
+    /// consists solely of `char::MAX` (`'\u{10ffff}'`).
+    ///
+    /// Because UTF-8 preserves Unicode scalar ordering and is prefix-free on
+    /// scalar values, a valid UTF-8 key `k` starts with `prefix` if and only if
+    /// `k >= prefix` and (`successor.is_none()` or `k < successor`).
+    pub(crate) fn prefix_successor_str(prefix: &str) -> Option<String> {
+        let mut chars: Vec<char> = prefix.chars().collect();
+        while let Some(ch) = chars.pop() {
+            if let Some(next_ch) = next_unicode_scalar(ch) {
+                let mut out: String = chars.into_iter().collect();
+                out.push(next_ch);
+                return Some(out);
+            }
+        }
+        None
+    }
+
+    /// Returns the half-open `[start, end)` range covering every valid UTF-8
+    /// key with `prefix`.
+    pub(crate) fn prefix_range_exclusive(prefix: &str) -> (String, Option<String>) {
+        (prefix.to_string(), Self::prefix_successor_str(prefix))
+    }
+
+    /// Collects all visible entries whose keys begin with `prefix` at `read_seq`,
+    /// including keys containing `'\u{10ffff}'` while excluding the bytewise
+    /// prefix successor itself.
+    pub(crate) fn scan_prefix(
+        &self,
+        prefix: &str,
+        read_seq: u64,
+    ) -> Result<Vec<(String, String)>, OmniError> {
+        let end = Self::prefix_successor_str(prefix);
+        self.scan_exclusive(prefix, end.as_deref(), read_seq)
+    }
+
+    /// Collects all visible entries in the half-open lexical range
+    /// `[start_key, end_exclusive)` (or `[start_key, +inf)` when `end_exclusive`
+    /// is `None`).
+    pub(crate) fn scan_exclusive(
+        &self,
+        start_key: &str,
+        end_exclusive: Option<&str>,
+        read_seq: u64,
+    ) -> Result<Vec<(String, String)>, OmniError> {
+        let mut results = Vec::new();
+        let end_bytes = end_exclusive.map(string_to_key);
+        let end_bound = match end_bytes.as_deref() {
+            Some(bytes) => ScanEnd::Exclusive(bytes),
+            None => ScanEnd::Unbounded,
+        };
+        let mut iter = self.scan_iter_bounds(string_to_key(start_key), end_bound, read_seq)?;
+        while let Some(entry) = iter.try_next()? {
+            results.push(entry);
+        }
+        Ok(results)
+    }
+
     /// Unlike the legacy `scan_iter`, errors cannot yield a successful prefix.
     pub fn scan(
         &self,
@@ -1838,6 +2411,176 @@ impl OmniKV {
         while let Some(entry) = iter.try_next()? {
             results.push(entry);
         }
+        Ok(results)
+    }
+
+    /// Collects up to `limit` visible entries in `[start_key, end_exclusive)` at `read_seq`
+    /// using a bounded k-way streaming merge across memtables and SSTables.
+    pub(crate) fn scan_exclusive_limit(
+        &self,
+        start_key: &str,
+        end_exclusive: Option<&str>,
+        read_seq: u64,
+        limit: usize,
+    ) -> Result<Vec<(String, String)>, OmniError> {
+        let end_bytes = end_exclusive.map(string_to_key);
+        let end_bound = match end_bytes.as_deref() {
+            Some(bytes) => ScanEnd::Exclusive(bytes),
+            None => ScanEnd::Unbounded,
+        };
+        self.scan_bounds_limit(string_to_key(start_key), end_bound, read_seq, limit)
+    }
+
+    /// Collects up to `limit` visible entries whose keys begin with `prefix` at `read_seq`.
+    pub(crate) fn scan_prefix_limit(
+        &self,
+        prefix: &str,
+        read_seq: u64,
+        limit: usize,
+    ) -> Result<Vec<(String, String)>, OmniError> {
+        let end = Self::prefix_successor_str(prefix);
+        self.scan_exclusive_limit(prefix, end.as_deref(), read_seq, limit)
+    }
+
+    /// Collects up to `limit` visible entries in the lexical range `[start_key, end_key]`
+    /// using a bounded k-way streaming merge across memtables and SSTables.
+    pub fn scan_limit(
+        &self,
+        start_key: &str,
+        end_key: &str,
+        read_seq: u64,
+        limit: usize,
+    ) -> Result<Vec<(String, String)>, OmniError> {
+        let end_bytes = string_to_key(end_key);
+        self.scan_bounds_limit(
+            string_to_key(start_key),
+            ScanEnd::Inclusive(&end_bytes),
+            read_seq,
+            limit,
+        )
+    }
+
+    fn scan_bounds_limit(
+        &self,
+        start_key: Vec<u8>,
+        end_bound: ScanEnd<'_>,
+        read_seq: u64,
+        limit: usize,
+    ) -> Result<Vec<(String, String)>, OmniError> {
+        let roots = self.roots.load();
+        if read_seq < roots.read_seq_floor {
+            return Err(OmniError::StaleSnapshot {
+                read_seq,
+                floor: roots.read_seq_floor,
+            });
+        }
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let active_mem = roots.memtable.clone();
+        let frozen = roots.frozen_memtables.clone();
+        let mem_start = Reverse(read_seq.saturating_add(1));
+
+        let mut sources: Vec<MergeSource<'_>> = Vec::with_capacity(
+            active_mem.len()
+                + frozen.len().saturating_mul(NUM_SHARDS)
+                + roots.sstables.len()
+                + roots.l1_sstables.len()
+                + 1,
+        );
+        for shard in active_mem.iter() {
+            sources.push(MergeSource::MemShard {
+                iter: shard.range((start_key.clone(), mem_start)..),
+                last_key: None,
+                exhausted: false,
+            });
+        }
+        for f_mem in frozen.iter().rev() {
+            for shard in f_mem.iter() {
+                sources.push(MergeSource::MemShard {
+                    iter: shard.range((start_key.clone(), mem_start)..),
+                    last_key: None,
+                    exhausted: false,
+                });
+            }
+        }
+        for (mmap, _, _) in roots.sstables.iter().rev() {
+            let reader = SSTableReader::from_mmap(mmap.clone());
+            sources.push(MergeSource::Sst {
+                iter: reader.iter_from(&start_key),
+                peeked: None,
+                exhausted: false,
+            });
+        }
+        for (mmap, _, _) in &**roots.l1_sstables {
+            let reader = SSTableReader::from_mmap(mmap.clone());
+            sources.push(MergeSource::Sst {
+                iter: reader.iter_from(&start_key),
+                peeked: None,
+                exhausted: false,
+            });
+        }
+        let base_reader = SSTableReader::from_mmap(roots.base_mmap.clone());
+        sources.push(MergeSource::Sst {
+            iter: base_reader.iter_from(&start_key),
+            peeked: None,
+            exhausted: false,
+        });
+
+        let mut heap: BinaryHeap<MergeHeapEntry> = BinaryHeap::with_capacity(sources.len());
+        for (source_id, source) in sources.iter_mut().enumerate() {
+            if let Some(candidate) = source.next_visible(&start_key, end_bound, read_seq) {
+                heap.push(MergeHeapEntry {
+                    candidate,
+                    source_id,
+                });
+            }
+        }
+
+        let mut results = Vec::with_capacity(limit.min(1024));
+        let mut last_decided_key: Option<Vec<u8>> = None;
+        let mut read_buffer = self.scan_buffer_pool.acquire();
+
+        while results.len() < limit {
+            let Some(MergeHeapEntry {
+                candidate,
+                source_id,
+            }) = heap.pop()
+            else {
+                break;
+            };
+            if let Some(next_candidate) =
+                sources[source_id].next_visible(&start_key, end_bound, read_seq)
+            {
+                heap.push(MergeHeapEntry {
+                    candidate: next_candidate,
+                    source_id,
+                });
+            }
+            if last_decided_key.as_deref() == Some(candidate.key.as_slice()) {
+                continue;
+            }
+            last_decided_key = Some(candidate.key.clone());
+            if candidate.length == 0 || (candidate.expiry > 0 && candidate.expiry <= now) {
+                continue;
+            }
+            let key = key_to_string(&candidate.key);
+            let value = self.read_from_heap_with_reader_into(
+                &roots.heap_reader,
+                roots.heap_generation,
+                candidate.offset,
+                candidate.length,
+                candidate.crc,
+                read_buffer.as_mut_vec(),
+            )?;
+            results.push((key, value));
+        }
+
         Ok(results)
     }
 
@@ -1862,6 +2605,7 @@ impl OmniKV {
             .write_mutex
             .lock()
             .map_err(|_| OmniError::LockPoisoned("heap write mutex".into()))?;
+        self.ensure_writes_not_fenced()?;
         let heap = self
             .heap_file
             .lock()
@@ -1885,6 +2629,8 @@ impl OmniKV {
                 pos += n as u64;
             }
         }
+        crate::failpoints::maybe_fail("heap::sync_data")
+            .map_err(|e| OmniError::IoError(format!("heap failure point: {e}")))?;
         heap.sync_data()?;
         self.heap_offset
             .store(offset + data.len() as u64, Ordering::SeqCst);
@@ -1915,7 +2661,21 @@ impl OmniKV {
             .heap_file
             .lock()
             .map_err(|_| OmniError::LockPoisoned("heap_file".into()))?;
+        crate::failpoints::maybe_fail("heap::sync_all")
+            .map_err(|e| OmniError::IoError(format!("heap failure point: {e}")))?;
         heap.sync_all()?;
+        Ok(())
+    }
+
+    pub(crate) fn validate_client_key_bytes(key: &[u8]) -> Result<(), OmniError> {
+        if key == b"__COMMIT_MARKER__"
+            || key.starts_with(b"__sys__/raft/")
+            || key.starts_with(b"__2PC_")
+        {
+            return Err(OmniError::IoError(
+                "reserved consensus/transaction system key".into(),
+            ));
+        }
         Ok(())
     }
 
@@ -1929,6 +2689,20 @@ impl OmniKV {
     /// This allows multiple concurrent batches to overlap their CPU-intensive
     /// compression work and only serialize briefly for sequence numbering.
     pub fn commit_batch(&self, tx: &WriteBatch) -> Result<u64, OmniError> {
+        self.ensure_writes_not_fenced()?;
+        for key in tx
+            .buffered_writes
+            .iter()
+            .map(|(key, _, _)| key.as_slice())
+            .chain(tx.buffered_deletes.iter().map(Vec::as_slice))
+        {
+            Self::validate_client_key_bytes(key)?;
+            if let Ok(key_str) = std::str::from_utf8(key)
+                && let Some(conflict) = self.ssi_history.check_prepared_write_conflict(key_str)
+            {
+                return Err(OmniError::IoError(conflict));
+            }
+        }
         // Clustered: client writes must be consensus-replicated before
         // they are acknowledged. The gateway proposes this batch as one
         // raft entry; raft's state machine (not this call) applies it
@@ -1936,9 +2710,441 @@ impl OmniKV {
         // is the raft log index the write was applied at — on followers
         // too, since only the leader accepts client writes.
         if let Some(gateway) = self.cluster_gateway.get() {
-            return gateway.commit_batch(tx);
+            return gateway.commit_batch_checked(tx, &self.ssi_history);
         }
         self.commit_batch_local(tx)
+    }
+
+    /// Captures a linearizable, pinned read snapshot after briefly quiescing
+    /// in-flight local writers so every write with `seq <= snapshot` is already
+    /// visible in the memtable, every subsequent write will receive
+    /// `seq > snapshot`, and compaction/GC will preserve versions and
+    /// tombstones above `snapshot` until the guard is dropped.
+    pub(crate) fn consistent_snapshot_guard(self: &Arc<Self>) -> Result<SnapshotGuard, OmniError> {
+        self.ensure_cluster_linearizable()?;
+        let _quiesce = self
+            .transition_guard
+            .write()
+            .map_err(|_| OmniError::LockPoisoned("transition_guard".into()))?;
+        let seq = self.global_seq.load(Ordering::SeqCst).saturating_sub(1);
+        let mut snaps = self
+            .active_snapshots
+            .lock()
+            .map_err(|_| OmniError::LockPoisoned("active_snapshots".into()))?;
+        *snaps.entry(seq).or_insert(0) += 1;
+        drop(snaps);
+        Ok(SnapshotGuard {
+            db: self.clone(),
+            sequence: seq,
+        })
+    }
+
+    /// Returns `true` if any record (put or tombstone) in `[range_start, range_end)`
+    /// has a sequence number `> after_seq` across memtables and persisted tables.
+    fn has_key_in_range_after_seq(
+        &self,
+        range_start: &str,
+        range_end: &str,
+        after_seq: u64,
+    ) -> bool {
+        if self.global_seq.load(Ordering::SeqCst).saturating_sub(1) <= after_seq {
+            return false;
+        }
+        let start_bytes = range_start.as_bytes().to_vec();
+        let end_bytes = range_end.as_bytes().to_vec();
+        if start_bytes >= end_bytes {
+            return false;
+        }
+        let roots = self.roots.load();
+        let mem_range_start = (start_bytes.clone(), Reverse(u64::MAX));
+        let mem_range_end = (end_bytes.clone(), Reverse(u64::MAX));
+
+        for shard in roots.memtable.iter() {
+            for entry in shard.range(mem_range_start.clone()..mem_range_end.clone()) {
+                if entry.key().1.0 > after_seq {
+                    return true;
+                }
+            }
+        }
+        for frozen in roots.frozen_memtables.iter() {
+            for shard in frozen.iter() {
+                for entry in shard.range(mem_range_start.clone()..mem_range_end.clone()) {
+                    if entry.key().1.0 > after_seq {
+                        return true;
+                    }
+                }
+            }
+        }
+        let scan_table = |mmap: &Arc<Mmap>| -> bool {
+            let reader = SSTableReader::from_mmap(mmap.clone());
+            for rec in reader.iter_from(&start_bytes) {
+                if rec.key >= end_bytes {
+                    break;
+                }
+                if rec.key >= start_bytes && rec.is_valid() && rec.seq > after_seq {
+                    return true;
+                }
+            }
+            false
+        };
+        for (mmap, _, _) in &**roots.sstables {
+            if scan_table(mmap) {
+                return true;
+            }
+        }
+        for (mmap, _, _) in &**roots.l1_sstables {
+            if scan_table(mmap) {
+                return true;
+            }
+        }
+        scan_table(&roots.base_mmap)
+    }
+
+    /// Returns `true` if any key in `keys` has a record (put or tombstone)
+    /// with a sequence number `> after_seq`.
+    fn has_any_key_after_seq(&self, keys: &[String], after_seq: u64) -> bool {
+        if keys.is_empty() || self.global_seq.load(Ordering::SeqCst).saturating_sub(1) <= after_seq
+        {
+            return false;
+        }
+        keys.iter()
+            .any(|key| self.get_seq_for_key(key, u64::MAX) > after_seq)
+    }
+
+    fn validate_conditional_batch(&self, tx: &WriteBatch) -> Result<(), OmniError> {
+        self.ensure_writes_not_fenced()?;
+        for key in tx
+            .buffered_writes
+            .iter()
+            .map(|(key, _, _)| key.as_slice())
+            .chain(tx.buffered_deletes.iter().map(Vec::as_slice))
+        {
+            Self::validate_client_key_bytes(key)?;
+            if let Ok(key_str) = std::str::from_utf8(key)
+                && let Some(conflict) = self.ssi_history.check_prepared_write_conflict(key_str)
+            {
+                return Err(OmniError::IoError(conflict));
+            }
+        }
+        Ok(())
+    }
+
+    /// Atomically verifies that no write (put or tombstone) landed on any key
+    /// in `watched_keys` after `read_seq`, and commits `tx` under that same
+    /// exclusion barrier. Used by multi-batch online document migrations so
+    /// intermediate chunks never clobber concurrent document updates or
+    /// resurrect concurrent deletes.
+    pub(crate) fn commit_batch_if_keys_unchanged(
+        &self,
+        tx: WriteBatch,
+        watched_keys: &[String],
+        read_seq: u64,
+    ) -> Result<Result<u64, ()>, OmniError> {
+        const KEYS_CHANGED_SENTINEL: &str = "__OMNIKV_KEYS_CHANGED__";
+        self.validate_conditional_batch(&tx)?;
+        if let Some(gateway) = self.cluster_gateway.get() {
+            let write_keys: Vec<String> = tx
+                .buffered_writes
+                .iter()
+                .map(|(k, _, _)| key_to_string(k))
+                .chain(tx.buffered_deletes.iter().map(|k| key_to_string(k)))
+                .collect();
+            let ssi = crate::transaction::SsiCommitRecord {
+                txn_id: 0,
+                write_keys,
+                read_keys: watched_keys.to_vec(),
+                read_ranges: Vec::new(),
+            };
+            let outcome = gateway.commit_ssi_blocking(ssi, move || {
+                {
+                    let _quiesce = self
+                        .transition_guard
+                        .write()
+                        .map_err(|_| "transition_guard poisoned".to_string())?;
+                    if self.has_any_key_after_seq(watched_keys, read_seq) {
+                        return Err(KEYS_CHANGED_SENTINEL.to_string());
+                    }
+                }
+                if let Some(conflict) = self.ssi_history.check_batch_prepared_conflicts(&tx) {
+                    return Err(conflict);
+                }
+                Ok(tx)
+            });
+            return match outcome {
+                Ok(seq) => Ok(Ok(seq)),
+                Err(msg) if msg == KEYS_CHANGED_SENTINEL => Ok(Err(())),
+                Err(msg) => Err(OmniError::IoError(msg)),
+            };
+        }
+
+        let _exclusive = self
+            .transition_guard
+            .write()
+            .map_err(|_| OmniError::LockPoisoned("transition_guard".into()))?;
+        self.ensure_writes_not_fenced()?;
+        if self.has_any_key_after_seq(watched_keys, read_seq) {
+            return Ok(Err(()));
+        }
+        if tx.is_empty() {
+            return Ok(Ok(read_seq));
+        }
+        let seq = self.commit_batch_local_locked(&tx)?;
+        Ok(Ok(seq))
+    }
+
+    /// Atomically verifies that no write (put or tombstone) landed in
+    /// `[range_start, range_end)` after `read_seq`, and commits `tx` under
+    /// that same exclusion barrier.
+    ///
+    /// Returns `Ok(Ok(commit_seq))` when committed, `Ok(Err(()))` when a
+    /// concurrent write modified `[range_start, range_end)` after `read_seq`
+    /// (signaling the caller to run another catch-up pass), or `Err(e)` on I/O
+    /// or validation error.
+    pub(crate) fn commit_batch_if_range_unchanged(
+        &self,
+        tx: WriteBatch,
+        range_start: &str,
+        range_end: &str,
+        read_seq: u64,
+    ) -> Result<Result<u64, ()>, OmniError> {
+        const RANGE_CHANGED_SENTINEL: &str = "__OMNIKV_RANGE_CHANGED__";
+        self.validate_conditional_batch(&tx)?;
+        if let Some(gateway) = self.cluster_gateway.get() {
+            let write_keys: Vec<String> = tx
+                .buffered_writes
+                .iter()
+                .map(|(k, _, _)| key_to_string(k))
+                .chain(tx.buffered_deletes.iter().map(|k| key_to_string(k)))
+                .collect();
+            let ssi = crate::transaction::SsiCommitRecord {
+                txn_id: 0,
+                write_keys,
+                read_keys: Vec::new(),
+                read_ranges: vec![(range_start.to_string(), range_end.to_string())],
+            };
+            let outcome = gateway.commit_ssi_blocking(ssi, move || {
+                {
+                    let _quiesce = self
+                        .transition_guard
+                        .write()
+                        .map_err(|_| "transition_guard poisoned".to_string())?;
+                    if self.has_key_in_range_after_seq(range_start, range_end, read_seq) {
+                        return Err(RANGE_CHANGED_SENTINEL.to_string());
+                    }
+                }
+                if let Some(conflict) = self.ssi_history.check_batch_prepared_conflicts(&tx) {
+                    return Err(conflict);
+                }
+                Ok(tx)
+            });
+            return match outcome {
+                Ok(seq) => Ok(Ok(seq)),
+                Err(msg) if msg == RANGE_CHANGED_SENTINEL => Ok(Err(())),
+                Err(msg) => Err(OmniError::IoError(msg)),
+            };
+        }
+
+        let _exclusive = self
+            .transition_guard
+            .write()
+            .map_err(|_| OmniError::LockPoisoned("transition_guard".into()))?;
+        self.ensure_writes_not_fenced()?;
+        if self.has_key_in_range_after_seq(range_start, range_end, read_seq) {
+            return Ok(Err(()));
+        }
+        if tx.is_empty() {
+            return Ok(Ok(read_seq));
+        }
+        let seq = self.commit_batch_local_locked(&tx)?;
+        Ok(Ok(seq))
+    }
+
+    /// Commits engine-internal 2PC metadata, bypassing client key validation.
+    pub(crate) fn commit_2pc_batch(&self, tx: &WriteBatch) -> Result<u64, OmniError> {
+        self.ensure_writes_not_fenced()?;
+        if let Some(gateway) = self.cluster_gateway.get() {
+            crate::dist_txn::validate_2pc_decision_writes(self, None, tx)?;
+            return gateway.commit_2pc_batch(tx);
+        }
+        let lock = self.sql_table_lock("\x002PC_LOCAL_COMMIT")?;
+        let _guard = lock
+            .lock()
+            .map_err(|_| OmniError::LockPoisoned("2PC local commit".into()))?;
+        let _topology_guard = self
+            .transition_guard
+            .read()
+            .map_err(|_| OmniError::LockPoisoned("transition_guard".into()))?;
+        crate::dist_txn::validate_2pc_decision_writes(self, None, tx)?;
+        let seq = self.commit_batch_local_locked(tx)?;
+        self.sync_prepared_2pc_from_batch(tx)?;
+        Ok(seq)
+    }
+
+    pub(crate) fn ensure_cluster_linearizable(&self) -> Result<(), OmniError> {
+        if let Some(gateway) = self.cluster_gateway.get() {
+            gateway.probe_blocking().map_err(OmniError::IoError)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn snapshot_install_epoch(&self) -> u64 {
+        self.snapshot_install_epoch.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn check_2pc_prepare_conflicts(
+        &self,
+        read_seq: u64,
+        write_keys: &[String],
+    ) -> Option<String> {
+        let committed = self.ssi_history.lock_committed();
+        self.check_2pc_prepare_conflicts_locked(&committed, read_seq, write_keys)
+    }
+
+    fn check_2pc_prepare_conflicts_locked(
+        &self,
+        committed: &[crate::transaction::CommittedTxn],
+        read_seq: u64,
+        write_keys: &[String],
+    ) -> Option<String> {
+        let read_seq_floor = self.roots.load().read_seq_floor;
+        if read_seq < read_seq_floor {
+            return Some(format!(
+                "STALE SNAPSHOT: 2PC prepare read_seq {read_seq} is below storage read_seq_floor {read_seq_floor}"
+            ));
+        }
+        self.ssi_history
+            .check_write_conflicts_locked(committed, read_seq, write_keys)
+            .or_else(|| {
+                write_keys.iter().find_map(|key| {
+                    let latest_seq = self.get_seq_for_key(key, u64::MAX);
+                    (latest_seq > read_seq).then(|| {
+                        format!(
+                            "SSI CONFLICT (WW): key '{}' written at seq {}",
+                            key, latest_seq
+                        )
+                    })
+                })
+            })
+    }
+
+    /// Commits a 2PC `PREPARED` batch (and, in clustered mode, its validated
+    /// `unvalidated: false` transition under the same consensus flight lock)
+    /// while atomically re-validating `read_seq` against `read_seq_floor`,
+    /// `snapshot_install_epoch`, SSI history, and current key sequences under
+    /// the same ordering guards as commits and snapshot installs.
+    pub(crate) fn commit_2pc_prepare_checked<F>(
+        &self,
+        tx: &WriteBatch,
+        read_seq: u64,
+        write_keys: &[String],
+        build_validated: F,
+    ) -> Result<u64, crate::dist_txn::PrepareCommitError>
+    where
+        F: FnOnce(u64) -> Result<WriteBatch, OmniError>,
+    {
+        use crate::dist_txn::PrepareCommitError;
+        self.ensure_writes_not_fenced()
+            .map_err(PrepareCommitError::PreProposal)?;
+        if let Some(gateway) = self.cluster_gateway.get() {
+            return gateway.commit_2pc_prepare_checked(
+                self,
+                tx,
+                read_seq,
+                write_keys,
+                build_validated,
+            );
+        }
+        let lock = self
+            .sql_table_lock("\x002PC_LOCAL_COMMIT")
+            .map_err(PrepareCommitError::PreProposal)?;
+        let _guard = lock.lock().map_err(|_| {
+            PrepareCommitError::PreProposal(OmniError::LockPoisoned("2PC local commit".into()))
+        })?;
+        let _topology_guard = self.transition_guard.read().map_err(|_| {
+            PrepareCommitError::PreProposal(OmniError::LockPoisoned("transition_guard".into()))
+        })?;
+        crate::dist_txn::validate_2pc_decision_writes(self, None, tx)
+            .map_err(PrepareCommitError::PreProposal)?;
+        let committed_guard = self.ssi_history.lock_committed();
+        if let Some(conflict) =
+            self.check_2pc_prepare_conflicts_locked(&committed_guard, read_seq, write_keys)
+        {
+            return Err(PrepareCommitError::PreProposal(OmniError::IoError(
+                conflict,
+            )));
+        }
+        let seq = self
+            .commit_batch_local_locked_skip_prepared(tx)
+            .map_err(PrepareCommitError::PostProposal)?;
+        self.sync_prepared_2pc_from_batch(tx)
+            .map_err(PrepareCommitError::PostProposal)?;
+        drop(committed_guard);
+        if let Ok(validated_batch) = build_validated(seq) {
+            let _ = crate::dist_txn::validate_2pc_decision_writes(self, None, &validated_batch)
+                .and_then(|()| self.commit_batch_local_locked_skip_prepared(&validated_batch))
+                .and_then(|_| self.sync_prepared_2pc_from_batch(&validated_batch));
+        }
+        Ok(seq)
+    }
+
+    pub(crate) fn commit_2pc_batch_with_ssi(
+        &self,
+        tx: &WriteBatch,
+        ssi: crate::transaction::SsiCommitRecord,
+    ) -> Result<u64, OmniError> {
+        self.ensure_writes_not_fenced()?;
+        if let Some(gateway) = self.cluster_gateway.get() {
+            crate::dist_txn::validate_2pc_decision_writes(self, None, tx)?;
+            return gateway.commit_2pc_batch_with_ssi(tx, ssi);
+        }
+        let lock = self.sql_table_lock("\x002PC_LOCAL_COMMIT")?;
+        let _guard = lock
+            .lock()
+            .map_err(|_| OmniError::LockPoisoned("2PC local commit".into()))?;
+        // Acquire transition_guard BEFORE committed_txns to preserve the
+        // engine's global lock order (matching TransactionManager::commit),
+        // and hold committed_txns across both batch publication and history
+        // insertion so no concurrent SSI transaction can validate against the
+        // published data before this commit's SSI record is visible.
+        let _topology_guard = self
+            .transition_guard
+            .read()
+            .map_err(|_| OmniError::LockPoisoned("transition_guard".into()))?;
+        crate::dist_txn::validate_2pc_decision_writes(self, None, tx)?;
+        let mut committed_guard = self.ssi_history.lock_committed();
+        let commit_seq = self.commit_batch_local_locked_skip_prepared(tx)?;
+        self.sync_prepared_2pc_from_batch(tx)?;
+        self.ssi_history.record_committed_locked(
+            &mut committed_guard,
+            ssi.txn_id,
+            commit_seq,
+            &ssi,
+        );
+        drop(committed_guard);
+        self.ssi_history.prune(self.min_active_snapshot());
+        Ok(commit_seq)
+    }
+
+    /// Fences any in-flight consensus proposals and local sequence reservations
+    /// so a newly registered 2PC prepared-key reservation cannot race past a
+    /// concurrent writer.
+    pub(crate) fn fence_write_reservation(&self) -> Result<(), OmniError> {
+        if let Some(gateway) = self.cluster_gateway.get() {
+            gateway.fence_blocking();
+        }
+        let _guard = self
+            .write_mutex
+            .lock()
+            .map_err(|_| OmniError::LockPoisoned("commit_seq".into()))?;
+        Ok(())
+    }
+
+    pub(crate) fn sync_prepared_2pc_reservations(&self) -> Result<(), OmniError> {
+        crate::dist_txn::sync_all_prepared_reservations(self)
+    }
+
+    pub(crate) fn sync_prepared_2pc_from_batch(&self, batch: &WriteBatch) -> Result<(), OmniError> {
+        crate::dist_txn::sync_prepared_reservations_from_batch(self, batch)
     }
 
     /// The single-node commit path, also used by the raft state machine
@@ -1962,6 +3168,22 @@ impl OmniKV {
     /// record missing (or the reverse), and pairing them under the shared lock
     /// is what matches build_snapshot's exclusive capture window.
     pub(crate) fn commit_batch_local_locked(&self, tx: &WriteBatch) -> Result<u64, OmniError> {
+        self.commit_batch_local_locked_inner(tx, false)
+    }
+
+    pub(crate) fn commit_batch_local_locked_skip_prepared(
+        &self,
+        tx: &WriteBatch,
+    ) -> Result<u64, OmniError> {
+        self.commit_batch_local_locked_inner(tx, true)
+    }
+
+    fn commit_batch_local_locked_inner(
+        &self,
+        tx: &WriteBatch,
+        skip_prepared_check: bool,
+    ) -> Result<u64, OmniError> {
+        self.ensure_writes_not_fenced()?;
         let start_time = std::time::Instant::now();
 
         // Write Backpressure: If L0 SSTables exceed threshold, wait for compaction
@@ -1971,16 +3193,41 @@ impl OmniKV {
         let l0_sstables = self.sstable_count();
         metrics_prometheus::record_compaction_backlog(self.compaction_backlog_sstables());
         if l0_sstables >= compaction_policy.l0_write_stall_threshold {
+            // Cap the stall wait budget so an extreme policy cannot overflow
+            // `Instant` or block indefinitely while holding `transition_guard`.
+            const MAX_WRITE_STALL_WAIT: std::time::Duration = std::time::Duration::from_secs(3600);
+            let total_wait = std::time::Duration::from_millis(
+                compaction_policy
+                    .write_stall_wait_ms
+                    .saturating_mul(compaction_policy.write_stall_wait_attempts as u64),
+            )
+            .min(MAX_WRITE_STALL_WAIT);
+            let deadline = std::time::Instant::now().checked_add(total_wait);
             let mut stalled = true;
-            for _ in 0..compaction_policy.write_stall_wait_attempts {
-                std::thread::sleep(std::time::Duration::from_millis(
-                    compaction_policy.write_stall_wait_ms,
-                ));
+            let (ref stall_lock, ref cv) = self.compaction_cv;
+            let mut guard = stall_lock.lock().unwrap_or_else(|e| e.into_inner());
+            loop {
+                if let Err(err) = self.ensure_writes_not_fenced() {
+                    drop(guard);
+                    return Err(err);
+                }
                 if self.sstable_count() < compaction_policy.l0_write_stall_threshold {
                     stalled = false;
                     break;
                 }
+                let Some(limit) = deadline else {
+                    break;
+                };
+                let remaining = limit.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                let (returned, _timeout) = cv
+                    .wait_timeout(guard, remaining)
+                    .unwrap_or_else(|e| e.into_inner());
+                guard = returned;
             }
+            drop(guard);
             if stalled {
                 metrics_prometheus::record_write_stall();
                 return Err(OmniError::WriteStall);
@@ -2031,10 +3278,54 @@ impl OmniKV {
                 .write_mutex
                 .lock()
                 .map_err(|_| OmniError::LockPoisoned("commit_seq".into()))?;
+            self.ensure_writes_not_fenced()?;
+            if !skip_prepared_check
+                && let Some(conflict) = self.ssi_history.check_batch_prepared_conflicts(tx)
+            {
+                return Err(OmniError::IoError(conflict));
+            }
             let seq = self.global_seq.fetch_add(num_records + 1, Ordering::SeqCst);
+            let commit_marker_seq = seq + num_records;
+            let mut stamped_any = false;
+            if skip_prepared_check {
+                for ((key, value, _), prepped) in
+                    tx.buffered_writes.iter().zip(prepped_writes.iter_mut())
+                {
+                    if let Some(stamped) =
+                        crate::dist_txn::stamp_2pc_commit_seq(key, value, commit_marker_seq)
+                    {
+                        let payload_bytes = stamped.as_bytes();
+                        let (final_bytes, length) = if payload_bytes.len() < 64 {
+                            (
+                                payload_bytes.to_vec(),
+                                (payload_bytes.len() as u64) | UNCOMPRESSED_FLAG,
+                            )
+                        } else {
+                            let comp = lz4_flex::compress_prepend_size(payload_bytes);
+                            let len = comp.len() as u64;
+                            (comp, len)
+                        };
+                        let mut hasher = crc32fast::Hasher::new();
+                        hasher.update(&final_bytes);
+                        prepped.1 = final_bytes;
+                        prepped.2 = length;
+                        prepped.3 = hasher.finalize();
+                        stamped_any = true;
+                    }
+                }
+            }
+            let effective_heap_bytes = if stamped_any {
+                prepped_writes
+                    .iter()
+                    .map(|(_, _, length, _, _)| length & !UNCOMPRESSED_FLAG)
+                    .sum()
+            } else {
+                total_heap_bytes
+            };
             let offset = self
                 .heap_offset
-                .fetch_add(total_heap_bytes, Ordering::SeqCst);
+                .fetch_add(effective_heap_bytes, Ordering::SeqCst);
+            self.ssi_history.record_plain_batch(tx, commit_marker_seq);
             (seq, offset)
         };
         // write_mutex is RELEASED here â€” other batches can now reserve their sequences
@@ -2191,9 +3482,12 @@ impl OmniKV {
             .lock()
             .map_err(|_| OmniError::LockPoisoned("wal lock".into()))?;
 
-        let result = heap
-            .sync_data()
-            .map_err(|e| OmniError::IoError(format!("group commit heap fsync failed: {e}")))
+        let result = crate::failpoints::maybe_fail("heap::sync_data")
+            .map_err(|e| OmniError::IoError(format!("heap failure point: {e}")))
+            .and_then(|()| {
+                heap.sync_data()
+                    .map_err(|e| OmniError::IoError(format!("group commit heap fsync failed: {e}")))
+            })
             .and_then(|()| {
                 wal.sync()
                     .map_err(|e| OmniError::IoError(format!("group commit wal fsync failed: {e}")))
@@ -2208,24 +3502,36 @@ impl OmniKV {
         result
     }
 
-    fn read_from_heap(
+    fn read_from_heap_with_reader(
         &self,
+        heap_reader: &File,
+        heap_generation: u64,
         offset: u64,
         length_with_flag: u64,
         expected_crc32: u32,
     ) -> Result<String, OmniError> {
         let mut buf = Vec::new();
-        self.read_from_heap_into(offset, length_with_flag, expected_crc32, &mut buf)
+        self.read_from_heap_with_reader_into(
+            heap_reader,
+            heap_generation,
+            offset,
+            length_with_flag,
+            expected_crc32,
+            &mut buf,
+        )
     }
 
-    fn read_from_heap_into(
+    fn read_from_heap_with_reader_into(
         &self,
+        heap_reader: &File,
+        heap_generation: u64,
         offset: u64,
         length_with_flag: u64,
         expected_crc32: u32,
         buf: &mut Vec<u8>,
     ) -> Result<String, OmniError> {
-        if let Some(cached) = self.block_cache.get(&offset) {
+        let cache_key = (heap_generation, offset);
+        if let Some(cached) = self.block_cache.get(&cache_key) {
             return Ok(cached);
         }
 
@@ -2235,24 +3541,18 @@ impl OmniKV {
         buf.clear();
         buf.resize(length as usize, 0);
 
-        // On Windows, use the writer handle (heap_file) for reads to guarantee
-        // visibility of recently written data. Windows doesn't guarantee
-        // read-after-write consistency across separate file handles for
-        // unflushed data. On Unix, pread on the reader handle is safe (POSIX).
         #[cfg(unix)]
         {
-            let file = self.roots.load().heap_reader.clone();
-            file.read_exact_at(buf.as_mut_slice(), offset)?;
+            heap_reader.read_exact_at(buf.as_mut_slice(), offset)?;
         }
         #[cfg(windows)]
         {
             use std::os::windows::fs::FileExt;
-            let file = self.roots.load().heap_reader.clone();
             // seek_read can return fewer bytes than requested (short read).
             // Loop until the entire buffer is filled.
             let mut total_read = 0usize;
             while total_read < buf.len() {
-                let n = file
+                let n = heap_reader
                     .seek_read(&mut buf[total_read..], offset + total_read as u64)
                     .map_err(|e| OmniError::IoError(format!("heap seek_read: {}", e)))?;
                 if n == 0 {
@@ -2277,7 +3577,7 @@ impl OmniKV {
         };
 
         if let Ok(ref val) = result {
-            self.block_cache.insert(offset, val.clone());
+            self.block_cache.insert(cache_key, val.clone());
         }
 
         result
@@ -2291,10 +3591,8 @@ impl OmniKV {
     }
 
     /// Internal bypass for Raft Snapshots: Iterates over the entire keyspace at the absolute latest sequence.
-    pub(crate) fn scan_all_latest_internal(
-        &self,
-    ) -> Result<impl Iterator<Item = (String, String)> + '_, OmniError> {
-        self.scan_iter("", "\u{10FFFF}", u64::MAX)
+    pub(crate) fn scan_all_latest_internal(&self) -> Result<ScanIterator<'_>, OmniError> {
+        self.scan_iter_bounds(Vec::new(), ScanEnd::Unbounded, u64::MAX)
     }
 
     pub fn find(&self, target_key: &str, read_seq: u64) -> Result<Option<String>, OmniError> {
@@ -2306,9 +3604,18 @@ impl OmniKV {
             .as_secs();
 
         let shard = shard_idx(&target_key);
+        let roots = self.roots.load();
+        if read_seq < roots.read_seq_floor {
+            return Err(OmniError::StaleSnapshot {
+                read_seq,
+                floor: roots.read_seq_floor,
+            });
+        }
 
-        let memtable = self.roots.load().memtable.clone();
-        for entry in memtable[shard].range((target_key.clone(), Reverse(read_seq))..) {
+        let memtable = roots.memtable.clone();
+        // Reverse(seq) ordering: exclusive lower bound at Reverse(read_seq+1) includes read_seq.
+        let memtable_start = Reverse(read_seq.saturating_add(1));
+        for entry in memtable[shard].range((target_key.clone(), memtable_start)..) {
             if entry.key().0 != target_key {
                 break;
             }
@@ -2320,7 +3627,13 @@ impl OmniKV {
                 if *expiry > 0 && *expiry <= now {
                     return Ok(None);
                 }
-                let val = self.read_from_heap(entry.value().0, *length, entry.value().2)?;
+                let val = self.read_from_heap_with_reader(
+                    &roots.heap_reader,
+                    roots.heap_generation,
+                    entry.value().0,
+                    *length,
+                    entry.value().2,
+                )?;
                 if let Ok(mut lock) = self.metrics.read_latencies.lock() {
                     let _ = lock.record(start_time.elapsed().as_micros() as u64);
                 }
@@ -2328,9 +3641,10 @@ impl OmniKV {
             }
         }
 
-        let frozen_memtables = self.roots.load().frozen_memtables.clone();
+        let frozen_memtables = roots.frozen_memtables.clone();
         for frozen in frozen_memtables.iter().rev() {
-            for entry in frozen[shard].range((target_key.clone(), Reverse(read_seq))..) {
+            let frozen_start = Reverse(read_seq.saturating_add(1));
+            for entry in frozen[shard].range((target_key.clone(), frozen_start)..) {
                 if entry.key().0 != target_key {
                     break;
                 }
@@ -2342,7 +3656,13 @@ impl OmniKV {
                     if *expiry > 0 && *expiry <= now {
                         return Ok(None);
                     }
-                    let val = self.read_from_heap(entry.value().0, *length, entry.value().2)?;
+                    let val = self.read_from_heap_with_reader(
+                        &roots.heap_reader,
+                        roots.heap_generation,
+                        entry.value().0,
+                        *length,
+                        entry.value().2,
+                    )?;
                     if let Ok(mut lock) = self.metrics.read_latencies.lock() {
                         let _ = lock.record(start_time.elapsed().as_micros() as u64);
                     }
@@ -2352,7 +3672,7 @@ impl OmniKV {
         }
 
         let mut pointer = None;
-        let sstables = self.roots.load().sstables.clone();
+        let sstables = roots.sstables.clone();
         for (mmap, bloom, _) in sstables.iter().rev() {
             let mut h = FnvHasher::default();
             target_key.hash(&mut h);
@@ -2366,7 +3686,7 @@ impl OmniKV {
         }
 
         if pointer.is_none() {
-            let l1_sstables = self.roots.load().l1_sstables.clone();
+            let l1_sstables = roots.l1_sstables.clone();
             for (mmap, bloom, _) in l1_sstables.iter().rev() {
                 let mut h = FnvHasher::default();
                 target_key.hash(&mut h);
@@ -2381,11 +3701,11 @@ impl OmniKV {
         }
 
         if pointer.is_none() {
-            let base_bloom = self.roots.load().base_bloom.clone();
+            let base_bloom = roots.base_bloom.clone();
             let mut h = FnvHasher::default();
             target_key.hash(&mut h);
             if base_bloom.might_contain(h.finish()) {
-                let base_mmap = self.roots.load().base_mmap.clone();
+                let base_mmap = roots.base_mmap.clone();
                 let reader = SSTableReader::from_mmap(base_mmap);
                 pointer = reader.find(&target_key, read_seq);
             }
@@ -2398,7 +3718,13 @@ impl OmniKV {
             if expiry > 0 && expiry <= now {
                 return Ok(None);
             }
-            let val = self.read_from_heap(offset, length, crc)?;
+            let val = self.read_from_heap_with_reader(
+                &roots.heap_reader,
+                roots.heap_generation,
+                offset,
+                length,
+                crc,
+            )?;
             if let Ok(mut lock) = self.metrics.read_latencies.lock() {
                 let _ = lock.record(start_time.elapsed().as_micros() as u64);
             }
@@ -2437,21 +3763,37 @@ impl OmniKV {
     ) -> Result<ScanIterator<'_>, OmniError> {
         let start_key = string_to_key(start_key);
         let end_key = string_to_key(end_key);
+        self.scan_iter_bounds(start_key, ScanEnd::Inclusive(&end_key), read_seq)
+    }
+
+    fn scan_iter_bounds(
+        &self,
+        start_key: Vec<u8>,
+        end_bound: ScanEnd<'_>,
+        read_seq: u64,
+    ) -> Result<ScanIterator<'_>, OmniError> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
 
-        // Phase 1: Collect candidate records from all levels into a single Vec.
-        // We use a Vec instead of BTreeMap to avoid per-insert O(log N) overhead.
+        // Phase 1: Collect candidate records from one consistent root snapshot.
+        let roots = self.roots.load();
+        if read_seq < roots.read_seq_floor {
+            return Err(OmniError::StaleSnapshot {
+                read_seq,
+                floor: roots.read_seq_floor,
+            });
+        }
         let mut candidates: Vec<ScanCandidate> = Vec::new();
 
-        // Memtable (highest priority â€” newest data)
-        let active_mem = self.roots.load().memtable.clone();
+        // Memtable (highest priority — newest data)
+        let active_mem = roots.memtable.clone();
         for shard in active_mem.iter() {
-            for entry in shard.range((start_key.clone(), Reverse(read_seq))..) {
+            let memtable_start = Reverse(read_seq.saturating_add(1));
+            for entry in shard.range((start_key.clone(), memtable_start)..) {
                 let key = entry.key().0.clone();
-                if key > end_key {
+                if end_bound.is_past(&key) {
                     break;
                 }
                 let seq = entry.key().1.0;
@@ -2469,12 +3811,13 @@ impl OmniKV {
         }
 
         // Frozen memtables (second priority)
-        let frozen = self.roots.load().frozen_memtables.clone();
+        let frozen = roots.frozen_memtables.clone();
         for f_mem in frozen.iter().rev() {
             for shard in f_mem.iter() {
-                for entry in shard.range((start_key.clone(), Reverse(read_seq))..) {
+                let frozen_start = Reverse(read_seq.saturating_add(1));
+                for entry in shard.range((start_key.clone(), frozen_start)..) {
                     let key = entry.key().0.clone();
-                    if key > end_key {
+                    if end_bound.is_past(&key) {
                         break;
                     }
                     let seq = entry.key().1.0;
@@ -2493,13 +3836,13 @@ impl OmniKV {
         }
 
         // L0 SSTables (newest first)
-        let sstables = self.roots.load().sstables.clone();
+        let sstables = roots.sstables.clone();
         for (mmap, _, _) in sstables.iter().rev() {
             let reader = SSTableReader::from_mmap(mmap.clone());
             // Sparse-index seeks may rewind before start_key; enforce both
-            // inclusive bounds before collecting any persisted candidate.
+            // bounds before collecting any persisted candidate.
             for rec in reader.iter_from(&start_key) {
-                if rec.key > end_key {
+                if end_bound.is_past(&rec.key) {
                     break;
                 }
                 if rec.key >= start_key && rec.is_valid() && rec.seq <= read_seq {
@@ -2516,11 +3859,11 @@ impl OmniKV {
         }
 
         // L1 SSTables
-        let l1_sstables = self.roots.load().l1_sstables.clone();
+        let l1_sstables = roots.l1_sstables.clone();
         for (mmap, _, _) in &**l1_sstables {
             let reader = SSTableReader::from_mmap(mmap.clone());
             for rec in reader.iter_from(&start_key) {
-                if rec.key > end_key {
+                if end_bound.is_past(&rec.key) {
                     break;
                 }
                 if rec.key >= start_key && rec.is_valid() && rec.seq <= read_seq {
@@ -2537,10 +3880,10 @@ impl OmniKV {
         }
 
         // Base file (oldest data, lowest priority)
-        let base_mmap = self.roots.load().base_mmap.clone();
+        let base_mmap = roots.base_mmap.clone();
         let reader = SSTableReader::from_mmap(base_mmap);
         for rec in reader.iter_from(&start_key) {
-            if rec.key > end_key {
+            if end_bound.is_past(&rec.key) {
                 break;
             }
             if rec.key >= start_key && rec.is_valid() && rec.seq <= read_seq {
@@ -2562,9 +3905,12 @@ impl OmniKV {
         // Phase 3: Deduplicate â€” keep only the first (newest) entry per key.
         candidates.dedup_by(|a, b| a.key == b.key);
 
-        // Phase 4: Lazy heap I/O â€” only read values when the iterator is consumed.
+        // Phase 4: Lazy heap I/O — retain the heap reader and generation from
+        // the exact StorageRoots snapshot that produced these offsets.
         Ok(ScanIterator {
             db: self,
+            heap_reader: roots.heap_reader.clone(),
+            heap_generation: roots.heap_generation,
             candidates: candidates.into_iter(),
             now,
             read_buffer: self.scan_buffer_pool.acquire(),
@@ -2579,7 +3925,8 @@ impl OmniKV {
 
         // 1. Active memtable
         let memtable = self.roots.load().memtable.clone();
-        for entry in memtable[shard].range((target_key.clone(), Reverse(read_seq))..) {
+        let memtable_start = Reverse(read_seq.saturating_add(1));
+        for entry in memtable[shard].range((target_key.clone(), memtable_start)..) {
             if entry.key().0 != target_key {
                 break;
             }
@@ -2591,7 +3938,8 @@ impl OmniKV {
         // 2. Frozen memtables
         let frozen_memtables = self.roots.load().frozen_memtables.clone();
         for frozen in frozen_memtables.iter().rev() {
-            for entry in frozen[shard].range((target_key.clone(), Reverse(read_seq))..) {
+            let frozen_start = Reverse(read_seq.saturating_add(1));
+            for entry in frozen[shard].range((target_key.clone(), frozen_start)..) {
                 if entry.key().0 != target_key {
                     break;
                 }
@@ -2673,49 +4021,77 @@ impl OmniKV {
         0
     }
 
+    fn notify_compaction_waiters(&self) {
+        let (ref stall_lock, ref cv) = self.compaction_cv;
+        let _guard = stall_lock.lock().unwrap_or_else(|e| e.into_inner());
+        cv.notify_all();
+    }
+
     /// Flushes the active memtable to disk as an L0 SSTable.
     pub fn compact_sstables(&self) -> Result<(), OmniError> {
-        let _topology_guard = self
-            .transition_guard
-            .read()
-            .map_err(|_| OmniError::LockPoisoned("transition_guard".into()))?;
-        self.compact_sstables_locked()
+        self.ensure_writes_not_fenced()?;
+        {
+            let _topology_guard = self
+                .transition_guard
+                .read()
+                .map_err(|_| OmniError::LockPoisoned("transition_guard".into()))?;
+            self.compact_sstables_locked()?;
+        }
+        // Only rotate (truncate) the WAL AFTER the flushed SSTable and manifest
+        // are durably published, and only when no concurrent writers or
+        // unflushed memtable entries exist. Otherwise keep the WAL intact so
+        // concurrent writes are never lost on crash.
+        if let Ok(_exclusive) = self.transition_guard.try_write()
+            && let Ok(_write_guard) = self.write_mutex.lock()
+            && !self.is_write_fenced()
+        {
+            let roots = self.roots.load();
+            let active_empty = roots.memtable.iter().all(|shard| shard.is_empty());
+            let frozen_empty = roots.frozen_memtables.is_empty();
+            if active_empty
+                && frozen_empty
+                && let Ok(mut wal) = self.wal.lock()
+            {
+                let _ = wal.rotate_segment();
+            }
+        }
+        Ok(())
     }
 
     /// Compacts the active memtable while the caller already holds the
     /// transition barrier. Backup creation uses this form while holding the
     /// barrier exclusively; reacquiring the read side there would deadlock.
     pub(crate) fn compact_sstables_locked(&self) -> Result<(), OmniError> {
+        self.ensure_writes_not_fenced()?;
         let started_at = std::time::Instant::now();
         let mut stats = CompactionStats::default();
-        let (frozen_idx, frozen_arc) = {
+        let frozen_arc = {
             let _guard = self
                 .write_mutex
                 .lock()
                 .map_err(|_| OmniError::LockPoisoned("compact".into()))?;
+            self.ensure_writes_not_fenced()?;
             let new_empty: SharedMemtable = Arc::new(std::array::from_fn(|_| SkipMap::new()));
-            // Atomically: swap memtable to empty and add old one to frozen list
-            let old_memtable = {
-                let current = self.roots.load();
-                let old = current.memtable.clone();
-                let mut new_frozen = current.frozen_memtables.as_ref().clone();
-                new_frozen.push(old.clone());
-                self.roots.store(Arc::new(StorageRoots {
-                    memtable: new_empty,
-                    frozen_memtables: Arc::new(new_frozen.clone()),
-                    base_mmap: current.base_mmap.clone(),
-                    base_bloom: current.base_bloom.clone(),
-                    sstables: current.sstables.clone(),
-                    l1_sstables: current.l1_sstables.clone(),
-                    manifest: current.manifest.clone(),
-                    heap_reader: current.heap_reader.clone(),
-                }));
-                (old, new_frozen.len() - 1)
-            };
-            if let Ok(mut wal) = self.wal.lock() {
-                let _ = wal.rotate_segment();
-            }
-            (old_memtable.1, old_memtable.0)
+            // Atomically: swap memtable to empty and add old one to frozen list.
+            // Do NOT truncate the WAL here: the frozen memtable is not durable
+            // until the L0 SSTable and updated manifest are fsynced below.
+            let current = self.roots.load();
+            let old = current.memtable.clone();
+            let mut new_frozen = current.frozen_memtables.as_ref().clone();
+            new_frozen.push(old.clone());
+            self.roots.store(Arc::new(StorageRoots {
+                memtable: new_empty,
+                frozen_memtables: Arc::new(new_frozen),
+                base_mmap: current.base_mmap.clone(),
+                base_bloom: current.base_bloom.clone(),
+                sstables: current.sstables.clone(),
+                l1_sstables: current.l1_sstables.clone(),
+                manifest: current.manifest.clone(),
+                heap_reader: current.heap_reader.clone(),
+                heap_generation: current.heap_generation,
+                read_seq_floor: current.read_seq_floor,
+            }));
+            old
         };
 
         let mut records = Vec::new();
@@ -2734,7 +4110,7 @@ impl OmniKV {
         }
 
         if records.is_empty() {
-            self.remove_frozen_memtable(frozen_idx)?;
+            self.remove_frozen_memtable(&frozen_arc)?;
             stats.record(
                 "memtable_to_l0",
                 started_at,
@@ -2779,24 +4155,38 @@ impl OmniKV {
         // treats the table as immutable and replaces it only by root swap.
         let mmap = unsafe { MmapOptions::new().map(&file)? };
 
+        let _publish_guard = self
+            .write_mutex
+            .lock()
+            .map_err(|_| OmniError::LockPoisoned("compact_publish".into()))?;
+        self.ensure_writes_not_fenced()?;
+
         let mut manifest = self.roots.load().manifest.clone().as_ref().clone();
         manifest.sstables.push(sst_path.clone());
         manifest.max_seq = manifest.max_seq.max(self.global_seq.load(Ordering::SeqCst));
-        manifest.save(&self.manifest_path)?;
+        self.publish_manifest_or_fence(&manifest, Some(&mut output_guard))?;
 
-        // CRITICAL: Publish manifest + sstables in a SINGLE atomic swap.
-        // Two separate update_roots calls would let readers see a manifest
-        // listing an SSTable that hasn't been added to roots yet.
-        let mut sstables = self.roots.load().sstables.clone().as_ref().clone();
+        // CRITICAL: Publish manifest + sstables + frozen removal in a SINGLE
+        // atomic swap under `write_mutex`.
+        let cur_roots = self.roots.load();
+        let mut sstables = cur_roots.sstables.clone().as_ref().clone();
         sstables.push((Arc::new(mmap), Arc::new(bloom), sst_path));
+        let mut frozen = cur_roots.frozen_memtables.clone().as_ref().clone();
+        if let Some(pos) = frozen
+            .iter()
+            .position(|entry| Arc::ptr_eq(entry, &frozen_arc))
+        {
+            frozen.remove(pos);
+        }
         self.update_roots(|r| StorageRoots {
             manifest: Arc::new(manifest),
             sstables: Arc::new(sstables),
+            frozen_memtables: Arc::new(frozen),
             ..r.clone()
         });
         output_guard.disarm();
+        drop(_publish_guard);
 
-        self.remove_frozen_memtable(frozen_idx)?;
         stats.record(
             "memtable_to_l0",
             started_at,
@@ -2815,10 +4205,11 @@ impl OmniKV {
             .transition_guard
             .read()
             .map_err(|_| OmniError::LockPoisoned("transition_guard".into()))?;
-        let _guard = self
+        let write_guard = self
             .write_mutex
             .lock()
             .map_err(|_| OmniError::LockPoisoned("compact_l0".into()))?;
+        self.ensure_writes_not_fenced()?;
         let sstables = self.roots.load().sstables.clone();
         if sstables.is_empty() {
             return Ok(());
@@ -2858,12 +4249,9 @@ impl OmniKV {
         if records.is_empty() {
             let mut manifest = self.roots.load().manifest.clone().as_ref().clone();
             manifest.sstables.clear();
-            manifest.save(&self.manifest_path)?;
+            self.publish_manifest_or_fence(&manifest, None)?;
             self.update_roots(|r| StorageRoots {
                 manifest: Arc::new(manifest),
-                ..r.clone()
-            });
-            self.update_roots(|r| StorageRoots {
                 sstables: Arc::new(Vec::new()),
                 ..r.clone()
             });
@@ -2877,6 +4265,8 @@ impl OmniKV {
             });
 
             stats.record("l0_to_l1", started_at, self.compaction_backlog_sstables());
+            drop(write_guard);
+            self.notify_compaction_waiters();
             return Ok(());
         }
 
@@ -2919,7 +4309,7 @@ impl OmniKV {
         manifest.sstables.clear();
         manifest.l1_sstables.push(sst_path.clone());
         manifest.max_seq = manifest.max_seq.max(self.global_seq.load(Ordering::SeqCst));
-        manifest.save(&self.manifest_path)?;
+        self.publish_manifest_or_fence(&manifest, Some(&mut output_guard))?;
 
         // CRITICAL: Publish manifest + l1_sstables + cleared L0 in a SINGLE atomic swap.
         let mut l1_sstables = self.roots.load().l1_sstables.clone().as_ref().clone();
@@ -2941,6 +4331,8 @@ impl OmniKV {
         });
 
         stats.record("l0_to_l1", started_at, self.compaction_backlog_sstables());
+        drop(write_guard);
+        self.notify_compaction_waiters();
         Ok(())
     }
 
@@ -2955,6 +4347,7 @@ impl OmniKV {
             .write_mutex
             .lock()
             .map_err(|_| OmniError::LockPoisoned("compact_l1_l2".into()))?;
+        self.ensure_writes_not_fenced()?;
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -3065,7 +4458,7 @@ impl OmniKV {
             .into_iter()
             .map(|(_, _, path)| path)
             .collect();
-        manifest.save(&self.manifest_path)?;
+        self.publish_manifest_or_fence(&manifest, Some(&mut output_guard))?;
 
         self.update_roots(|r| StorageRoots {
             base_mmap: Arc::new(new_base_mmap),
@@ -3097,14 +4490,19 @@ impl OmniKV {
     pub fn run_garbage_collection(&self) -> Result<(), OmniError> {
         let started_at = std::time::Instant::now();
         let mut stats = CompactionStats::default();
+        // Acquire the exclusive transition barrier plus write_mutex so no
+        // writer or L0/L1 compaction can mutate memtables, publish stale-heap
+        // SSTables, or race heap swaps until GC publishes the replacement root.
+        // Lock-free readers keep using their previously captured Arc<StorageRoots>.
         let _topology_guard = self
             .transition_guard
-            .read()
+            .write()
             .map_err(|_| OmniError::LockPoisoned("transition_guard".into()))?;
-        let _guard = self
+        let write_guard = self
             .write_mutex
             .lock()
             .map_err(|_| OmniError::LockPoisoned("GC write mutex".into()))?;
+        self.ensure_writes_not_fenced()?;
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -3119,8 +4517,8 @@ impl OmniKV {
                 versions.insert(seq, (offset, length, crc, expiry));
             };
 
-        let base_mmap = self.roots.load().base_mmap.clone();
-        let reader = SSTableReader::from_mmap(base_mmap);
+        let cur_roots = self.roots.load();
+        let reader = SSTableReader::from_mmap(cur_roots.base_mmap.clone());
         for rec in reader.iter_from(b"") {
             if rec.is_valid() {
                 add_to_merged(
@@ -3134,8 +4532,7 @@ impl OmniKV {
             }
         }
 
-        let sstables = self.roots.load().sstables.clone();
-        for (mmap, _, _) in &**sstables {
+        for (mmap, _, _) in &**cur_roots.sstables {
             let reader = SSTableReader::from_mmap(mmap.clone());
             for rec in reader.iter_from(b"") {
                 if rec.is_valid() {
@@ -3151,8 +4548,7 @@ impl OmniKV {
             }
         }
 
-        let l1_sstables = self.roots.load().l1_sstables.clone();
-        for (mmap, _, _) in &**l1_sstables {
+        for (mmap, _, _) in &**cur_roots.l1_sstables {
             let reader = SSTableReader::from_mmap(mmap.clone());
             for rec in reader.iter_from(b"") {
                 if rec.is_valid() {
@@ -3168,8 +4564,24 @@ impl OmniKV {
             }
         }
 
-        let memtable = self.roots.load().memtable.clone();
-        for shard in memtable.iter() {
+        for frozen in cur_roots.frozen_memtables.iter() {
+            for shard in frozen.iter() {
+                for entry in shard.iter() {
+                    let key = entry.key().0.clone();
+                    let seq = entry.key().1.0;
+                    add_to_merged(
+                        key,
+                        seq,
+                        entry.value().0,
+                        entry.value().1,
+                        entry.value().2,
+                        entry.value().3,
+                    );
+                }
+            }
+        }
+
+        for shard in cur_roots.memtable.iter() {
             for entry in shard.iter() {
                 let key = entry.key().0.clone();
                 let seq = entry.key().1.0;
@@ -3292,44 +4704,51 @@ impl OmniKV {
         let new_base_mmap = unsafe { MmapOptions::new().map(&new_base_file)? };
 
         let new_heap_reader = OpenOptions::new().read(true).open(&new_heap_path)?;
-        // Capture the pre-GC manifest before publishing the replacement
-        // topology. Cleanup must delete these obsolete files, never the new
-        // paths that are about to become the active roots.
-        let old_manifest = self.roots.load().manifest.clone().as_ref().clone();
+        let old_manifest = cur_roots.manifest.as_ref().clone();
         let mut manifest_for_roots = old_manifest.clone();
         manifest_for_roots.heap_path = new_heap_path.clone();
         manifest_for_roots.base_path = new_base_path.clone();
         manifest_for_roots.sstables.clear();
         manifest_for_roots.l1_sstables.clear();
-        bloom.save(&bloom_path_for_base(&new_base_path))?;
-        manifest_for_roots.save(&self.manifest_path)?;
+        let cur_next_seq = self.global_seq.load(Ordering::SeqCst);
+        let checkpoint_seq = cur_next_seq.saturating_sub(1);
+        manifest_for_roots.wal_checkpoint_seq =
+            manifest_for_roots.wal_checkpoint_seq.max(checkpoint_seq);
+        manifest_for_roots.max_seq = manifest_for_roots.max_seq.max(cur_next_seq);
 
-        let cur = self.roots.load();
+        // Acquire `heap_file` BEFORE persisting the replacement manifest so no
+        // fallible lock acquisition remains between `publish_manifest_or_fence`
+        // and `output_guard.disarm()`.
+        let mut heap_lock = self
+            .heap_file
+            .lock()
+            .map_err(|_| OmniError::LockPoisoned("heap_file".into()))?;
+        bloom.save(&bloom_path_for_base(&new_base_path))?;
+        self.publish_manifest_or_fence(&manifest_for_roots, Some(&mut output_guard))?;
+
+        // Writers and compactions are fenced by exclusive `transition_guard` +
+        // `write_mutex`, and every memtable/frozen_memtable entry has been
+        // rewritten into `new_base_mmap` / `new_heap_path`. Publish brand-new
+        // empty memtables so no pointer addressing the old heap generation can
+        // ever be read against the replacement heap. Existing readers keep
+        // reading the previous `Arc<StorageRoots>` untouched.
+        let new_empty_memtable: SharedMemtable = Arc::new(std::array::from_fn(|_| SkipMap::new()));
+        *heap_lock = new_heap_file;
+        self.heap_offset.store(current_offset, Ordering::SeqCst);
         self.roots.store(Arc::new(StorageRoots {
             base_mmap: Arc::new(new_base_mmap),
             base_bloom: Arc::new(bloom),
             sstables: Arc::new(Vec::new()),
             l1_sstables: Arc::new(Vec::new()),
             heap_reader: Arc::new(new_heap_reader),
+            heap_generation: self.next_heap_generation.fetch_add(1, Ordering::Relaxed),
+            read_seq_floor: cur_roots.read_seq_floor,
             manifest: Arc::new(manifest_for_roots),
-            memtable: cur.memtable.clone(),
-            frozen_memtables: cur.frozen_memtables.clone(),
+            memtable: new_empty_memtable,
+            frozen_memtables: Arc::new(Vec::new()),
         }));
         output_guard.disarm();
         self.block_cache.invalidate_all();
-
-        let mut heap_lock = self
-            .heap_file
-            .lock()
-            .map_err(|_| OmniError::LockPoisoned("heap_file".into()))?;
-        *heap_lock = new_heap_file;
-        self.heap_offset.store(current_offset, Ordering::SeqCst);
-        // NOTE: Do NOT clear the active memtable here.
-        // Writes that arrived between GC start and this point are in the
-        // active memtable but NOT in the new base file. Clearing them
-        // would silently discard committed data.
-        // These entries are harmless duplicates that will be deduplicated
-        // during the next compaction cycle.
 
         std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_secs(5));
@@ -3344,11 +4763,21 @@ impl OmniKV {
             }
         });
 
-        if let Ok(mut wal) = self.wal.lock() {
-            let _ = wal.clear();
+        match self.wal.lock() {
+            Ok(mut wal) => {
+                if let Err(err) = wal.clear() {
+                    tracing::warn!(error = %err, "heap_gc WAL clear failed (checkpointed in manifest)");
+                }
+            }
+            Err(_) => {
+                tracing::warn!("heap_gc WAL lock poisoned while clearing WAL");
+            }
         }
 
         stats.record("heap_gc", started_at, self.compaction_backlog_sstables());
+        drop(heap_lock);
+        drop(write_guard);
+        self.notify_compaction_waiters();
         Ok(())
     }
 
@@ -3368,6 +4797,9 @@ impl OmniKV {
                 let mut gc_counter: u32 = 0;
                 loop {
                     std::thread::sleep(std::time::Duration::from_millis(check_interval_ms));
+                    if db.is_write_fenced() {
+                        continue;
+                    }
 
                     let mut did_compact = false;
                     let compaction_policy = match db.compaction_policy() {
@@ -4009,5 +5441,432 @@ mod tests {
             no_leader.to_string(),
             "not the leader; no leader elected yet"
         );
+    }
+
+    #[test]
+    fn write_stall_wait_ignores_no_progress_wakeup_and_proceeds_when_l0_clears() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db = OmniKV::open(
+            dir.path()
+                .join("manifest.json")
+                .to_str()
+                .expect("manifest path"),
+            dir.path().join("wal.bin").to_str().expect("wal path"),
+        )
+        .expect("open db");
+
+        // Raise threshold while seeding 2 L0 SSTables.
+        db.set_compaction_policy(CompactionPolicy {
+            l0_compaction_trigger: 1,
+            l1_compaction_trigger: 1,
+            l0_write_stall_threshold: 4,
+            write_stall_wait_attempts: 1,
+            write_stall_wait_ms: 500,
+        })
+        .expect("set seed policy");
+        for i in 0..2 {
+            let mut b = WriteBatch::new();
+            b.set(&format!("seed_{i}"), "v".into())
+                .expect("stage seed key");
+            db.commit_batch(&b).expect("commit seed key");
+            db.compact_sstables().expect("flush L0");
+        }
+        assert_eq!(db.sstable_count(), 2);
+
+        // Stall at 2 L0 SSTables with 1 attempt of 500ms.
+        db.set_compaction_policy(CompactionPolicy {
+            l0_compaction_trigger: 1,
+            l1_compaction_trigger: 1,
+            l0_write_stall_threshold: 2,
+            write_stall_wait_attempts: 1,
+            write_stall_wait_ms: 500,
+        })
+        .expect("set stall policy");
+
+        let started = std::time::Instant::now();
+        let db_bg = db.clone();
+        let writer_ready = Arc::new(std::sync::Barrier::new(2));
+        let bg_ready = writer_ready.clone();
+        let bg = std::thread::spawn(move || {
+            bg_ready.wait();
+            // Hold `stall_lock` momentarily only after the writer has raced into
+            // `commit_batch`, then fire multiple no-progress wakeups before clearing L0.
+            for _ in 0..3 {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                db_bg.notify_compaction_waiters();
+            }
+            // Clear L0 shortly afterwards, well within the 500ms budget.
+            std::thread::sleep(std::time::Duration::from_millis(40));
+            db_bg.compact_l0_to_l1().expect("compact L0 to L1");
+        });
+
+        let mut writer_batch = WriteBatch::new();
+        writer_batch
+            .set("after_stall", "ok".into())
+            .expect("stage writer key");
+        writer_ready.wait();
+        db.commit_batch(&writer_batch)
+            .expect("writer must wait through no-progress wakeup until compaction clears L0");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= std::time::Duration::from_millis(80),
+            "writer should wait until compaction clears L0 (elapsed={elapsed:?})"
+        );
+        bg.join().expect("background compactor joined");
+        assert_eq!(
+            db.find("after_stall", db.get_seq()).expect("read key"),
+            Some("ok".into())
+        );
+    }
+
+    #[test]
+    fn open_restores_durable_2pc_prepared_key_reservations_before_participant_init() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let manifest = dir
+            .path()
+            .join("manifest.json")
+            .to_str()
+            .expect("manifest path")
+            .to_string();
+        let wal = dir
+            .path()
+            .join("wal.bin")
+            .to_str()
+            .expect("wal path")
+            .to_string();
+
+        {
+            let db = OmniKV::open(&manifest, &wal).expect("open db");
+            let participant = crate::dist_txn::TwoPhaseParticipant::new(2, db.clone());
+            let prep = participant.prepare(
+                (1, 501),
+                &[crate::dist_txn::DistWrite {
+                    node_id: 2,
+                    key: "reserved_on_reopen".into(),
+                    value: Some("prepared_v".into()),
+                    ttl: 0,
+                }],
+            );
+            assert_eq!(prep.vote, crate::dist_txn::Vote::Commit);
+        }
+
+        // Reopen without creating TwoPhaseParticipant yet: plain writes must
+        // still be blocked from clobbering the durable PREPARED key.
+        let reopened = OmniKV::open(&manifest, &wal).expect("reopen db");
+        let mut plain = WriteBatch::new();
+        plain
+            .set("reserved_on_reopen", "clobber".into())
+            .expect("stage plain write");
+        assert!(
+            reopened.commit_batch(&plain).is_err(),
+            "plain write must not overwrite a durable 2PC PREPARED key after restart"
+        );
+    }
+
+    #[test]
+    fn scan_iterator_retains_captured_heap_generation_across_heap_gc_swap() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let manifest = dir
+            .path()
+            .join("manifest.json")
+            .to_str()
+            .expect("manifest path")
+            .to_string();
+        let wal = dir
+            .path()
+            .join("wal.bin")
+            .to_str()
+            .expect("wal path")
+            .to_string();
+        let db = OmniKV::open(&manifest, &wal).expect("open db");
+
+        let mut b1 = WriteBatch::new();
+        b1.set("gen/a", "old_value_a".into()).expect("stage a");
+        b1.set("gen/b", "old_value_b".into()).expect("stage b");
+        db.commit_batch(&b1).expect("commit gen 1");
+        let snap_seq = db.get_seq();
+
+        // Capture a lazy ScanIterator against generation 1 before GC replaces the heap.
+        let mut iter = db
+            .scan_iter_bounds(
+                string_to_key("gen/"),
+                ScanEnd::Exclusive(&string_to_key("gen0")),
+                snap_seq,
+            )
+            .expect("start scan on gen 1");
+
+        // Overwrite with new values and run heap GC to swap to generation 2,
+        // then read gen 2 so block_cache holds offset 0 of generation 2.
+        let mut b2 = WriteBatch::new();
+        b2.set("gen/a", "new_value_a".into()).expect("overwrite a");
+        b2.set("gen/b", "new_value_b".into()).expect("overwrite b");
+        db.commit_batch(&b2).expect("commit gen 2 writes");
+        db.flush_memtable_to_disk(1).expect("flush before gc");
+        db.run_garbage_collection().expect("run heap gc");
+        assert_eq!(
+            db.find("gen/a", db.get_seq()).expect("read gen 2 a"),
+            Some("new_value_a".into())
+        );
+
+        // Consuming the gen-1 ScanIterator must still return gen-1 values,
+        // never cross-reading or hitting block_cache entries from gen 2.
+        let mut collected = Vec::new();
+        while let Some(pair) = iter.try_next().expect("read gen 1 entry") {
+            collected.push(pair);
+        }
+        assert_eq!(
+            collected,
+            vec![
+                ("gen/a".to_string(), "old_value_a".to_string()),
+                ("gen/b".to_string(), "old_value_b".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn heap_gc_without_prior_flush_does_not_publish_stale_memtable_offsets() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let manifest = dir
+            .path()
+            .join("manifest.json")
+            .to_str()
+            .expect("manifest path")
+            .to_string();
+        let wal = dir
+            .path()
+            .join("wal.bin")
+            .to_str()
+            .expect("wal path")
+            .to_string();
+        let db = OmniKV::open(&manifest, &wal).expect("open db");
+
+        // Commit `z` first (heap offset 0) and then `a` without flushing.
+        // GC rewrites the heap in sorted key order (`a` at offset 0, `z` later).
+        let mut b1 = WriteBatch::new();
+        b1.set("z", "Z".into()).expect("stage z");
+        db.commit_batch(&b1).expect("commit z");
+
+        let mut b2 = WriteBatch::new();
+        b2.set("a", "A".into()).expect("stage a");
+        db.commit_batch(&b2).expect("commit a");
+
+        // Capture pre-GC WAL bytes to simulate a crash right after manifest.save()
+        // and before wal.clear() completes.
+        let pre_gc_wal_bytes = std::fs::read(&wal).expect("read pre-gc wal bytes");
+        assert!(
+            !pre_gc_wal_bytes.is_empty(),
+            "pre-gc WAL must contain unflushed records"
+        );
+
+        // Capture a pre-GC lazy iterator before GC runs (still without flushing).
+        let snap_seq = db.get_seq();
+        let mut pre_gc_iter = db
+            .scan_iter_bounds(string_to_key("a"), ScanEnd::Inclusive(b"z"), snap_seq)
+            .expect("start pre-gc scan");
+
+        db.run_garbage_collection()
+            .expect("heap gc without prior flush must succeed");
+
+        // Uncached post-GC reads must read the replacement heap via the rebuilt
+        // base SSTable instead of stale memtable pointers into the old heap.
+        assert_eq!(
+            db.find("z", db.get_seq()).expect("read z after gc"),
+            Some("Z".into())
+        );
+        assert_eq!(
+            db.find("a", db.get_seq()).expect("read a after gc"),
+            Some("A".into())
+        );
+
+        let mut pre_gc_rows = Vec::new();
+        while let Some(pair) = pre_gc_iter.try_next().expect("read pre-gc iter") {
+            pre_gc_rows.push(pair);
+        }
+        assert_eq!(
+            pre_gc_rows,
+            vec![
+                ("a".to_string(), "A".to_string()),
+                ("z".to_string(), "Z".to_string()),
+            ]
+        );
+
+        // Drop DB, restore pre-GC WAL bytes (old heap offsets!), reopen, and
+        // verify wal_checkpoint_seq prevents stale WAL replay from corrupting reads.
+        drop(pre_gc_iter);
+        drop(db);
+        std::fs::write(&wal, &pre_gc_wal_bytes).expect("restore pre-gc wal bytes");
+        let reopened =
+            OmniKV::open(&manifest, &wal).expect("reopen after gc crash before wal clear");
+        assert_eq!(
+            reopened.find("z", reopened.get_seq()).expect("reopen z"),
+            Some("Z".into())
+        );
+        assert_eq!(
+            reopened.find("a", reopened.get_seq()).expect("reopen a"),
+            Some("A".into())
+        );
+    }
+
+    #[test]
+    fn open_fails_closed_when_unfinished_snapshot_rollback_dir_exists() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let manifest_path = dir.path().join("manifest.json");
+        let wal_path = dir.path().join("wal.bin");
+        let manifest_str = manifest_path.to_str().expect("manifest path").to_string();
+        let wal_str = wal_path.to_str().expect("wal path").to_string();
+
+        // Case 1: non-empty unresolved rollback dir without manifest fails closed.
+        let unresolved = dir.path().join("old_snapshot_interrupted");
+        std::fs::create_dir_all(&unresolved).expect("create unresolved dir");
+        let backup_manifest = unresolved.join("manifest.json");
+        std::fs::write(&backup_manifest, b"original-manifest").expect("write backup manifest");
+
+        let err = OmniKV::open(&manifest_str, &wal_str)
+            .err()
+            .expect("open must fail closed on unfinished snapshot promotion");
+        assert!(
+            err.to_string().contains("unfinished snapshot promotion"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            !manifest_path.exists(),
+            "open must not create an empty manifest when unfinished rollback dir exists"
+        );
+        assert_eq!(
+            std::fs::read(&backup_manifest).expect("backup must remain intact"),
+            b"original-manifest"
+        );
+
+        // Case 2: even an empty rollback dir without a live manifest fails closed.
+        std::fs::remove_file(&backup_manifest).expect("remove sentinel");
+        assert!(
+            OmniKV::open(&manifest_str, &wal_str).is_err(),
+            "empty rollback dir without live manifest must fail closed"
+        );
+        assert!(!manifest_path.exists());
+
+        // Removing the unresolved dir lets a genuinely fresh database open cleanly.
+        std::fs::remove_dir_all(&unresolved).expect("clear unresolved dir");
+        let fresh = OmniKV::open(&manifest_str, &wal_str).expect("fresh open should succeed");
+        drop(fresh);
+
+        // Case 3: `.install_complete` paired with `.rollback_failed` must fail closed even with manifest present.
+        let failed_dir = dir.path().join("old_snapshot_failed");
+        std::fs::create_dir_all(&failed_dir).expect("create failed dir");
+        std::fs::write(failed_dir.join(".install_complete"), b"ok").expect("write complete");
+        std::fs::write(failed_dir.join(".rollback_failed"), b"failed").expect("write failed");
+        assert!(
+            OmniKV::open(&manifest_str, &wal_str).is_err(),
+            "rollback_failed marker must fail closed even when manifest exists"
+        );
+    }
+
+    #[test]
+    fn bounded_streaming_scans_match_full_scans_across_levels_mvcc_tombstones_and_ttl() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let manifest = dir
+            .path()
+            .join("manifest.json")
+            .to_str()
+            .expect("manifest path")
+            .to_string();
+        let wal = dir
+            .path()
+            .join("wal.bin")
+            .to_str()
+            .expect("wal path")
+            .to_string();
+        let db = OmniKV::open(&manifest, &wal).expect("open db");
+
+        // Layer 1 (compacted all the way to base): initial keys k00..k19.
+        let mut b1 = WriteBatch::new();
+        for i in 0..20 {
+            b1.set(&format!("k{i:02}"), format!("base-{i}"))
+                .expect("set base");
+        }
+        let seq_base = db.commit_batch(&b1).expect("commit base");
+        db.flush_memtable_to_disk(0).expect("flush base to l0");
+        db.compact_l0_to_l1().expect("compact to l1");
+        db.compact_l1_to_l2().expect("compact to base");
+
+        // Layer 2 (L1): overwrite multiples of 3, delete k02/k05, add expired k04.
+        let mut b2 = WriteBatch::new();
+        for i in (0..20).step_by(3) {
+            b2.set(&format!("k{i:02}"), format!("l1-{i}"))
+                .expect("set l1");
+        }
+        b2.delete("k02").expect("del k02");
+        b2.delete("k05").expect("del k05");
+        b2.set_with_expiry("k04", "expired".into(), 1)
+            .expect("set expired k04");
+        let seq_l1 = db.commit_batch(&b2).expect("commit l1");
+        db.flush_memtable_to_disk(0).expect("flush l1");
+        db.compact_l0_to_l1().expect("compact l0 to l1");
+
+        // Layer 3 (L0): multiple versions of k03 & k06, resurrect k05.
+        let mut b3 = WriteBatch::new();
+        b3.set("k03", "l0-a".into()).expect("set k03 a");
+        b3.set("k06", "l0-a".into()).expect("set k06 a");
+        b3.set("k05", "resurrected".into()).expect("resurrect k05");
+        db.commit_batch(&b3).expect("commit l0 a");
+        let mut b4 = WriteBatch::new();
+        b4.set("k03", "l0-b".into()).expect("set k03 b");
+        b4.delete("k06").expect("del k06");
+        let seq_l0 = db.commit_batch(&b4).expect("commit l0 b");
+        db.flush_memtable_to_disk(0).expect("flush l0");
+
+        // Layer 4 (active memtable): overwrite k00, delete k01, add k07-mem.
+        let mut b5 = WriteBatch::new();
+        b5.set("k00", "mem-0".into()).expect("set k00");
+        b5.delete("k01").expect("del k01");
+        b5.set("k07", "mem-7".into()).expect("set k07");
+        let seq_latest = db.commit_batch(&b5).expect("commit mem");
+
+        for snap_seq in [seq_base, seq_l1, seq_l0, seq_latest] {
+            let full_inc = db.scan("k00", "k19", snap_seq).expect("full scan");
+            let full_exc = db.scan_prefix("k", snap_seq).expect("full prefix scan");
+            for lim in [0, 1, 2, 5, 11, 50] {
+                let got_inc = db
+                    .scan_limit("k00", "k19", snap_seq, lim)
+                    .expect("scan_limit");
+                assert_eq!(got_inc, full_inc[..lim.min(full_inc.len())]);
+
+                let got_exc = db
+                    .scan_exclusive_limit("k00", Some("k15"), snap_seq, lim)
+                    .expect("scan_exclusive_limit");
+                let expected_exc: Vec<_> = full_exc
+                    .iter()
+                    .filter(|(k, _)| k.as_str() >= "k00" && k.as_str() < "k15")
+                    .take(lim)
+                    .cloned()
+                    .collect();
+                assert_eq!(got_exc, expected_exc);
+            }
+        }
+        // Empty inverted range and stale snapshot floor checks.
+        assert_eq!(
+            db.scan_limit("k10", "k05", seq_latest, 5)
+                .expect("inverted range")
+                .len(),
+            0
+        );
+        assert_eq!(
+            db.scan_exclusive_limit("k05", Some("k05"), seq_latest, 5)
+                .expect("empty exclusive range")
+                .len(),
+            0
+        );
+        db.update_roots(|r| StorageRoots {
+            read_seq_floor: seq_latest.saturating_add(1),
+            ..r.clone()
+        });
+        assert!(matches!(
+            db.scan_exclusive_limit("k00", Some("k15"), seq_latest, 0),
+            Err(OmniError::StaleSnapshot { .. })
+        ));
+        assert!(matches!(
+            db.scan_limit("k00", "k19", seq_latest, 5),
+            Err(OmniError::StaleSnapshot { .. })
+        ));
     }
 }

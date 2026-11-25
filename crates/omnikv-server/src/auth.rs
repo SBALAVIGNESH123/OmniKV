@@ -65,6 +65,8 @@ pub enum RequiredRole {
     Read,
     Write,
     Backup,
+    Restore,
+    Cluster,
     Admin,
 }
 
@@ -74,6 +76,8 @@ impl RequiredRole {
             Self::Read => "read",
             Self::Write => "write",
             Self::Backup => "backup",
+            Self::Restore => "restore",
+            Self::Cluster => "cluster",
             Self::Admin => "admin",
         }
     }
@@ -86,6 +90,8 @@ impl RequiredRole {
             Self::Read => matches!(role, "read" | "write" | "admin"),
             Self::Write => matches!(role, "write" | "admin"),
             Self::Backup => matches!(role, "backup" | "admin"),
+            Self::Restore => matches!(role, "restore" | "admin"),
+            Self::Cluster => matches!(role, "cluster" | "admin"),
             Self::Admin => role == "admin",
         }
     }
