@@ -780,9 +780,23 @@ impl SqlExecutor {
         // later statements in the block see it. Outside one, the
         // catalog's own autocommit path (which also updates its cache).
         if self.is_transactional() {
-            // Drain any interrupted large drop for this name before staging a
-            // replacement table so orphaned rows/indexes cannot resurrect on commit.
+            // Check whether an interrupted large drop was still pending at this
+            // transaction's fixed MVCC snapshot. If so, finish draining the dead
+            // table now and require the transaction to restart at a newer snapshot
+            // so subsequent SELECT/DML in the same transaction cannot read old
+            // pre-drain rows that were still live at `seq`.
+            let pending_at_snapshot = self
+                .db
+                .find(&Catalog::dropping_table_key(name), seq)
+                .map_err(|e| format!("{e:?}"))?
+                .is_some();
             self.catalog.finish_pending_drop(name)?;
+            if pending_at_snapshot {
+                return Err(format!(
+                    "table '{}' had an interrupted DROP TABLE pending at this transaction's snapshot; cleanup is now complete — restart the transaction and retry CREATE TABLE",
+                    name
+                ));
+            }
             // The staging path must reject a duplicate exactly like the
             // autocommit path (Catalog::create_table checks the cache):
             // staging would silently overwrite the existing definition

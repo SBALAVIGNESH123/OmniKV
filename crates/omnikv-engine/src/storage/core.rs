@@ -5856,5 +5856,17 @@ mod tests {
                 .len(),
             0
         );
+        db.update_roots(|r| StorageRoots {
+            read_seq_floor: seq_latest.saturating_add(1),
+            ..r.clone()
+        });
+        assert!(matches!(
+            db.scan_exclusive_limit("k00", Some("k15"), seq_latest, 0),
+            Err(OmniError::StaleSnapshot { .. })
+        ));
+        assert!(matches!(
+            db.scan_limit("k00", "k19", seq_latest, 5),
+            Err(OmniError::StaleSnapshot { .. })
+        ));
     }
 }

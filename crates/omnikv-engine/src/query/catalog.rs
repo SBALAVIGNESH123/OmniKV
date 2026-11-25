@@ -150,6 +150,13 @@ impl TableDef {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PendingTableDrop {
+    table: TableDef,
+    #[serde(default)]
+    rename_stage_keys: Vec<String>,
+}
+
 /// The table catalog — stored inside OmniKV itself.
 pub struct Catalog {
     db: Arc<OmniKV>,
@@ -217,6 +224,18 @@ impl Catalog {
         self.finish_pending_drop_locked(name)
     }
 
+    fn parse_pending_table_drop(dropping_key: &str, raw: &str) -> Result<PendingTableDrop, String> {
+        if let Ok(pending) = serde_json::from_str::<PendingTableDrop>(raw) {
+            return Ok(pending);
+        }
+        let table: TableDef = serde_json::from_str(raw)
+            .map_err(|e| format!("Invalid pending DROP TABLE record '{dropping_key}': {e}"))?;
+        Ok(PendingTableDrop {
+            table,
+            rename_stage_keys: Vec::new(),
+        })
+    }
+
     fn finish_pending_drop_locked(&self, name: &str) -> Result<(), String> {
         let dropping_key = Self::dropping_table_key(name);
         let Some(raw) = self
@@ -226,9 +245,8 @@ impl Catalog {
         else {
             return Ok(());
         };
-        let table: TableDef = serde_json::from_str(&raw)
-            .map_err(|e| format!("Invalid pending DROP TABLE record '{dropping_key}': {e}"))?;
-        self.drain_dropping_table_entry(&dropping_key, &table)
+        let pending = Self::parse_pending_table_drop(&dropping_key, &raw)?;
+        self.drain_dropping_table_entry(&dropping_key, &pending)
     }
 
     /// Completes all interrupted large-table drops recorded under
@@ -245,9 +263,8 @@ impl Catalog {
             .map_err(|e| format!("{e:?}"))?;
         let mut recovered = 0usize;
         for (dropping_key, raw) in pending {
-            let table: TableDef = serde_json::from_str(&raw)
-                .map_err(|e| format!("Invalid pending DROP TABLE record '{dropping_key}': {e}"))?;
-            self.drain_dropping_table_entry(&dropping_key, &table)?;
+            let record = Self::parse_pending_table_drop(&dropping_key, &raw)?;
+            self.drain_dropping_table_entry(&dropping_key, &record)?;
             recovered += 1;
         }
         Ok(recovered)
@@ -256,8 +273,9 @@ impl Catalog {
     fn drain_dropping_table_entry(
         &self,
         dropping_key: &str,
-        table: &TableDef,
+        pending: &PendingTableDrop,
     ) -> Result<(), String> {
+        let table = &pending.table;
         let chunk_cap = WriteBatch::MAX_OPS.saturating_sub(4).max(1);
         let row_prefix = table.row_prefix();
         loop {
@@ -288,14 +306,19 @@ impl Catalog {
             )
             .map_err(|e| format!("{e:?}"))?;
 
-        let stage_entries = crate::schema::SchemaManager::active_rename_stages_for_namespace(
+        let mut stage_keys: std::collections::BTreeSet<String> =
+            pending.rename_stage_keys.iter().cloned().collect();
+        for (stage_key, _) in crate::schema::SchemaManager::active_rename_stages_for_namespace(
             &self.db,
             &table.name,
             crate::secondary_index::IndexNamespace::Sql,
             self.db.get_seq(),
         )
-        .map_err(|e| format!("{e:?}"))?;
-        for (stage_key, _) in stage_entries {
+        .map_err(|e| format!("{e:?}"))?
+        {
+            stage_keys.insert(stage_key);
+        }
+        for stage_key in stage_keys {
             let row_marker_prefix =
                 crate::schema::SchemaManager::rename_row_stage_prefix(&stage_key);
             loop {
@@ -473,6 +496,7 @@ impl Catalog {
 
         if fits_single_batch {
             let mut batch = WriteBatch::new();
+            let mut ssi_write_keys = Vec::with_capacity(active_indexes.len().saturating_add(1));
             for key in &single_batch_data_keys {
                 batch.delete(key).map_err(|e| format!("{e:?}"))?;
             }
@@ -480,6 +504,7 @@ impl Catalog {
                 let (idx_cat_key, idx_ready_key) = IndexManager::index_meta_keys_for_def(def);
                 batch.delete(&idx_cat_key).map_err(|e| format!("{e:?}"))?;
                 batch.delete(&idx_ready_key).map_err(|e| format!("{e:?}"))?;
+                ssi_write_keys.push(idx_cat_key);
             }
             for (ret_key, _) in &retired_indexes {
                 batch.delete(ret_key).map_err(|e| format!("{e:?}"))?;
@@ -488,7 +513,18 @@ impl Catalog {
                 batch.delete(stage_key).map_err(|e| format!("{e:?}"))?;
             }
             batch.delete(&cat_key).map_err(|e| format!("{e:?}"))?;
-            self.db.commit_batch(&batch).map_err(|e| format!("{e:?}"))?;
+            ssi_write_keys.push(cat_key);
+            let commit_seq = self.db.commit_batch(&batch).map_err(|e| format!("{e:?}"))?;
+            self.db.ssi_history().record_committed(
+                0,
+                commit_seq,
+                &crate::transaction::SsiCommitRecord {
+                    txn_id: 0,
+                    write_keys: ssi_write_keys,
+                    read_keys: Vec::new(),
+                    read_ranges: Vec::new(),
+                },
+            );
             let mut cache = self
                 .cache
                 .write()
@@ -511,7 +547,11 @@ impl Catalog {
             ));
         }
         let dropping_key = Self::dropping_table_key(&table.name);
-        let dropping_value = serde_json::to_string(&table)
+        let pending_drop = PendingTableDrop {
+            table,
+            rename_stage_keys: stage_entries.into_iter().map(|(k, _)| k).collect(),
+        };
+        let dropping_value = serde_json::to_string(&pending_drop)
             .map_err(|e| format!("Serialize pending drop table: {e}"))?;
         let mut cutover = WriteBatch::new();
         cutover.delete(&cat_key).map_err(|e| format!("{e:?}"))?;
@@ -545,7 +585,7 @@ impl Catalog {
             cache.remove(&name_lower);
         }
 
-        self.drain_dropping_table_entry(&dropping_key, &table)
+        self.drain_dropping_table_entry(&dropping_key, &pending_drop)
     }
 
     /// The storage key and serialized TableDef a CREATE TABLE writes —

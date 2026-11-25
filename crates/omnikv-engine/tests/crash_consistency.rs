@@ -1229,12 +1229,54 @@ fn partial_add_field_failpoint_defers_catalog_and_recovers_on_retry() {
 }
 
 #[cfg(feature = "failpoints")]
+fn seed_and_interrupt_large_drop(manifest: &str, wal: &str, registry: &FailRegistry) -> u32 {
+    use omni_engine::catalog::Catalog;
+    use omni_engine::secondary_index::{IndexFieldType, IndexManager};
+
+    let db = OmniKV::open(manifest, wal).expect("open db");
+    let _executor = seed_fp_uq_table(&db, "fp_big_drop", WriteBatch::MAX_OPS + 120);
+    let idx_mgr = IndexManager::new(db.clone());
+    let id = idx_mgr
+        .create_sql_index(
+            "fp_big_drop_code_idx",
+            "fp_big_drop",
+            vec![("code".into(), IndexFieldType::String)],
+            false,
+        )
+        .expect("create index");
+    idx_mgr
+        .rebuild_index("fp_big_drop_code_idx")
+        .expect("rebuild");
+    let mut legacy_stage = WriteBatch::new();
+    legacy_stage
+        .set(
+            "\u{0}SCHEMA\u{0}rename_stage:11:fp_big_drop:3:old:3:new",
+            "1".into(),
+        )
+        .expect("stage key");
+    db.commit_batch(&legacy_stage).expect("commit legacy stage");
+
+    let catalog = Catalog::new(db);
+    registry.arm("catalog::drop_table_after_partial_chunk");
+    let drop_err = catalog
+        .drop_table("fp_big_drop")
+        .expect_err("armed failpoint must interrupt large drop_table mid-chunk");
+    registry.reset();
+    assert!(
+        drop_err.contains("catalog::drop_table_after_partial_chunk"),
+        "unexpected drop_err: {drop_err}"
+    );
+    id
+}
+
+#[cfg(feature = "failpoints")]
 #[test]
 fn interrupted_large_drop_table_hides_table_and_recovers_without_resurrection() {
     use omni_engine::catalog::Catalog;
-    use omni_engine::secondary_index::{IndexFieldType, IndexManager};
+    use omni_engine::secondary_index::IndexManager;
     use omni_engine::sql::parse_sql;
     use omni_engine::sql_exec::{ExecResult, SqlExecutor};
+    use std::collections::HashMap;
     use std::sync::Arc;
 
     let _lock = TEST_SERIAL
@@ -1245,45 +1287,11 @@ fn interrupted_large_drop_table_hides_table_and_recovers_without_resurrection() 
 
     let dir = TempDir::new().expect("tempdir");
     let (m, w) = fresh_db_paths(&dir);
-    let total_rows = WriteBatch::MAX_OPS + 120;
-    let idx_id = {
-        let db = OmniKV::open(&m, &w).expect("open db");
-        let _executor = seed_fp_uq_table(&db, "fp_big_drop", total_rows);
-        let idx_mgr = IndexManager::new(db.clone());
-        let id = idx_mgr
-            .create_sql_index(
-                "fp_big_drop_code_idx",
-                "fp_big_drop",
-                vec![("code".into(), IndexFieldType::String)],
-                false,
-            )
-            .expect("create index");
-        idx_mgr
-            .rebuild_index("fp_big_drop_code_idx")
-            .expect("rebuild");
+    let idx_id = seed_and_interrupt_large_drop(&m, &w, &registry);
 
-        let catalog = Catalog::new(db);
-        registry.arm("catalog::drop_table_after_partial_chunk");
-        let drop_err = catalog
-            .drop_table("fp_big_drop")
-            .expect_err("armed failpoint must interrupt large drop_table mid-chunk");
-        registry.reset();
-        assert!(
-            drop_err.contains("catalog::drop_table_after_partial_chunk"),
-            "unexpected drop_err: {drop_err}"
-        );
-        id
-    };
-
-    // Reopen after simulated crash: table and index MUST ALREADY BE HIDDEN
-    // (never exposed half-deleted), while the durable DROPPING_TABLE marker
-    // tracks the remaining orphaned rows/index entries.
     let db2 = OmniKV::open(&m, &w).expect("reopen db");
     let catalog2 = Arc::new(Catalog::new(db2.clone()));
-    assert!(
-        catalog2.get_table("fp_big_drop").is_none(),
-        "table must stay hidden after interrupted large DROP TABLE"
-    );
+    assert!(catalog2.get_table("fp_big_drop").is_none());
     assert!(
         db2.find(&Catalog::catalog_key("fp_big_drop"), db2.get_seq())
             .expect("find catalog key")
@@ -1292,22 +1300,32 @@ fn interrupted_large_drop_table_hides_table_and_recovers_without_resurrection() 
     assert!(
         db2.find(&Catalog::dropping_table_key("fp_big_drop"), db2.get_seq())
             .expect("find dropping marker")
-            .is_some(),
-        "durable DROPPING_TABLE marker must persist across crash"
+            .is_some()
     );
     assert!(
         IndexManager::new(db2.clone())
             .definition("fp_big_drop_code_idx")
-            .is_err(),
-        "active SQL index must already be retired at cutover"
+            .is_err()
     );
 
-    // Recreating the same table name automatically finishes the pending drop
-    // first so ZERO orphaned rows or index entries can resurrect.
-    let exec2 = SqlExecutor::new(db2.clone(), catalog2.clone());
-    exec2
+    // A transaction opened before cleanup completes rejects CREATE TABLE (so
+    // later SELECTs at its stale snapshot cannot read pre-drain rows) while
+    // finishing the pending drop cleanly for subsequent statements.
+    let stale_txn_exec = SqlExecutor::with_transaction(
+        db2.clone(),
+        catalog2.clone(),
+        db2.get_seq(),
+        &HashMap::new(),
+    );
+    let Err(txn_err) = stale_txn_exec
         .execute(&parse_sql("CREATE TABLE fp_big_drop (id TEXT PRIMARY KEY, code TEXT)").unwrap())
-        .expect("recreate table after interrupted drop");
+    else {
+        panic!("stale-snapshot transactional CREATE TABLE must fail closed after draining");
+    };
+    assert!(
+        txn_err.contains("interrupted DROP TABLE"),
+        "unexpected stale-txn error: {txn_err}"
+    );
     assert!(
         db2.find(&Catalog::dropping_table_key("fp_big_drop"), db2.get_seq())
             .expect("dropping marker cleared")
@@ -1318,6 +1336,19 @@ fn interrupted_large_drop_table_hides_table_and_recovers_without_resurrection() 
             .expect("retired index cleared")
             .is_none()
     );
+    assert!(
+        db2.find(
+            "\u{0}SCHEMA\u{0}rename_stage:11:fp_big_drop:3:old:3:new",
+            db2.get_seq()
+        )
+        .expect("legacy rename stage cleared")
+        .is_none()
+    );
+
+    let exec2 = SqlExecutor::new(db2, catalog2.clone());
+    exec2
+        .execute(&parse_sql("CREATE TABLE fp_big_drop (id TEXT PRIMARY KEY, code TEXT)").unwrap())
+        .expect("recreate table after cleanup");
     let ExecResult::Rows { rows, .. } = exec2
         .execute(&parse_sql("SELECT id FROM fp_big_drop").unwrap())
         .expect("select recreated table")

@@ -1527,8 +1527,29 @@ impl IndexManager {
             .lock()
             .map_err(|_| OmniError::LockPoisoned("index DDL".into()))?;
         let recheck_seq = self.db.get_seq();
-        if self.db.find(&retired_key, recheck_seq)?.is_none() {
+        let Some(raw_recheck) = self.db.find(&retired_key, recheck_seq)? else {
             return Ok(());
+        };
+        let def_recheck: IndexDefinition = serde_json::from_str(&raw_recheck).map_err(|e| {
+            OmniError::IoError(format!(
+                "malformed retired index metadata at '{retired_key}': {e}"
+            ))
+        })?;
+        if let Some(expected) = expected_name
+            && !def_recheck.name.eq_ignore_ascii_case(expected)
+        {
+            return Err(OmniError::IoError(format!(
+                "drop receipt for index '{expected}' references retired ID {id} belonging to different index '{}'",
+                def_recheck.name
+            )));
+        }
+        if let Some(expected_ns) = expected_namespace
+            && def_recheck.namespace != expected_ns
+        {
+            return Err(OmniError::IoError(format!(
+                "drop receipt for index '{}' references retired ID {id} in namespace {:?}, expected {expected_ns:?}",
+                def_recheck.name, def_recheck.namespace
+            )));
         }
         if let Some(active) = IndexCatalog::load_checked_at(&self.db, recheck_seq)?.get(id) {
             return Err(OmniError::IoError(format!(
@@ -1536,9 +1557,9 @@ impl IndexManager {
                 active.name,
                 active.collection,
                 active.namespace,
-                def.name,
-                def.collection,
-                def.namespace
+                def_recheck.name,
+                def_recheck.collection,
+                def_recheck.namespace
             )));
         }
         self.purge_retired_index_entries(id)
