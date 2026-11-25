@@ -1110,9 +1110,10 @@ impl SqlExecutor {
             } else if needs_rewrite {
                 batch.set(&key, typed).map_err(|e| format!("{:?}", e))?;
             }
+            let row_overlay = self.pending_overlay();
             let mut reads = self.pending_reads.borrow_mut();
             index_manager
-                .replace_document_indexes_with_catalog_for_namespace(
+                .replace_document_indexes_with_catalog_for_namespace_with_overlay(
                     &index_catalog,
                     &table.name,
                     crate::secondary_index::IndexNamespace::Sql,
@@ -1122,6 +1123,7 @@ impl SqlExecutor {
                     &new_document,
                     &mut batch,
                     reads.as_mut(),
+                    row_overlay.as_ref(),
                 )
                 .map_err(|e| format!("Index maintenance failed: {e}"))?;
         }
@@ -1369,11 +1371,12 @@ impl SqlExecutor {
         let mut count = 0;
         self.seed_pending_indexes(&mut batch)?;
 
+        let row_overlay = self.pending_overlay();
         for (key, canonical_pk, value, document) in planned_inserts {
             batch.set(&key, value).map_err(|e| format!("{:?}", e))?;
             let mut reads = self.pending_reads.borrow_mut();
             index_manager
-                .index_document_with_catalog_for_namespace(
+                .index_document_with_catalog_for_namespace_with_overlay(
                     &index_catalog,
                     &table.name,
                     crate::secondary_index::IndexNamespace::Sql,
@@ -1381,6 +1384,7 @@ impl SqlExecutor {
                     &document,
                     &mut batch,
                     reads.as_mut(),
+                    row_overlay.as_ref(),
                 )
                 .map_err(|e| format!("Index maintenance failed: {e}"))?;
             count += 1;
@@ -2792,6 +2796,7 @@ impl SqlExecutor {
             (WriteBatch::new(), read_seq)
         };
         self.seed_pending_indexes(&mut batch)?;
+        let row_overlay = self.pending_overlay();
         for (_, _, effective_old_pk, old_document, canonical_pk, key, value, new_document) in
             planned_updates
         {
@@ -2804,7 +2809,7 @@ impl SqlExecutor {
             batch.set(&key, value).map_err(|e| format!("{:?}", e))?;
             let mut reads = self.pending_reads.borrow_mut();
             index_manager
-                .replace_document_indexes_with_catalog_for_namespace(
+                .replace_document_indexes_with_catalog_for_namespace_with_overlay(
                     &index_catalog,
                     &table.name,
                     crate::secondary_index::IndexNamespace::Sql,
@@ -2814,6 +2819,7 @@ impl SqlExecutor {
                     &new_document,
                     &mut batch,
                     reads.as_mut(),
+                    row_overlay.as_ref(),
                 )
                 .map_err(|e| format!("Index maintenance failed: {e}"))?;
         }

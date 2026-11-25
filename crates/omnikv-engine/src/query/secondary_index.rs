@@ -507,6 +507,29 @@ fn document_field<'a>(
     })
 }
 
+fn encode_index_key_for_document(
+    definition: &IndexDefinition,
+    primary_key: &str,
+    document: &serde_json::Value,
+) -> Result<Option<String>, OmniError> {
+    let mut values = Vec::with_capacity(definition.fields.len());
+    for (field, field_type) in &definition.fields {
+        let Some(value) = document_field(document, field).filter(|value| !value.is_null()) else {
+            return Ok(None);
+        };
+        let encoded =
+            try_encode_index_value_for_version(value, field_type, definition.encoding_version)
+                .ok_or_else(|| {
+                    OmniError::IoError(format!(
+                        "invalid value for indexed field '{field}' in index '{}'",
+                        definition.name
+                    ))
+                })?;
+        values.push(encoded);
+    }
+    Ok(Some(build_index_key(definition.id, &values, primary_key)))
+}
+
 fn index_entries_for_namespace(
     catalog: &IndexCatalog,
     collection: &str,
@@ -527,27 +550,10 @@ fn index_entries_for_namespace(
         }
     }
     let mut entries = Vec::new();
-    'indexes: for definition in catalog.indexes_for_namespace(collection, namespace) {
-        let mut values = Vec::new();
-        for (field, field_type) in &definition.fields {
-            let Some(value) = document_field(document, field).filter(|value| !value.is_null())
-            else {
-                continue 'indexes;
-            };
-            let encoded =
-                try_encode_index_value_for_version(value, field_type, definition.encoding_version)
-                    .ok_or_else(|| {
-                        OmniError::IoError(format!(
-                            "invalid value for indexed field '{field}' in index '{}'",
-                            definition.name
-                        ))
-                    })?;
-            values.push(encoded);
+    for definition in catalog.indexes_for_namespace(collection, namespace) {
+        if let Some(key) = encode_index_key_for_document(definition, primary_key, document)? {
+            entries.push((definition.clone(), key));
         }
-        entries.push((
-            definition.clone(),
-            build_index_key(definition.id, &values, primary_key),
-        ));
     }
     Ok(entries)
 }
@@ -1645,9 +1651,41 @@ impl IndexManager {
         batch: &mut WriteBatch,
         read_collector: Option<&mut crate::volcano::ReadCollector>,
     ) -> Result<(), OmniError> {
+        self.index_document_with_catalog_for_namespace_with_overlay(
+            catalog,
+            collection,
+            namespace,
+            primary_key,
+            document,
+            batch,
+            read_collector,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn index_document_with_catalog_for_namespace_with_overlay(
+        &self,
+        catalog: &IndexCatalog,
+        collection: &str,
+        namespace: IndexNamespace,
+        primary_key: &str,
+        document: &serde_json::Value,
+        batch: &mut WriteBatch,
+        read_collector: Option<&mut crate::volcano::ReadCollector>,
+        row_overlay: Option<&HashMap<String, Option<String>>>,
+    ) -> Result<(), OmniError> {
         let entries =
             index_entries_for_namespace(catalog, collection, namespace, primary_key, document)?;
-        self.write_new_index_entries(&entries, primary_key, batch, read_collector)
+        self.write_new_index_entries(
+            catalog,
+            &entries,
+            primary_key,
+            None,
+            batch,
+            read_collector,
+            row_overlay,
+        )
     }
 
     pub(crate) fn validate_document_indexes_with_catalog_for_namespace(
@@ -1750,6 +1788,34 @@ impl IndexManager {
         batch: &mut WriteBatch,
         read_collector: Option<&mut crate::volcano::ReadCollector>,
     ) -> Result<(), OmniError> {
+        self.replace_document_indexes_with_catalog_for_namespace_with_overlay(
+            catalog,
+            collection,
+            namespace,
+            old_primary_key,
+            old_document,
+            new_primary_key,
+            new_document,
+            batch,
+            read_collector,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn replace_document_indexes_with_catalog_for_namespace_with_overlay(
+        &self,
+        catalog: &IndexCatalog,
+        collection: &str,
+        namespace: IndexNamespace,
+        old_primary_key: &str,
+        old_document: &serde_json::Value,
+        new_primary_key: &str,
+        new_document: &serde_json::Value,
+        batch: &mut WriteBatch,
+        read_collector: Option<&mut crate::volcano::ReadCollector>,
+        row_overlay: Option<&HashMap<String, Option<String>>>,
+    ) -> Result<(), OmniError> {
         let old_entries = index_entries_for_namespace(
             catalog,
             collection,
@@ -1772,7 +1838,16 @@ impl IndexManager {
                 append_index_delete(batch, old_key)?;
             }
         }
-        self.write_new_index_entries(&new_entries, new_primary_key, batch, read_collector)
+        let replaced_pk = (old_primary_key != new_primary_key).then_some(old_primary_key);
+        self.write_new_index_entries(
+            catalog,
+            &new_entries,
+            new_primary_key,
+            replaced_pk,
+            batch,
+            read_collector,
+            row_overlay,
+        )
     }
 
     /// Removes index entries for a document collection DELETE or pre-UPDATE
@@ -1832,21 +1907,28 @@ impl IndexManager {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn write_new_index_entries(
         &self,
+        catalog: &IndexCatalog,
         entries: &[(IndexDefinition, String)],
         primary_key: &str,
+        replaced_primary_key: Option<&str>,
         batch: &mut WriteBatch,
         mut read_collector: Option<&mut crate::volcano::ReadCollector>,
+        row_overlay: Option<&HashMap<String, Option<String>>>,
     ) -> Result<(), OmniError> {
         for (idx_def, idx_key) in entries {
             if idx_def.unique {
                 self.check_unique(
+                    catalog,
                     idx_def,
                     idx_key,
                     primary_key,
+                    replaced_primary_key,
                     batch,
                     read_collector.as_deref_mut(),
+                    row_overlay,
                 )?;
             }
             append_index_set(batch, idx_key, primary_key)?;
@@ -1997,13 +2079,17 @@ impl IndexManager {
         out
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn check_unique(
         &self,
+        catalog: &IndexCatalog,
         idx_def: &IndexDefinition,
         idx_key: &str,
         primary_key: &str,
+        replaced_primary_key: Option<&str>,
         batch: &WriteBatch,
-        read_collector: Option<&mut crate::volcano::ReadCollector>,
+        mut read_collector: Option<&mut crate::volcano::ReadCollector>,
+        row_overlay: Option<&HashMap<String, Option<String>>>,
     ) -> Result<(), OmniError> {
         let base_prefix = &idx_key[..idx_key.len() - primary_key.len()];
         let scan_prefix = build_index_scan_prefix(idx_def.id);
@@ -2025,7 +2111,7 @@ impl IndexManager {
         };
 
         let seq = self.db.get_seq();
-        if let Some(collector) = read_collector {
+        if let Some(collector) = read_collector.as_deref_mut() {
             for (range_start, range_end) in &ranges {
                 collector
                     .ranges
@@ -2075,6 +2161,228 @@ impl IndexManager {
                 && pending_pk != primary_key
             {
                 return Err(unique_violation(idx_def));
+            }
+        }
+        // When a unique index is not ready (e.g. unbuilt or left partial after
+        // an interrupted `bind_index_namespace` / `rebuild_index`), index
+        // entries alone are incomplete and could miss existing rows. Fall back
+        // to scanning underlying collection rows to guarantee uniqueness.
+        if !catalog.is_ready(idx_def.id) {
+            self.check_unique_against_collection_rows(
+                catalog,
+                idx_def,
+                idx_key,
+                primary_key,
+                replaced_primary_key,
+                seq,
+                batch,
+                read_collector,
+                row_overlay,
+            )?;
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn check_unique_against_collection_rows(
+        &self,
+        catalog: &IndexCatalog,
+        idx_def: &IndexDefinition,
+        idx_key: &str,
+        primary_key: &str,
+        replaced_primary_key: Option<&str>,
+        seq: u64,
+        batch: &WriteBatch,
+        mut read_collector: Option<&mut crate::volcano::ReadCollector>,
+        row_overlay: Option<&HashMap<String, Option<String>>>,
+    ) -> Result<(), OmniError> {
+        let effective_ns = catalog.effective_namespace(idx_def).ok_or_else(|| {
+            OmniError::IoError(format!(
+                "unique index '{}' on collection '{}' has ambiguous namespace and is not ready",
+                idx_def.name, idx_def.collection
+            ))
+        })?;
+        let target_prefix = Self::canonical_unique_prefix(idx_def, idx_key, primary_key);
+        let sql_table = if effective_ns == IndexNamespace::Sql {
+            self.db
+                .find(
+                    &crate::catalog::Catalog::catalog_key(&idx_def.collection),
+                    seq,
+                )?
+                .map(|raw| {
+                    serde_json::from_str::<crate::catalog::TableDef>(&raw).map_err(|error| {
+                        OmniError::IoError(format!("invalid SQL table definition: {error}"))
+                    })
+                })
+                .transpose()?
+                .filter(|table| table.name == idx_def.collection)
+        } else {
+            None
+        };
+        let sql_row_format = sql_table
+            .as_ref()
+            .map(|table| table.row_format)
+            .unwrap_or_default();
+
+        let check_row_value = |row_key: &str,
+                               prefix: &str,
+                               is_sql_rows: bool,
+                               raw_value: &str,
+                               overwritten_in_batch: bool|
+         -> Result<(), OmniError> {
+            let raw_pk = row_key.strip_prefix(prefix).unwrap_or(row_key);
+            let effective_pk = if is_sql_rows {
+                sql_table
+                    .as_ref()
+                    .map(|table| crate::volcano::canonicalize_pk_key(table, raw_pk))
+                    .unwrap_or_else(|| raw_pk.to_string())
+            } else {
+                raw_pk.to_string()
+            };
+            if raw_pk == primary_key
+                || effective_pk == primary_key
+                || (!overwritten_in_batch
+                    && replaced_primary_key.is_some_and(|old| raw_pk == old || effective_pk == old))
+            {
+                return Ok(());
+            }
+            let doc = if is_sql_rows {
+                let row = crate::plan_exec::PlanExecutor::deserialize_row_checked(
+                    raw_value,
+                    sql_row_format,
+                )
+                .map_err(|error| {
+                    OmniError::IoError(format!(
+                        "cannot verify unready unique index '{}' against corrupt SQL row '{}': {error}",
+                        idx_def.name, row_key
+                    ))
+                })?;
+                serde_json::to_value(&row).map_err(|error| {
+                    OmniError::IoError(format!(
+                        "cannot verify unready unique index '{}' against SQL row '{}': {error}",
+                        idx_def.name, row_key
+                    ))
+                })?
+            } else {
+                serde_json::from_str::<serde_json::Value>(raw_value).map_err(|error| {
+                    OmniError::IoError(format!(
+                        "cannot verify unready unique index '{}' against corrupt document '{}': {error}",
+                        idx_def.name, row_key
+                    ))
+                })?
+            };
+            let Some(existing_idx_key) =
+                encode_index_key_for_document(idx_def, &effective_pk, &doc)?
+            else {
+                return Ok(());
+            };
+            let existing_prefix =
+                Self::canonical_unique_prefix(idx_def, &existing_idx_key, &effective_pk);
+            if existing_prefix == target_prefix {
+                return Err(unique_violation(idx_def));
+            }
+            Ok(())
+        };
+
+        for (prefix, end) in collection_row_ranges_for_namespace(&idx_def.collection, effective_ns)
+        {
+            if let Some(collector) = read_collector.as_deref_mut() {
+                collector.ranges.push((prefix.clone(), end.clone()));
+            }
+            let is_sql_rows = prefix.starts_with("\x00T\x00");
+            let mut visited_keys = HashSet::new();
+
+            for (row_key, storage_val) in self.db.scan_exclusive(&prefix, Some(&end), seq)? {
+                visited_keys.insert(row_key.clone());
+                if batch
+                    .buffered_deletes
+                    .iter()
+                    .any(|deleted| deleted.as_slice() == row_key.as_bytes())
+                {
+                    continue;
+                }
+                let (effective_val, overwritten_in_batch) = if let Some((_, staged_val, _)) = batch
+                    .buffered_writes
+                    .iter()
+                    .rev()
+                    .find(|(k, _, _)| k.as_slice() == row_key.as_bytes())
+                {
+                    (staged_val.as_str(), true)
+                } else if let Some(ov_entry) = row_overlay.and_then(|ov| ov.get(&row_key)) {
+                    let Some(ov_val) = ov_entry.as_deref() else {
+                        continue;
+                    };
+                    (ov_val, false)
+                } else {
+                    (storage_val.as_str(), false)
+                };
+                check_row_value(
+                    &row_key,
+                    &prefix,
+                    is_sql_rows,
+                    effective_val,
+                    overwritten_in_batch,
+                )?;
+            }
+
+            if let Some(ov) = row_overlay {
+                for (row_key, ov_entry) in ov {
+                    if row_key.as_str() < prefix.as_str()
+                        || row_key.as_str() >= end.as_str()
+                        || visited_keys.contains(row_key)
+                    {
+                        continue;
+                    }
+                    visited_keys.insert(row_key.clone());
+                    if batch
+                        .buffered_deletes
+                        .iter()
+                        .any(|deleted| deleted.as_slice() == row_key.as_bytes())
+                    {
+                        continue;
+                    }
+                    let (effective_val, overwritten_in_batch) = if let Some((_, staged_val, _)) =
+                        batch
+                            .buffered_writes
+                            .iter()
+                            .rev()
+                            .find(|(k, _, _)| k.as_slice() == row_key.as_bytes())
+                    {
+                        (staged_val.as_str(), true)
+                    } else if let Some(ov_val) = ov_entry.as_deref() {
+                        (ov_val, false)
+                    } else {
+                        continue;
+                    };
+                    check_row_value(
+                        row_key,
+                        &prefix,
+                        is_sql_rows,
+                        effective_val,
+                        overwritten_in_batch,
+                    )?;
+                }
+            }
+
+            for (pending_key, pending_val, _) in batch.buffered_writes.iter().rev() {
+                let Ok(row_key) = std::str::from_utf8(pending_key) else {
+                    continue;
+                };
+                if row_key < prefix.as_str()
+                    || row_key >= end.as_str()
+                    || visited_keys.contains(row_key)
+                {
+                    continue;
+                }
+                visited_keys.insert(row_key.to_string());
+                if batch
+                    .buffered_deletes
+                    .iter()
+                    .any(|deleted| deleted.as_slice() == pending_key.as_slice())
+                {
+                    continue;
+                }
+                check_row_value(row_key, &prefix, is_sql_rows, pending_val, true)?;
             }
         }
         Ok(())
@@ -2352,6 +2660,11 @@ impl IndexManager {
         let seq = self.db.get_seq();
         let mut single_catalog = IndexCatalog::empty();
         single_catalog.register_in_memory(idx_def.clone());
+        // Mark `idx_def` ready ONLY in this rebuild-local catalog: all prior
+        // entries were just cleared above and this loop scans every collection
+        // row once in order, so index+batch uniqueness checks are complete and
+        // O(N). Durable readiness (`READY_PREFIX`) is written only at the end.
+        single_catalog.ready.insert(idx_def.id);
         let table_row_format = self
             .db
             .find(
@@ -2405,6 +2718,9 @@ impl IndexManager {
                 if batch.op_count() >= 1000 {
                     self.db.commit_batch(&batch)?;
                     batch = WriteBatch::new();
+                    crate::failpoints::maybe_fail("index::rebuild_after_partial_commit").map_err(
+                        |e| OmniError::IoError(format!("index rebuild failure point: {e}")),
+                    )?;
                 }
             }
         }

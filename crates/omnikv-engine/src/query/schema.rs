@@ -641,58 +641,101 @@ impl SchemaManager {
                 default_value,
             } => self.with_collection_lock(collection, || {
                 let seq = self.db.get_seq();
-                let sql_target = self.load_target_sql_table(collection, explicit_namespace, seq)?;
-                let effective_field = sql_target
-                    .as_ref()
-                    .and_then(|(_, t)| {
-                        t.columns
-                            .iter()
-                            .find(|c| c.name.eq_ignore_ascii_case(field_name))
-                            .map(|c| c.name.clone())
-                    })
-                    .unwrap_or_else(|| field_name.clone());
-                let (target_collection, target_namespace) = match sql_target.as_ref() {
-                    Some((_, t)) => (t.name.as_str(), IndexNamespace::Sql),
-                    None => (collection.as_str(), IndexNamespace::Document),
-                };
-                self.backfill_field(
-                    target_collection,
-                    target_namespace,
-                    &effective_field,
-                    Some(default_value),
-                )?;
-                if let Some((catalog_key, mut table)) = sql_target
-                    && !table
+                if let Some((catalog_key, mut table)) =
+                    self.load_target_sql_table(collection, explicit_namespace, seq)?
+                {
+                    let table_id = table.durable_identity();
+                    let done_key = Self::add_done_key(
+                        version,
+                        direction,
+                        attempt_id,
+                        step_index,
+                        IndexNamespace::Sql,
+                        &table.name,
+                        field_name,
+                    );
+                    let expected_done = Self::sql_done_receipt(&table_id);
+                    // Honor a completed receipt for this exact table identity
+                    // BEFORE inspecting columns or rows so retrying a failed
+                    // later step never re-adds a field that a subsequent step
+                    // already renamed or removed.
+                    if self.db.find(&done_key, seq)?.as_deref() == Some(expected_done.as_str()) {
+                        return Ok(());
+                    }
+                    let effective_field = table
+                        .columns
+                        .iter()
+                        .find(|c| c.name.eq_ignore_ascii_case(field_name))
+                        .map(|c| c.name.clone())
+                        .unwrap_or_else(|| field_name.clone());
+                    let table_name = table.name.clone();
+                    let row_format = table.row_format;
+                    let catalog_update = if !table
                         .columns
                         .iter()
                         .any(|c| c.name.eq_ignore_ascii_case(field_name))
-                {
-                    let col_type = match default_value {
-                        serde_json::Value::Number(n) if n.is_i64() || n.is_u64() => {
-                            crate::catalog::ColumnType::Integer
-                        }
-                        serde_json::Value::Number(_) => crate::catalog::ColumnType::Float,
-                        serde_json::Value::Bool(_) => crate::catalog::ColumnType::Boolean,
-                        _ => crate::catalog::ColumnType::Text,
+                    {
+                        let col_type = match default_value {
+                            serde_json::Value::Number(n) if n.is_i64() || n.is_u64() => {
+                                crate::catalog::ColumnType::Integer
+                            }
+                            serde_json::Value::Number(_) => crate::catalog::ColumnType::Float,
+                            serde_json::Value::Bool(_) => crate::catalog::ColumnType::Boolean,
+                            _ => crate::catalog::ColumnType::Text,
+                        };
+                        table.columns.push(crate::catalog::Column {
+                            name: field_name.clone(),
+                            col_type,
+                            nullable: true,
+                            primary_key: false,
+                            default: match default_value {
+                                serde_json::Value::Null => None,
+                                serde_json::Value::String(s) => Some(s.clone()),
+                                other => Some(other.to_string()),
+                            },
+                        });
+                        let cat_value = serde_json::to_string(&table)
+                            .map_err(|e| crate::OmniError::IoError(e.to_string()))?;
+                        Some((catalog_key, cat_value))
+                    } else {
+                        None
                     };
-                    table.columns.push(crate::catalog::Column {
-                        name: field_name.clone(),
-                        col_type,
-                        nullable: true,
-                        primary_key: false,
-                        default: match default_value {
-                            serde_json::Value::Null => None,
-                            serde_json::Value::String(s) => Some(s.clone()),
-                            other => Some(other.to_string()),
-                        },
-                    });
-                    let cat_value = serde_json::to_string(&table)
-                        .map_err(|e| crate::OmniError::IoError(e.to_string()))?;
-                    let mut cat_batch = WriteBatch::new();
-                    cat_batch.set(&catalog_key, cat_value)?;
-                    self.db.commit_batch(&cat_batch)?;
+                    return self.add_field_online(
+                        &table_name,
+                        IndexNamespace::Sql,
+                        row_format,
+                        &effective_field,
+                        default_value,
+                        catalog_update
+                            .as_ref()
+                            .map(|(k, v)| (k.as_str(), v.as_str())),
+                        &done_key,
+                        &expected_done,
+                    );
                 }
-                Ok(())
+
+                let done_key = Self::add_done_key(
+                    version,
+                    direction,
+                    attempt_id,
+                    step_index,
+                    IndexNamespace::Document,
+                    collection,
+                    field_name,
+                );
+                if self.db.find(&done_key, seq)?.as_deref() == Some("done") {
+                    return Ok(());
+                }
+                self.add_field_online(
+                    collection,
+                    IndexNamespace::Document,
+                    crate::catalog::RowFormat::default(),
+                    field_name,
+                    default_value,
+                    None,
+                    &done_key,
+                    "done",
+                )
             }),
             SchemaOp::RemoveField {
                 collection,
@@ -775,7 +818,21 @@ impl SchemaManager {
                         &done_key,
                     );
                 }
-                self.backfill_field(collection, IndexNamespace::Document, field_name, None)
+                let done_key = Self::doc_remove_done_key(
+                    version, direction, attempt_id, step_index, collection, field_name,
+                );
+                if self.db.find(&done_key, seq)?.as_deref() == Some("done") {
+                    return Ok(());
+                }
+                self.backfill_field_with_receipt(
+                    collection,
+                    IndexNamespace::Document,
+                    crate::catalog::RowFormat::default(),
+                    field_name,
+                    None,
+                    None,
+                    Some((&done_key, "done")),
+                )
             }),
             SchemaOp::RenameField {
                 collection,
@@ -1091,6 +1148,67 @@ impl SchemaManager {
         Ok(false)
     }
 
+    fn add_done_prefix(version: Version, direction: &str, attempt_id: &str) -> String {
+        format!(
+            "\x00SCHEMA\x00add_done:{version:06}:{direction}:{}:{attempt_id}:",
+            attempt_id.len()
+        )
+    }
+
+    fn add_done_key(
+        version: Version,
+        direction: &str,
+        attempt_id: &str,
+        step_index: usize,
+        namespace: IndexNamespace,
+        collection: &str,
+        field_name: &str,
+    ) -> String {
+        let ns_tag = match namespace {
+            IndexNamespace::Sql => "sql",
+            IndexNamespace::Document => "doc",
+            IndexNamespace::Both => "both",
+        };
+        let field = if namespace == IndexNamespace::Sql {
+            field_name.to_lowercase()
+        } else {
+            field_name.to_string()
+        };
+        format!(
+            "{}{step_index:06}:{ns_tag}:{}:{}:{}:{}",
+            Self::add_done_prefix(version, direction, attempt_id),
+            collection.len(),
+            collection,
+            field.len(),
+            field
+        )
+    }
+
+    fn doc_remove_done_prefix(version: Version, direction: &str, attempt_id: &str) -> String {
+        format!(
+            "\x00SCHEMA\x00doc_remove_done:{version:06}:{direction}:{}:{attempt_id}:",
+            attempt_id.len()
+        )
+    }
+
+    fn doc_remove_done_key(
+        version: Version,
+        direction: &str,
+        attempt_id: &str,
+        step_index: usize,
+        collection: &str,
+        field_name: &str,
+    ) -> String {
+        format!(
+            "{}{step_index:06}:{}:{}:{}:{}",
+            Self::doc_remove_done_prefix(version, direction, attempt_id),
+            collection.len(),
+            collection,
+            field_name.len(),
+            field_name
+        )
+    }
+
     fn remove_done_prefix(version: Version, direction: &str, attempt_id: &str) -> String {
         format!(
             "\x00SCHEMA\x00remove_done:{version:06}:{direction}:{}:{attempt_id}:",
@@ -1250,6 +1368,29 @@ impl SchemaManager {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn add_field_online(
+        &self,
+        collection: &str,
+        namespace: IndexNamespace,
+        sql_row_format: crate::catalog::RowFormat,
+        field_name: &str,
+        default_value: &serde_json::Value,
+        sql_catalog_update: Option<(&str, &str)>,
+        done_key: &str,
+        done_value: &str,
+    ) -> Result<(), OmniError> {
+        self.backfill_field_with_receipt(
+            collection,
+            namespace,
+            sql_row_format,
+            field_name,
+            Some(default_value),
+            sql_catalog_update,
+            Some((done_key, done_value)),
+        )
+    }
+
     fn backfill_field(
         &self,
         collection: &str,
@@ -1257,23 +1398,52 @@ impl SchemaManager {
         field_name: &str,
         default_value: Option<&serde_json::Value>,
     ) -> Result<(), OmniError> {
-        self.index_manager.refresh_catalog()?;
         let seq = self.db.get_seq();
-        let catalog = self.index_manager.catalog_snapshot_at(seq)?;
-        let sql_table = if namespace == IndexNamespace::Sql {
+        let sql_row_format = if namespace == IndexNamespace::Sql {
             self.db
                 .find(
                     &format!("\x00CATALOG\x00{}", collection.to_lowercase()),
                     seq,
                 )?
                 .and_then(|raw| serde_json::from_str::<crate::catalog::TableDef>(&raw).ok())
+                .map(|table| table.row_format)
+                .unwrap_or_default()
         } else {
-            None
+            crate::catalog::RowFormat::default()
         };
-        let sql_row_format = sql_table
-            .as_ref()
-            .map(|table| table.row_format)
-            .unwrap_or_default();
+        self.backfill_field_with_receipt(
+            collection,
+            namespace,
+            sql_row_format,
+            field_name,
+            default_value,
+            None,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn backfill_field_with_receipt(
+        &self,
+        collection: &str,
+        namespace: IndexNamespace,
+        sql_row_format: crate::catalog::RowFormat,
+        field_name: &str,
+        default_value: Option<&serde_json::Value>,
+        sql_catalog_update: Option<(&str, &str)>,
+        done_receipt: Option<(&str, &str)>,
+    ) -> Result<(), OmniError> {
+        self.index_manager.refresh_catalog()?;
+        let seq = self.db.get_seq();
+        let catalog = self.index_manager.catalog_snapshot_at(seq)?;
+        let sql_table_present = namespace == IndexNamespace::Sql
+            && self
+                .db
+                .find(
+                    &format!("\x00CATALOG\x00{}", collection.to_lowercase()),
+                    seq,
+                )?
+                .is_some();
         let sql_default = match default_value {
             Some(serde_json::Value::Null) => Some(serde_json::Value::Null),
             Some(serde_json::Value::String(s)) => {
@@ -1282,7 +1452,7 @@ impl SchemaManager {
                     && sql_row_format == crate::catalog::RowFormat::Legacy
                 {
                     let sql_prefix = format!("\x00T\x00{}\x00", collection);
-                    if sql_table.is_some() || !self.db.scan_prefix(&sql_prefix, seq)?.is_empty() {
+                    if sql_table_present || !self.db.scan_prefix(&sql_prefix, seq)?.is_empty() {
                         return Err(OmniError::IoError(format!(
                             "literal \"NULL\" default for field '{field_name}' is not supported on legacy SQL table '{collection}'"
                         )));
@@ -1295,7 +1465,7 @@ impl SchemaManager {
             Some(other) => {
                 if namespace == IndexNamespace::Sql {
                     let sql_prefix = format!("\x00T\x00{}\x00", collection);
-                    if sql_table.is_some() || !self.db.scan_prefix(&sql_prefix, seq)?.is_empty() {
+                    if sql_table_present || !self.db.scan_prefix(&sql_prefix, seq)?.is_empty() {
                         return Err(OmniError::IoError(format!(
                             "unsupported SQL row value for field '{field_name}': {other}"
                         )));
@@ -1339,6 +1509,14 @@ impl SchemaManager {
                     {
                         self.db.commit_batch(&batch)?;
                         batch = WriteBatch::new();
+                        if default_value.is_some() {
+                            crate::failpoints::maybe_fail("schema::add_field_after_partial_batch")
+                                .map_err(|e| {
+                                    OmniError::IoError(format!(
+                                        "schema add_field failure point: {e}"
+                                    ))
+                                })?;
+                        }
                     }
                     self.stage_doc_update(
                         &catalog,
@@ -1355,11 +1533,37 @@ impl SchemaManager {
                     if batch.op_count() >= WriteBatch::MAX_OPS / 2 && !batch.is_empty() {
                         self.db.commit_batch(&batch)?;
                         batch = WriteBatch::new();
+                        if default_value.is_some() {
+                            crate::failpoints::maybe_fail("schema::add_field_after_partial_batch")
+                                .map_err(|e| {
+                                    OmniError::IoError(format!(
+                                        "schema add_field failure point: {e}"
+                                    ))
+                                })?;
+                        }
                     }
                 }
             }
         }
 
+        // Publish any trailing backfilled rows, SQL catalog column update, and
+        // durable step-completion receipt atomically in the final WriteBatch.
+        // For small tables/collections this commits the entire AddField step
+        // atomically in one batch; for large multi-batch migrations the
+        // intermediate row chunks are idempotent on retry and the catalog +
+        // receipt flip atomically only once every row has been backfilled.
+        let tail_ops =
+            usize::from(sql_catalog_update.is_some()) + usize::from(done_receipt.is_some());
+        if !batch.is_empty() && batch.op_count().saturating_add(tail_ops) > WriteBatch::MAX_OPS {
+            self.db.commit_batch(&batch)?;
+            batch = WriteBatch::new();
+        }
+        if let Some((cat_key, cat_val)) = sql_catalog_update {
+            batch.set(cat_key, cat_val.to_string())?;
+        }
+        if let Some((done_key, done_val)) = done_receipt {
+            batch.set(done_key, done_val.to_string())?;
+        }
         if !batch.is_empty() {
             self.db.commit_batch(&batch)?;
         }
@@ -1675,8 +1879,10 @@ impl SchemaManager {
         for done_prefix in [
             Self::create_index_done_prefix(record.version, direction, attempt_id),
             Self::drop_index_done_prefix(record.version, direction, attempt_id),
+            Self::add_done_prefix(record.version, direction, attempt_id),
             Self::rename_done_prefix(record.version, direction, attempt_id),
             Self::remove_done_prefix(record.version, direction, attempt_id),
+            Self::doc_remove_done_prefix(record.version, direction, attempt_id),
         ] {
             for (done_key, _) in self.db.scan_prefix(&done_prefix, seq)? {
                 receipt_keys.push(done_key);

@@ -1068,3 +1068,163 @@ fn pre_rename_manifest_failure_cleans_outputs_without_fencing_writes() {
         Some("v2".into())
     );
 }
+
+#[cfg(feature = "failpoints")]
+fn seed_fp_uq_table(
+    db: &std::sync::Arc<OmniKV>,
+    table: &str,
+    count: usize,
+) -> omni_engine::sql_exec::SqlExecutor {
+    use omni_engine::catalog::Catalog;
+    use omni_engine::sql::parse_sql;
+    use omni_engine::sql_exec::SqlExecutor;
+    use std::sync::Arc;
+
+    let executor = SqlExecutor::new(db.clone(), Arc::new(Catalog::new(db.clone())));
+    executor
+        .execute(
+            &parse_sql(&format!(
+                "CREATE TABLE {table} (id TEXT PRIMARY KEY, code TEXT)"
+            ))
+            .unwrap(),
+        )
+        .expect("create table");
+    let mut seed = WriteBatch::new();
+    for i in 1..=count {
+        let pk = format!("{i:04}");
+        let row = serde_json::json!({ "id": pk, "code": format!("c{i:04}") });
+        seed.set(&format!("\u{0}T\u{0}{table}\u{0}{pk}"), row.to_string())
+            .expect("set");
+        if seed.op_count() >= 500 {
+            db.commit_batch(&seed).expect("commit seed");
+            seed = WriteBatch::new();
+        }
+    }
+    if !seed.is_empty() {
+        db.commit_batch(&seed).expect("commit tail");
+    }
+    executor
+}
+
+#[cfg(feature = "failpoints")]
+#[test]
+fn partial_unique_index_rebuild_failpoint_still_enforces_uniqueness() {
+    use omni_engine::secondary_index::{IndexFieldType, IndexManager};
+    use omni_engine::sql::parse_sql;
+
+    let _lock = TEST_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let registry = FailRegistry::new();
+    registry.reset();
+
+    let dir = TempDir::new().expect("tempdir");
+    let (m, w) = fresh_db_paths(&dir);
+    let db = OmniKV::open(&m, &w).expect("open db");
+    let executor = seed_fp_uq_table(&db, "fp_uq", 1005);
+
+    let idx_mgr = IndexManager::new(db);
+    let idx_id = idx_mgr
+        .create_sql_index(
+            "fp_uq_code",
+            "fp_uq",
+            vec![("code".into(), IndexFieldType::String)],
+            true,
+        )
+        .expect("create unique index");
+
+    registry.arm("index::rebuild_after_partial_commit");
+    let rebuild_err = idx_mgr
+        .rebuild_index("fp_uq_code")
+        .expect_err("partial rebuild failpoint must fail rebuild");
+    registry.reset();
+    assert!(
+        rebuild_err
+            .to_string()
+            .contains("index::rebuild_after_partial_commit"),
+        "unexpected rebuild err: {rebuild_err}"
+    );
+    assert!(!idx_mgr.catalog_snapshot().expect("snap").is_ready(idx_id));
+    assert_eq!(
+        idx_mgr
+            .lookup("fp_uq_code", &[serde_json::json!("c1005")])
+            .expect("lookup")
+            .len(),
+        0
+    );
+    let Err(dup_err) = executor
+        .execute(&parse_sql("INSERT INTO fp_uq (id, code) VALUES ('2000', 'c1005')").unwrap())
+    else {
+        panic!("duplicate insert against unindexed tail row must fail");
+    };
+    assert!(dup_err.contains("UNIQUE CONSTRAINT"), "err: {dup_err}");
+
+    assert_eq!(idx_mgr.rebuild_index("fp_uq_code").expect("rebuild"), 1005);
+    assert!(idx_mgr.catalog_snapshot().expect("snap").is_ready(idx_id));
+}
+
+#[cfg(feature = "failpoints")]
+#[test]
+fn partial_add_field_failpoint_defers_catalog_and_recovers_on_retry() {
+    use omni_engine::schema::{Migration, SchemaManager, SchemaOp};
+    use omni_engine::secondary_index::{IndexManager, IndexNamespace};
+    use std::sync::Arc;
+
+    let _lock = TEST_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let registry = FailRegistry::new();
+    registry.reset();
+
+    let dir = TempDir::new().expect("tempdir");
+    let (m, w) = fresh_db_paths(&dir);
+    let db = OmniKV::open(&m, &w).expect("open db");
+    let _executor = seed_fp_uq_table(&db, "fp_add", WriteBatch::MAX_OPS / 2 + 25);
+
+    let idx_mgr = Arc::new(IndexManager::new(db.clone()));
+    let schema = SchemaManager::new(db.clone(), idx_mgr);
+    let mig = Migration {
+        version: 1,
+        description: "large add + rename".into(),
+        up: vec![
+            SchemaOp::AddField {
+                collection: "fp_add".into(),
+                field_name: "old_tag".into(),
+                default_value: serde_json::json!("t0"),
+            }
+            .in_namespace(IndexNamespace::Sql),
+            SchemaOp::RenameField {
+                collection: "fp_add".into(),
+                old_name: "old_tag".into(),
+                new_name: "new_tag".into(),
+            }
+            .in_namespace(IndexNamespace::Sql),
+        ],
+        down: vec![],
+    };
+
+    registry.arm("schema::add_field_after_partial_batch");
+    let add_err = schema
+        .migrate_up(&mig)
+        .expect_err("partial add_field failpoint must fail migration");
+    registry.reset();
+    assert!(
+        add_err
+            .to_string()
+            .contains("schema::add_field_after_partial_batch"),
+        "unexpected add err: {add_err}"
+    );
+    let mid_cat = db
+        .find("\u{0}CATALOG\u{0}fp_add", db.get_seq())
+        .expect("cat")
+        .expect("table exists");
+    assert!(!mid_cat.contains("old_tag"));
+
+    schema.migrate_up(&mig).expect("retry must succeed");
+    let final_cat = db
+        .find("\u{0}CATALOG\u{0}fp_add", db.get_seq())
+        .expect("cat")
+        .expect("table exists");
+    assert!(!final_cat.contains("old_tag"));
+    assert!(final_cat.contains("new_tag"));
+}

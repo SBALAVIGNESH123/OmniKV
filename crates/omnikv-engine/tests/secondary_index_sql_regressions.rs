@@ -4980,3 +4980,449 @@ fn schema_explicit_namespace_migrations_reject_invalid_targets_and_enforce_drop(
     schema.migrate_up(&valid_drop).unwrap();
     assert!(idx_mgr.definition("scoped_doc_idx").is_err());
 }
+
+fn seed_padded_sql_rows(db: &OmniKV, table: &str, count: usize, dup_at: usize) {
+    let mut seed = WriteBatch::new();
+    for i in 1..=count {
+        let pk = format!("{i:04}");
+        let email = if i == dup_at {
+            "e0001".to_string()
+        } else {
+            format!("e{i:04}")
+        };
+        let row = serde_json::json!({ "id": pk, "email": email });
+        seed.set(&format!("\u{0}T\u{0}{table}\u{0}{pk}"), row.to_string())
+            .unwrap();
+        if seed.op_count() >= 500 {
+            db.commit_batch(&seed).unwrap();
+            seed = WriteBatch::new();
+        }
+    }
+    if !seed.is_empty() {
+        db.commit_batch(&seed).unwrap();
+    }
+}
+
+#[test]
+fn unready_unique_index_after_partial_bind_rebuild_failure_rejects_duplicate_writes() {
+    let (db, _dir, executor) = setup();
+    let idx_mgr = IndexManager::new(db.clone());
+    execute(
+        &executor,
+        "CREATE TABLE uq_partial (id TEXT PRIMARY KEY, email TEXT)",
+    );
+    // 0001..=1000 commit in rebuild batch 1; 1001 duplicates 0001 so batch 2
+    // fails before 1002..=1005 are indexed.
+    seed_padded_sql_rows(&db, "uq_partial", 1005, 1001);
+
+    let mut legacy = WriteBatch::new();
+    legacy
+        .set(
+            "\u{0}IDX_CATALOG\u{0}77",
+            r#"{"id":77,"name":"uq_partial_email","collection":"uq_partial","fields":[["email","String"]],"unique":true,"encoding_version":1,"namespace":"Both"}"#
+                .into(),
+        )
+        .unwrap();
+    legacy.set("\u{0}IDX_NEXT_ID", "78".into()).unwrap();
+    db.commit_batch(&legacy).unwrap();
+
+    assert!(
+        idx_mgr
+            .bind_index_namespace("uq_partial_email", IndexNamespace::Sql)
+            .is_err()
+    );
+    assert!(!idx_mgr.catalog_snapshot().unwrap().is_ready(77));
+    assert_eq!(
+        idx_mgr
+            .lookup("uq_partial_email", &[serde_json::json!("e0001")])
+            .unwrap(),
+        vec!["0001".to_string()]
+    );
+    assert_eq!(
+        idx_mgr
+            .lookup("uq_partial_email", &[serde_json::json!("e1005")])
+            .unwrap()
+            .len(),
+        0
+    );
+
+    let Err(dup_ins) = executor.execute(
+        &parse_sql("INSERT INTO uq_partial (id, email) VALUES ('2000', 'e1005')").unwrap(),
+    ) else {
+        panic!("duplicate insert against unindexed row must fail");
+    };
+    assert!(dup_ins.contains("UNIQUE CONSTRAINT"), "err: {dup_ins}");
+    let Err(dup_upd) = executor
+        .execute(&parse_sql("UPDATE uq_partial SET email = 'e1005' WHERE id = '0002'").unwrap())
+    else {
+        panic!("duplicate update against unindexed row must fail");
+    };
+    assert!(dup_upd.contains("UNIQUE CONSTRAINT"), "err: {dup_upd}");
+
+    // Moving row 1005's PK while keeping its own email must succeed, and
+    // duplicate inserts against the moved row must still fail.
+    execute(
+        &executor,
+        "UPDATE uq_partial SET id = '1099' WHERE id = '1005'",
+    );
+    assert!(
+        executor
+            .execute(
+                &parse_sql("INSERT INTO uq_partial (id, email) VALUES ('2001', 'e1005')").unwrap()
+            )
+            .is_err()
+    );
+
+    // Explicit transaction deleting row 1099 then inserting 'e1005' must succeed.
+    let tm = TransactionManager::new(db.clone());
+    let mut txn = tm.begin();
+    let mut tx_exec = SqlExecutor::with_transaction(
+        db.clone(),
+        Arc::new(Catalog::at_snapshot(db, txn.read_seq)),
+        txn.read_seq,
+        &HashMap::new(),
+    );
+    execute(&tx_exec, "DELETE FROM uq_partial WHERE id = '1099'");
+    execute(
+        &tx_exec,
+        "INSERT INTO uq_partial (id, email) VALUES ('2002', 'e1005')",
+    );
+    if let Some(reads) = tx_exec.drain_reads() {
+        txn.read_set.extend(reads.keys);
+        txn.read_ranges.extend(reads.ranges);
+    }
+    if let Some(staged) = tx_exec.flush_batch() {
+        for (k, v, ttl) in staged.buffered_writes {
+            txn.write_set
+                .insert(String::from_utf8(k).unwrap(), (Some(v), ttl));
+        }
+        for k in staged.buffered_deletes {
+            txn.write_set
+                .insert(String::from_utf8(k).unwrap(), (None, 0));
+        }
+    }
+    tm.commit(&mut txn).unwrap();
+
+    execute(
+        &executor,
+        "UPDATE uq_partial SET email = 'e1001' WHERE id = '1001'",
+    );
+    assert_eq!(idx_mgr.rebuild_index("uq_partial_email").unwrap(), 1005);
+    assert!(idx_mgr.catalog_snapshot().unwrap().is_ready(77));
+    assert_eq!(
+        idx_mgr
+            .lookup("uq_partial_email", &[serde_json::json!("e1005")])
+            .unwrap(),
+        vec!["2002".to_string()]
+    );
+}
+
+#[test]
+fn unready_document_unique_index_after_partial_rebuild_failure_rejects_duplicate() {
+    let (db, _dir, _executor) = setup();
+    let idx_mgr = IndexManager::new(db.clone());
+
+    let mut seed = WriteBatch::new();
+    for i in 1..=1005usize {
+        let pk = format!("{i:04}");
+        let code = if i == 1001 {
+            "c0001".to_string()
+        } else {
+            format!("c{i:04}")
+        };
+        let doc = serde_json::json!({ "code": code });
+        seed.set(&format!("doc_uq:{pk}"), doc.to_string()).unwrap();
+        if seed.op_count() >= 500 {
+            db.commit_batch(&seed).unwrap();
+            seed = WriteBatch::new();
+        }
+    }
+    if !seed.is_empty() {
+        db.commit_batch(&seed).unwrap();
+    }
+
+    let id = idx_mgr
+        .create_document_index(
+            "doc_uq_code",
+            "doc_uq",
+            vec![("code".into(), IndexFieldType::String)],
+            true,
+        )
+        .unwrap();
+    assert!(idx_mgr.rebuild_index("doc_uq_code").is_err());
+    assert!(!idx_mgr.catalog_snapshot().unwrap().is_ready(id));
+    assert_eq!(
+        idx_mgr
+            .lookup("doc_uq_code", &[serde_json::json!("c1005")])
+            .unwrap()
+            .len(),
+        0
+    );
+
+    let mut dup = WriteBatch::new();
+    let doc = serde_json::json!({ "code": "c1005" });
+    dup.set("doc_uq:2000", doc.to_string()).unwrap();
+    let err = idx_mgr
+        .index_document("doc_uq", "2000", &doc, &mut dup)
+        .expect_err("unready unique document index must reject duplicate of unindexed doc");
+    assert!(err.to_string().contains("UNIQUE CONSTRAINT"), "err: {err}");
+}
+
+#[test]
+fn schema_migration_add_field_receipt_skips_readd_on_retry_for_sql() {
+    let (db, _dir, executor) = setup();
+    let idx_mgr = Arc::new(IndexManager::new(db.clone()));
+    let schema = SchemaManager::new(db.clone(), idx_mgr);
+
+    execute(
+        &executor,
+        "CREATE TABLE mig_add_sql (id INTEGER PRIMARY KEY, val TEXT)",
+    );
+    execute(
+        &executor,
+        "INSERT INTO mig_add_sql (id, val) VALUES (1, 'dup'), (2, 'dup')",
+    );
+    let m1 = Migration {
+        version: 1,
+        description: "add then rename then unique index (sql)".into(),
+        up: vec![
+            SchemaOp::AddField {
+                collection: "mig_add_sql".into(),
+                field_name: "old_col".into(),
+                default_value: serde_json::json!("def"),
+            },
+            SchemaOp::RenameField {
+                collection: "mig_add_sql".into(),
+                old_name: "old_col".into(),
+                new_name: "new_col".into(),
+            },
+            SchemaOp::CreateIndex {
+                name: "mig_add_sql_val_uq".into(),
+                collection: "mig_add_sql".into(),
+                fields: vec![("val".into(), IndexFieldType::String)],
+                unique: true,
+            },
+        ],
+        down: vec![],
+    };
+    assert!(
+        schema.migrate_up(&m1).is_err(),
+        "step 3 unique index must fail on duplicate val"
+    );
+
+    execute(
+        &executor,
+        "UPDATE mig_add_sql SET val = 'uniq' WHERE id = 2",
+    );
+    schema.migrate_up(&m1).unwrap();
+
+    let table_def: omni_engine::catalog::TableDef = serde_json::from_str(
+        &db.find("\u{0}CATALOG\u{0}mig_add_sql", db.get_seq())
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    let col_names: Vec<&str> = table_def.columns.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(col_names, vec!["id", "val", "new_col"]);
+    for pk in ["1", "2"] {
+        let row = read_json_value(&db, &format!("\u{0}T\u{0}mig_add_sql\u{0}{pk}"));
+        assert_eq!(row.get("old_col"), None, "old_col must not be re-added");
+        assert_eq!(row.get("new_col"), Some(&serde_json::json!("def")));
+    }
+    assert_eq!(
+        db.scan(
+            "\u{0}SCHEMA\u{0}add_done:",
+            "\u{0}SCHEMA\u{0}add_done;",
+            db.get_seq()
+        )
+        .unwrap()
+        .len(),
+        0,
+        "add_done receipts must be cleaned on Applied"
+    );
+}
+
+#[test]
+fn schema_migration_add_field_receipt_skips_readd_on_retry_for_document() {
+    let (db, _dir, _executor) = setup();
+    let idx_mgr = Arc::new(IndexManager::new(db.clone()));
+    let schema = SchemaManager::new(db.clone(), idx_mgr);
+
+    let mut seed = WriteBatch::new();
+    seed.set("mig_add_doc:1", r#"{"val":"dup"}"#.into())
+        .unwrap();
+    seed.set("mig_add_doc:2", r#"{"val":"dup"}"#.into())
+        .unwrap();
+    db.commit_batch(&seed).unwrap();
+    let m1 = Migration {
+        version: 1,
+        description: "add then rename then unique index (doc)".into(),
+        up: vec![
+            SchemaOp::AddField {
+                collection: "mig_add_doc".into(),
+                field_name: "old_f".into(),
+                default_value: serde_json::json!("dval"),
+            },
+            SchemaOp::RenameField {
+                collection: "mig_add_doc".into(),
+                old_name: "old_f".into(),
+                new_name: "new_f".into(),
+            },
+            SchemaOp::CreateIndex {
+                name: "mig_add_doc_val_uq".into(),
+                collection: "mig_add_doc".into(),
+                fields: vec![("val".into(), IndexFieldType::String)],
+                unique: true,
+            },
+        ],
+        down: vec![],
+    };
+    assert!(schema.migrate_up(&m1).is_err());
+
+    let mut fix = WriteBatch::new();
+    fix.set("mig_add_doc:2", r#"{"val":"uniq","new_f":"dval"}"#.into())
+        .unwrap();
+    db.commit_batch(&fix).unwrap();
+    schema.migrate_up(&m1).unwrap();
+
+    for key in ["mig_add_doc:1", "mig_add_doc:2"] {
+        let doc = read_json_value(&db, key);
+        assert_eq!(doc.get("old_f"), None, "old_f must not be re-added");
+        assert_eq!(doc.get("new_f"), Some(&serde_json::json!("dval")));
+    }
+    assert_eq!(
+        db.scan(
+            "\u{0}SCHEMA\u{0}add_done:",
+            "\u{0}SCHEMA\u{0}add_done;",
+            db.get_seq()
+        )
+        .unwrap()
+        .len(),
+        0,
+        "add_done receipts must be cleaned on Applied"
+    );
+}
+
+#[test]
+fn schema_migration_add_field_receipt_handles_multi_batch_sql_retry() {
+    let (db, _dir, executor) = setup();
+    let idx_mgr = Arc::new(IndexManager::new(db.clone()));
+    let schema = SchemaManager::new(db.clone(), idx_mgr);
+
+    execute(
+        &executor,
+        "CREATE TABLE big_add_mig (id INTEGER PRIMARY KEY, tag TEXT)",
+    );
+    let total_rows = WriteBatch::MAX_OPS / 2 + 25;
+    let mut seed = WriteBatch::new();
+    for i in 1..=total_rows {
+        let tag = if i == 2 {
+            "t1".to_string()
+        } else {
+            format!("t{i}")
+        };
+        let row = serde_json::json!({ "id": i.to_string(), "tag": tag });
+        seed.set(&format!("\u{0}T\u{0}big_add_mig\u{0}{i}"), row.to_string())
+            .unwrap();
+        if seed.op_count() >= 500 {
+            db.commit_batch(&seed).unwrap();
+            seed = WriteBatch::new();
+        }
+    }
+    if !seed.is_empty() {
+        db.commit_batch(&seed).unwrap();
+    }
+
+    let m1 = Migration {
+        version: 1,
+        description: "large add + rename + unique index".into(),
+        up: vec![
+            SchemaOp::AddField {
+                collection: "big_add_mig".into(),
+                field_name: "old_col".into(),
+                default_value: serde_json::json!("d0"),
+            },
+            SchemaOp::RenameField {
+                collection: "big_add_mig".into(),
+                old_name: "old_col".into(),
+                new_name: "new_col".into(),
+            },
+            SchemaOp::CreateIndex {
+                name: "big_add_mig_tag_uq".into(),
+                collection: "big_add_mig".into(),
+                fields: vec![("tag".into(), IndexFieldType::String)],
+                unique: true,
+            },
+        ],
+        down: vec![],
+    };
+    assert!(schema.migrate_up(&m1).is_err());
+
+    execute(&executor, "UPDATE big_add_mig SET tag = 't2' WHERE id = 2");
+    schema.migrate_up(&m1).unwrap();
+
+    let table_def: omni_engine::catalog::TableDef = serde_json::from_str(
+        &db.find("\u{0}CATALOG\u{0}big_add_mig", db.get_seq())
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    let cols: Vec<&str> = table_def.columns.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(cols, vec!["id", "tag", "new_col"]);
+    for sample in [1, total_rows / 2, total_rows] {
+        let row = read_json_value(&db, &format!("\u{0}T\u{0}big_add_mig\u{0}{sample}"));
+        assert_eq!(row.get("old_col"), None);
+        assert_eq!(row.get("new_col"), Some(&serde_json::json!("d0")));
+    }
+}
+
+#[test]
+fn schema_migration_add_field_receipt_is_bound_to_sql_table_identity() {
+    let (db, _dir, executor) = setup();
+    let idx_mgr = Arc::new(IndexManager::new(db.clone()));
+    let schema = SchemaManager::new(db, idx_mgr);
+
+    execute(
+        &executor,
+        "CREATE TABLE recreated_add_tbl (id INTEGER PRIMARY KEY, tag TEXT)",
+    );
+    execute(
+        &executor,
+        "INSERT INTO recreated_add_tbl (id, tag) VALUES (1, 'dup'), (2, 'dup')",
+    );
+    let m1 = Migration {
+        version: 1,
+        description: "add field bound to table identity".into(),
+        up: vec![
+            SchemaOp::AddField {
+                collection: "recreated_add_tbl".into(),
+                field_name: "extra".into(),
+                default_value: serde_json::json!("v1"),
+            },
+            SchemaOp::CreateIndex {
+                name: "recreated_add_tbl_tag_uq".into(),
+                collection: "recreated_add_tbl".into(),
+                fields: vec![("tag".into(), IndexFieldType::String)],
+                unique: true,
+            },
+        ],
+        down: vec![],
+    };
+    assert!(schema.migrate_up(&m1).is_err());
+
+    execute(&executor, "DROP TABLE recreated_add_tbl");
+    execute(
+        &executor,
+        "CREATE TABLE recreated_add_tbl (id INTEGER PRIMARY KEY, tag TEXT)",
+    );
+    execute(
+        &executor,
+        "INSERT INTO recreated_add_tbl (id, tag) VALUES (1, 'ok')",
+    );
+    schema.migrate_up(&m1).unwrap();
+
+    assert_eq!(
+        select_rows(&executor, "SELECT id, extra FROM recreated_add_tbl"),
+        vec![vec!["1", "v1"]]
+    );
+}
