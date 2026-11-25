@@ -17,7 +17,7 @@ use std::os::unix::fs::FileExt;
 #[cfg(windows)]
 use std::os::windows::fs::FileExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock, Weak};
 
 pub struct FnvHasher(u64);
@@ -471,12 +471,31 @@ pub struct BloomFilter {
     num_hashes: usize,
 }
 
+#[derive(Debug)]
+enum AtomicReplaceError {
+    BeforeRename(OmniError),
+    AfterRenameSyncFailed(OmniError),
+}
+
+impl AtomicReplaceError {
+    fn into_omni_error(self) -> OmniError {
+        match self {
+            Self::BeforeRename(err) | Self::AfterRenameSyncFailed(err) => err,
+        }
+    }
+}
+
 /// Atomically publish a small metadata file after its contents have reached
-/// stable storage. Readers either see the previous complete file or the new
-/// complete file; they never observe a partially-written JSON sidecar.
-fn atomic_replace(path: &str, content: &[u8]) -> Result<(), OmniError> {
+/// stable storage, distinguishing failures before `rename()` from failures in
+/// post-rename directory durability.
+fn atomic_replace_checked(
+    path: &str,
+    content: &[u8],
+    before_rename_failpoint: Option<&str>,
+    after_rename_failpoint: Option<&str>,
+) -> Result<(), AtomicReplaceError> {
     let tmp_path = format!("{path}.tmp");
-    let result = (|| {
+    let before_rename = (|| {
         let mut file = OpenOptions::new()
             .create(true)
             .truncate(true)
@@ -485,25 +504,60 @@ fn atomic_replace(path: &str, content: &[u8]) -> Result<(), OmniError> {
         file.write_all(content)?;
         file.sync_all()?;
         drop(file);
-        std::fs::rename(&tmp_path, path)?;
-
-        // On Unix, syncing the directory makes the rename durable across a
-        // sudden power loss as well as making the file contents durable.
-        #[cfg(unix)]
-        if let Some(parent) = Path::new(path)
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-        {
-            File::open(parent)?.sync_all()?;
+        if let Some(fp) = before_rename_failpoint {
+            crate::failpoints::maybe_fail(fp)?;
         }
-
+        std::fs::rename(&tmp_path, path)?;
         Ok::<(), OmniError>(())
     })();
 
-    if result.is_err() {
+    if let Err(err) = before_rename {
         let _ = std::fs::remove_file(&tmp_path);
+        return Err(AtomicReplaceError::BeforeRename(err));
     }
-    result
+
+    // `rename()` has already made the new file visible at `path`. Any failure
+    // from this point on leaves publication durability uncertain, so callers
+    // must preserve newly referenced files and stop accepting writes under a
+    // superseded in-memory topology.
+    if let Some(fp) = after_rename_failpoint
+        && let Err(err) = crate::failpoints::maybe_fail(fp)
+    {
+        return Err(AtomicReplaceError::AfterRenameSyncFailed(
+            OmniError::IoError(format!("post-rename directory sync failed: {err}")),
+        ));
+    }
+
+    // On Unix, syncing the directory makes the rename durable across a
+    // sudden power loss as well as making the file contents durable.
+    #[cfg(unix)]
+    {
+        let parent = Path::new(path)
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let sync_res: Result<(), std::io::Error> = (|| {
+            let dir = File::open(parent)?;
+            dir.sync_all()
+        })();
+        if let Err(err) = sync_res {
+            return Err(AtomicReplaceError::AfterRenameSyncFailed(
+                OmniError::IoError(format!(
+                    "post-rename directory sync failed for '{}': {err}",
+                    parent.display()
+                )),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+/// Atomically publish a small metadata file after its contents have reached
+/// stable storage. Readers either see the previous complete file or the new
+/// complete file; they never observe a partially-written JSON sidecar.
+fn atomic_replace(path: &str, content: &[u8]) -> Result<(), OmniError> {
+    atomic_replace_checked(path, content, None, None).map_err(AtomicReplaceError::into_omni_error)
 }
 
 impl BloomFilter {
@@ -768,13 +822,27 @@ impl Manifest {
         }
         Ok(m)
     }
-    pub fn save(&self, path: &str) -> Result<(), OmniError> {
+    fn save_checked(&self, path: &str) -> Result<(), AtomicReplaceError> {
         // Always write current format version.
         let mut to_save = self.clone();
         to_save.format_version = MANIFEST_FORMAT_VERSION;
-        let content = serde_json::to_string(&to_save)
-            .map_err(|e| OmniError::IoError(format!("Manifest serialize: {}", e)))?;
-        atomic_replace(path, content.as_bytes())
+        let content = serde_json::to_string(&to_save).map_err(|e| {
+            AtomicReplaceError::BeforeRename(OmniError::IoError(format!(
+                "Manifest serialize: {}",
+                e
+            )))
+        })?;
+        atomic_replace_checked(
+            path,
+            content.as_bytes(),
+            Some("manifest::before_rename"),
+            Some("manifest::sync_dir_after_rename"),
+        )
+    }
+
+    pub fn save(&self, path: &str) -> Result<(), OmniError> {
+        self.save_checked(path)
+            .map_err(AtomicReplaceError::into_omni_error)
     }
 }
 
@@ -1369,6 +1437,12 @@ pub struct OmniKV {
     // collide, and create_new(true) then fails with EEXIST.
     file_seq: std::sync::atomic::AtomicU64,
 
+    // Fail-stop write fence tripped whenever manifest `rename()` succeeded but
+    // post-rename directory durability failed, leaving the on-disk manifest and
+    // in-memory topology potentially diverged until reopen/recovery.
+    write_fenced: AtomicBool,
+    write_fence_reason: Mutex<Option<String>>,
+
     // Must be declared last: Rust drops struct fields in declaration order, so
     // all mmap-bearing roots and files are released before the database LOCK
     // file is unlocked and closed.
@@ -1537,6 +1611,8 @@ impl OmniKV {
             // Start from a process-unique seed so reopening a database does
             // not immediately reuse the previous instance's token sequence.
             file_seq: std::sync::atomic::AtomicU64::new(rand::random()),
+            write_fenced: AtomicBool::new(false),
+            write_fence_reason: Mutex::new(None),
             db_lock,
         });
         db.sync_prepared_2pc_reservations()?;
@@ -1624,14 +1700,70 @@ impl OmniKV {
         self.sstable_count() + self.l1_sstable_count()
     }
 
-    fn remove_frozen_memtable(&self, frozen_idx: usize) -> Result<(), OmniError> {
+    /// Returns `true` when this database instance has entered fail-stop
+    /// read-only mode after an uncertain post-rename manifest publication.
+    pub fn is_write_fenced(&self) -> bool {
+        self.write_fenced.load(Ordering::Acquire)
+    }
+
+    fn trip_write_fence(&self, reason: String) {
+        if let Ok(mut guard) = self.write_fence_reason.lock()
+            && guard.is_none()
+        {
+            *guard = Some(reason);
+        }
+        self.write_fenced.store(true, Ordering::Release);
+        self.notify_compaction_waiters();
+    }
+
+    fn ensure_writes_not_fenced(&self) -> Result<(), OmniError> {
+        if !self.write_fenced.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let reason = self
+            .write_fence_reason
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone())
+            .unwrap_or_else(|| {
+                "storage writes fenced after uncertain manifest publication; reopen required".into()
+            });
+        Err(OmniError::IoError(reason))
+    }
+
+    fn publish_manifest_or_fence(
+        &self,
+        manifest: &Manifest,
+        output_guard: Option<&mut CompactionOutputGuard>,
+    ) -> Result<(), OmniError> {
+        match manifest.save_checked(&self.manifest_path) {
+            Ok(()) => Ok(()),
+            Err(AtomicReplaceError::BeforeRename(err)) => Err(err),
+            Err(AtomicReplaceError::AfterRenameSyncFailed(err)) => {
+                // `rename()` already made the replacement manifest visible on
+                // disk. Never delete newly referenced compaction/GC outputs,
+                // keep prior files intact for live readers, and fail-stop all
+                // further writes until the database is reopened and recovered.
+                if let Some(guard) = output_guard {
+                    guard.disarm();
+                }
+                let reason = format!(
+                    "manifest publication durability uncertain after rename ({err}); writes halted until database reopen"
+                );
+                self.trip_write_fence(reason.clone());
+                Err(OmniError::IoError(reason))
+            }
+        }
+    }
+
+    fn remove_frozen_memtable(&self, target: &SharedMemtable) -> Result<(), OmniError> {
         let _guard = self
             .write_mutex
             .lock()
             .map_err(|_| OmniError::LockPoisoned("compact".into()))?;
         let mut frozen = self.roots.load().frozen_memtables.clone().as_ref().clone();
-        if frozen_idx < frozen.len() {
-            frozen.remove(frozen_idx);
+        if let Some(pos) = frozen.iter().position(|entry| Arc::ptr_eq(entry, target)) {
+            frozen.remove(pos);
             self.update_roots(|r| StorageRoots {
                 frozen_memtables: Arc::new(frozen),
                 ..r.clone()
@@ -2194,6 +2326,7 @@ impl OmniKV {
             .write_mutex
             .lock()
             .map_err(|_| OmniError::LockPoisoned("heap write mutex".into()))?;
+        self.ensure_writes_not_fenced()?;
         let heap = self
             .heap_file
             .lock()
@@ -2277,6 +2410,7 @@ impl OmniKV {
     /// This allows multiple concurrent batches to overlap their CPU-intensive
     /// compression work and only serialize briefly for sequence numbering.
     pub fn commit_batch(&self, tx: &WriteBatch) -> Result<u64, OmniError> {
+        self.ensure_writes_not_fenced()?;
         for key in tx
             .buffered_writes
             .iter()
@@ -2304,6 +2438,7 @@ impl OmniKV {
 
     /// Commits engine-internal 2PC metadata, bypassing client key validation.
     pub(crate) fn commit_2pc_batch(&self, tx: &WriteBatch) -> Result<u64, OmniError> {
+        self.ensure_writes_not_fenced()?;
         if let Some(gateway) = self.cluster_gateway.get() {
             crate::dist_txn::validate_2pc_decision_writes(self, None, tx)?;
             return gateway.commit_2pc_batch(tx);
@@ -2369,6 +2504,8 @@ impl OmniKV {
         write_keys: &[String],
     ) -> Result<u64, crate::dist_txn::PrepareCommitError> {
         use crate::dist_txn::PrepareCommitError;
+        self.ensure_writes_not_fenced()
+            .map_err(PrepareCommitError::PreProposal)?;
         if let Some(gateway) = self.cluster_gateway.get() {
             return gateway.commit_2pc_prepare_checked(self, tx, read_seq, write_keys);
         }
@@ -2405,6 +2542,7 @@ impl OmniKV {
         tx: &WriteBatch,
         ssi: crate::transaction::SsiCommitRecord,
     ) -> Result<u64, OmniError> {
+        self.ensure_writes_not_fenced()?;
         if let Some(gateway) = self.cluster_gateway.get() {
             crate::dist_txn::validate_2pc_decision_writes(self, None, tx)?;
             return gateway.commit_2pc_batch_with_ssi(tx, ssi);
@@ -2495,6 +2633,7 @@ impl OmniKV {
         tx: &WriteBatch,
         skip_prepared_check: bool,
     ) -> Result<u64, OmniError> {
+        self.ensure_writes_not_fenced()?;
         let start_time = std::time::Instant::now();
 
         // Write Backpressure: If L0 SSTables exceed threshold, wait for compaction
@@ -2518,6 +2657,10 @@ impl OmniKV {
             let (ref stall_lock, ref cv) = self.compaction_cv;
             let mut guard = stall_lock.lock().unwrap_or_else(|e| e.into_inner());
             loop {
+                if let Err(err) = self.ensure_writes_not_fenced() {
+                    drop(guard);
+                    return Err(err);
+                }
                 if self.sstable_count() < compaction_policy.l0_write_stall_threshold {
                     stalled = false;
                     break;
@@ -2585,6 +2728,7 @@ impl OmniKV {
                 .write_mutex
                 .lock()
                 .map_err(|_| OmniError::LockPoisoned("commit_seq".into()))?;
+            self.ensure_writes_not_fenced()?;
             if !skip_prepared_check
                 && let Some(conflict) = self.ssi_history.check_batch_prepared_conflicts(tx)
             {
@@ -3335,6 +3479,7 @@ impl OmniKV {
 
     /// Flushes the active memtable to disk as an L0 SSTable.
     pub fn compact_sstables(&self) -> Result<(), OmniError> {
+        self.ensure_writes_not_fenced()?;
         {
             let _topology_guard = self
                 .transition_guard
@@ -3348,6 +3493,7 @@ impl OmniKV {
         // concurrent writes are never lost on crash.
         if let Ok(_exclusive) = self.transition_guard.try_write()
             && let Ok(_write_guard) = self.write_mutex.lock()
+            && !self.is_write_fenced()
         {
             let roots = self.roots.load();
             let active_empty = roots.memtable.iter().all(|shard| shard.is_empty());
@@ -3366,37 +3512,36 @@ impl OmniKV {
     /// transition barrier. Backup creation uses this form while holding the
     /// barrier exclusively; reacquiring the read side there would deadlock.
     pub(crate) fn compact_sstables_locked(&self) -> Result<(), OmniError> {
+        self.ensure_writes_not_fenced()?;
         let started_at = std::time::Instant::now();
         let mut stats = CompactionStats::default();
-        let (frozen_idx, frozen_arc) = {
+        let frozen_arc = {
             let _guard = self
                 .write_mutex
                 .lock()
                 .map_err(|_| OmniError::LockPoisoned("compact".into()))?;
+            self.ensure_writes_not_fenced()?;
             let new_empty: SharedMemtable = Arc::new(std::array::from_fn(|_| SkipMap::new()));
             // Atomically: swap memtable to empty and add old one to frozen list.
             // Do NOT truncate the WAL here: the frozen memtable is not durable
             // until the L0 SSTable and updated manifest are fsynced below.
-            let old_memtable = {
-                let current = self.roots.load();
-                let old = current.memtable.clone();
-                let mut new_frozen = current.frozen_memtables.as_ref().clone();
-                new_frozen.push(old.clone());
-                self.roots.store(Arc::new(StorageRoots {
-                    memtable: new_empty,
-                    frozen_memtables: Arc::new(new_frozen.clone()),
-                    base_mmap: current.base_mmap.clone(),
-                    base_bloom: current.base_bloom.clone(),
-                    sstables: current.sstables.clone(),
-                    l1_sstables: current.l1_sstables.clone(),
-                    manifest: current.manifest.clone(),
-                    heap_reader: current.heap_reader.clone(),
-                    heap_generation: current.heap_generation,
-                    read_seq_floor: current.read_seq_floor,
-                }));
-                (old, new_frozen.len() - 1)
-            };
-            (old_memtable.1, old_memtable.0)
+            let current = self.roots.load();
+            let old = current.memtable.clone();
+            let mut new_frozen = current.frozen_memtables.as_ref().clone();
+            new_frozen.push(old.clone());
+            self.roots.store(Arc::new(StorageRoots {
+                memtable: new_empty,
+                frozen_memtables: Arc::new(new_frozen),
+                base_mmap: current.base_mmap.clone(),
+                base_bloom: current.base_bloom.clone(),
+                sstables: current.sstables.clone(),
+                l1_sstables: current.l1_sstables.clone(),
+                manifest: current.manifest.clone(),
+                heap_reader: current.heap_reader.clone(),
+                heap_generation: current.heap_generation,
+                read_seq_floor: current.read_seq_floor,
+            }));
+            old
         };
 
         let mut records = Vec::new();
@@ -3415,7 +3560,7 @@ impl OmniKV {
         }
 
         if records.is_empty() {
-            self.remove_frozen_memtable(frozen_idx)?;
+            self.remove_frozen_memtable(&frozen_arc)?;
             stats.record(
                 "memtable_to_l0",
                 started_at,
@@ -3460,24 +3605,38 @@ impl OmniKV {
         // treats the table as immutable and replaces it only by root swap.
         let mmap = unsafe { MmapOptions::new().map(&file)? };
 
+        let _publish_guard = self
+            .write_mutex
+            .lock()
+            .map_err(|_| OmniError::LockPoisoned("compact_publish".into()))?;
+        self.ensure_writes_not_fenced()?;
+
         let mut manifest = self.roots.load().manifest.clone().as_ref().clone();
         manifest.sstables.push(sst_path.clone());
         manifest.max_seq = manifest.max_seq.max(self.global_seq.load(Ordering::SeqCst));
-        manifest.save(&self.manifest_path)?;
+        self.publish_manifest_or_fence(&manifest, Some(&mut output_guard))?;
 
-        // CRITICAL: Publish manifest + sstables in a SINGLE atomic swap.
-        // Two separate update_roots calls would let readers see a manifest
-        // listing an SSTable that hasn't been added to roots yet.
-        let mut sstables = self.roots.load().sstables.clone().as_ref().clone();
+        // CRITICAL: Publish manifest + sstables + frozen removal in a SINGLE
+        // atomic swap under `write_mutex`.
+        let cur_roots = self.roots.load();
+        let mut sstables = cur_roots.sstables.clone().as_ref().clone();
         sstables.push((Arc::new(mmap), Arc::new(bloom), sst_path));
+        let mut frozen = cur_roots.frozen_memtables.clone().as_ref().clone();
+        if let Some(pos) = frozen
+            .iter()
+            .position(|entry| Arc::ptr_eq(entry, &frozen_arc))
+        {
+            frozen.remove(pos);
+        }
         self.update_roots(|r| StorageRoots {
             manifest: Arc::new(manifest),
             sstables: Arc::new(sstables),
+            frozen_memtables: Arc::new(frozen),
             ..r.clone()
         });
         output_guard.disarm();
+        drop(_publish_guard);
 
-        self.remove_frozen_memtable(frozen_idx)?;
         stats.record(
             "memtable_to_l0",
             started_at,
@@ -3500,6 +3659,7 @@ impl OmniKV {
             .write_mutex
             .lock()
             .map_err(|_| OmniError::LockPoisoned("compact_l0".into()))?;
+        self.ensure_writes_not_fenced()?;
         let sstables = self.roots.load().sstables.clone();
         if sstables.is_empty() {
             return Ok(());
@@ -3539,7 +3699,7 @@ impl OmniKV {
         if records.is_empty() {
             let mut manifest = self.roots.load().manifest.clone().as_ref().clone();
             manifest.sstables.clear();
-            manifest.save(&self.manifest_path)?;
+            self.publish_manifest_or_fence(&manifest, None)?;
             self.update_roots(|r| StorageRoots {
                 manifest: Arc::new(manifest),
                 sstables: Arc::new(Vec::new()),
@@ -3599,7 +3759,7 @@ impl OmniKV {
         manifest.sstables.clear();
         manifest.l1_sstables.push(sst_path.clone());
         manifest.max_seq = manifest.max_seq.max(self.global_seq.load(Ordering::SeqCst));
-        manifest.save(&self.manifest_path)?;
+        self.publish_manifest_or_fence(&manifest, Some(&mut output_guard))?;
 
         // CRITICAL: Publish manifest + l1_sstables + cleared L0 in a SINGLE atomic swap.
         let mut l1_sstables = self.roots.load().l1_sstables.clone().as_ref().clone();
@@ -3637,6 +3797,7 @@ impl OmniKV {
             .write_mutex
             .lock()
             .map_err(|_| OmniError::LockPoisoned("compact_l1_l2".into()))?;
+        self.ensure_writes_not_fenced()?;
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -3747,7 +3908,7 @@ impl OmniKV {
             .into_iter()
             .map(|(_, _, path)| path)
             .collect();
-        manifest.save(&self.manifest_path)?;
+        self.publish_manifest_or_fence(&manifest, Some(&mut output_guard))?;
 
         self.update_roots(|r| StorageRoots {
             base_mmap: Arc::new(new_base_mmap),
@@ -3791,6 +3952,7 @@ impl OmniKV {
             .write_mutex
             .lock()
             .map_err(|_| OmniError::LockPoisoned("GC write mutex".into()))?;
+        self.ensure_writes_not_fenced()?;
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -4005,26 +4167,14 @@ impl OmniKV {
         manifest_for_roots.max_seq = manifest_for_roots.max_seq.max(cur_next_seq);
 
         // Acquire `heap_file` BEFORE persisting the replacement manifest so no
-        // fallible lock acquisition remains between `manifest.save()` and
-        // `output_guard.disarm()`.
+        // fallible lock acquisition remains between `publish_manifest_or_fence`
+        // and `output_guard.disarm()`.
         let mut heap_lock = self
             .heap_file
             .lock()
             .map_err(|_| OmniError::LockPoisoned("heap_file".into()))?;
         bloom.save(&bloom_path_for_base(&new_base_path))?;
-        if let Err(err) = manifest_for_roots.save(&self.manifest_path) {
-            // `atomic_replace` can rename the new manifest into place and then
-            // fail while syncing its parent directory. Preserve the new heap
-            // and base unless we can confirm the live manifest still points to
-            // the previous generation.
-            let live_points_to_old = Manifest::load(&self.manifest_path).is_ok_and(|live| {
-                live.heap_path != new_heap_path && live.base_path != new_base_path
-            });
-            if !live_points_to_old {
-                output_guard.disarm();
-            }
-            return Err(err);
-        }
+        self.publish_manifest_or_fence(&manifest_for_roots, Some(&mut output_guard))?;
 
         // Writers and compactions are fenced by exclusive `transition_guard` +
         // `write_mutex`, and every memtable/frozen_memtable entry has been
@@ -4097,6 +4247,9 @@ impl OmniKV {
                 let mut gc_counter: u32 = 0;
                 loop {
                     std::thread::sleep(std::time::Duration::from_millis(check_interval_ms));
+                    if db.is_write_fenced() {
+                        continue;
+                    }
 
                     let mut did_compact = false;
                     let compaction_policy = match db.compaction_policy() {

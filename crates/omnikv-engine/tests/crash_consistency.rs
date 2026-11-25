@@ -781,3 +781,290 @@ fn snapshot_promotion_fails_closed_when_rollback_sync_or_marker_fails() {
         );
     });
 }
+
+#[cfg(feature = "failpoints")]
+fn commit_kv(db: &OmniKV, key: &str, value: &str) -> Result<u64, omni_engine::OmniError> {
+    let mut wb = WriteBatch::new();
+    wb.set(key, value.to_string()).expect("wb.set");
+    db.commit_batch(&wb)
+}
+
+#[cfg(feature = "failpoints")]
+#[test]
+fn gc_post_rename_manifest_sync_failure_fences_writes_and_preserves_reopen() {
+    let _lock = TEST_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let registry = FailRegistry::new();
+    registry.reset();
+
+    let dir = TempDir::new().expect("tempdir");
+    let (manifest_path, wal_path) = fresh_db_paths(&dir);
+    let db = OmniKV::open(&manifest_path, &wal_path).expect("open db");
+    commit_kv(&db, "k1", "v1_old").expect("commit k1 old");
+    commit_kv(&db, "k2", "v2").expect("commit k2");
+    commit_kv(&db, "k1", "v1_new").expect("commit k1 new");
+    db.compact_sstables().expect("flush L0");
+    commit_kv(&db, "k3", "v3_memtable").expect("commit k3");
+
+    let pre_gc = omni_engine::Manifest::load(&manifest_path).expect("pre-GC manifest");
+    registry.arm("manifest::sync_dir_after_rename");
+    let gc_err = db
+        .run_garbage_collection()
+        .expect_err("post-rename sync failure must fail GC");
+    registry.reset();
+    assert!(
+        gc_err
+            .to_string()
+            .contains("manifest::sync_dir_after_rename"),
+        "expected armed failpoint in GC error: {gc_err}"
+    );
+
+    let post_gc = omni_engine::Manifest::load(&manifest_path).expect("post-GC manifest");
+    assert_ne!(
+        post_gc.heap_path, pre_gc.heap_path,
+        "new manifest must be visible"
+    );
+    assert_ne!(
+        post_gc.base_path, pre_gc.base_path,
+        "new base must be visible"
+    );
+    assert!(
+        std::path::Path::new(&post_gc.heap_path).exists(),
+        "new heap must be preserved"
+    );
+    assert!(
+        std::path::Path::new(&post_gc.base_path).exists(),
+        "new base must be preserved"
+    );
+
+    // No write or compaction may be accepted against the superseded old heap.
+    let post_write_err = commit_kv(&db, "k_rejected", "must_not_land")
+        .expect_err("writes after failed GC must be fenced");
+    assert!(
+        post_write_err.to_string().contains("writes halted"),
+        "unexpected fenced write error: {post_write_err}"
+    );
+    assert!(
+        db.compact_sstables().is_err(),
+        "compaction must stay fenced"
+    );
+    assert!(db.run_garbage_collection().is_err(), "GC must stay fenced");
+
+    // Live reads remain consistent against preserved pre-GC files.
+    for (k, v) in [("k1", "v1_new"), ("k2", "v2"), ("k3", "v3_memtable")] {
+        assert_eq!(
+            db.find_latest_internal(k).expect("live read"),
+            Some(v.to_string())
+        );
+    }
+
+    assert_fenced_and_reopen_recovers(
+        db,
+        &manifest_path,
+        &wal_path,
+        &[("k1", "v1_new"), ("k2", "v2"), ("k3", "v3_memtable")],
+    );
+    let reopened = OmniKV::open(&manifest_path, &wal_path).expect("second reopen");
+    assert_eq!(
+        reopened
+            .find_latest_internal("k_rejected")
+            .expect("k_rejected"),
+        None
+    );
+    assert_eq!(
+        reopened
+            .find_latest_internal("after_reopen")
+            .expect("after_reopen"),
+        Some("ok".into())
+    );
+}
+
+#[cfg(feature = "failpoints")]
+fn assert_fenced_and_reopen_recovers(
+    db: std::sync::Arc<OmniKV>,
+    manifest_path: &str,
+    wal_path: &str,
+    expected_entries: &[(&str, &str)],
+) {
+    assert!(
+        db.is_write_fenced(),
+        "post-rename failure must fence writes"
+    );
+    assert!(
+        commit_kv(&db, "fenced_write", "must_fail").is_err(),
+        "subsequent write must be rejected while fenced"
+    );
+    drop(db);
+
+    let reopened = OmniKV::open(manifest_path, wal_path).expect("reopen must succeed");
+    assert!(
+        !reopened.is_write_fenced(),
+        "reopen must resume writable state"
+    );
+    for (k, v) in expected_entries {
+        assert_eq!(
+            reopened
+                .find_latest_internal(k)
+                .expect("read recovered key"),
+            Some((*v).to_string()),
+            "acknowledged value for '{k}' must survive reopen"
+        );
+    }
+    assert_eq!(
+        reopened
+            .find_latest_internal("fenced_write")
+            .expect("read fenced"),
+        None
+    );
+    commit_kv(&reopened, "after_reopen", "ok").expect("write after reopen must succeed");
+}
+
+#[cfg(feature = "failpoints")]
+#[test]
+fn compaction_publishers_post_rename_sync_failure_preserve_outputs_and_reopen() {
+    let _lock = TEST_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let registry = FailRegistry::new();
+    registry.reset();
+
+    // 1. Memtable-to-L0 flush
+    {
+        let dir = TempDir::new().expect("l0 tempdir");
+        let (m, w) = fresh_db_paths(&dir);
+        let db = OmniKV::open(&m, &w).expect("open l0 db");
+        commit_kv(&db, "m1", "vm1").expect("commit m1");
+        commit_kv(&db, "m2", "vm2").expect("commit m2");
+        registry.arm("manifest::sync_dir_after_rename");
+        let err = db.compact_sstables().expect_err("L0 flush must fail");
+        registry.reset();
+        assert!(err.to_string().contains("manifest::sync_dir_after_rename"));
+        let disk = omni_engine::Manifest::load(&m).expect("load L0 manifest");
+        assert_eq!(
+            disk.sstables.len(),
+            1,
+            "manifest must reference new L0 SSTable"
+        );
+        assert!(
+            std::path::Path::new(&disk.sstables[0]).exists(),
+            "L0 SSTable must not be deleted"
+        );
+        assert_fenced_and_reopen_recovers(db, &m, &w, &[("m1", "vm1"), ("m2", "vm2")]);
+    }
+
+    // 2. L0-to-L1 compaction
+    {
+        let dir = TempDir::new().expect("l1 tempdir");
+        let (m, w) = fresh_db_paths(&dir);
+        let db = OmniKV::open(&m, &w).expect("open l1 db");
+        commit_kv(&db, "a1", "va1").expect("commit a1");
+        db.compact_sstables().expect("flush L0 #1");
+        commit_kv(&db, "a2", "va2").expect("commit a2");
+        db.compact_sstables().expect("flush L0 #2");
+        registry.arm("manifest::sync_dir_after_rename");
+        let err = db.compact_l0_to_l1().expect_err("L0->L1 must fail");
+        registry.reset();
+        assert!(err.to_string().contains("manifest::sync_dir_after_rename"));
+        let disk = omni_engine::Manifest::load(&m).expect("load L1 manifest");
+        assert_eq!(
+            disk.sstables.len(),
+            0,
+            "L0 list cleared in visible manifest"
+        );
+        assert_eq!(
+            disk.l1_sstables.len(),
+            1,
+            "manifest must reference new L1 SSTable"
+        );
+        assert!(
+            std::path::Path::new(&disk.l1_sstables[0]).exists(),
+            "L1 SSTable must not be deleted"
+        );
+        assert_fenced_and_reopen_recovers(db, &m, &w, &[("a1", "va1"), ("a2", "va2")]);
+    }
+
+    // 3. L1-to-base compaction
+    {
+        let dir = TempDir::new().expect("base tempdir");
+        let (m, w) = fresh_db_paths(&dir);
+        let db = OmniKV::open(&m, &w).expect("open base db");
+        commit_kv(&db, "b1", "vb1").expect("commit b1");
+        db.compact_sstables().expect("flush L0");
+        db.compact_l0_to_l1().expect("compact L0->L1");
+        let old_base = omni_engine::Manifest::load(&m)
+            .expect("old manifest")
+            .base_path;
+        registry.arm("manifest::sync_dir_after_rename");
+        let err = db.compact_l1_to_l2().expect_err("L1->base must fail");
+        registry.reset();
+        assert!(err.to_string().contains("manifest::sync_dir_after_rename"));
+        let disk = omni_engine::Manifest::load(&m).expect("load base manifest");
+        assert_ne!(
+            disk.base_path, old_base,
+            "visible manifest must reference new base"
+        );
+        assert!(
+            std::path::Path::new(&disk.base_path).exists(),
+            "new base must not be deleted"
+        );
+        assert_fenced_and_reopen_recovers(db, &m, &w, &[("b1", "vb1")]);
+    }
+}
+
+#[cfg(feature = "failpoints")]
+#[test]
+fn pre_rename_manifest_failure_cleans_outputs_without_fencing_writes() {
+    let _lock = TEST_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let registry = FailRegistry::new();
+    registry.reset();
+
+    let dir = TempDir::new().expect("tempdir");
+    let (m, w) = fresh_db_paths(&dir);
+    {
+        let db = OmniKV::open(&m, &w).expect("open db");
+        commit_kv(&db, "k1", "v1").expect("commit k1");
+        db.compact_sstables().expect("flush L0");
+
+        registry.arm("manifest::before_rename");
+        let err = db
+            .compact_l0_to_l1()
+            .expect_err("pre-rename failure must fail compaction");
+        registry.reset();
+        assert!(err.to_string().contains("manifest::before_rename"));
+        assert!(
+            !db.is_write_fenced(),
+            "pre-rename failure must NOT fence writes"
+        );
+
+        let disk = omni_engine::Manifest::load(&m).expect("load unchanged manifest");
+        assert_eq!(
+            disk.sstables.len(),
+            1,
+            "original L0 must remain in manifest"
+        );
+        assert_eq!(disk.l1_sstables.len(), 0, "no L1 must appear in manifest");
+        let orphan_l1_exists = fs::read_dir(dir.path())
+            .expect("read_dir")
+            .filter_map(Result::ok)
+            .any(|entry| entry.file_name().to_string_lossy().contains("_l1_"));
+        assert!(
+            !orphan_l1_exists,
+            "pre-rename output guard must remove unreferenced L1 output"
+        );
+
+        commit_kv(&db, "k2", "v2").expect("writes must remain allowed after pre-rename failure");
+    }
+
+    let reopened = OmniKV::open(&m, &w).expect("reopen after pre-rename failure");
+    assert_eq!(
+        reopened.find_latest_internal("k1").expect("k1"),
+        Some("v1".into())
+    );
+    assert_eq!(
+        reopened.find_latest_internal("k2").expect("k2"),
+        Some("v2".into())
+    );
+}
