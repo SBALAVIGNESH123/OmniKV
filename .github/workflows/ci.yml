@@ -94,6 +94,8 @@ jobs:
           ~/.cargo/git
           target
         key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+    - name: Run engine library unit tests (schema, 2PC, storage, pgwire, crypto)
+      run: cargo test -p omnikv-engine --lib --locked -- --test-threads=1
     - name: Run every non-performance integration test target
       run: python3 scripts/ci_all_integration_tests.py
 

@@ -4343,6 +4343,7 @@ fn v0_float_index_deduplicates_signed_zero_lookup_and_spanning_range() {
         "{\"id\":92,\"name\":\"v0_dedup_idx\",\"collection\":\"v0_dedup\",\"fields\":[[\"score\",\"Float\"]],\"unique\":false,\"encoding_version\":0,\"namespace\":\"Document\"}".into(),
     )
     .unwrap();
+    v0.set("\u{0}IDX_READY\u{0}92", "ready".into()).unwrap();
     v0.set(
         "\u{0}IDX\u{0}00000092\u{0}7fffffffffffffff\u{0}pk1",
         "pk1".into(),
@@ -5032,18 +5033,17 @@ fn unready_unique_index_after_partial_bind_rebuild_failure_rejects_duplicate_wri
             .is_err()
     );
     assert!(!idx_mgr.catalog_snapshot().unwrap().is_ready(77));
-    assert_eq!(
+    assert!(
         idx_mgr
             .lookup("uq_partial_email", &[serde_json::json!("e0001")])
-            .unwrap(),
-        vec!["0001".to_string()]
-    );
-    assert_eq!(
-        idx_mgr
-            .lookup("uq_partial_email", &[serde_json::json!("e1005")])
-            .unwrap()
-            .len(),
-        0
+            .is_err()
+            && idx_mgr
+                .range_scan(
+                    "uq_partial_email",
+                    &serde_json::json!("e0000"),
+                    &serde_json::json!("e9999"),
+                )
+                .is_err()
     );
 
     let Err(dup_ins) = executor.execute(
@@ -5151,12 +5151,11 @@ fn unready_document_unique_index_after_partial_rebuild_failure_rejects_duplicate
         .unwrap();
     assert!(idx_mgr.rebuild_index("doc_uq_code").is_err());
     assert!(!idx_mgr.catalog_snapshot().unwrap().is_ready(id));
-    assert_eq!(
+    assert!(
         idx_mgr
             .lookup("doc_uq_code", &[serde_json::json!("c1005")])
-            .unwrap()
-            .len(),
-        0
+            .is_err(),
+        "public lookup on unready document index must fail closed"
     );
 
     let mut dup = WriteBatch::new();
@@ -6219,4 +6218,142 @@ fn create_then_drop_index_replay_blocks_unattributable_or_mismatched_legacy_drop
         let mig = create_then_drop_migration(1, col, idx, op_ns);
         assert!(schema.migrate_up(&mig).is_err(), "{label} must fail closed");
     }
+}
+
+#[test]
+fn drop_index_receipt_rejects_mismatched_active_and_retired_index_names() {
+    let (db, _dir, executor) = setup();
+    let idx_mgr = Arc::new(IndexManager::new(db.clone()));
+    let schema = SchemaManager::new(db.clone(), idx_mgr.clone());
+
+    execute(
+        &executor,
+        "CREATE TABLE users_drop_name (id INTEGER PRIMARY KEY, tag TEXT)",
+    );
+    let users_idx_id = idx_mgr
+        .create_sql_index(
+            "users_idx",
+            "users_drop_name",
+            vec![("tag".into(), IndexFieldType::String)],
+            false,
+        )
+        .unwrap();
+    let mut ret_wb = WriteBatch::new();
+    ret_wb
+        .set(
+            "\u{0}IDX_RETIRED\u{0}95",
+            r#"{"id":95,"name":"other_retired_idx","collection":"users_drop_name","fields":[["tag","String"]],"unique":false,"encoding_version":1,"namespace":"Sql"}"#.into(),
+        )
+        .unwrap();
+    db.commit_batch(&ret_wb).unwrap();
+
+    let drop_orders = Migration {
+        version: 1,
+        description: "mismatched drop receipt ID must fail closed".into(),
+        up: vec![
+            SchemaOp::DropIndex {
+                name: "orders_idx".into(),
+            }
+            .in_namespace(IndexNamespace::Sql),
+        ],
+        down: vec![],
+    };
+
+    for (payload, label) in [
+        (format!("dropping:{users_idx_id}"), "active dropping"),
+        (format!("done:{users_idx_id}"), "active done"),
+        ("dropping:95".to_string(), "retired dropping"),
+    ] {
+        seed_legacy_drop_receipt(&db, 1, "att_nm", 0, "orders_idx", &payload);
+        assert!(
+            schema.migrate_up(&drop_orders).is_err(),
+            "{label} mismatched ID must fail closed"
+        );
+    }
+    assert!(
+        idx_mgr.definition("users_idx").is_ok(),
+        "users_idx must not be dropped by mismatched orders_idx receipt"
+    );
+    assert!(
+        db.find("\u{0}IDX_RETIRED\u{0}95", db.get_seq())
+            .unwrap()
+            .is_some(),
+        "retired definition of other_retired_idx must remain untouched"
+    );
+}
+
+#[test]
+fn public_index_lookup_and_range_scan_fail_closed_when_unready_or_ambiguous() {
+    let (db, _dir, executor) = setup();
+    let idx_mgr = IndexManager::new(db.clone());
+
+    execute(
+        &executor,
+        "CREATE TABLE pub_lookup_tbl (id INTEGER PRIMARY KEY, score INTEGER)",
+    );
+    execute(
+        &executor,
+        "INSERT INTO pub_lookup_tbl (id, score) VALUES (1, 10), (2, 20)",
+    );
+
+    // 1. Index created on non-empty table starts unready: public lookup and
+    // range_scan must fail closed until rebuild_index runs.
+    idx_mgr
+        .create_sql_index(
+            "pub_lookup_score_idx",
+            "pub_lookup_tbl",
+            vec![("score".into(), IndexFieldType::Integer)],
+            false,
+        )
+        .unwrap();
+    assert!(
+        idx_mgr
+            .lookup("pub_lookup_score_idx", &[serde_json::json!(10)])
+            .is_err()
+    );
+    assert!(
+        idx_mgr
+            .range_scan(
+                "pub_lookup_score_idx",
+                &serde_json::json!(1),
+                &serde_json::json!(30),
+            )
+            .is_err()
+    );
+    idx_mgr.rebuild_index("pub_lookup_score_idx").unwrap();
+    assert_eq!(
+        idx_mgr
+            .lookup("pub_lookup_score_idx", &[serde_json::json!(10)])
+            .unwrap(),
+        vec!["1".to_string()]
+    );
+
+    // 2. Legacy `Both` index with ambiguous ownership (both SQL table and
+    // Document rows exist) must fail closed even if marked ready.
+    let mut ambig = WriteBatch::new();
+    ambig
+        .set("pub_lookup_tbl:doc1", r#"{"score":10}"#.into())
+        .unwrap();
+    ambig
+        .set(
+            "\u{0}IDX_CATALOG\u{0}92",
+            r#"{"id":92,"name":"pub_ambig_both_idx","collection":"pub_lookup_tbl","fields":[["score","Integer"]],"unique":false,"encoding_version":1,"namespace":"Both"}"#.into(),
+        )
+        .unwrap();
+    ambig.set("\u{0}IDX_READY\u{0}92", "ready".into()).unwrap();
+    db.commit_batch(&ambig).unwrap();
+    assert!(
+        idx_mgr
+            .lookup("pub_ambig_both_idx", &[serde_json::json!(10)])
+            .is_err()
+    );
+    assert!(
+        idx_mgr
+            .range_scan(
+                "pub_ambig_both_idx",
+                &serde_json::json!(1),
+                &serde_json::json!(30),
+            )
+            .is_err()
+    );
 }

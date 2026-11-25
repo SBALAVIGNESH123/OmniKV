@@ -1145,12 +1145,11 @@ fn partial_unique_index_rebuild_failpoint_still_enforces_uniqueness() {
         "unexpected rebuild err: {rebuild_err}"
     );
     assert!(!idx_mgr.catalog_snapshot().expect("snap").is_ready(idx_id));
-    assert_eq!(
+    assert!(
         idx_mgr
             .lookup("fp_uq_code", &[serde_json::json!("c1005")])
-            .expect("lookup")
-            .len(),
-        0
+            .is_err(),
+        "public lookup on unready index after partial rebuild failure must fail closed"
     );
     let Err(dup_err) = executor
         .execute(&parse_sql("INSERT INTO fp_uq (id, code) VALUES ('2000', 'c1005')").unwrap())

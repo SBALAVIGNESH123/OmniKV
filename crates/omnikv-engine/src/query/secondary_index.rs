@@ -1058,13 +1058,82 @@ impl IndexManager {
         let catalog_value =
             serde_json::to_string(&def).map_err(|e| OmniError::IoError(e.to_string()))?;
 
-        let mut batch = WriteBatch::new();
-        batch.set(&catalog_key, catalog_value)?;
-        batch.set(NEXT_ID_KEY, next_id.to_string())?;
-        if let Some(receipt_key) = building_receipt_key {
-            batch.set(receipt_key, format!("building:{id}"))?;
-        }
-        let commit_seq = self.db.commit_batch(&batch)?;
+        let commit_seq = if building_receipt_key.is_none() {
+            match namespace {
+                IndexNamespace::Sql => {
+                    let check_seq = self.db.get_seq();
+                    let is_empty = collection_row_ranges_for_namespace(collection, namespace)
+                        .into_iter()
+                        .try_fold(true, |empty, (prefix, end)| -> Result<bool, OmniError> {
+                            if !empty {
+                                return Ok(false);
+                            }
+                            Ok(self
+                                .db
+                                .scan_exclusive_limit(&prefix, Some(&end), check_seq, 1)?
+                                .is_empty())
+                        })?;
+                    let mut batch = WriteBatch::new();
+                    batch.set(&catalog_key, catalog_value)?;
+                    batch.set(NEXT_ID_KEY, next_id.to_string())?;
+                    if is_empty {
+                        batch.set(&format!("{READY_PREFIX}{id}"), "ready".into())?;
+                    }
+                    self.db.commit_batch(&batch)?
+                }
+                IndexNamespace::Document => {
+                    let snap = self.db.consistent_snapshot_guard()?;
+                    let check_seq = snap.sequence();
+                    let doc_range = collection_row_ranges_for_namespace(collection, namespace)
+                        .into_iter()
+                        .next();
+                    let is_empty = match &doc_range {
+                        Some((prefix, end)) => self
+                            .db
+                            .scan_exclusive_limit(prefix, Some(end), check_seq, 1)?
+                            .is_empty(),
+                        None => true,
+                    };
+                    if is_empty && let Some((prefix, end)) = doc_range {
+                        let mut ready_batch = WriteBatch::new();
+                        ready_batch.set(&catalog_key, catalog_value.clone())?;
+                        ready_batch.set(NEXT_ID_KEY, next_id.to_string())?;
+                        ready_batch.set(&format!("{READY_PREFIX}{id}"), "ready".into())?;
+                        match self.db.commit_batch_if_range_unchanged(
+                            ready_batch,
+                            &prefix,
+                            &end,
+                            check_seq,
+                        )? {
+                            Ok(seq) => seq,
+                            Err(()) => {
+                                // A concurrent document write landed before we
+                                // could mark the empty index ready; publish the
+                                // index unready so callers must run rebuild_index.
+                                let mut unready_batch = WriteBatch::new();
+                                unready_batch.set(&catalog_key, catalog_value)?;
+                                unready_batch.set(NEXT_ID_KEY, next_id.to_string())?;
+                                self.db.commit_batch(&unready_batch)?
+                            }
+                        }
+                    } else {
+                        let mut batch = WriteBatch::new();
+                        batch.set(&catalog_key, catalog_value)?;
+                        batch.set(NEXT_ID_KEY, next_id.to_string())?;
+                        self.db.commit_batch(&batch)?
+                    }
+                }
+                IndexNamespace::Both => unreachable!("rejected above"),
+            }
+        } else {
+            let mut batch = WriteBatch::new();
+            batch.set(&catalog_key, catalog_value)?;
+            batch.set(NEXT_ID_KEY, next_id.to_string())?;
+            if let Some(receipt_key) = building_receipt_key {
+                batch.set(receipt_key, format!("building:{id}"))?;
+            }
+            self.db.commit_batch(&batch)?
+        };
         self.db.ssi_history().record_committed(
             0,
             commit_seq,
@@ -1105,6 +1174,50 @@ impl IndexManager {
         seq: u64,
     ) -> Result<(DropIndexReceiptState, Option<IndexNamespace>, Vec<IndexId>), OmniError> {
         let (state, stored_ns, ids) = parse_drop_index_receipt(receipt)?;
+        // Always verify every referenced ID against active and retired
+        // definitions at `seq` so a mismatched or forged receipt for `name`
+        // can never purge, drop, or short-circuit a different index.
+        let catalog = IndexCatalog::load_checked_at(&self.db, seq)?;
+        let mut proved_expected_ns = false;
+        for &id in &ids {
+            if let Some(def) = catalog.get(id) {
+                if !def.name.eq_ignore_ascii_case(name) {
+                    return Err(OmniError::IoError(format!(
+                        "drop receipt for index '{name}' references active ID {id} belonging to different index '{}'",
+                        def.name
+                    )));
+                }
+                if let Some(expected_ns) = expected_namespace {
+                    if def.namespace != expected_ns {
+                        return Err(OmniError::IoError(format!(
+                            "drop receipt for index '{name}' references ID {id} in namespace {:?}, expected {expected_ns:?}",
+                            def.namespace
+                        )));
+                    }
+                    proved_expected_ns = true;
+                }
+            }
+            let retired_key = format!("{RETIRED_PREFIX}{id}");
+            if let Some(raw) = self.db.find(&retired_key, seq)?
+                && let Ok(def) = serde_json::from_str::<IndexDefinition>(&raw)
+            {
+                if !def.name.eq_ignore_ascii_case(name) {
+                    return Err(OmniError::IoError(format!(
+                        "drop receipt for index '{name}' references retired ID {id} belonging to different index '{}'",
+                        def.name
+                    )));
+                }
+                if let Some(expected_ns) = expected_namespace {
+                    if def.namespace != expected_ns {
+                        return Err(OmniError::IoError(format!(
+                            "drop receipt for index '{name}' references retired ID {id} in namespace {:?}, expected {expected_ns:?}",
+                            def.namespace
+                        )));
+                    }
+                    proved_expected_ns = true;
+                }
+            }
+        }
         if let Some(expected_ns) = expected_namespace {
             if let Some(actual_ns) = stored_ns {
                 if actual_ns != expected_ns {
@@ -1114,37 +1227,11 @@ impl IndexManager {
                 }
             } else if from_legacy_key {
                 // Legacy pre-upgrade receipts had no namespace tag in the key
-                // or payload. Validate safely before honoring: reject if any
-                // tracked ID belongs to another namespace, if an unrelated
-                // active/retired index matching `expected_ns` remains, or (when
-                // a collection is known and no live/retired definition proves
-                // ownership) if the collection does not unambiguously resolve
-                // to `expected_ns`.
-                let catalog = IndexCatalog::load_checked_at(&self.db, seq)?;
-                let mut proved_expected_ns = false;
-                for &id in &ids {
-                    if let Some(def) = catalog.get(id) {
-                        if def.namespace != expected_ns {
-                            return Err(OmniError::IoError(format!(
-                                "legacy drop receipt for index '{name}' references ID {id} in namespace {:?}, expected {expected_ns:?}",
-                                def.namespace
-                            )));
-                        }
-                        proved_expected_ns = true;
-                    }
-                    let retired_key = format!("{RETIRED_PREFIX}{id}");
-                    if let Some(raw) = self.db.find(&retired_key, seq)?
-                        && let Ok(def) = serde_json::from_str::<IndexDefinition>(&raw)
-                    {
-                        if def.namespace != expected_ns {
-                            return Err(OmniError::IoError(format!(
-                                "legacy drop receipt for index '{name}' references retired ID {id} in namespace {:?}, expected {expected_ns:?}",
-                                def.namespace
-                            )));
-                        }
-                        proved_expected_ns = true;
-                    }
-                }
+                // or payload. Reject if an unrelated active/retired index
+                // matching `expected_ns` remains, or (when a collection is
+                // known and no live/retired definition proves ownership) if
+                // the collection does not unambiguously resolve to
+                // `expected_ns`.
                 if let Some(active) = catalog.get_by_name(name)
                     && active.namespace.matches(expected_ns)
                     && !ids.contains(&active.id)
@@ -1239,12 +1326,18 @@ impl IndexManager {
                 }
                 DropIndexReceiptState::Dropping => {
                     for &id in &ids {
-                        self.purge_retired_index_if_present(id)?;
+                        self.purge_retired_index_if_present(id, Some(name))?;
                         if let Some(def) =
                             IndexCatalog::load_checked_at(&self.db, self.db.get_seq())?
                                 .get(id)
                                 .cloned()
                         {
+                            if !def.name.eq_ignore_ascii_case(name) {
+                                return Err(OmniError::IoError(format!(
+                                    "drop receipt for index '{name}' references active ID {id} belonging to different index '{}'",
+                                    def.name
+                                )));
+                            }
                             let lock = self.db.sql_table_lock(&def.collection)?;
                             let _guard = lock
                                 .lock()
@@ -1340,13 +1433,25 @@ impl IndexManager {
         self.purge_retired_index_entries(id)
     }
 
-    fn purge_retired_index_if_present(&self, id: IndexId) -> Result<(), OmniError> {
+    fn purge_retired_index_if_present(
+        &self,
+        id: IndexId,
+        expected_name: Option<&str>,
+    ) -> Result<(), OmniError> {
         let retired_key = format!("{RETIRED_PREFIX}{id}");
         let Some(raw) = self.db.find(&retired_key, self.db.get_seq())? else {
             return Ok(());
         };
         let def: IndexDefinition =
             serde_json::from_str(&raw).map_err(|e| OmniError::IoError(e.to_string()))?;
+        if let Some(expected) = expected_name
+            && !def.name.eq_ignore_ascii_case(expected)
+        {
+            return Err(OmniError::IoError(format!(
+                "drop receipt for index '{expected}' references retired ID {id} belonging to different index '{}'",
+                def.name
+            )));
+        }
         let lock = self.db.sql_table_lock(&def.collection)?;
         let _guard = lock
             .lock()
@@ -2577,6 +2682,25 @@ impl IndexManager {
         Ok(())
     }
 
+    fn ensure_index_readable(
+        catalog: &IndexCatalog,
+        idx_def: &IndexDefinition,
+    ) -> Result<(), OmniError> {
+        if !catalog.is_ready(idx_def.id) {
+            return Err(OmniError::IoError(format!(
+                "Index '{}' is not ready; run rebuild_index('{}') before querying it",
+                idx_def.name, idx_def.name
+            )));
+        }
+        if catalog.effective_namespace(idx_def).is_none() {
+            return Err(OmniError::IoError(format!(
+                "legacy index '{}' on collection '{}' has ambiguous namespace ownership; call bind_index_namespace('{}', IndexNamespace::Sql | IndexNamespace::Document) to bind and rebuild it",
+                idx_def.name, idx_def.collection, idx_def.name
+            )));
+        }
+        Ok(())
+    }
+
     /// LOOKUP — finds all primary keys matching an exact value on an index.
     pub fn lookup(
         &self,
@@ -2599,6 +2723,7 @@ impl IndexManager {
         let idx_def = catalog
             .get_by_name(index_name)
             .ok_or_else(|| OmniError::IoError(format!("Index '{}' not found", index_name)))?;
+        Self::ensure_index_readable(&catalog, idx_def)?;
 
         if values.len() != idx_def.fields.len() {
             return Err(OmniError::IoError(format!(
@@ -2672,6 +2797,7 @@ impl IndexManager {
         let idx_def = catalog
             .get_by_name(index_name)
             .ok_or_else(|| OmniError::IoError(format!("Index '{}' not found", index_name)))?;
+        Self::ensure_index_readable(&catalog, idx_def)?;
 
         let Some((_, ft)) = idx_def.fields.first() else {
             return Err(OmniError::IoError(format!(

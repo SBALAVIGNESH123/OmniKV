@@ -1806,6 +1806,9 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
             read_seq_floor: final_floor,
         };
         self.db.roots.store(Arc::new(new_roots));
+        self.db
+            .snapshot_install_epoch
+            .fetch_add(1, Ordering::SeqCst);
         self.db.block_cache.invalidate_all();
 
         // ── Phase H: Durably mark completion and retire rollback backup ──

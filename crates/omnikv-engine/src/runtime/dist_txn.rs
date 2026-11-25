@@ -1197,6 +1197,11 @@ struct ParticipantLogEntry {
     /// recovery reconciles any lingering unvalidated record to `ABORTED`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     unvalidated: bool,
+    /// Set on clustered `unvalidated: true -> unvalidated: false` transitions
+    /// so deterministic Raft state-machine validation can require an intact,
+    /// non-snapshot-imported `unvalidated: true` predecessor record.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    validated_from_unvalidated: bool,
 }
 
 fn participant_prepare_key(node_id: u64, txn_id: GlobalTxnId) -> String {
@@ -1310,6 +1315,7 @@ fn commit_entry_exceeds_storage_limit(
         commit_seq: Some(u64::MAX),
         snapshot_imported: false,
         unvalidated: false,
+        validated_from_unvalidated: false,
     };
     let committed_encoded = serde_json::to_string(&worst_committed)
         .map_err(|error| OmniError::IoError(format!("commit log serialization failed: {error}")))?;
@@ -1454,7 +1460,7 @@ fn check_2pc_participant_writes(
             Some(prev) => Some(prev.clone()),
             None => latest_participant_entry(db, staged, key)?,
         };
-        if let Some(prev) = prev_entry {
+        if let Some(prev) = &prev_entry {
             if is_illegal_participant_transition(&prev.state, &entry.state) {
                 return Ok(Some(format!(
                     "conflicting 2PC participant decision for key '{key}': {} -> {}",
@@ -1467,6 +1473,26 @@ fn check_2pc_participant_writes(
             {
                 return Ok(Some(format!(
                     "conflicting 2PC participant writes for key '{key}'"
+                )));
+            }
+        }
+        if entry.state == "PREPARED" && !entry.unvalidated {
+            if let Some(prev) = &prev_entry
+                && prev.state == "PREPARED"
+                && prev.unvalidated
+                && prev.snapshot_imported
+            {
+                return Ok(Some(format!(
+                    "cannot validate snapshot-imported 2PC prepared record '{key}'"
+                )));
+            }
+            if entry.validated_from_unvalidated
+                && !prev_entry.as_ref().is_some_and(|prev| {
+                    prev.state == "PREPARED" && prev.unvalidated && !prev.snapshot_imported
+                })
+            {
+                return Ok(Some(format!(
+                    "cannot validate 2PC prepared record '{key}': prior unvalidated record is missing or was imported via snapshot"
                 )));
             }
         }
@@ -1778,12 +1804,18 @@ pub(crate) fn stamp_2pc_commit_seq(
 /// not visible locally.
 pub(crate) fn sanitize_2pc_entry_for_snapshot_install(key: &str, value: &str) -> Option<String> {
     let mut entry = parse_participant_entry(key, value)?;
-    if entry.state != "COMMITTED" {
-        return None;
+    match entry.state.as_str() {
+        "COMMITTED" => {
+            entry.commit_seq = None;
+            entry.snapshot_imported = true;
+            serde_json::to_string(&entry).ok()
+        }
+        "PREPARED" if entry.unvalidated => {
+            entry.snapshot_imported = true;
+            serde_json::to_string(&entry).ok()
+        }
+        _ => None,
     }
-    entry.commit_seq = None;
-    entry.snapshot_imported = true;
-    serde_json::to_string(&entry).ok()
 }
 
 pub(crate) fn collect_prepared_reservations(
@@ -2137,6 +2169,7 @@ impl TwoPhaseParticipant {
         // In clustered mode, mark it `unvalidated: true` until post-apply
         // snapshot validation succeeds so a failed/indeterminate prepare can
         // never turn into a `Vote::Commit` on retry.
+        let is_clustered = self.db.is_clustered();
         let prepare_key = participant_prepare_key(self.node_id, txn_id);
         let log_entry = ParticipantLogEntry {
             txn_id,
@@ -2146,7 +2179,8 @@ impl TwoPhaseParticipant {
             prepare_seq: 0,
             commit_seq: None,
             snapshot_imported: false,
-            unvalidated: self.db.is_clustered(),
+            unvalidated: is_clustered,
+            validated_from_unvalidated: false,
         };
         let mut prepare_batch = WriteBatch::new();
         let encoded = match serde_json::to_string(&log_entry) {
@@ -2168,7 +2202,7 @@ impl TwoPhaseParticipant {
             txn_id,
             writes,
             &write_keys,
-            self.db.is_clustered(),
+            is_clustered,
         ) {
             Ok(false) => {}
             Ok(true) => {
@@ -2203,52 +2237,33 @@ impl TwoPhaseParticipant {
             &legacy_participant_prepare_key(txn_id),
             format!("PREPARED:{}", self.node_id),
         );
-        match self
-            .db
-            .commit_2pc_prepare_checked(&prepare_batch, read_seq, &write_keys)
-        {
-            Ok(prepare_seq) => {
+        let node_id = self.node_id;
+        let prepare_key_ref = &prepare_key;
+        match self.db.commit_2pc_prepare_checked(
+            &prepare_batch,
+            read_seq,
+            &write_keys,
+            |prepare_seq| {
                 let persisted = ParticipantLogEntry {
                     txn_id,
-                    node_id: self.node_id,
+                    node_id,
                     state: "PREPARED".into(),
                     writes: writes.to_vec(),
                     prepare_seq,
                     commit_seq: None,
                     snapshot_imported: false,
                     unvalidated: false,
+                    validated_from_unvalidated: is_clustered,
                 };
+                let encoded = serde_json::to_string(&persisted).map_err(|error| {
+                    OmniError::IoError(format!("prepare log serialization failed: {error}"))
+                })?;
                 let mut update = WriteBatch::new();
-                let update_res = serde_json::to_string(&persisted)
-                    .map_err(|error| {
-                        OmniError::IoError(format!("prepare log serialization failed: {error}"))
-                    })
-                    .and_then(|encoded| {
-                        update.set(&prepare_key, encoded)?;
-                        self.db.commit_2pc_batch(&update)
-                    });
-                if let Err(err) = update_res
-                    && self.db.is_clustered()
-                {
-                    // Clustered prepares are only eligible to vote Commit once
-                    // the validated (`unvalidated: false`) record is durable.
-                    let already_validated = self
-                        .db
-                        .ensure_cluster_linearizable()
-                        .and_then(|()| self.load_participant_log(txn_id))
-                        .ok()
-                        .flatten()
-                        .is_some_and(|entry| entry.state == "PREPARED" && !entry.unvalidated);
-                    if !already_validated {
-                        self.reconcile_failed_prepare(txn_id, writes, &write_keys, &err);
-                        return PrepareResult {
-                            node_id: self.node_id,
-                            txn_id,
-                            vote: Vote::Abort(format!("validated prepare record failed: {err}")),
-                            prepare_seq: 0,
-                        };
-                    }
-                }
+                update.set(prepare_key_ref, encoded)?;
+                Ok(update)
+            },
+        ) {
+            Ok(prepare_seq) => {
                 // Store the prepared batch for later commit
                 let mut prepared = self.prepared.lock().unwrap_or_else(|e| e.into_inner());
                 prepared.insert(
@@ -2315,6 +2330,7 @@ impl TwoPhaseParticipant {
             commit_seq: None,
             snapshot_imported: false,
             unvalidated: false,
+            validated_from_unvalidated: false,
         };
         let mut abort_batch = WriteBatch::new();
         let abort_committed = serde_json::to_string(&abort_entry)
@@ -2425,6 +2441,7 @@ impl TwoPhaseParticipant {
                     commit_seq: None,
                     snapshot_imported: false,
                     unvalidated: false,
+                    validated_from_unvalidated: false,
                 };
                 let mut abort_batch = WriteBatch::new();
                 abort_batch.set(
@@ -2598,6 +2615,7 @@ impl TwoPhaseParticipant {
             commit_seq: None,
             snapshot_imported: false,
             unvalidated: false,
+            validated_from_unvalidated: false,
         };
         commit_batch.set(
             &participant_prepare_key(self.node_id, txn_id),
@@ -2660,6 +2678,7 @@ impl TwoPhaseParticipant {
             commit_seq: None,
             snapshot_imported: false,
             unvalidated: false,
+            validated_from_unvalidated: false,
         };
         let mut log_batch = WriteBatch::new();
         log_batch.set(
@@ -2856,6 +2875,7 @@ mod tests {
             commit_seq: None,
             snapshot_imported: false,
             unvalidated: false,
+            validated_from_unvalidated: false,
         };
         commit_batch
             .set(
@@ -3009,6 +3029,7 @@ mod tests {
                 commit_seq: None,
                 snapshot_imported: false,
                 unvalidated: false,
+                validated_from_unvalidated: false,
             };
             let mut batch = WriteBatch::new();
             batch
@@ -3137,6 +3158,7 @@ mod tests {
             commit_seq: None,
             snapshot_imported: false,
             unvalidated: false,
+            validated_from_unvalidated: false,
         };
         let mut prepare_batch = WriteBatch::new();
         prepare_batch
@@ -3183,6 +3205,7 @@ mod tests {
                 commit_seq: None,
                 snapshot_imported: false,
                 unvalidated: false,
+                validated_from_unvalidated: false,
             })
             .unwrap()
         };
@@ -3308,6 +3331,7 @@ mod tests {
             commit_seq: None,
             snapshot_imported: false,
             unvalidated: false,
+            validated_from_unvalidated: false,
         };
         let mut pa_abort = WriteBatch::new();
         pa_abort
@@ -3379,6 +3403,7 @@ mod tests {
             commit_seq: None,
             snapshot_imported: false,
             unvalidated: false,
+            validated_from_unvalidated: false,
         };
         let mut init = WriteBatch::new();
         init.set(&auth_key, serde_json::to_string(&valid_entry).unwrap())
@@ -3647,6 +3672,7 @@ mod tests {
             commit_seq: None,
             snapshot_imported: false,
             unvalidated: false,
+            validated_from_unvalidated: false,
         };
         let mut abort_batch = WriteBatch::new();
         abort_batch
@@ -3959,6 +3985,7 @@ mod tests {
             commit_seq: None,
             snapshot_imported: false,
             unvalidated: true,
+            validated_from_unvalidated: false,
         };
         let mut seed = WriteBatch::new();
         seed.set(
@@ -4088,6 +4115,7 @@ mod tests {
             commit_seq: None,
             snapshot_imported: false,
             unvalidated: false,
+            validated_from_unvalidated: false,
         };
         let mut seed = WriteBatch::new();
         seed.set(&legacy_participant_prepare_key(t1), "PREPARED:10".into())
@@ -4116,6 +4144,7 @@ mod tests {
             commit_seq: None,
             snapshot_imported: false,
             unvalidated: false,
+            validated_from_unvalidated: false,
         };
         let mut conflict = WriteBatch::new();
         conflict
@@ -4165,6 +4194,7 @@ mod tests {
             commit_seq: None,
             snapshot_imported: false,
             unvalidated: false,
+            validated_from_unvalidated: false,
         };
         let valid_json = serde_json::to_string(&valid_entry).unwrap();
 
@@ -4250,6 +4280,7 @@ mod tests {
             commit_seq: None,
             snapshot_imported: false,
             unvalidated: false,
+            validated_from_unvalidated: false,
         };
         let mut seed = WriteBatch::new();
         seed.set(
@@ -4423,5 +4454,104 @@ mod tests {
             .unwrap()
             .is_some()
         );
+    }
+
+    #[test]
+    fn prepared_validation_rejects_snapshot_imported_unvalidated_and_stale_floor() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = OmniKV::open(
+            dir.path().join("manifest.json").to_str().unwrap(),
+            dir.path().join("wal.bin").to_str().unwrap(),
+        )
+        .unwrap();
+
+        let txn_id: GlobalTxnId = (7, 42);
+        let key = participant_prepare_key(1, txn_id);
+        let write = DistWrite {
+            node_id: 1,
+            key: "acct:1".into(),
+            value: Some("100".into()),
+            ttl: 0,
+        };
+        let unval_entry = ParticipantLogEntry {
+            txn_id,
+            node_id: 1,
+            state: "PREPARED".into(),
+            writes: vec![write.clone()],
+            prepare_seq: 0,
+            commit_seq: None,
+            snapshot_imported: false,
+            unvalidated: true,
+            validated_from_unvalidated: false,
+        };
+        let unval_json = serde_json::to_string(&unval_entry).unwrap();
+
+        // 1. Snapshot import must sanitize `unvalidated: true` PREPARED records
+        // by marking `snapshot_imported: true`.
+        let sanitized = sanitize_2pc_entry_for_snapshot_install(&key, &unval_json)
+            .expect("unvalidated PREPARED must be sanitized on snapshot install");
+        let sanitized_entry: ParticipantLogEntry = serde_json::from_str(&sanitized).unwrap();
+        assert!(sanitized_entry.snapshot_imported);
+        assert!(sanitized_entry.unvalidated);
+
+        // 2. Validating a missing unvalidated record (`validated_from_unvalidated: true`)
+        // must be rejected deterministically.
+        let validate_entry = ParticipantLogEntry {
+            txn_id,
+            node_id: 1,
+            state: "PREPARED".into(),
+            writes: vec![write],
+            prepare_seq: 10,
+            commit_seq: None,
+            snapshot_imported: false,
+            unvalidated: false,
+            validated_from_unvalidated: true,
+        };
+        let mut validate_batch = WriteBatch::new();
+        validate_batch
+            .set(&key, serde_json::to_string(&validate_entry).unwrap())
+            .unwrap();
+        assert!(
+            validate_2pc_decision_writes(&db, None, &validate_batch).is_err(),
+            "validated_from_unvalidated must fail when prior unvalidated record is absent"
+        );
+
+        // 3. Validating a snapshot-imported unvalidated record must fail closed.
+        let mut imported_batch = WriteBatch::new();
+        imported_batch.set(&key, sanitized).unwrap();
+        db.commit_2pc_batch(&imported_batch).unwrap();
+        assert!(
+            validate_2pc_decision_writes(&db, None, &validate_batch).is_err(),
+            "snapshot-imported unvalidated PREPARED must never transition to validated"
+        );
+
+        // 4. A live non-snapshot-imported unvalidated record transitions cleanly.
+        let live_txn: GlobalTxnId = (7, 43);
+        let live_key = participant_prepare_key(1, live_txn);
+        let mut live_unval = unval_entry;
+        live_unval.txn_id = live_txn;
+        live_unval.writes[0].key = "acct:2".into();
+        let mut live_seed = WriteBatch::new();
+        live_seed
+            .set(&live_key, serde_json::to_string(&live_unval).unwrap())
+            .unwrap();
+        db.commit_2pc_batch(&live_seed).unwrap();
+        let mut live_val = validate_entry;
+        live_val.txn_id = live_txn;
+        live_val.writes[0].key = "acct:2".into();
+        let mut live_val_batch = WriteBatch::new();
+        live_val_batch
+            .set(&live_key, serde_json::to_string(&live_val).unwrap())
+            .unwrap();
+        validate_2pc_decision_writes(&db, None, &live_val_batch).unwrap();
+
+        // 5. `check_2pc_prepare_conflicts` must reject `read_seq < read_seq_floor`.
+        let mut raised = (**db.load_roots()).clone();
+        raised.read_seq_floor = 50;
+        db.roots.store(Arc::new(raised));
+        let conflict = db
+            .check_2pc_prepare_conflicts(49, &["acct:3".into()])
+            .expect("stale read_seq below read_seq_floor must conflict");
+        assert!(conflict.contains("read_seq_floor"), "conflict: {conflict}");
     }
 }

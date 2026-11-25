@@ -1392,6 +1392,10 @@ pub struct OmniKV {
     pub(crate) replica_retention_floors: Mutex<BTreeMap<String, u64>>,
     pub(crate) block_cache: moka::sync::Cache<(u64, u64), String>,
     pub(crate) next_heap_generation: AtomicU64,
+    /// Monotonically incremented under `transition_guard.write()` on every
+    /// Raft snapshot installation so in-flight 2PC prepares detect any
+    /// intervening snapshot replacement before voting `Commit`.
+    pub(crate) snapshot_install_epoch: AtomicU64,
     scan_buffer_pool: Arc<ScanBufferPool>,
     compaction_policy: RwLock<CompactionPolicy>,
 
@@ -1604,6 +1608,7 @@ impl OmniKV {
             replica_retention_floors: Mutex::new(BTreeMap::new()),
             block_cache: moka::sync::Cache::builder().max_capacity(100_000).build(),
             next_heap_generation: AtomicU64::new(2),
+            snapshot_install_epoch: AtomicU64::new(0),
             scan_buffer_pool: Arc::new(ScanBufferPool::default()),
             compaction_policy: RwLock::new(CompactionPolicy::default()),
             compaction_cv: (std::sync::Mutex::new(()), std::sync::Condvar::new()),
@@ -2715,6 +2720,10 @@ impl OmniKV {
         Ok(())
     }
 
+    pub(crate) fn snapshot_install_epoch(&self) -> u64 {
+        self.snapshot_install_epoch.load(Ordering::SeqCst)
+    }
+
     pub(crate) fn check_2pc_prepare_conflicts(
         &self,
         read_seq: u64,
@@ -2730,6 +2739,12 @@ impl OmniKV {
         read_seq: u64,
         write_keys: &[String],
     ) -> Option<String> {
+        let read_seq_floor = self.roots.load().read_seq_floor;
+        if read_seq < read_seq_floor {
+            return Some(format!(
+                "STALE SNAPSHOT: 2PC prepare read_seq {read_seq} is below storage read_seq_floor {read_seq_floor}"
+            ));
+        }
         self.ssi_history
             .check_write_conflicts_locked(committed, read_seq, write_keys)
             .or_else(|| {
@@ -2745,20 +2760,32 @@ impl OmniKV {
             })
     }
 
-    /// Commits a 2PC `PREPARED` batch while atomically re-validating `read_seq`
-    /// against SSI history and current key sequences under the same ordering
-    /// guards as commits and snapshot installs.
-    pub(crate) fn commit_2pc_prepare_checked(
+    /// Commits a 2PC `PREPARED` batch (and, in clustered mode, its validated
+    /// `unvalidated: false` transition under the same consensus flight lock)
+    /// while atomically re-validating `read_seq` against `read_seq_floor`,
+    /// `snapshot_install_epoch`, SSI history, and current key sequences under
+    /// the same ordering guards as commits and snapshot installs.
+    pub(crate) fn commit_2pc_prepare_checked<F>(
         &self,
         tx: &WriteBatch,
         read_seq: u64,
         write_keys: &[String],
-    ) -> Result<u64, crate::dist_txn::PrepareCommitError> {
+        build_validated: F,
+    ) -> Result<u64, crate::dist_txn::PrepareCommitError>
+    where
+        F: FnOnce(u64) -> Result<WriteBatch, OmniError>,
+    {
         use crate::dist_txn::PrepareCommitError;
         self.ensure_writes_not_fenced()
             .map_err(PrepareCommitError::PreProposal)?;
         if let Some(gateway) = self.cluster_gateway.get() {
-            return gateway.commit_2pc_prepare_checked(self, tx, read_seq, write_keys);
+            return gateway.commit_2pc_prepare_checked(
+                self,
+                tx,
+                read_seq,
+                write_keys,
+                build_validated,
+            );
         }
         let lock = self
             .sql_table_lock("\x002PC_LOCAL_COMMIT")
@@ -2785,6 +2812,11 @@ impl OmniKV {
         self.sync_prepared_2pc_from_batch(tx)
             .map_err(PrepareCommitError::PostProposal)?;
         drop(committed_guard);
+        if let Ok(validated_batch) = build_validated(seq) {
+            let _ = crate::dist_txn::validate_2pc_decision_writes(self, None, &validated_batch)
+                .and_then(|()| self.commit_batch_local_locked_skip_prepared(&validated_batch))
+                .and_then(|_| self.sync_prepared_2pc_from_batch(&validated_batch));
+        }
         Ok(seq)
     }
 
