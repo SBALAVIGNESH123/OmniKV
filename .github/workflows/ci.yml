@@ -122,7 +122,7 @@ jobs:
     - name: Durability evidence with failure injection enabled
       run: cargo test -p omnikv-engine --test durability_evidence --features failpoints --locked -- --test-threads=1 --nocapture
     - name: Storage crash oracle with failure injection enabled
-      run: cargo test -p omnikv-engine --test storage_oracle --features failpoints --locked -- --test-threads=1 --nocapture
+      run: cargo test -p omnikv-engine --test storage_oracle_failpoints --features failpoints --locked -- --test-threads=1 --nocapture
 
   test-transactions:
     name: Transaction & Concurrency Tests

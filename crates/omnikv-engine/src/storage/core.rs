@@ -1212,14 +1212,21 @@ impl SSTableReader {
         }
     }
 
-    fn get_block_for_key(&self, target: &[u8]) -> Option<usize> {
+    /// Returns `(start_offset, fallback_offset)` for `target`.
+    ///
+    /// Uses strict `<` so multiple MVCC versions of `target` spanning a
+    /// sparse-index block boundary remain reachable from the preceding block.
+    /// When a preceding block is selected and an indexed block with key >= target
+    /// follows it, `fallback_offset` points to that indexed block so a decode
+    /// failure in the preceding block cannot hide intact versions of `target`.
+    fn get_block_offsets_for_key(&self, target: &[u8]) -> (usize, Option<usize>) {
         let data = self.data.as_slice();
         if data.len() < 16 {
-            return Some(0);
+            return (0, None);
         }
         let magic = &data[data.len() - 8..];
         if magic != b"OMNIV2**" {
-            return Some(0);
+            return (0, None);
         }
 
         let Ok(index_offset) = usize::try_from(u64::from_le_bytes(
@@ -1227,22 +1234,22 @@ impl SSTableReader {
                 .try_into()
                 .expect("SSTable trailer offset length was prevalidated"),
         )) else {
-            return Some(0);
+            return (0, None);
         };
         if index_offset > data.len() - 16 {
-            return Some(0);
+            return (0, None);
         }
 
         let index_data = &data[index_offset..data.len() - 16];
         if index_data.len() < 8 {
-            return Some(0);
+            return (0, None);
         }
         let Ok(num_entries) = usize::try_from(u64::from_le_bytes(
             index_data[0..8]
                 .try_into()
                 .expect("SSTable index header length was prevalidated"),
         )) else {
-            return Some(0);
+            return (0, None);
         };
 
         // Each sparse index entry is at least 10 bytes (2-byte key_len + 8-byte offset).
@@ -1278,14 +1285,19 @@ impl SSTableReader {
         // the block immediately before the first index entry with key >= target.
         let idx = entries.partition_point(|&(k, _)| k < target);
         if idx == 0 {
-            Some(0)
+            (0, None)
         } else {
-            let block_offset = entries[idx - 1].1;
-            if block_offset >= index_offset {
-                Some(0)
+            let start_offset = entries[idx - 1].1;
+            let start = if start_offset >= index_offset {
+                0
             } else {
-                Some(block_offset)
-            }
+                start_offset
+            };
+            let fallback = entries
+                .get(idx)
+                .map(|&(_, off)| off)
+                .filter(|&off| off > start && off < index_offset);
+            (start, fallback)
         }
     }
 
@@ -1299,7 +1311,7 @@ impl SSTableReader {
         read_seq: u64,
     ) -> Option<(u64, ValuePointer)> {
         let data = self.data.as_slice();
-        let mut offset = self.get_block_for_key(target_key).unwrap_or(0);
+        let (mut offset, mut fallback_offset) = self.get_block_offsets_for_key(target_key);
         let mut best: Option<(u64, ValuePointer)> = None;
 
         while offset < data.len() {
@@ -1329,6 +1341,10 @@ impl SSTableReader {
                         (rec.offset, rec.length, rec.payload_crc32, rec.expiry),
                     ));
                 }
+            } else if let Some(fb) = fallback_offset.take()
+                && offset < fb
+            {
+                offset = fb;
             } else {
                 break;
             }
@@ -1337,10 +1353,11 @@ impl SSTableReader {
     }
 
     pub fn iter_from(&self, start_key: &[u8]) -> SSTableIterator {
-        let offset = self.get_block_for_key(start_key).unwrap_or(0);
+        let (offset, fallback_offset) = self.get_block_offsets_for_key(start_key);
         SSTableIterator {
             data: self.data.clone(),
             offset,
+            fallback_offset,
         }
     }
 }
@@ -1348,6 +1365,7 @@ impl SSTableReader {
 pub struct SSTableIterator {
     data: SSTableData,
     offset: usize,
+    fallback_offset: Option<usize>,
 }
 
 impl Iterator for SSTableIterator {
@@ -1355,24 +1373,31 @@ impl Iterator for SSTableIterator {
 
     fn next(&mut self) -> Option<Self::Item> {
         let data = self.data.as_slice();
-        if self.offset >= data.len() {
-            return None;
-        }
-        if data.len() >= 16 && &data[data.len() - 8..] == b"OMNIV2**" {
-            let index_offset = u64::from_le_bytes(
-                data[data.len() - 16..data.len() - 8]
-                    .try_into()
-                    .expect("SSTable trailer offset length was prevalidated"),
-            ) as usize;
-            if self.offset >= index_offset {
+        loop {
+            if self.offset >= data.len() {
                 return None;
             }
-        }
-        if let Some((rec, len)) = OmniRecord::decode(&data[self.offset..]) {
-            self.offset += len;
-            Some(rec)
-        } else {
-            None
+            if data.len() >= 16 && &data[data.len() - 8..] == b"OMNIV2**" {
+                let index_offset = u64::from_le_bytes(
+                    data[data.len() - 16..data.len() - 8]
+                        .try_into()
+                        .expect("SSTable trailer offset length was prevalidated"),
+                ) as usize;
+                if self.offset >= index_offset {
+                    return None;
+                }
+            }
+            if let Some((rec, len)) = OmniRecord::decode(&data[self.offset..]) {
+                self.offset += len;
+                return Some(rec);
+            }
+            if let Some(fb) = self.fallback_offset.take()
+                && self.offset < fb
+            {
+                self.offset = fb;
+                continue;
+            }
+            return None;
         }
     }
 }
@@ -3454,7 +3479,16 @@ impl OmniKV {
                     "group commit engine poisoned by an earlier fsync failure".into(),
                 ));
             }
-            wal.append_batch_nosync(&wal_records)?;
+            if let Err(err) = wal.append_batch_nosync(&wal_records) {
+                if wal.is_fenced() {
+                    let reason = format!(
+                        "WAL partial-append rollback failed ({err}); writes halted until database reopen"
+                    );
+                    self.group_commit.poison(OmniError::IoError(reason.clone()));
+                    self.trip_write_fence(reason);
+                }
+                return Err(err);
+            }
         }
 
         // ── GROUP COMMIT: batch heap + WAL fsyncs ──
@@ -3472,15 +3506,23 @@ impl OmniKV {
         // The batch is not on disk; it must not become visible.
         sync_outcome?;
 
-        // Memtable insertion (SkipMap is lock-free for concurrent inserts)
-        let memtable = self.roots.load().memtable.clone();
-        for (rec, _) in &wal_records {
-            if key_to_string(&rec.key) != "__COMMIT_MARKER__" {
-                let shard = shard_idx(&rec.key);
-                memtable[shard].insert(
-                    (rec.key.clone(), Reverse(rec.seq)),
-                    (rec.offset, rec.length, rec.payload_crc32, rec.expiry),
-                );
+        // Memtable insertion must serialize with `compact_sstables_locked`'s
+        // memtable swap under `write_mutex` so a concurrent flush cannot rotate
+        // and discard a memtable while this committed batch is still inserting.
+        {
+            let _publish_guard = self
+                .write_mutex
+                .lock()
+                .map_err(|_| OmniError::LockPoisoned("commit_publish".into()))?;
+            let memtable = self.roots.load().memtable.clone();
+            for (rec, _) in &wal_records {
+                if rec.key.as_slice() != b"__COMMIT_MARKER__" {
+                    let shard = shard_idx(&rec.key);
+                    memtable[shard].insert(
+                        (rec.key.clone(), Reverse(rec.seq)),
+                        (rec.offset, rec.length, rec.payload_crc32, rec.expiry),
+                    );
+                }
             }
         }
 
@@ -3615,7 +3657,18 @@ impl OmniKV {
         let result = if is_uncompressed {
             Ok(String::from_utf8_lossy(buf.as_slice()).to_string())
         } else {
-            let decompressed = lz4_flex::decompress_size_prepended(buf.as_slice())
+            if buf.len() < 4 {
+                return Err(OmniError::IoError(
+                    "corrupt heap record: missing LZ4 size prefix".into(),
+                ));
+            }
+            let declared = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+            if declared > MAX_VALUE_SIZE {
+                return Err(OmniError::IoError(format!(
+                    "corrupt heap record: decoded length {declared} exceeds maximum {MAX_VALUE_SIZE}"
+                )));
+            }
+            let decompressed = lz4_flex::decompress(&buf[4..], declared)
                 .map_err(|e| OmniError::IoError(format!("LZ4 Error: {:?}", e)))?;
             Ok(String::from_utf8_lossy(&decompressed).to_string())
         };

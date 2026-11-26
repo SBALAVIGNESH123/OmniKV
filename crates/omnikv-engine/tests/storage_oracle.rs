@@ -5,7 +5,9 @@
 //! and failpoint-injected crashes across L0/L1/L2 compaction, heap GC, MVCC
 //! snapshots, range scans, and cold restarts.
 
-use omni_engine::{CompactionPolicy, OmniKV, SSTableReader, WriteBatch};
+use omni_engine::{
+    CompactionPolicy, OmniError, OmniKV, OmniRecord, SSTableReader, SSTableWriter, WriteBatch,
+};
 use proptest::prelude::*;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -365,7 +367,8 @@ fn wal_every_byte_truncation_recovers_exact_atomic_batch_prefix() {
     model.insert("k02".into(), Some("base_c".into()));
     db.compact_sstables().expect("flush b1 to L0");
 
-    let mut valid_prefixes = vec![normalize_model(&model)];
+    let mut boundaries: Vec<(usize, BTreeMap<String, Option<String>>)> =
+        vec![(0, normalize_model(&model))];
 
     // Subsequent atomic multi-key batches stay in WAL.
     let wal_batches: Vec<Vec<BatchItem>> = vec![
@@ -395,7 +398,10 @@ fn wal_every_byte_truncation_recovers_exact_atomic_batch_prefix() {
     ];
     for (step, items) in wal_batches.iter().enumerate() {
         apply_multi_batch(&db, &mut model, items, step + 10);
-        valid_prefixes.push(normalize_model(&model));
+        let wal_end = fs::read(dir.path().join("wal.bin"))
+            .expect("read wal after batch")
+            .len();
+        boundaries.push((wal_end, normalize_model(&model)));
     }
     db.sync_all().expect("sync wal");
     drop(db);
@@ -405,6 +411,11 @@ fn wal_every_byte_truncation_recovers_exact_atomic_batch_prefix() {
         !wal_bytes.is_empty(),
         "WAL must contain uncommitted batches"
     );
+    assert_eq!(
+        boundaries.last().map(|(end, _)| *end),
+        Some(wal_bytes.len()),
+        "final batch boundary must match full WAL length"
+    );
 
     for cut in 0..=wal_bytes.len() {
         let trial = TempDir::new().expect("trial dir");
@@ -413,9 +424,14 @@ fn wal_every_byte_truncation_recovers_exact_atomic_batch_prefix() {
 
         let recovered = open_db(trial.path());
         let actual = read_db_state(&recovered);
-        assert!(
-            valid_prefixes.contains(&actual),
-            "WAL truncation at byte {cut}/{} exposed non-atomic state: {actual:?}",
+        let (_, expected) = boundaries
+            .iter()
+            .rfind(|(end, _)| *end <= cut)
+            .expect("boundary at offset 0 always exists");
+        assert_eq!(
+            &actual,
+            expected,
+            "WAL truncation at byte {cut}/{} diverged from exact atomic prefix",
             wal_bytes.len()
         );
     }
@@ -444,7 +460,6 @@ fn wal_tail_bitflip_corruption_never_panics_or_exposes_half_batch() {
     let db = open_db(dir.path());
     let mut model: BTreeMap<String, Option<String>> = BTreeMap::new();
 
-    let mut valid_prefixes = vec![normalize_model(&model)];
     let batch1 = vec![
         BatchItem::SetSmall { key: 0, tag: 1 },
         BatchItem::SetCompressed {
@@ -454,7 +469,7 @@ fn wal_tail_bitflip_corruption_never_panics_or_exposes_half_batch() {
         },
     ];
     apply_multi_batch(&db, &mut model, &batch1, 1);
-    valid_prefixes.push(normalize_model(&model));
+    let expected_after_b1 = normalize_model(&model);
 
     let wal_after_b1 = fs::read(dir.path().join("wal.bin"))
         .expect("wal after b1")
@@ -466,14 +481,14 @@ fn wal_tail_bitflip_corruption_never_panics_or_exposes_half_batch() {
         BatchItem::Delete { key: 0 },
     ];
     apply_multi_batch(&db, &mut model, &batch2, 2);
-    valid_prefixes.push(normalize_model(&model));
     db.sync_all().expect("sync wal");
     drop(db);
 
     let wal_bytes = fs::read(dir.path().join("wal.bin")).expect("read full wal");
     assert!(wal_bytes.len() > wal_after_b1);
 
-    // Flip a byte at every offset inside batch 2 and assert atomic recovery.
+    // Flip a byte at every offset inside batch 2: batch 1 must survive intact
+    // and corrupted batch 2 must never replay (including CRC trailer flips).
     for pos in wal_after_b1..wal_bytes.len() {
         let trial = TempDir::new().expect("bitflip trial");
         copy_dir_files(dir.path(), trial.path());
@@ -483,9 +498,9 @@ fn wal_tail_bitflip_corruption_never_panics_or_exposes_half_batch() {
 
         let recovered = open_db(trial.path());
         let actual = read_db_state(&recovered);
-        assert!(
-            valid_prefixes.contains(&actual),
-            "bitflip at WAL offset {pos} exposed non-atomic/corrupt state: {actual:?}"
+        assert_eq!(
+            actual, expected_after_b1,
+            "bitflip at WAL offset {pos} must preserve batch 1 and reject batch 2"
         );
     }
 }
@@ -568,184 +583,67 @@ fn wal_mid_stream_crc_corruption_stops_at_atomic_prefix_and_preserves_post_recov
     );
 }
 
-#[cfg(feature = "failpoints")]
-fn seed_failpoint_state(db: &OmniKV) -> BTreeMap<String, Option<String>> {
-    let mut committed = BTreeMap::new();
-    let seed_batches = [
-        vec![
-            BatchItem::SetSmall { key: 0, tag: 1 },
-            BatchItem::SetCompressed {
-                key: 1,
-                tag: 2,
-                repeat: 12,
-            },
-        ],
-        vec![
-            BatchItem::SetSmall { key: 2, tag: 3 },
-            BatchItem::Delete { key: 0 },
-        ],
-        vec![
-            BatchItem::SetCompressed {
-                key: 3,
-                tag: 4,
-                repeat: 10,
-            },
-            BatchItem::SetSmall { key: 4, tag: 5 },
-        ],
-    ];
-    for (i, items) in seed_batches.iter().enumerate() {
-        apply_multi_batch(db, &mut committed, items, i + 1);
-        if i == 0 {
-            db.compact_sstables().expect("seed L0");
-            db.compact_l0_to_l1().expect("seed L1");
-        } else if i == 1 {
-            db.compact_sstables().expect("seed second L0");
-        }
-    }
-    normalize_model(&committed)
-}
-
-#[cfg(feature = "failpoints")]
-#[test]
-fn failpoint_injected_crashes_preserve_durability_and_atomicity() {
-    use omni_engine::failpoints::FailRegistry;
-
-    let registry = FailRegistry::new();
-    registry.reset();
-
-    let failpoints = [
-        ("wal::sync", "commit"),
-        ("heap::sync_data", "commit"),
-        ("manifest::before_rename", "flush"),
-        ("manifest::before_rename", "l1"),
-        ("manifest::before_rename", "l2"),
-        ("manifest::before_rename", "gc"),
-        ("manifest::sync_dir_after_rename", "flush"),
-        ("manifest::sync_dir_after_rename", "l1"),
-        ("manifest::sync_dir_after_rename", "l2"),
-        ("manifest::sync_dir_after_rename", "gc"),
-    ];
-
-    for (fp, phase) in failpoints {
-        let dir = TempDir::new().expect("failpoint dir");
-        let db = open_db(dir.path());
-        let expected_before = seed_failpoint_state(&db);
-
-        registry.arm(fp);
-        let outcome = match phase {
-            "commit" => {
-                let mut failing = WriteBatch::new();
-                failing
-                    .set("k07", compressed_val(9, 14, 99))
-                    .expect("stage fail commit");
-                failing.delete("k02").expect("stage fail delete");
-                db.commit_batch(&failing).map(|_| ())
-            }
-            "flush" => db.compact_sstables(),
-            "l1" => db.compact_l0_to_l1(),
-            "l2" => db.compact_l1_to_l2(),
-            "gc" => db.run_garbage_collection(),
-            _ => unreachable!(),
-        };
-        registry.reset();
-
-        assert!(
-            outcome.is_err(),
-            "failpoint {fp} during {phase} must return an error"
-        );
-        if fp == "manifest::sync_dir_after_rename" {
-            assert!(
-                db.is_write_fenced(),
-                "post-rename sync failure during {phase} must fence further writes"
-            );
-        }
-
-        // Simulate crash + restart: committed state must be 100% intact.
-        drop(db);
-        let reopened = open_db(dir.path());
-        assert_eq!(
-            read_db_state(&reopened),
-            expected_before,
-            "state corrupted after failpoint {fp} during {phase}"
-        );
-
-        // Post-recovery writes must succeed cleanly and survive a subsequent restart.
-        let mut post = WriteBatch::new();
-        post.set("k08", format!("ok_{phase}"))
-            .expect("stage post-failpoint write");
-        reopened
-            .commit_batch(&post)
-            .expect("commit after failpoint recovery");
-        drop(reopened);
-
-        let reopened2 = open_db(dir.path());
-        let mut expected_after = expected_before;
-        expected_after.insert("k08".into(), Some(format!("ok_{phase}")));
-        assert_eq!(
-            read_db_state(&reopened2),
-            expected_after,
-            "post-recovery commit lost on restart after failpoint {fp} during {phase}"
-        );
-    }
-}
-
 #[test]
 fn sstable_multiversion_hot_key_across_blocks_preserves_latest_and_snapshots() {
     let dir = TempDir::new().expect("multiversion dir");
     let db = open_db(dir.path());
 
     let mut snap_early = None;
+    let mut early_key_seq = None;
     let mut snap_mid = None;
+    let mut mid_key_seq = None;
+    let mut latest_key_seq = None;
     let total_updates: usize = 180;
     for i in 0..total_updates {
         let mut batch = WriteBatch::new();
         batch
             .set("hot_key", format!("val_{i:04}"))
             .expect("stage hot_key update");
-        db.commit_batch(&batch).expect("commit hot_key update");
+        let commit_marker_seq = db.commit_batch(&batch).expect("commit hot_key update");
+        // Single-op batch reserves [value_seq, commit_marker_seq].
+        let value_seq = commit_marker_seq - 1;
         if i == 1 {
             snap_early = Some(db.snapshot());
+            early_key_seq = Some(value_seq);
         } else if i == 90 {
             snap_mid = Some(db.snapshot());
+            mid_key_seq = Some(value_seq);
+        }
+        if i + 1 == total_updates {
+            latest_key_seq = Some(value_seq);
         }
     }
     let snap_early = snap_early.expect("early snapshot");
+    let early_key_seq = early_key_seq.expect("early key seq");
     let snap_mid = snap_mid.expect("mid snapshot");
+    let mid_key_seq = mid_key_seq.expect("mid key seq");
+    let latest_key_seq = latest_key_seq.expect("latest key seq");
     let latest_val = format!("val_{:04}", total_updates - 1);
 
     let check_all = |db: &OmniKV, stage: &str| {
-        let latest_seq = db.get_seq();
-        assert_eq!(
-            db.find("hot_key", latest_seq).expect("find latest"),
-            Some(latest_val.clone()),
-            "latest find mismatch after {stage}"
-        );
-        assert_eq!(
-            db.scan("hot_key", "hot_key", latest_seq)
-                .expect("scan latest"),
-            vec![("hot_key".to_string(), latest_val.clone())],
-            "latest scan mismatch after {stage}"
-        );
-        assert_eq!(
-            db.find("hot_key", snap_early).expect("find early snap"),
-            Some("val_0001".to_string()),
-            "early snapshot find mismatch after {stage}"
-        );
-        assert_eq!(
-            db.scan("hot_key", "hot_key", snap_early)
-                .expect("scan early snap"),
-            vec![("hot_key".to_string(), "val_0001".to_string())],
-            "early snapshot scan mismatch after {stage}"
-        );
-        assert_eq!(
-            db.find("hot_key", snap_mid).expect("find mid snap"),
-            Some("val_0090".to_string()),
-            "mid snapshot find mismatch after {stage}"
-        );
-        assert!(
-            db.get_seq_for_key("hot_key", latest_seq) >= snap_mid,
-            "get_seq_for_key missed latest version after {stage}"
-        );
+        let checks = [
+            ("latest", db.get_seq(), latest_val.as_str(), latest_key_seq),
+            ("mid snap", snap_mid, "val_0090", mid_key_seq),
+            ("early snap", snap_early, "val_0001", early_key_seq),
+        ];
+        for (label, read_seq, expected_val, expected_key_seq) in checks {
+            assert_eq!(
+                db.find("hot_key", read_seq).expect("find hot_key"),
+                Some(expected_val.to_string()),
+                "{label} find mismatch after {stage}"
+            );
+            assert_eq!(
+                db.scan("hot_key", "hot_key", read_seq)
+                    .expect("scan hot_key"),
+                vec![("hot_key".to_string(), expected_val.to_string())],
+                "{label} scan mismatch after {stage}"
+            );
+            assert_eq!(
+                db.get_seq_for_key("hot_key", read_seq),
+                expected_key_seq,
+                "{label} get_seq_for_key mismatch after {stage}"
+            );
+        }
     };
 
     check_all(&db, "memtable");
@@ -828,64 +726,160 @@ fn sstable_two_version_key_straddling_block_boundary_preserves_both_versions() {
     db.unregister_snapshot(snap_v1);
 }
 
+fn assert_snapshot_equivalence(
+    db: &OmniKV,
+    snap: u64,
+    writers: usize,
+    last_seen_val: &mut [usize],
+    last_seen_seq: &mut [u64],
+) -> BTreeMap<String, String> {
+    let full_scan = db.scan("cw_0", "cw_9", snap).expect("concurrent scan");
+    let limited_scan = db
+        .scan_limit("cw_0", "cw_9", snap, 2)
+        .expect("concurrent scan_limit");
+    let expected_limit: Vec<(String, String)> = full_scan.iter().take(2).cloned().collect();
+    assert_eq!(
+        limited_scan, expected_limit,
+        "scan_limit(2) diverged from scan() under concurrent compaction at seq {snap}"
+    );
+    let scan_map: BTreeMap<String, String> = full_scan.into_iter().collect();
+    for writer_id in 0..writers {
+        let key = format!("cw_{writer_id}");
+        let found = db.find(&key, snap).expect("concurrent find");
+        assert_eq!(
+            found.as_ref(),
+            scan_map.get(&key),
+            "find() and scan() diverged under concurrent compaction for {key} at seq {snap}"
+        );
+        let key_seq = db.get_seq_for_key(&key, snap);
+        assert!(
+            key_seq >= last_seen_seq[writer_id],
+            "get_seq_for_key regressed for {key}: {key_seq} < {} at seq {snap}",
+            last_seen_seq[writer_id]
+        );
+        last_seen_seq[writer_id] = key_seq;
+        if let Some(val) = found {
+            assert!(
+                key_seq > 0,
+                "get_seq_for_key returned 0 for existing key {key} at seq {snap}"
+            );
+            let parsed: usize = val.parse().expect("numeric value");
+            assert!(
+                parsed >= last_seen_val[writer_id],
+                "value regressed for {key}: {parsed} < {} at seq {snap}",
+                last_seen_val[writer_id]
+            );
+            last_seen_val[writer_id] = parsed;
+        }
+    }
+    scan_map
+}
+
 fn verify_concurrent_reader_loop(
     db: &OmniKV,
     done: &std::sync::atomic::AtomicBool,
+    compactions: &std::sync::atomic::AtomicUsize,
+    reader_checks: &std::sync::atomic::AtomicUsize,
+    verified_pinned: &std::sync::atomic::AtomicUsize,
     writers: usize,
 ) {
     use std::sync::atomic::Ordering;
 
     let mut last_seen_val = vec![0usize; writers];
     let mut last_seen_seq = vec![0u64; writers];
+    let mut checked_across_compaction = false;
     while !done.load(Ordering::Acquire) {
         let snap = db.snapshot();
-        let full_scan = db.scan("cw_0", "cw_9", snap).expect("concurrent scan");
-        let limited_scan = db
-            .scan_limit("cw_0", "cw_9", snap, 2)
-            .expect("concurrent scan_limit");
-        let expected_limit: Vec<(String, String)> = full_scan.iter().take(2).cloned().collect();
-        assert_eq!(
-            limited_scan, expected_limit,
-            "scan_limit(2) diverged from scan() under concurrent compaction at seq {snap}"
-        );
-        let scan_map: BTreeMap<String, String> = full_scan.into_iter().collect();
-        for writer_id in 0..writers {
-            let key = format!("cw_{writer_id}");
-            let found = db.find(&key, snap).expect("concurrent find");
-            assert_eq!(
-                found.as_ref(),
-                scan_map.get(&key),
-                "find() and scan() diverged under concurrent compaction for {key} at seq {snap}"
-            );
-            let key_seq = db.get_seq_for_key(&key, snap);
-            assert!(
-                key_seq >= last_seen_seq[writer_id],
-                "get_seq_for_key regressed for {key}: {key_seq} < {} at seq {snap}",
-                last_seen_seq[writer_id]
-            );
-            last_seen_seq[writer_id] = key_seq;
-            if let Some(val) = found {
-                assert!(
-                    key_seq > 0,
-                    "get_seq_for_key returned 0 for existing key {key} at seq {snap}"
+        let compactions_before = compactions.load(Ordering::Acquire);
+        let first_view =
+            assert_snapshot_equivalence(db, snap, writers, &mut last_seen_val, &mut last_seen_seq);
+
+        if !checked_across_compaction {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while compactions.load(Ordering::Acquire) == compactions_before
+                && !done.load(Ordering::Acquire)
+                && std::time::Instant::now() < deadline
+            {
+                std::thread::yield_now();
+            }
+            if compactions.load(Ordering::Acquire) > compactions_before {
+                let second_view = assert_snapshot_equivalence(
+                    db,
+                    snap,
+                    writers,
+                    &mut last_seen_val,
+                    &mut last_seen_seq,
                 );
-                let parsed: usize = val.parse().expect("numeric value");
-                assert!(
-                    parsed >= last_seen_val[writer_id],
-                    "value regressed for {key}: {parsed} < {} at seq {snap}",
-                    last_seen_val[writer_id]
+                assert_eq!(
+                    second_view, first_view,
+                    "pinned snapshot view changed across live compaction at seq {snap}"
                 );
-                last_seen_val[writer_id] = parsed;
+                checked_across_compaction = true;
+                verified_pinned.fetch_add(1, Ordering::Release);
             }
         }
+
         db.unregister_snapshot(snap);
+        reader_checks.fetch_add(1, Ordering::Release);
+    }
+}
+
+fn run_concurrent_compactor_loop(
+    db: &OmniKV,
+    done: &std::sync::atomic::AtomicBool,
+    compactions: &std::sync::atomic::AtomicUsize,
+) {
+    use std::sync::atomic::Ordering;
+
+    let mut round = 0usize;
+    while !done.load(Ordering::Acquire) {
+        db.compact_sstables().expect("concurrent L0 flush");
+        if round.is_multiple_of(3) {
+            db.compact_l0_to_l1().expect("concurrent L0->L1");
+        }
+        if round.is_multiple_of(6) {
+            db.compact_l1_to_l2().expect("concurrent L1->L2");
+        }
+        if round.is_multiple_of(10) {
+            db.run_garbage_collection().expect("concurrent GC");
+        }
+        round += 1;
+        compactions.fetch_add(1, Ordering::Release);
+    }
+}
+
+fn run_concurrent_writer_loop(
+    db: &OmniKV,
+    writer_id: usize,
+    updates: usize,
+    reader_checks: &std::sync::atomic::AtomicUsize,
+    verified_pinned: &std::sync::atomic::AtomicUsize,
+) {
+    use std::sync::atomic::Ordering;
+
+    let key = format!("cw_{writer_id}");
+    for step in 1..=updates {
+        let mut batch = WriteBatch::new();
+        batch
+            .set(&key, format!("{step:06}"))
+            .expect("stage concurrent write");
+        db.commit_batch(&batch).expect("commit concurrent write");
+        if step == updates / 2 {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while (verified_pinned.load(Ordering::Acquire) < 1
+                || reader_checks.load(Ordering::Acquire) < 2)
+                && std::time::Instant::now() < deadline
+            {
+                std::thread::yield_now();
+            }
+        }
     }
 }
 
 #[test]
 fn concurrent_writers_readers_and_compactions_preserve_mvcc_monotonicity_and_find_scan_equivalence()
 {
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::thread;
 
     const WRITERS: usize = 4;
@@ -894,19 +888,23 @@ fn concurrent_writers_readers_and_compactions_preserve_mvcc_monotonicity_and_fin
     let dir = TempDir::new().expect("concurrent oracle dir");
     let db = open_db(dir.path());
     let done = Arc::new(AtomicBool::new(false));
+    let compactions = Arc::new(AtomicUsize::new(0));
+    let reader_checks = Arc::new(AtomicUsize::new(0));
+    let verified_pinned = Arc::new(AtomicUsize::new(0));
 
     let handles: Vec<_> = (0..WRITERS)
         .map(|writer_id| {
             let db = db.clone();
+            let reader_checks = reader_checks.clone();
+            let verified_pinned = verified_pinned.clone();
             thread::spawn(move || {
-                let key = format!("cw_{writer_id}");
-                for step in 1..=UPDATES_PER_WRITER {
-                    let mut batch = WriteBatch::new();
-                    batch
-                        .set(&key, format!("{step:06}"))
-                        .expect("stage concurrent write");
-                    db.commit_batch(&batch).expect("commit concurrent write");
-                }
+                run_concurrent_writer_loop(
+                    &db,
+                    writer_id,
+                    UPDATES_PER_WRITER,
+                    &reader_checks,
+                    &verified_pinned,
+                );
             })
         })
         .collect();
@@ -914,40 +912,50 @@ fn concurrent_writers_readers_and_compactions_preserve_mvcc_monotonicity_and_fin
     let compactor = {
         let db = db.clone();
         let done = done.clone();
-        thread::spawn(move || {
-            let mut round = 0usize;
-            while !done.load(Ordering::Acquire) {
-                db.compact_sstables().expect("concurrent L0 flush");
-                if round.is_multiple_of(3) {
-                    db.compact_l0_to_l1().expect("concurrent L0->L1");
-                }
-                if round.is_multiple_of(6) {
-                    db.compact_l1_to_l2().expect("concurrent L1->L2");
-                }
-                if round.is_multiple_of(10) {
-                    db.run_garbage_collection().expect("concurrent GC");
-                }
-                round += 1;
-            }
-        })
+        let compactions = compactions.clone();
+        thread::spawn(move || run_concurrent_compactor_loop(&db, &done, &compactions))
     };
-
     let readers: Vec<_> = (0..2)
         .map(|_| {
             let db = db.clone();
             let done = done.clone();
-            thread::spawn(move || verify_concurrent_reader_loop(&db, &done, WRITERS))
+            let compactions = compactions.clone();
+            let reader_checks = reader_checks.clone();
+            let verified_pinned = verified_pinned.clone();
+            thread::spawn(move || {
+                verify_concurrent_reader_loop(
+                    &db,
+                    &done,
+                    &compactions,
+                    &reader_checks,
+                    &verified_pinned,
+                    WRITERS,
+                );
+            })
         })
         .collect();
 
+    let mut writer_results = Vec::with_capacity(handles.len());
     for h in handles {
-        h.join().expect("writer thread");
+        writer_results.push(h.join());
     }
     done.store(true, Ordering::Release);
-    compactor.join().expect("compactor thread");
+    let compactor_result = compactor.join();
+    let mut reader_results = Vec::with_capacity(readers.len());
     for r in readers {
-        r.join().expect("reader thread");
+        reader_results.push(r.join());
     }
+    for res in writer_results {
+        res.expect("writer thread");
+    }
+    compactor_result.expect("compactor thread");
+    for res in reader_results {
+        res.expect("reader thread");
+    }
+    assert!(
+        verified_pinned.load(Ordering::Acquire) >= 1 && reader_checks.load(Ordering::Acquire) >= 2,
+        "readers must compare pinned snapshots across compaction during writer phase"
+    );
 
     let final_seq = db.get_seq();
     for writer_id in 0..WRITERS {
@@ -1144,4 +1152,77 @@ fn expired_ttl_keys_stay_invisible_and_do_not_resurrect_older_versions() {
 
     let reopened = open_db(dir.path());
     assert_ttl(&reopened, "reopen");
+}
+
+#[test]
+fn sstable_corrupt_preceding_block_falls_back_to_indexed_target_block() {
+    let dir = TempDir::new().expect("corrupt block fallback dir");
+    let sst_path = dir.path().join("fallback.sst");
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .read(true)
+        .open(&sst_path)
+        .expect("create fallback sst");
+
+    let mut writer = SSTableWriter::new(&file);
+    for i in 0u64..180 {
+        let key = format!("key_{i:04}").into_bytes();
+        let rec = OmniRecord::new(i + 1, key, i * 16, 8, 1234, 0);
+        writer.append(&rec).expect("append sstable rec");
+    }
+    writer.finish().expect("finish sstable");
+    drop(file);
+
+    let mut bytes = fs::read(&sst_path).expect("read sstable bytes");
+    // Corrupt the very first record in Block 0 so `OmniRecord::decode` returns None
+    // before reaching Block 1 (which starts around key_0085).
+    bytes[0..12].fill(0xFF);
+    let reader = SSTableReader::new(&bytes);
+
+    // Keys in Block 1 and Block 2 must remain readable via fallback to their
+    // indexed block even though Block 0 fails decode.
+    let target = b"key_0150";
+    let found = reader.find(target, u64::MAX);
+    assert!(
+        found.is_some(),
+        "find() must fall back to indexed target block when preceding block fails decode"
+    );
+    assert!(
+        reader.iter_from(target).any(|rec| rec.key == target),
+        "iter_from() must fall back to indexed target block when preceding block fails decode"
+    );
+}
+
+#[test]
+fn corrupt_lz4_declared_size_above_max_value_size_returns_error_without_oom() {
+    let dir = TempDir::new().expect("lz4 cap dir");
+    let db = open_db(dir.path());
+
+    // Craft a compressed payload with a valid CRC32 whose 4-byte LZ4 header
+    // declares an oversized 1 GiB uncompressed length.
+    let mut forged = Vec::new();
+    forged.extend_from_slice(&(1024u32 * 1024 * 1024).to_le_bytes());
+    forged.extend_from_slice(&[0x00, 0x01, 0x02, 0x03]);
+    let crc = crc32fast::hash(&forged);
+    let offset = db.append_to_heap(&forged).expect("append forged payload");
+    let seq = db.get_seq() + 1;
+    // Note: UNCOMPRESSED_FLAG is NOT set, so the engine treats it as LZ4.
+    db.insert_replica_record(
+        b"forged_lz4".to_vec(),
+        seq,
+        offset,
+        forged.len() as u64,
+        crc,
+        0,
+    );
+
+    let err = db
+        .find("forged_lz4", seq)
+        .expect_err("oversized declared LZ4 length must fail closed");
+    assert!(
+        matches!(err, OmniError::IoError(ref msg) if msg.contains("exceeds maximum")),
+        "expected oversized LZ4 length error, got {err:?}"
+    );
 }
