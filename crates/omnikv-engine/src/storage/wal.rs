@@ -54,23 +54,63 @@ impl WriteAheadLog {
         })
     }
 
-    /// Replay the WAL from disk, returning all recovered OmniRecords.
-    /// Also needs the heap path to verify payload integrity.
+    /// Replay the WAL from disk, returning all recovered OmniRecords without
+    /// mutating the WAL file.
     pub fn replay(wal_path: &str, _heap_path: &str) -> Result<Vec<OmniRecord>, OmniError> {
+        let (records, _valid_end, _file_len) = Self::replay_prefix(wal_path)?;
+        Ok(records)
+    }
+
+    /// Replay the WAL from disk and durably truncate any torn or corrupted
+    /// tail past the last complete committed batch.
+    ///
+    /// Without truncating the torn tail before opening the WAL for appends,
+    /// new commits would land after the corrupt bytes and be silently dropped
+    /// on the next restart.
+    pub(crate) fn replay_and_heal(
+        wal_path: &str,
+        _heap_path: &str,
+    ) -> Result<Vec<OmniRecord>, OmniError> {
+        let (records, valid_end, file_len) = Self::replay_prefix(wal_path)?;
+        if valid_end < file_len {
+            let file = OpenOptions::new()
+                .write(true)
+                .open(wal_path)
+                .map_err(|e| OmniError::IoError(format!("WAL heal open: {e}")))?;
+            file.set_len(valid_end as u64)
+                .map_err(|e| OmniError::IoError(format!("WAL heal truncate: {e}")))?;
+            file.sync_all()
+                .map_err(|e| OmniError::IoError(format!("WAL heal fsync: {e}")))?;
+            eprintln!(
+                "[WAL] Truncated torn/corrupt tail at offset {valid_end} (was {file_len} bytes)"
+            );
+        }
+        Ok(records)
+    }
+
+    /// Scans the WAL strictly from byte 0, stopping at the first incomplete,
+    /// non-committed, or CRC-mismatched batch so later batches can never
+    /// replay over a corrupted predecessor. Returns `(records, valid_end, file_len)`.
+    fn replay_prefix(wal_path: &str) -> Result<(Vec<OmniRecord>, usize, usize), OmniError> {
         let file = match File::open(wal_path) {
             Ok(f) => f,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((Vec::new(), 0, 0)),
             Err(e) => return Err(OmniError::IoError(format!("WAL replay open: {}", e))),
         };
 
         let mut reader = BufReader::new(file);
         let mut all_data = Vec::new();
-        if reader.read_to_end(&mut all_data).is_err() || all_data.is_empty() {
-            return Ok(Vec::new());
+        reader
+            .read_to_end(&mut all_data)
+            .map_err(|e| OmniError::IoError(format!("WAL replay read: {}", e)))?;
+        if all_data.is_empty() {
+            return Ok((Vec::new(), 0, 0));
         }
 
+        let file_len = all_data.len();
         let mut records = Vec::new();
         let mut offset = 0;
+        let mut valid_end = 0;
 
         while offset + 4 <= all_data.len() {
             let batch_start = offset;
@@ -84,7 +124,10 @@ impl WriteAheadLog {
                 break;
             }
 
-            let mut batch_records = Vec::with_capacity(count);
+            // Cap preallocation to the maximum number of encoded records that
+            // could physically fit in the remaining WAL bytes.
+            let remaining = all_data.len().saturating_sub(offset);
+            let mut batch_records = Vec::with_capacity(count.min(remaining / 16));
             let mut batch_ok = true;
 
             for _ in 0..count {
@@ -117,34 +160,33 @@ impl WriteAheadLog {
                 let computed_crc = hasher.finalize();
 
                 if stored_crc != computed_crc {
-                    // CRC mismatch — batch is corrupted, skip it
+                    // CRC mismatch — stop replay at this atomic prefix boundary so
+                    // no later batch can apply out of causal order over corrupt history.
                     eprintln!(
-                        "[WAL] Batch CRC mismatch at offset {}: stored={:#x}, computed={:#x} — skipping",
+                        "[WAL] Batch CRC mismatch at offset {}: stored={:#x}, computed={:#x} — stopping replay",
                         batch_start, stored_crc, computed_crc
                     );
-                    continue;
+                    break;
                 }
-            } else if batch_ok {
-                // No CRC trailer — truncated batch
-                batch_ok = false;
+            } else {
+                // Truncated batch or missing CRC trailer — stop replay.
+                break;
             }
 
-            // Only accept complete batches that end with a COMMIT_MARKER
-            if batch_ok && !batch_records.is_empty() {
-                let last = &batch_records[batch_records.len() - 1];
-                let key_str = String::from_utf8_lossy(&last.key);
-                if key_str == "__COMMIT_MARKER__" {
-                    // Don't include the marker itself
-                    batch_records.pop();
-                    records.extend(batch_records);
-                }
-                // If no commit marker → incomplete batch → discard
+            // Only accept complete batches that end with a COMMIT_MARKER.
+            if let Some(last) = batch_records.last()
+                && last.key.as_slice() == b"__COMMIT_MARKER__"
+            {
+                batch_records.pop();
+                records.extend(batch_records);
+                valid_end = offset;
             } else {
-                break; // Corrupted or truncated WAL — stop replay
+                // Incomplete / uncommitted batch — stop replay at batch_start.
+                break;
             }
         }
 
-        Ok(records)
+        Ok((records, valid_end, file_len))
     }
 
     /// Append a batch of records (including the commit marker) atomically.
@@ -287,6 +329,9 @@ impl WriteAheadLog {
     /// Must only be called after every record in the WAL has been durably
     /// flushed and published in the manifest.
     pub fn rotate_segment(&mut self) -> Result<(), OmniError> {
+        // Drain any buffered bytes before truncating so dropping the previous
+        // `BufWriter` below cannot flush stale bytes back into the empty file.
+        let _ = self.writer.flush();
         let file = OpenOptions::new()
             .create(true)
             .write(true)

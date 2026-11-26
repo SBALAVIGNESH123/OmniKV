@@ -637,6 +637,7 @@ const UNCOMPRESSED_FLAG: u64 = 1 << 63;
 const NUM_SHARDS: usize = 16;
 
 type ValuePointer = (u64, u64, u32, u64);
+type BlockCacheKey = (u64, u64, u64, u32);
 type VersionedValuePointers = std::collections::BTreeMap<u64, ValuePointer>;
 type MemtableShard = SkipMap<(Vec<u8>, Reverse<u64>), ValuePointer>;
 type Memtable = [MemtableShard; NUM_SHARDS];
@@ -1221,12 +1222,14 @@ impl SSTableReader {
             return Some(0);
         }
 
-        let index_offset = u64::from_le_bytes(
+        let Ok(index_offset) = usize::try_from(u64::from_le_bytes(
             data[data.len() - 16..data.len() - 8]
                 .try_into()
                 .expect("SSTable trailer offset length was prevalidated"),
-        ) as usize;
-        if index_offset >= data.len() {
+        )) else {
+            return Some(0);
+        };
+        if index_offset > data.len() - 16 {
             return Some(0);
         }
 
@@ -1234,13 +1237,17 @@ impl SSTableReader {
         if index_data.len() < 8 {
             return Some(0);
         }
-        let num_entries = u64::from_le_bytes(
+        let Ok(num_entries) = usize::try_from(u64::from_le_bytes(
             index_data[0..8]
                 .try_into()
                 .expect("SSTable index header length was prevalidated"),
-        ) as usize;
+        )) else {
+            return Some(0);
+        };
 
-        let mut entries = Vec::with_capacity(num_entries);
+        // Each sparse index entry is at least 10 bytes (2-byte key_len + 8-byte offset).
+        let max_possible_entries = (index_data.len() - 8) / 10;
+        let mut entries = Vec::with_capacity(num_entries.min(max_possible_entries));
         let mut curr = 8;
         for _ in 0..num_entries {
             if curr + 2 > index_data.len() {
@@ -1266,19 +1273,34 @@ impl SSTableReader {
             entries.push((key, offset));
         }
 
-        let idx = entries.partition_point(|&(k, _)| k <= target);
+        // Strict `<`: multiple MVCC versions of `target` can span sparse-index
+        // block boundaries, so the earliest version of `target` may reside in
+        // the block immediately before the first index entry with key >= target.
+        let idx = entries.partition_point(|&(k, _)| k < target);
         if idx == 0 {
             Some(0)
         } else {
-            Some(entries[idx - 1].1)
+            let block_offset = entries[idx - 1].1;
+            if block_offset >= index_offset {
+                Some(0)
+            } else {
+                Some(block_offset)
+            }
         }
     }
 
     pub fn find(&self, target_key: &[u8], read_seq: u64) -> Option<(u64, u64, u32, u64)> {
+        self.find_with_seq(target_key, read_seq).map(|(_, ptr)| ptr)
+    }
+
+    pub(crate) fn find_with_seq(
+        &self,
+        target_key: &[u8],
+        read_seq: u64,
+    ) -> Option<(u64, ValuePointer)> {
         let data = self.data.as_slice();
         let mut offset = self.get_block_for_key(target_key).unwrap_or(0);
-        let mut best = None;
-        let mut best_seq = 0;
+        let mut best: Option<(u64, ValuePointer)> = None;
 
         while offset < data.len() {
             if data.len() >= 16 && &data[data.len() - 8..] == b"OMNIV2**" {
@@ -1300,10 +1322,12 @@ impl SSTableReader {
                 if rec.key.as_slice() == target_key
                     && rec.is_valid()
                     && rec.seq <= read_seq
-                    && (best.is_none() || rec.seq > best_seq)
+                    && best.is_none_or(|(best_seq, _)| rec.seq > best_seq)
                 {
-                    best_seq = rec.seq;
-                    best = Some((rec.offset, rec.length, rec.payload_crc32, rec.expiry));
+                    best = Some((
+                        rec.seq,
+                        (rec.offset, rec.length, rec.payload_crc32, rec.expiry),
+                    ));
                 }
             } else {
                 break;
@@ -1331,6 +1355,9 @@ impl Iterator for SSTableIterator {
 
     fn next(&mut self) -> Option<Self::Item> {
         let data = self.data.as_slice();
+        if self.offset >= data.len() {
+            return None;
+        }
         if data.len() >= 16 && &data[data.len() - 8..] == b"OMNIV2**" {
             let index_offset = u64::from_le_bytes(
                 data[data.len() - 16..data.len() - 8]
@@ -1541,7 +1568,7 @@ pub struct OmniKV {
     pub metrics: Arc<Metrics>,
     pub(crate) active_snapshots: Mutex<std::collections::BTreeMap<u64, usize>>,
     pub(crate) replica_retention_floors: Mutex<BTreeMap<String, u64>>,
-    pub(crate) block_cache: moka::sync::Cache<(u64, u64), String>,
+    pub(crate) block_cache: moka::sync::Cache<BlockCacheKey, String>,
     pub(crate) next_heap_generation: AtomicU64,
     /// Monotonically incremented under `transition_guard.write()` on every
     /// Raft snapshot installation so in-flight 2PC prepares detect any
@@ -2139,7 +2166,7 @@ impl OmniKV {
         let memtable = Arc::new(std::array::from_fn(|_| SkipMap::new()));
         let mut global_seq = manifest.max_seq;
 
-        let recovered_records = wal::WriteAheadLog::replay(wal_path, &manifest.heap_path)?;
+        let recovered_records = wal::WriteAheadLog::replay_and_heal(wal_path, &manifest.heap_path)?;
         if !recovered_records.is_empty() {
             for rec in recovered_records {
                 if rec.seq <= manifest.wal_checkpoint_seq {
@@ -3530,13 +3557,30 @@ impl OmniKV {
         expected_crc32: u32,
         buf: &mut Vec<u8>,
     ) -> Result<String, OmniError> {
-        let cache_key = (heap_generation, offset);
+        let is_uncompressed = (length_with_flag & UNCOMPRESSED_FLAG) != 0;
+        let length = length_with_flag & !UNCOMPRESSED_FLAG;
+
+        // Empty-string values occupy 0 heap bytes, so their `offset` can equal
+        // the next non-empty value's offset. Validate CRC directly without
+        // touching disk or colliding with neighboring entries in `block_cache`.
+        if is_uncompressed && length == 0 {
+            if crc32fast::hash(b"") != expected_crc32 {
+                return Err(OmniError::IoError("Payload CRC32 mismatch!".into()));
+            }
+            return Ok(String::new());
+        }
+
+        let max_encoded_len = (MAX_VALUE_SIZE as u64).saturating_mul(2);
+        if length > max_encoded_len {
+            return Err(OmniError::IoError(format!(
+                "corrupt heap record length {length} exceeds maximum {max_encoded_len}"
+            )));
+        }
+
+        let cache_key: BlockCacheKey = (heap_generation, offset, length_with_flag, expected_crc32);
         if let Some(cached) = self.block_cache.get(&cache_key) {
             return Ok(cached);
         }
-
-        let is_uncompressed = (length_with_flag & UNCOMPRESSED_FLAG) != 0;
-        let length = length_with_flag & !UNCOMPRESSED_FLAG;
 
         buf.clear();
         buf.resize(length as usize, 0);
@@ -3612,6 +3656,21 @@ impl OmniKV {
             });
         }
 
+        let mut key_hasher = FnvHasher::default();
+        target_key.hash(&mut key_hasher);
+        let key_hash = key_hasher.finish();
+
+        // Pick the highest sequence <= read_seq across every level of this
+        // single atomic `StorageRoots` snapshot. Concurrent writers release
+        // `write_mutex` before memtable insertion, so an older seq can land in
+        // a newer memtable or L0 SSTable after a higher seq was already rotated.
+        let mut best: Option<(u64, ValuePointer)> = None;
+        let consider = |best: &mut Option<(u64, ValuePointer)>, seq: u64, ptr: ValuePointer| {
+            if best.is_none_or(|(best_seq, _)| seq > best_seq) {
+                *best = Some((seq, ptr));
+            }
+        };
+
         let memtable = roots.memtable.clone();
         // Reverse(seq) ordering: exclusive lower bound at Reverse(read_seq+1) includes read_seq.
         let memtable_start = Reverse(read_seq.saturating_add(1));
@@ -3619,99 +3678,58 @@ impl OmniKV {
             if entry.key().0 != target_key {
                 break;
             }
-            if entry.key().1.0 <= read_seq {
-                let (_, length, _, expiry) = entry.value();
-                if *length == 0 {
-                    return Ok(None);
-                }
-                if *expiry > 0 && *expiry <= now {
-                    return Ok(None);
-                }
-                let val = self.read_from_heap_with_reader(
-                    &roots.heap_reader,
-                    roots.heap_generation,
-                    entry.value().0,
-                    *length,
-                    entry.value().2,
-                )?;
-                if let Ok(mut lock) = self.metrics.read_latencies.lock() {
-                    let _ = lock.record(start_time.elapsed().as_micros() as u64);
-                }
-                return Ok(Some(val));
+            let seq = entry.key().1.0;
+            if seq <= read_seq {
+                consider(&mut best, seq, *entry.value());
+                break;
             }
         }
 
-        let frozen_memtables = roots.frozen_memtables.clone();
-        for frozen in frozen_memtables.iter().rev() {
-            let frozen_start = Reverse(read_seq.saturating_add(1));
-            for entry in frozen[shard].range((target_key.clone(), frozen_start)..) {
-                if entry.key().0 != target_key {
-                    break;
-                }
-                if entry.key().1.0 <= read_seq {
-                    let (_, length, _, expiry) = entry.value();
-                    if *length == 0 {
-                        return Ok(None);
+        if best.is_none_or(|(seq, _)| seq < read_seq) {
+            for frozen in roots.frozen_memtables.iter().rev() {
+                for entry in frozen[shard].range((target_key.clone(), memtable_start)..) {
+                    if entry.key().0 != target_key {
+                        break;
                     }
-                    if *expiry > 0 && *expiry <= now {
-                        return Ok(None);
-                    }
-                    let val = self.read_from_heap_with_reader(
-                        &roots.heap_reader,
-                        roots.heap_generation,
-                        entry.value().0,
-                        *length,
-                        entry.value().2,
-                    )?;
-                    if let Ok(mut lock) = self.metrics.read_latencies.lock() {
-                        let _ = lock.record(start_time.elapsed().as_micros() as u64);
-                    }
-                    return Ok(Some(val));
-                }
-            }
-        }
-
-        let mut pointer = None;
-        let sstables = roots.sstables.clone();
-        for (mmap, bloom, _) in sstables.iter().rev() {
-            let mut h = FnvHasher::default();
-            target_key.hash(&mut h);
-            if bloom.might_contain(h.finish()) {
-                let reader = SSTableReader::from_mmap(mmap.clone());
-                if let Some(ptr) = reader.find(&target_key, read_seq) {
-                    pointer = Some(ptr);
-                    break;
-                }
-            }
-        }
-
-        if pointer.is_none() {
-            let l1_sstables = roots.l1_sstables.clone();
-            for (mmap, bloom, _) in l1_sstables.iter().rev() {
-                let mut h = FnvHasher::default();
-                target_key.hash(&mut h);
-                if bloom.might_contain(h.finish()) {
-                    let reader = SSTableReader::from_mmap(mmap.clone());
-                    if let Some(ptr) = reader.find(&target_key, read_seq) {
-                        pointer = Some(ptr);
+                    let seq = entry.key().1.0;
+                    if seq <= read_seq {
+                        consider(&mut best, seq, *entry.value());
                         break;
                     }
                 }
             }
         }
 
-        if pointer.is_none() {
-            let base_bloom = roots.base_bloom.clone();
-            let mut h = FnvHasher::default();
-            target_key.hash(&mut h);
-            if base_bloom.might_contain(h.finish()) {
-                let base_mmap = roots.base_mmap.clone();
-                let reader = SSTableReader::from_mmap(base_mmap);
-                pointer = reader.find(&target_key, read_seq);
+        if best.is_none_or(|(seq, _)| seq < read_seq) {
+            for (mmap, bloom, _) in roots.sstables.iter().rev() {
+                if bloom.might_contain(key_hash) {
+                    let reader = SSTableReader::from_mmap(mmap.clone());
+                    if let Some((seq, ptr)) = reader.find_with_seq(&target_key, read_seq) {
+                        consider(&mut best, seq, ptr);
+                    }
+                }
             }
         }
 
-        if let Some((offset, length, crc, expiry)) = pointer {
+        if best.is_none_or(|(seq, _)| seq < read_seq) {
+            for (mmap, bloom, _) in roots.l1_sstables.iter().rev() {
+                if bloom.might_contain(key_hash) {
+                    let reader = SSTableReader::from_mmap(mmap.clone());
+                    if let Some((seq, ptr)) = reader.find_with_seq(&target_key, read_seq) {
+                        consider(&mut best, seq, ptr);
+                    }
+                }
+            }
+        }
+
+        if best.is_none_or(|(seq, _)| seq < read_seq) && roots.base_bloom.might_contain(key_hash) {
+            let reader = SSTableReader::from_mmap(roots.base_mmap.clone());
+            if let Some((seq, ptr)) = reader.find_with_seq(&target_key, read_seq) {
+                consider(&mut best, seq, ptr);
+            }
+        }
+
+        if let Some((_, (offset, length, crc, expiry))) = best {
             if length == 0 {
                 return Ok(None);
             }
@@ -3922,103 +3940,75 @@ impl OmniKV {
     pub fn get_seq_for_key(&self, target_key: &str, read_seq: u64) -> u64 {
         let target_key = target_key.as_bytes().to_vec();
         let shard = shard_idx(&target_key);
+        let roots = self.roots.load();
+        let mut key_hasher = FnvHasher::default();
+        target_key.hash(&mut key_hasher);
+        let key_hash = key_hasher.finish();
+
+        let mut best_seq = 0u64;
+        let memtable_start = Reverse(read_seq.saturating_add(1));
 
         // 1. Active memtable
-        let memtable = self.roots.load().memtable.clone();
-        let memtable_start = Reverse(read_seq.saturating_add(1));
-        for entry in memtable[shard].range((target_key.clone(), memtable_start)..) {
+        for entry in roots.memtable[shard].range((target_key.clone(), memtable_start)..) {
             if entry.key().0 != target_key {
                 break;
             }
-            if entry.key().1.0 <= read_seq {
-                return entry.key().1.0;
+            let seq = entry.key().1.0;
+            if seq <= read_seq {
+                best_seq = best_seq.max(seq);
+                break;
             }
         }
 
         // 2. Frozen memtables
-        let frozen_memtables = self.roots.load().frozen_memtables.clone();
-        for frozen in frozen_memtables.iter().rev() {
-            let frozen_start = Reverse(read_seq.saturating_add(1));
-            for entry in frozen[shard].range((target_key.clone(), frozen_start)..) {
-                if entry.key().0 != target_key {
-                    break;
-                }
-                if entry.key().1.0 <= read_seq {
-                    return entry.key().1.0;
+        if best_seq < read_seq {
+            for frozen in roots.frozen_memtables.iter().rev() {
+                for entry in frozen[shard].range((target_key.clone(), memtable_start)..) {
+                    if entry.key().0 != target_key {
+                        break;
+                    }
+                    let seq = entry.key().1.0;
+                    if seq <= read_seq {
+                        best_seq = best_seq.max(seq);
+                        break;
+                    }
                 }
             }
         }
 
-        // Helper: search SSTables via iter_from (returns OmniRecord with .seq)
-        let search_sstable = |mmap: &Arc<Mmap>, bloom: &BloomFilter| -> Option<u64> {
-            let mut h = FnvHasher::default();
-            target_key.hash(&mut h);
-            if !bloom.might_contain(h.finish()) {
-                return None;
-            }
-            let reader = SSTableReader::from_mmap(mmap.clone());
-            let mut best_seq = 0u64;
-            for rec in reader.iter_from(&target_key) {
-                if rec.key > target_key {
-                    break;
+        // 3. L0 SSTables
+        if best_seq < read_seq {
+            for (mmap, bloom, _) in roots.sstables.iter().rev() {
+                if bloom.might_contain(key_hash) {
+                    let reader = SSTableReader::from_mmap(mmap.clone());
+                    if let Some((seq, _)) = reader.find_with_seq(&target_key, read_seq) {
+                        best_seq = best_seq.max(seq);
+                    }
                 }
-                if rec.key == target_key
-                    && rec.is_valid()
-                    && rec.seq <= read_seq
-                    && rec.seq > best_seq
-                {
-                    best_seq = rec.seq;
-                }
-            }
-            if best_seq > 0 { Some(best_seq) } else { None }
-        };
-
-        // 3. L0 SSTables (newest first)
-        let sstables = self.roots.load().sstables.clone();
-        for (mmap, bloom, _) in sstables.iter().rev() {
-            if let Some(seq) = search_sstable(mmap, bloom) {
-                return seq;
             }
         }
 
         // 4. L1 SSTables
-        let l1_sstables = self.roots.load().l1_sstables.clone();
-        for (mmap, bloom, _) in l1_sstables.iter().rev() {
-            if let Some(seq) = search_sstable(mmap, bloom) {
-                return seq;
+        if best_seq < read_seq {
+            for (mmap, bloom, _) in roots.l1_sstables.iter().rev() {
+                if bloom.might_contain(key_hash) {
+                    let reader = SSTableReader::from_mmap(mmap.clone());
+                    if let Some((seq, _)) = reader.find_with_seq(&target_key, read_seq) {
+                        best_seq = best_seq.max(seq);
+                    }
+                }
             }
         }
 
         // 5. Base file
-        {
-            let base_bloom = self.roots.load().base_bloom.clone();
-            let mut h = FnvHasher::default();
-            target_key.hash(&mut h);
-            if !base_bloom.might_contain(h.finish()) {
-                return 0;
+        if best_seq < read_seq && roots.base_bloom.might_contain(key_hash) {
+            let reader = SSTableReader::from_mmap(roots.base_mmap.clone());
+            if let Some((seq, _)) = reader.find_with_seq(&target_key, read_seq) {
+                best_seq = best_seq.max(seq);
             }
         }
-        {
-            let base_mmap = self.roots.load().base_mmap.clone();
-            let reader = SSTableReader::from_mmap(base_mmap);
-            let mut best_seq = 0u64;
-            for rec in reader.iter_from(&target_key) {
-                if rec.key > target_key {
-                    break;
-                }
-                if rec.key == target_key
-                    && rec.is_valid()
-                    && rec.seq <= read_seq
-                    && rec.seq > best_seq
-                {
-                    best_seq = rec.seq;
-                }
-            }
-            if best_seq > 0 {
-                return best_seq;
-            }
-        }
-        0
+
+        best_seq
     }
 
     fn notify_compaction_waiters(&self) {

@@ -419,11 +419,16 @@ fn test_wal_corruption_partial_recovery() {
     // All 50 valid keys must be present
     verify_all_keys(&db2, 50, "wal_ok");
 
-    // New writes must work after recovery
+    // New writes must work after recovery and survive a subsequent restart.
     put(&db2, "after_corruption", "works");
     assert_get(&db2, "after_corruption", "works");
+    drop(db2);
 
-    println!("✓ WAL partial corruption: 50 valid keys recovered, new writes work");
+    let db3 = reopen(&dir);
+    verify_all_keys(&db3, 50, "wal_ok");
+    assert_get(&db3, "after_corruption", "works");
+
+    println!("✓ WAL partial corruption: 50 valid keys recovered, new writes survive restart");
 }
 
 // ═══════════════════════════════════════════════════════════════════════

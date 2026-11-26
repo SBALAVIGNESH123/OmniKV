@@ -12,6 +12,7 @@ const PRODUCTION_FILES: &[&str] = &[
     "src/query/catalog.rs",
     "src/storage/transaction.rs",
     "src/storage/core.rs",
+    "src/storage/wal.rs",
     "src/raft/raft_network.rs",
 ];
 
