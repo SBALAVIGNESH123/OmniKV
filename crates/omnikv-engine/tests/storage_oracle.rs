@@ -790,19 +790,19 @@ fn verify_concurrent_reader_loop(
     let mut checked_across_compaction = false;
     while !done.load(Ordering::Acquire) {
         let snap = db.snapshot();
-        let compactions_before = compactions.load(Ordering::Acquire);
         let first_view =
             assert_snapshot_equivalence(db, snap, writers, &mut last_seen_val, &mut last_seen_seq);
+        let compactions_after_first = compactions.load(Ordering::Acquire);
 
         if !checked_across_compaction {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-            while compactions.load(Ordering::Acquire) == compactions_before
+            while compactions.load(Ordering::Acquire) == compactions_after_first
                 && !done.load(Ordering::Acquire)
                 && std::time::Instant::now() < deadline
             {
                 std::thread::yield_now();
             }
-            if compactions.load(Ordering::Acquire) > compactions_before {
+            if compactions.load(Ordering::Acquire) > compactions_after_first {
                 let second_view = assert_snapshot_equivalence(
                     db,
                     snap,
@@ -831,7 +831,7 @@ fn run_concurrent_compactor_loop(
 ) {
     use std::sync::atomic::Ordering;
 
-    let mut round = 0usize;
+    let mut round = 1usize;
     while !done.load(Ordering::Acquire) {
         db.compact_sstables().expect("concurrent L0 flush");
         if round.is_multiple_of(3) {
@@ -1073,17 +1073,90 @@ fn empty_string_values_do_not_poison_neighboring_keys_in_block_cache() {
 
 #[test]
 fn corrupt_sstable_trailer_index_offset_in_trailer_window_never_panics() {
-    // Construct corrupt OMNIV2** blobs whose `index_offset` lies in
-    // `(len - 16)..len` (previously panicked on `&data[index_offset..len - 16]`)
-    // or at `u64::MAX`.
-    for bad_offset in [48u64, 56, 63, 64, u64::MAX] {
-        let mut blob = vec![0u8; 64];
-        blob[48..56].copy_from_slice(&bad_offset.to_le_bytes());
-        blob[56..64].copy_from_slice(b"OMNIV2**");
+    // Construct corrupt OMNIV2** blobs containing a genuinely decodable record
+    // followed by a trailer whose `index_offset` lies in `(len - 23)..=len` or
+    // `u64::MAX`. Malformed trailer offsets must fail closed (returning 0 data
+    // bytes) rather than decoding across index/trailer bytes.
+    let valid_rec = OmniRecord::new(1, b"any_key".to_vec(), 0, 8, 42, 0).encode();
+    let blob_len = 80usize;
+    assert!(valid_rec.len() <= blob_len - 24);
+    for bad_offset in [57u64, 64, 65, 72, 79, 80, u64::MAX] {
+        let mut blob = vec![0u8; blob_len];
+        blob[..valid_rec.len()].copy_from_slice(&valid_rec);
+        // Precondition: the prefix record itself is valid & decodable, proving
+        // the `None`/`0` outcomes below come from fail-closed trailer validation.
+        assert!(
+            OmniRecord::decode(&blob[..valid_rec.len()]).is_some(),
+            "prefix record must be genuinely decodable"
+        );
+        blob[blob_len - 16..blob_len - 8].copy_from_slice(&bad_offset.to_le_bytes());
+        blob[blob_len - 8..blob_len].copy_from_slice(b"OMNIV2**");
         let reader = SSTableReader::new(&blob);
         assert!(reader.find(b"any_key", u64::MAX).is_none());
         assert_eq!(reader.iter_from(b"any_key").count(), 0);
+        assert_eq!(reader.iter_from(b"").count(), 0);
     }
+}
+
+#[test]
+fn sstable_decoder_never_reads_past_data_end_into_sparse_index() {
+    let dir = TempDir::new().expect("data_end dir");
+    let sst_path = dir.path().join("boundary.sst");
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .read(true)
+        .open(&sst_path)
+        .expect("create boundary sst");
+    let mut writer = SSTableWriter::new(&file);
+    let rec1 = OmniRecord::new(1, b"k_a".to_vec(), 0, 4, 11, 0);
+    let rec2 = OmniRecord::new(2, b"k_b".to_vec(), 4, 4, 22, 0);
+    writer.append(&rec1).expect("append rec1");
+    writer.append(&rec2).expect("append rec2");
+    writer.finish().expect("finish boundary sst");
+    drop(file);
+
+    let mut bytes = fs::read(&sst_path).expect("read boundary sst");
+    let index_offset = usize::try_from(u64::from_le_bytes(
+        bytes[bytes.len() - 16..bytes.len() - 8]
+            .try_into()
+            .expect("trailer offset"),
+    ))
+    .expect("index offset fits in usize");
+    let rec1_len = rec1.encode().len();
+    assert!(rec1_len < index_offset);
+    // In `OmniRecord::encode`, `seq` is bytes 0..8, `key_len: u16` is bytes 8..10,
+    // and total encoded length is `42 + key_len` (ending with a 4-byte CRC32).
+    // Forge a valid-CRC record starting at `rec1_len` whose payload straddles
+    // `index_offset` by 4 bytes into the sparse index: decoding `&data[rec1_len..]`
+    // succeeds and emits sparse-index bytes as a valid record, whereas decoding
+    // strictly from `&data[rec1_len..data_end]` stops cleanly at `data_end`.
+    let rec2_avail = index_offset - rec1_len;
+    assert!(rec2_avail >= 42);
+    let oversized_key_len = u16::try_from(rec2_avail - 42 + 4).expect("key_len fits in u16");
+    let straddle_end = rec1_len + 42 + usize::from(oversized_key_len);
+    assert!(straddle_end <= bytes.len() - 16);
+    bytes[rec1_len + 8..rec1_len + 10].copy_from_slice(&oversized_key_len.to_le_bytes());
+    let forged_crc = crc32fast::hash(&bytes[rec1_len..straddle_end - 4]);
+    bytes[straddle_end - 4..straddle_end].copy_from_slice(&forged_crc.to_le_bytes());
+
+    // Anti-vacuity precondition: without the `..data_end` slice bound, `decode`
+    // WOULD return a forged `is_valid()` record spanning into the sparse index.
+    let (forged_rec, _) = OmniRecord::decode(&bytes[rec1_len..])
+        .expect("unbounded slice must decode the straddling forged record");
+    assert!(forged_rec.is_valid());
+
+    let reader = SSTableReader::new(&bytes);
+    let decoded: Vec<OmniRecord> = reader.iter_from(b"").collect();
+    assert_eq!(
+        decoded.len(),
+        1,
+        "decoder must stop at data_end without consuming sparse-index bytes"
+    );
+    assert_eq!(decoded[0].key, b"k_a");
+    assert_eq!(reader.find(b"k_a", u64::MAX), Some((0, 4, 11, 0)));
+    assert_eq!(reader.find(&forged_rec.key, u64::MAX), None);
 }
 
 #[test]
@@ -1154,6 +1227,38 @@ fn expired_ttl_keys_stay_invisible_and_do_not_resurrect_older_versions() {
     assert_ttl(&reopened, "reopen");
 }
 
+fn parse_sstable_index(bytes: &[u8]) -> Vec<(Vec<u8>, usize)> {
+    assert!(bytes.len() >= 24 && &bytes[bytes.len() - 8..] == b"OMNIV2**");
+    let index_offset = usize::try_from(u64::from_le_bytes(
+        bytes[bytes.len() - 16..bytes.len() - 8]
+            .try_into()
+            .expect("trailer index_offset"),
+    ))
+    .expect("index_offset fits in usize");
+    let index_data = &bytes[index_offset..bytes.len() - 16];
+    let count = usize::try_from(u64::from_le_bytes(
+        index_data[0..8].try_into().expect("entry count"),
+    ))
+    .expect("entry count fits in usize");
+    let mut entries = Vec::with_capacity(count);
+    let mut curr = 8;
+    for _ in 0..count {
+        let key_len = usize::from(u16::from_le_bytes(
+            index_data[curr..curr + 2].try_into().expect("key len"),
+        ));
+        curr += 2;
+        let key = index_data[curr..curr + key_len].to_vec();
+        curr += key_len;
+        let offset = usize::try_from(u64::from_le_bytes(
+            index_data[curr..curr + 8].try_into().expect("block offset"),
+        ))
+        .expect("block offset fits in usize");
+        curr += 8;
+        entries.push((key, offset));
+    }
+    entries
+}
+
 #[test]
 fn sstable_corrupt_preceding_block_falls_back_to_indexed_target_block() {
     let dir = TempDir::new().expect("corrupt block fallback dir");
@@ -1166,32 +1271,114 @@ fn sstable_corrupt_preceding_block_falls_back_to_indexed_target_block() {
         .open(&sst_path)
         .expect("create fallback sst");
 
+    let mut expected_ptrs = BTreeMap::new();
     let mut writer = SSTableWriter::new(&file);
-    for i in 0u64..180 {
+    for i in 0u32..180 {
         let key = format!("key_{i:04}").into_bytes();
-        let rec = OmniRecord::new(i + 1, key, i * 16, 8, 1234, 0);
+        let ptr = (u64::from(i) * 16, 8, 1234 + i, 0);
+        expected_ptrs.insert(key.clone(), ptr);
+        let rec = OmniRecord::new(u64::from(i) + 1, key, ptr.0, ptr.1, ptr.2, ptr.3);
         writer.append(&rec).expect("append sstable rec");
     }
     writer.finish().expect("finish sstable");
     drop(file);
 
     let mut bytes = fs::read(&sst_path).expect("read sstable bytes");
-    // Corrupt the very first record in Block 0 so `OmniRecord::decode` returns None
-    // before reaching Block 1 (which starts around key_0085).
+    let index = parse_sstable_index(&bytes);
+    assert!(index.len() >= 2, "fixture must span at least 2 blocks");
+    // Derive the exact first nonzero indexed key so the strict `<` seek starts
+    // inside Block 0 (at offset 0) and MUST encounter the corruption there.
+    let (block1_key, block1_offset) = (&index[1].0, index[1].1);
+    assert!(block1_offset > 0);
     bytes[0..12].fill(0xFF);
     let reader = SSTableReader::new(&bytes);
 
-    // Keys in Block 1 and Block 2 must remain readable via fallback to their
-    // indexed block even though Block 0 fails decode.
-    let target = b"key_0150";
-    let found = reader.find(target, u64::MAX);
+    let expected_ptr = *expected_ptrs
+        .get(block1_key)
+        .expect("block1 key pointer exists");
+    assert_eq!(
+        reader.find(block1_key, u64::MAX),
+        Some(expected_ptr),
+        "find() must fall back from corrupt Block 0 to Block 1 with exact pointer"
+    );
+    let iter_rec = reader
+        .iter_from(block1_key)
+        .find(|rec| rec.key == *block1_key)
+        .expect("iter_from() must recover block1 key after Block 0 decode failure");
+    assert_eq!(
+        (
+            iter_rec.offset,
+            iter_rec.length,
+            iter_rec.payload_crc32,
+            iter_rec.expiry
+        ),
+        expected_ptr
+    );
+}
+
+#[test]
+fn sstable_corrupt_first_duplicate_key_block_advances_to_later_intact_block() {
+    let dir = TempDir::new().expect("dup key fallback dir");
+    let sst_path = dir.path().join("dup_fallback.sst");
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .read(true)
+        .open(&sst_path)
+        .expect("create dup fallback sst");
+
+    let mut writer = SSTableWriter::new(&file);
+    // Prefix key so Block 0 starts with "aaa", followed by enough versions of
+    // "dup_key" to create at least two indexed blocks starting with "dup_key".
+    writer
+        .append(&OmniRecord::new(1, b"aaa".to_vec(), 0, 8, 1, 0))
+        .expect("append prefix");
+    let total_versions = 220u32;
+    let mut latest_ptr = (0, 0, 0, 0);
+    for seq in 2..=total_versions + 1 {
+        let seq_u64 = u64::from(seq);
+        let ptr = (seq_u64 * 32, 16, seq, 0);
+        latest_ptr = ptr;
+        writer
+            .append(&OmniRecord::new(
+                seq_u64,
+                b"dup_key".to_vec(),
+                ptr.0,
+                ptr.1,
+                ptr.2,
+                ptr.3,
+            ))
+            .expect("append dup_key version");
+    }
+    writer.finish().expect("finish dup sstable");
+    drop(file);
+
+    let mut bytes = fs::read(&sst_path).expect("read dup sstable");
+    let dup_blocks: Vec<usize> = parse_sstable_index(&bytes)
+        .into_iter()
+        .filter_map(|(k, off)| (k == b"dup_key").then_some(off))
+        .collect();
     assert!(
-        found.is_some(),
-        "find() must fall back to indexed target block when preceding block fails decode"
+        dup_blocks.len() >= 2,
+        "dup_key must start at least two indexed blocks, got {dup_blocks:?}"
+    );
+    // Corrupt the FIRST indexed block for "dup_key"; the second indexed block
+    // (carrying the highest seq) remains intact and must still be readable.
+    let first_dup_block = dup_blocks[0];
+    bytes[first_dup_block..first_dup_block + 12].fill(0xFF);
+    let reader = SSTableReader::new(&bytes);
+
+    assert_eq!(
+        reader.find(b"dup_key", u64::MAX),
+        Some(latest_ptr),
+        "find() must skip corrupt first dup_key block and recover latest version in later block"
     );
     assert!(
-        reader.iter_from(target).any(|rec| rec.key == target),
-        "iter_from() must fall back to indexed target block when preceding block fails decode"
+        reader
+            .iter_from(b"dup_key")
+            .any(|rec| rec.key == b"dup_key" && rec.seq == u64::from(total_versions) + 1),
+        "iter_from() must advance past corrupt first dup_key block to intact later block"
     );
 }
 
