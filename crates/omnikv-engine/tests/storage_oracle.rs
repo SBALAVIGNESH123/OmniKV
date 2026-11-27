@@ -1710,26 +1710,126 @@ fn wal_mid_stream_dropped_heap_stops_at_atomic_prefix_and_does_not_apply_later_b
     assert_eq!(read_db_state(&reopened), expected_final);
 }
 
+fn assert_corrupt_sstable_tier_fails_closed(src_dir: &Path, target: &str, zero_fill: bool) {
+    let trial = TempDir::new().expect("corrupt trial dir");
+    copy_isolated_db_dir(src_dir, trial.path());
+    let manifest_str = trial
+        .path()
+        .join("manifest.json")
+        .to_string_lossy()
+        .to_string();
+    let wal_str = trial.path().join("wal.bin").to_string_lossy().to_string();
+    let manifest_before = Manifest::load(&manifest_str).expect("load trial manifest");
+    let (victim, corrupt_key) = match target {
+        "l0" => (manifest_before.sstables[0].clone(), "k02_b"),
+        "l1" => (manifest_before.l1_sstables[0].clone(), "k01_b"),
+        "base" => (manifest_before.base_path.clone(), "k00_b"),
+        _ => unreachable!(),
+    };
+    if zero_fill {
+        // 4096-byte zeroed L0/L1 and 8192-byte zeroed base must all fail
+        // closed immediately at load time on `OmniKV::open`.
+        let zero_len = if target == "base" { 8192 } else { 4096 };
+        fs::write(&victim, vec![0u8; zero_len]).expect("zero-fill victim sstable");
+        assert!(
+            OmniKV::open(&manifest_str, &wal_str).is_err(),
+            "{target} (zero_fill=true): OmniKV::open must reject zero-filled SSTable at load time"
+        );
+        return;
+    }
+
+    let mut raw = fs::read(&victim).expect("read victim sstable");
+    let (_, rec0_len) = OmniRecord::decode(&raw).expect("decode first record in victim");
+    // Corrupt Record 1 inside Block 0 while leaving Block 0's start record,
+    // sparse index, and footer intact.
+    raw[rec0_len..rec0_len + 12].fill(0xFF);
+    fs::write(&victim, &raw).expect("corrupt mid-block record");
+
+    let reopened = open_db(trial.path());
+    let read_seq = reopened.get_seq();
+    assert!(
+        reopened.find(corrupt_key, read_seq).is_err(),
+        "{target}: point read reaching corrupt mid-block record must fail closed"
+    );
+    assert!(
+        reopened.scan("k00_a", "k99_z", read_seq).is_err(),
+        "{target}: scan reaching corrupt mid-block record must fail closed"
+    );
+    assert!(
+        reopened.scan_limit("k00_a", "k99_z", read_seq, 32).is_err(),
+        "{target}: scan_limit reaching corrupt mid-block record must fail closed"
+    );
+    assert_eq!(
+        reopened.get_seq_for_key(corrupt_key, read_seq),
+        u64::MAX,
+        "{target}: get_seq_for_key reaching corrupt mid-block record must fail closed"
+    );
+
+    let primary_res = match target {
+        "l0" => reopened.compact_l0_to_l1(),
+        "l1" => reopened.compact_l1_to_l2(),
+        "base" => reopened.run_garbage_collection(),
+        _ => unreachable!(),
+    };
+    assert!(
+        primary_res.is_err(),
+        "{target} (zero_fill=false) primary compaction/GC must fail closed on corrupt SSTable"
+    );
+    let secondary_res = match target {
+        "l0" | "l1" => reopened.run_garbage_collection(),
+        "base" => reopened.compact_l1_to_l2(),
+        _ => unreachable!(),
+    };
+    assert!(
+        secondary_res.is_err(),
+        "{target} (zero_fill=false) secondary compaction/GC must fail closed on corrupt SSTable"
+    );
+    let manifest_after = Manifest::load(&manifest_str).expect("reload trial manifest");
+    assert_eq!(
+        manifest_after.base_path, manifest_before.base_path,
+        "{target}: corrupt compaction must not overwrite base manifest pointer"
+    );
+    assert_eq!(
+        manifest_after.l1_sstables, manifest_before.l1_sstables,
+        "{target}: corrupt compaction must not drop L1 manifest pointers"
+    );
+    assert_eq!(
+        manifest_after.sstables, manifest_before.sstables,
+        "{target}: corrupt compaction must not drop L0 manifest pointers"
+    );
+}
+
 #[test]
 fn compaction_and_gc_fail_closed_on_corrupt_sstable() {
     let dir = TempDir::new().expect("corrupt sst dir");
     let db = open_db(dir.path());
 
+    // Place 2 records per tier so mid-block record corruption (Record 1, not
+    // the Block 0 start validated at open time) exercises post-open read,
+    // compaction, and GC fail-closed paths, while zero-filled files exercise
+    // immediate load-time rejection on `OmniKV::open`.
     let mut b_base = WriteBatch::new();
-    b_base.set("k00", "in_base".into()).expect("stage base");
+    b_base
+        .set("k00_a", "in_base_a".into())
+        .expect("stage base a");
+    b_base
+        .set("k00_b", "in_base_b".into())
+        .expect("stage base b");
     db.commit_batch(&b_base).expect("commit base");
     db.compact_sstables().expect("flush base L0");
     db.compact_l0_to_l1().expect("compact base L1");
     db.compact_l1_to_l2().expect("compact base L2");
 
     let mut b_l1 = WriteBatch::new();
-    b_l1.set("k01", "in_l1".into()).expect("stage l1");
+    b_l1.set("k01_a", "in_l1_a".into()).expect("stage l1 a");
+    b_l1.set("k01_b", "in_l1_b".into()).expect("stage l1 b");
     db.commit_batch(&b_l1).expect("commit l1");
     db.compact_sstables().expect("flush l1 L0");
     db.compact_l0_to_l1().expect("compact l1");
 
     let mut b_l0 = WriteBatch::new();
-    b_l0.set("k02", "in_l0".into()).expect("stage l0");
+    b_l0.set("k02_a", "in_l0_a".into()).expect("stage l0 a");
+    b_l0.set("k02_b", "in_l0_b".into()).expect("stage l0 b");
     db.commit_batch(&b_l0).expect("commit l0");
     db.compact_sstables().expect("flush l0");
     drop(db);
@@ -1742,64 +1842,7 @@ fn compaction_and_gc_fail_closed_on_corrupt_sstable() {
         ("l1", true),
         ("base", true),
     ] {
-        let trial = TempDir::new().expect("corrupt trial dir");
-        copy_isolated_db_dir(dir.path(), trial.path());
-        let manifest_path = trial.path().join("manifest.json");
-        let manifest_str = manifest_path.to_string_lossy().to_string();
-        let manifest_before = Manifest::load(&manifest_str).expect("load trial manifest");
-        let victim = match target {
-            "l0" => manifest_before.sstables[0].clone(),
-            "l1" => manifest_before.l1_sstables[0].clone(),
-            "base" => manifest_before.base_path.clone(),
-            _ => unreachable!(),
-        };
-        let bytes = if zero_fill {
-            // 4096-byte zeroed L0/L1 and 8192-byte zeroed base must all fail
-            // closed rather than being mistaken for an empty base placeholder.
-            let zero_len = if target == "base" { 8192 } else { 4096 };
-            vec![0u8; zero_len]
-        } else {
-            let mut raw = fs::read(&victim).expect("read victim sstable");
-            raw[..12].fill(0xFF);
-            raw
-        };
-        fs::write(&victim, &bytes).expect("corrupt victim sstable");
-
-        let reopened = open_db(trial.path());
-        let primary_res = match target {
-            "l0" => reopened.compact_l0_to_l1(),
-            "l1" => reopened.compact_l1_to_l2(),
-            "base" => reopened.run_garbage_collection(),
-            _ => unreachable!(),
-        };
-        assert!(
-            primary_res.is_err(),
-            "{target} (zero_fill={zero_fill}) primary compaction/GC must fail closed on corrupt SSTable"
-        );
-        // Also exercise the secondary strict-scan consumer of each tier (GC on
-        // corrupt L0/L1 and L1->L2 on corrupt base) so neither path can drift.
-        let secondary_res = match target {
-            "l0" | "l1" => reopened.run_garbage_collection(),
-            "base" => reopened.compact_l1_to_l2(),
-            _ => unreachable!(),
-        };
-        assert!(
-            secondary_res.is_err(),
-            "{target} (zero_fill={zero_fill}) secondary compaction/GC must fail closed on corrupt SSTable"
-        );
-        let manifest_after = Manifest::load(&manifest_str).expect("reload trial manifest");
-        assert_eq!(
-            manifest_after.base_path, manifest_before.base_path,
-            "{target} (zero_fill={zero_fill}): corrupt compaction must not overwrite base manifest pointer"
-        );
-        assert_eq!(
-            manifest_after.l1_sstables, manifest_before.l1_sstables,
-            "{target} (zero_fill={zero_fill}): corrupt compaction must not drop L1 manifest pointers"
-        );
-        assert_eq!(
-            manifest_after.sstables, manifest_before.sstables,
-            "{target} (zero_fill={zero_fill}): corrupt compaction must not drop L0 manifest pointers"
-        );
+        assert_corrupt_sstable_tier_fails_closed(dir.path(), target, zero_fill);
     }
 }
 
@@ -1837,6 +1880,7 @@ fn sstable_strict_validation_rejects_zero_and_shifted_footer_offsets() {
             .join("manifest.json")
             .to_string_lossy()
             .to_string();
+        let wal_str = trial.path().join("wal.bin").to_string_lossy().to_string();
         let manifest_before = Manifest::load(&manifest_str).expect("load trial manifest");
         let l0_path = &manifest_before.sstables[0];
         let mut bytes = fs::read(l0_path).expect("read trial L0");
@@ -1844,19 +1888,19 @@ fn sstable_strict_validation_rejects_zero_and_shifted_footer_offsets() {
         bytes[len - 16..len - 8].copy_from_slice(&forged_index_offset.to_le_bytes());
         fs::write(l0_path, &bytes).expect("write forged footer L0");
 
-        let reopened = open_db(trial.path());
         assert!(
-            reopened.compact_l0_to_l1().is_err(),
-            "{label}: L0->L1 compaction must fail closed instead of dropping records"
+            OmniKV::open(&manifest_str, &wal_str).is_err(),
+            "{label}: OmniKV::open must fail closed immediately on forged v2 footer offset"
         );
         let manifest_after = Manifest::load(&manifest_str).expect("reload trial manifest");
         assert_eq!(
             manifest_after.sstables, manifest_before.sstables,
-            "{label}: failed compaction must preserve original L0 manifest entry"
+            "{label}: failed open must preserve original L0 manifest entry"
         );
-        assert!(
-            manifest_after.l1_sstables.is_empty(),
-            "{label}: failed compaction must not publish truncated L1 table"
+        assert_eq!(
+            manifest_after.l1_sstables,
+            Vec::<String>::new(),
+            "{label}: failed open must not modify L1 manifest entries"
         );
     }
 }
@@ -1904,6 +1948,7 @@ fn l1_to_l2_compaction_aborts_on_misaligned_l0_sparse_index_offset() {
         .join("manifest.json")
         .to_string_lossy()
         .to_string();
+    let wal_str = dir.path().join("wal.bin").to_string_lossy().to_string();
     let manifest_before = Manifest::load(&manifest_str).expect("load manifest");
     let l0_path = &manifest_before.sstables[0];
     let mut bytes = fs::read(l0_path).expect("read L0");
@@ -1922,10 +1967,9 @@ fn l1_to_l2_compaction_aborts_on_misaligned_l0_sparse_index_offset() {
     bytes[entry1_off_pos..entry1_off_pos + 8].copy_from_slice(&bad_block1_off.to_le_bytes());
     fs::write(l0_path, &bytes).expect("write misaligned L0");
 
-    let reopened = open_db(dir.path());
     assert!(
-        reopened.compact_l1_to_l2().is_err(),
-        "L1->L2 must fail closed when an L0 sparse-index offset is misaligned instead of dropping tombstones"
+        OmniKV::open(&manifest_str, &wal_str).is_err(),
+        "OmniKV::open must fail closed immediately when an L0 sparse-index block offset is misaligned"
     );
     let manifest_after = Manifest::load(&manifest_str).expect("reload manifest");
     assert_eq!(manifest_after.l1_sstables, manifest_before.l1_sstables);
@@ -1937,7 +1981,7 @@ fn zero_filled_4096_byte_generated_base_fails_closed_while_legacy_empty_base_mig
     // 1. A generated base SSTable with one 2010-byte key has exact length
     //    `42 + 2010 (record) + 8 + 2 + 2010 + 8 (index) + 16 (footer) = 4096`.
     //    Zero-filling it in place without changing its length MUST fail closed
-    //    in both GC and L1->L2 compaction.
+    //    immediately on `OmniKV::open`.
     let dir = TempDir::new().expect("gen 4096 base dir");
     let db = open_db(dir.path());
     let key_2010 = "b".repeat(2010);
@@ -1955,7 +1999,7 @@ fn zero_filled_4096_byte_generated_base_fails_closed_while_legacy_empty_base_mig
         4096,
         "generated 1-record base with 2010-byte key must be exactly 4096 bytes"
     );
-    // Stage an L1 table so `compact_l1_to_l2()` performs real work too.
+    // Stage an L1 table so manifest contains active upper-tier entries too.
     let mut b2 = WriteBatch::new();
     b2.set("k_l1", "l1_val".into()).expect("stage l1 key");
     db.commit_batch(&b2).expect("commit l1 key");
@@ -1963,38 +2007,31 @@ fn zero_filled_4096_byte_generated_base_fails_closed_while_legacy_empty_base_mig
     db.compact_l0_to_l1().expect("compact second L1");
     drop(db);
 
-    for op in ["gc", "l1_to_l2"] {
-        let trial = TempDir::new().expect("zero 4096 trial dir");
-        copy_isolated_db_dir(dir.path(), trial.path());
-        let manifest_str = trial
-            .path()
-            .join("manifest.json")
-            .to_string_lossy()
-            .to_string();
-        let manifest_before = Manifest::load(&manifest_str).expect("load trial manifest");
-        assert_eq!(
-            fs::metadata(&manifest_before.base_path)
-                .expect("trial base meta")
-                .len(),
-            4096
-        );
-        fs::write(&manifest_before.base_path, vec![0u8; 4096])
-            .expect("zero-fill 4096B generated base without changing length");
+    let trial = TempDir::new().expect("zero 4096 trial dir");
+    copy_isolated_db_dir(dir.path(), trial.path());
+    let manifest_str = trial
+        .path()
+        .join("manifest.json")
+        .to_string_lossy()
+        .to_string();
+    let wal_str = trial.path().join("wal.bin").to_string_lossy().to_string();
+    let manifest_before = Manifest::load(&manifest_str).expect("load trial manifest");
+    assert_eq!(
+        fs::metadata(&manifest_before.base_path)
+            .expect("trial base meta")
+            .len(),
+        4096
+    );
+    fs::write(&manifest_before.base_path, vec![0u8; 4096])
+        .expect("zero-fill 4096B generated base without changing length");
 
-        let reopened = open_db(trial.path());
-        let res = match op {
-            "gc" => reopened.run_garbage_collection(),
-            "l1_to_l2" => reopened.compact_l1_to_l2(),
-            _ => unreachable!(),
-        };
-        assert!(
-            res.is_err(),
-            "{op}: length-preserving zero-fill of a 4096-byte generated base must fail closed"
-        );
-        let manifest_after = Manifest::load(&manifest_str).expect("reload trial manifest");
-        assert_eq!(manifest_after.base_path, manifest_before.base_path);
-        assert_eq!(manifest_after.heap_path, manifest_before.heap_path);
-    }
+    assert!(
+        OmniKV::open(&manifest_str, &wal_str).is_err(),
+        "length-preserving zero-fill of a 4096-byte generated base must fail closed on open"
+    );
+    let manifest_after = Manifest::load(&manifest_str).expect("reload trial manifest");
+    assert_eq!(manifest_after.base_path, manifest_before.base_path);
+    assert_eq!(manifest_after.heap_path, manifest_before.heap_path);
 
     // 2. A genuine untouched pre-v2 legacy placeholder (`{manifest_path}_base.bin`
     //    of 4096 zero bytes, `wal_checkpoint_seq == 0`, `read_seq_floor == 0`)

@@ -4,7 +4,7 @@
 //! database manifest, the storage files referenced by that manifest, an optional
 //! WAL, and a small metadata file used for restore-time verification.
 
-use crate::storage::core::bloom_path_for_base;
+use crate::storage::core::{BloomFilter, SSTableReader, SSTableWriter, bloom_path_for_base};
 use crate::{Manifest, OmniKV};
 use flate2::Compression;
 use flate2::read::GzDecoder;
@@ -95,6 +95,31 @@ fn create_backup_internal(
     let (backup_manifest, file_plan) =
         build_backup_plan(&source_manifest, source_manifest_dir, wal_path)?;
 
+    // Read and validate the source base table BEFORE creating/truncating
+    // `output_path` so an invalid base never leaves a partial archive behind.
+    let allow_legacy_base =
+        OmniKV::manifest_allows_legacy_zero_base(&source_manifest, manifest_path);
+    let prepared_base_bytes = if let Some((source, _)) = file_plan
+        .iter()
+        .find(|(_, archive_path)| archive_path == BASE_ENTRY)
+    {
+        let base_bytes = std::fs::read(source)
+            .map_err(|e| format!("Read backup source {}: {e}", source.display()))?;
+        SSTableReader::validate_table_layout(&base_bytes, allow_legacy_base).map_err(|e| {
+            format!(
+                "Validate source base SSTable {} for backup: {e}",
+                source.display()
+            )
+        })?;
+        if allow_legacy_base && base_bytes.len() == 4096 && base_bytes.iter().all(|&b| b == 0) {
+            Some(SSTableWriter::empty_table_bytes().to_vec())
+        } else {
+            Some(base_bytes)
+        }
+    } else {
+        None
+    };
+
     let file = File::create(output_path).map_err(|e| format!("Cannot create backup file: {e}"))?;
     let encoder = GzEncoder::new(file, Compression::default());
     let mut tar = Builder::new(encoder);
@@ -113,7 +138,13 @@ fn create_backup_internal(
     append_bytes(&mut tar, MANIFEST_ENTRY, &manifest_bytes, &mut metadata)?;
 
     for (source, archive_path) in file_plan {
-        append_existing_file(&mut tar, &source, &archive_path, &mut metadata)?;
+        if archive_path == BASE_ENTRY
+            && let Some(ref base_bytes) = prepared_base_bytes
+        {
+            append_bytes(&mut tar, &archive_path, base_bytes, &mut metadata)?;
+        } else {
+            append_existing_file(&mut tar, &source, &archive_path, &mut metadata)?;
+        }
     }
 
     let metadata_bytes = serde_json::to_vec_pretty(&metadata)
@@ -252,8 +283,8 @@ fn create_encrypted_backup_internal(
     passphrase: &str,
 ) -> Result<String, String> {
     let temp_path = format!("{output_path}.tmp");
-    create_backup_internal(db, manifest_path, wal_path, &temp_path)?;
     let _cleanup = TempFileCleanup::new(temp_path.clone());
+    create_backup_internal(db, manifest_path, wal_path, &temp_path)?;
 
     let mut data = Vec::new();
     File::open(&temp_path)
@@ -457,10 +488,99 @@ fn rewrite_restored_manifest(restore_root: &Path) -> Result<(), String> {
         .map(|path| rebase_restored_path(restore_root, path))
         .collect::<Result<Vec<_>, String>>()?;
 
+    maybe_upgrade_legacy_zero_base(&manifest)?;
+
     manifest
         .save(manifest_path_str)
         .map_err(|e| format!("Rewrite restored manifest: {e}"))?;
 
+    Ok(())
+}
+
+/// Upgrades a restored pre-v2 untouched 4096-byte zero placeholder `base.bin`
+/// into a valid 24-byte `OMNIV2**` empty SSTable so pre-v2 backups containing
+/// L0/L1 tables open, compact, and run GC cleanly without loosening strict
+/// base-table validation for live databases.
+///
+/// Only triggers when:
+/// - `wal_checkpoint_seq == 0` (covers both untouched initial `_base.bin` and
+///   pre-v2 Raft snapshot `data_base.bin` placeholders where `read_seq_floor > 0`),
+/// - `manifest.base_path` names a regular file `base.bin` containing 4096
+///   all-zero bytes, and
+/// - `base.bloom` is either absent (omitted by pre-v2 backups of `.bin` bases)
+///   or valid with no bits set.
+///
+/// A zero-filled 4096-byte generated base whose `base.bloom` records live keys
+/// (or is corrupt) is left untouched so `OmniKV::open` fails closed.
+fn maybe_upgrade_legacy_zero_base(manifest: &Manifest) -> Result<(), String> {
+    if manifest.wal_checkpoint_seq != 0 {
+        return Ok(());
+    }
+    let Some(base_name) = Path::new(&manifest.base_path).file_name() else {
+        return Ok(());
+    };
+    let is_restored_base = {
+        #[cfg(windows)]
+        {
+            base_name
+                .to_str()
+                .is_some_and(|name| name.eq_ignore_ascii_case(BASE_ENTRY))
+        }
+        #[cfg(not(windows))]
+        {
+            base_name == std::ffi::OsStr::new(BASE_ENTRY)
+        }
+    };
+    if !is_restored_base {
+        return Ok(());
+    }
+    let base_path = Path::new(&manifest.base_path);
+    let Ok(meta) = std::fs::metadata(base_path) else {
+        return Ok(());
+    };
+    if !meta.is_file() || meta.len() != 4096 {
+        return Ok(());
+    }
+    let base_bytes = std::fs::read(base_path)
+        .map_err(|e| format!("Read restored base SSTable {}: {e}", base_path.display()))?;
+    if base_bytes.len() != 4096 || !base_bytes.iter().all(|&b| b == 0) {
+        return Ok(());
+    }
+    let bloom_path = bloom_path_for_base(&manifest.base_path);
+    if Path::new(&bloom_path).exists() {
+        match BloomFilter::load(&bloom_path) {
+            Ok(bloom) if !bloom.has_any_bit_set() => {}
+            _ => return Ok(()),
+        }
+    }
+
+    let empty_v2 = SSTableWriter::empty_table_bytes();
+    let tmp_path = format!("{}.upgrade.tmp", manifest.base_path);
+    let write_res: Result<(), std::io::Error> = (|| {
+        let mut tmp = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&tmp_path)?;
+        tmp.write_all(&empty_v2)?;
+        tmp.sync_all()?;
+        drop(tmp);
+        std::fs::rename(&tmp_path, base_path)?;
+        #[cfg(unix)]
+        if let Some(parent) = base_path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            File::open(parent)?.sync_all()?;
+        }
+        Ok(())
+    })();
+    if let Err(err) = write_res {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(format!(
+            "Upgrade restored legacy empty base {}: {err}",
+            base_path.display()
+        ));
+    }
     Ok(())
 }
 

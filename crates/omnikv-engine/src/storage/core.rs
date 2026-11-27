@@ -590,6 +590,10 @@ impl BloomFilter {
         Ok(bloom)
     }
 
+    pub(crate) fn has_any_bit_set(&self) -> bool {
+        self.bitset.iter().any(|&word| word != 0)
+    }
+
     pub fn new(expected_elements: usize) -> Self {
         let elements = expected_elements.max(1);
         let p = 0.01_f64;
@@ -1027,7 +1031,7 @@ impl MergeSource<'_> {
         start_key: &[u8],
         end_bound: ScanEnd<'_>,
         read_seq: u64,
-    ) -> Option<ScanCandidate> {
+    ) -> Result<Option<ScanCandidate>, OmniError> {
         match self {
             Self::MemShard {
                 iter,
@@ -1035,13 +1039,13 @@ impl MergeSource<'_> {
                 exhausted,
             } => {
                 if *exhausted {
-                    return None;
+                    return Ok(None);
                 }
                 for entry in iter.by_ref() {
                     let (key, rev_seq) = entry.key();
                     if end_bound.is_past(key) {
                         *exhausted = true;
-                        return None;
+                        return Ok(None);
                     }
                     let seq = rev_seq.0;
                     if seq > read_seq {
@@ -1053,17 +1057,17 @@ impl MergeSource<'_> {
                     let owned_key = key.clone();
                     *last_key = Some(owned_key.clone());
                     let val = entry.value();
-                    return Some(ScanCandidate {
+                    return Ok(Some(ScanCandidate {
                         key: owned_key,
                         seq,
                         offset: val.0,
                         length: val.1,
                         crc: val.2,
                         expiry: val.3,
-                    });
+                    }));
                 }
                 *exhausted = true;
-                None
+                Ok(None)
             }
             Self::Sst {
                 iter,
@@ -1071,13 +1075,13 @@ impl MergeSource<'_> {
                 exhausted,
             } => {
                 if *exhausted {
-                    return None;
+                    return Ok(None);
                 }
                 let mut best: Option<OmniRecord> = None;
                 loop {
                     let rec = match peeked.take() {
                         Some(rec) => rec,
-                        None => match iter.next() {
+                        None => match iter.try_next()? {
                             Some(rec) => rec,
                             None => {
                                 *exhausted = true;
@@ -1106,14 +1110,14 @@ impl MergeSource<'_> {
                         best = Some(rec);
                     }
                 }
-                best.map(|rec| ScanCandidate {
+                Ok(best.map(|rec| ScanCandidate {
                     key: rec.key,
                     seq: rec.seq,
                     offset: rec.offset,
                     length: rec.length,
                     crc: rec.payload_crc32,
                     expiry: rec.expiry,
-                })
+                }))
             }
         }
     }
@@ -1425,22 +1429,77 @@ impl SSTableReader {
         ))
     }
 
-    /// Resolves `(data_end, start_offset, fallback_offsets)` for infallible
-    /// best-effort read paths (`find`, `find_with_seq`, `iter_from`).
+    /// Validates the `OMNIV2**` footer, sparse-index structure, and every
+    /// sparse-index block-start record alignment once at table load or
+    /// publication time so malformed tables fail closed before entering
+    /// `StorageRoots`.
+    pub(crate) fn validate_table_layout(
+        data: &[u8],
+        allow_legacy_zero_base: bool,
+    ) -> Result<(), OmniError> {
+        let layout = Self::parse_strict_sstable_layout(data, allow_legacy_zero_base)?;
+        for (idx, (key_range, entry_offset)) in layout.index_entries.iter().enumerate() {
+            let block_end = layout
+                .index_entries
+                .get(idx + 1)
+                .map_or(layout.data_end, |(_, next_off)| *next_off);
+            let Some((rec, _)) = OmniRecord::decode(&data[*entry_offset..block_end]) else {
+                return Err(OmniError::IoError(format!(
+                    "corrupt SSTable sparse index: block offset {entry_offset} does not point to a valid record"
+                )));
+            };
+            if rec.key.as_slice() != &data[key_range.clone()] {
+                return Err(OmniError::IoError(format!(
+                    "corrupt SSTable sparse index: key mismatch at block offset {entry_offset}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Resolves `(data_end, start_offset)` for strict internal read paths
+    /// (`find_with_seq`, `try_iter_from`).
+    ///
+    /// Fails closed on any malformed `OMNIV2**` footer/index or missing magic
+    /// (unless `allow_legacy_zero_base` is `true` for a manifest-backed
+    /// 4096-byte zero placeholder). Uses strict `<` so multiple MVCC versions
+    /// of `target` spanning a sparse-index block boundary remain reachable from
+    /// the preceding block.
+    fn resolve_strict_read_offsets(
+        data: &[u8],
+        target: &[u8],
+        allow_legacy_zero_base: bool,
+    ) -> Result<(usize, usize), OmniError> {
+        let layout = Self::parse_strict_sstable_layout(data, allow_legacy_zero_base)?;
+        if layout.data_end == 0 || layout.index_entries.is_empty() {
+            return Ok((layout.data_end, 0));
+        }
+
+        let idx = layout
+            .index_entries
+            .partition_point(|(key_range, _)| &data[key_range.clone()] < target);
+        let start = if idx == 0 {
+            0
+        } else {
+            layout.index_entries[idx - 1].1
+        };
+        Ok((layout.data_end, start))
+    }
+
+    /// Resolves `(data_end, start_offset, fallback_offsets)` for the public
+    /// infallible best-effort inspection APIs (`SSTableReader::find`,
+    /// `SSTableReader::iter_from`).
     ///
     /// For `OMNIV2**` tables, parses and validates the complete sparse-index
-    /// layout once (failing closed to `data_end = 0` on malformed footers or
-    /// indices). For legacy raw-record byte slices without `OMNIV2**` magic,
-    /// scans linearly from offset `0..data.len()`.
-    ///
-    /// Uses strict `<` so multiple MVCC versions of `target` spanning a
-    /// sparse-index block boundary remain reachable from the preceding block.
-    fn resolve_read_offsets(
-        &self,
+    /// layout (returning `data_end = 0` on malformed footers or indices) and
+    /// queues later matching block offsets so callers inspecting a single
+    /// partially damaged table can recover intact blocks. For raw-record slices
+    /// without `OMNIV2**` magic, scans linearly from `0..data.len()`.
+    fn resolve_best_effort_read_offsets(
+        data: &[u8],
         target: &[u8],
         only_equal_key: bool,
     ) -> (usize, usize, std::collections::VecDeque<usize>) {
-        let data = self.data.as_slice();
         if data.len() >= 16 && &data[data.len() - 8..] == b"OMNIV2**" {
             let Ok(layout) = Self::parse_strict_sstable_layout(data, false) else {
                 return (0, 0, std::collections::VecDeque::new());
@@ -1449,9 +1508,6 @@ impl SSTableReader {
                 return (layout.data_end, 0, std::collections::VecDeque::new());
             }
 
-            // Strict `<`: multiple MVCC versions of `target` can span sparse-index
-            // block boundaries, so the earliest version of `target` may reside in
-            // the block immediately before the first index entry with key >= target.
             let idx = layout
                 .index_entries
                 .partition_point(|(key_range, _)| &data[key_range.clone()] < target);
@@ -1479,17 +1535,9 @@ impl SSTableReader {
     }
 
     pub fn find(&self, target_key: &[u8], read_seq: u64) -> Option<(u64, u64, u32, u64)> {
-        self.find_with_seq(target_key, read_seq).map(|(_, ptr)| ptr)
-    }
-
-    pub(crate) fn find_with_seq(
-        &self,
-        target_key: &[u8],
-        read_seq: u64,
-    ) -> Option<(u64, ValuePointer)> {
         let data = self.data.as_slice();
         let (data_end, mut offset, mut fallback_offsets) =
-            self.resolve_read_offsets(target_key, true);
+            Self::resolve_best_effort_read_offsets(data, target_key, true);
         let mut best: Option<(u64, ValuePointer)> = None;
 
         'walk: while offset < data_end {
@@ -1517,16 +1565,71 @@ impl SSTableReader {
                 break;
             }
         }
-        best
+        best.map(|(_, ptr)| ptr)
+    }
+
+    pub(crate) fn find_with_seq(
+        &self,
+        target_key: &[u8],
+        read_seq: u64,
+        allow_legacy_zero_base: bool,
+    ) -> Result<Option<(u64, ValuePointer)>, OmniError> {
+        let data = self.data.as_slice();
+        let (data_end, mut offset) =
+            Self::resolve_strict_read_offsets(data, target_key, allow_legacy_zero_base)?;
+        let mut best: Option<(u64, ValuePointer)> = None;
+
+        while offset < data_end {
+            let Some((rec, len)) = OmniRecord::decode(&data[offset..data_end]) else {
+                return Err(OmniError::IoError(format!(
+                    "corrupt SSTable record at byte offset {offset} (data_end={data_end})"
+                )));
+            };
+            offset += len;
+            if rec.key.as_slice() > target_key {
+                break;
+            }
+            if rec.key.as_slice() == target_key
+                && rec.seq <= read_seq
+                && best.is_none_or(|(best_seq, _)| rec.seq > best_seq)
+            {
+                best = Some((
+                    rec.seq,
+                    (rec.offset, rec.length, rec.payload_crc32, rec.expiry),
+                ));
+            }
+        }
+        Ok(best)
+    }
+
+    pub(crate) fn try_iter_from(
+        &self,
+        start_key: &[u8],
+        allow_legacy_zero_base: bool,
+    ) -> Result<SSTableIterator, OmniError> {
+        let (data_end, offset) = Self::resolve_strict_read_offsets(
+            self.data.as_slice(),
+            start_key,
+            allow_legacy_zero_base,
+        )?;
+        Ok(SSTableIterator {
+            data: self.data.clone(),
+            offset,
+            data_end,
+            fallback_offsets: std::collections::VecDeque::new(),
+            strict: true,
+        })
     }
 
     pub fn iter_from(&self, start_key: &[u8]) -> SSTableIterator {
-        let (data_end, offset, fallback_offsets) = self.resolve_read_offsets(start_key, false);
+        let (data_end, offset, fallback_offsets) =
+            Self::resolve_best_effort_read_offsets(self.data.as_slice(), start_key, false);
         SSTableIterator {
             data: self.data.clone(),
             offset,
             data_end,
             fallback_offsets,
+            strict: false,
         }
     }
 
@@ -1640,20 +1743,25 @@ pub struct SSTableIterator {
     offset: usize,
     data_end: usize,
     fallback_offsets: std::collections::VecDeque<usize>,
+    strict: bool,
 }
 
-impl Iterator for SSTableIterator {
-    type Item = OmniRecord;
-
-    fn next(&mut self) -> Option<Self::Item> {
+impl SSTableIterator {
+    pub(crate) fn try_next(&mut self) -> Result<Option<OmniRecord>, OmniError> {
         let data = self.data.as_slice();
         'walk: loop {
             if self.offset >= self.data_end {
-                return None;
+                return Ok(None);
             }
             if let Some((rec, len)) = OmniRecord::decode(&data[self.offset..self.data_end]) {
                 self.offset += len;
-                return Some(rec);
+                return Ok(Some(rec));
+            }
+            if self.strict {
+                return Err(OmniError::IoError(format!(
+                    "corrupt SSTable record at byte offset {} (data_end={})",
+                    self.offset, self.data_end
+                )));
             }
             while let Some(fb) = self.fallback_offsets.pop_front() {
                 if fb > self.offset && fb < self.data_end {
@@ -1661,8 +1769,17 @@ impl Iterator for SSTableIterator {
                     continue 'walk;
                 }
             }
-            return None;
+            self.offset = self.data_end;
+            return Ok(None);
         }
+    }
+}
+
+impl Iterator for SSTableIterator {
+    type Item = OmniRecord;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.try_next().ok().flatten()
     }
 }
 
@@ -1675,6 +1792,12 @@ pub struct SSTableWriter<'a> {
 }
 
 impl<'a> SSTableWriter<'a> {
+    pub(crate) fn empty_table_bytes() -> [u8; 24] {
+        let mut bytes = [0u8; 24];
+        bytes[16..24].copy_from_slice(b"OMNIV2**");
+        bytes
+    }
+
     pub fn new(file: &'a File) -> Self {
         Self {
             writer: BufWriter::new(file),
@@ -2398,6 +2521,12 @@ impl OmniKV {
         let reader = SSTableReader::from_mmap(base_mmap.clone());
         let base_bloom_path = bloom_path_for_base(&manifest.base_path);
         let allow_legacy_base = Self::manifest_allows_legacy_zero_base(&manifest, manifest_path);
+        SSTableReader::validate_table_layout(&base_mmap, allow_legacy_base).map_err(|e| {
+            OmniError::IoError(format!(
+                "corrupt base SSTable '{}' referenced by manifest: {e}",
+                manifest.base_path
+            ))
+        })?;
         let base_bloom = match BloomFilter::load(&base_bloom_path) {
             Ok(b) => b,
             Err(_) => {
@@ -2427,6 +2556,11 @@ impl OmniKV {
                     "failed to memory-map L0 SSTable '{sst_path}' referenced by manifest: {e}"
                 ))
             })?);
+            SSTableReader::validate_table_layout(&mmap, false).map_err(|e| {
+                OmniError::IoError(format!(
+                    "corrupt L0 SSTable '{sst_path}' referenced by manifest: {e}"
+                ))
+            })?;
             let reader = SSTableReader::from_mmap(mmap.clone());
             let bloom_path = bloom_path_for_base(sst_path);
             let bloom = match BloomFilter::load(&bloom_path) {
@@ -2460,6 +2594,11 @@ impl OmniKV {
                     "failed to memory-map L1 SSTable '{sst_path}' referenced by manifest: {e}"
                 ))
             })?);
+            SSTableReader::validate_table_layout(&mmap, false).map_err(|e| {
+                OmniError::IoError(format!(
+                    "corrupt L1 SSTable '{sst_path}' referenced by manifest: {e}"
+                ))
+            })?;
             let reader = SSTableReader::from_mmap(mmap.clone());
             let bloom_path = bloom_path_for_base(sst_path);
             let bloom = match BloomFilter::load(&bloom_path) {
@@ -2709,7 +2848,10 @@ impl OmniKV {
     ///
     /// Generated base tables (`_base_<ts>_<tok>.sst`, `_database_compacted_*`,
     /// or non-empty restored `base.bin`) always return `false`.
-    fn manifest_allows_legacy_zero_base(manifest: &Manifest, manifest_path: &str) -> bool {
+    pub(crate) fn manifest_allows_legacy_zero_base(
+        manifest: &Manifest,
+        manifest_path: &str,
+    ) -> bool {
         fn file_names_match(a: &std::ffi::OsStr, b: &std::ffi::OsStr) -> bool {
             #[cfg(windows)]
             {
@@ -3037,10 +3179,12 @@ impl OmniKV {
                 });
             }
         }
+        let allow_legacy_base =
+            Self::manifest_allows_legacy_zero_base(&roots.manifest, &self.manifest_path);
         for (mmap, _, _) in roots.sstables.iter().rev() {
             let reader = SSTableReader::from_mmap(mmap.clone());
             sources.push(MergeSource::Sst {
-                iter: reader.iter_from(&start_key),
+                iter: reader.try_iter_from(&start_key, false)?,
                 peeked: None,
                 exhausted: false,
             });
@@ -3048,21 +3192,21 @@ impl OmniKV {
         for (mmap, _, _) in &**roots.l1_sstables {
             let reader = SSTableReader::from_mmap(mmap.clone());
             sources.push(MergeSource::Sst {
-                iter: reader.iter_from(&start_key),
+                iter: reader.try_iter_from(&start_key, false)?,
                 peeked: None,
                 exhausted: false,
             });
         }
         let base_reader = SSTableReader::from_mmap(roots.base_mmap.clone());
         sources.push(MergeSource::Sst {
-            iter: base_reader.iter_from(&start_key),
+            iter: base_reader.try_iter_from(&start_key, allow_legacy_base)?,
             peeked: None,
             exhausted: false,
         });
 
         let mut heap: BinaryHeap<MergeHeapEntry> = BinaryHeap::with_capacity(sources.len());
         for (source_id, source) in sources.iter_mut().enumerate() {
-            if let Some(candidate) = source.next_visible(&start_key, end_bound, read_seq) {
+            if let Some(candidate) = source.next_visible(&start_key, end_bound, read_seq)? {
                 heap.push(MergeHeapEntry {
                     candidate,
                     source_id,
@@ -3083,7 +3227,7 @@ impl OmniKV {
                 break;
             };
             if let Some(next_candidate) =
-                sources[source_id].next_visible(&start_key, end_bound, read_seq)
+                sources[source_id].next_visible(&start_key, end_bound, read_seq)?
             {
                 heap.push(MergeHeapEntry {
                     candidate: next_candidate,
@@ -3339,29 +3483,51 @@ impl OmniKV {
                 }
             }
         }
-        let scan_table = |mmap: &Arc<Mmap>| -> bool {
+        let allow_legacy_base =
+            Self::manifest_allows_legacy_zero_base(&roots.manifest, &self.manifest_path);
+        let scan_table = |mmap: &Arc<Mmap>, allow_legacy: bool| -> bool {
             let reader = SSTableReader::from_mmap(mmap.clone());
-            for rec in reader.iter_from(&start_bytes) {
-                if rec.key >= end_bytes {
-                    break;
-                }
-                if rec.key >= start_bytes && rec.is_valid() && rec.seq > after_seq {
+            let mut iter = match reader.try_iter_from(&start_bytes, allow_legacy) {
+                Ok(iter) => iter,
+                Err(err) => {
+                    tracing::error!(
+                        "corrupt SSTable encountered during range conflict check ({err}); failing closed"
+                    );
                     return true;
+                }
+            };
+            loop {
+                match iter.try_next() {
+                    Ok(Some(rec)) => {
+                        if rec.key >= end_bytes {
+                            break;
+                        }
+                        if rec.key >= start_bytes && rec.is_valid() && rec.seq > after_seq {
+                            return true;
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(err) => {
+                        tracing::error!(
+                            "corrupt SSTable record encountered during range conflict check ({err}); failing closed"
+                        );
+                        return true;
+                    }
                 }
             }
             false
         };
         for (mmap, _, _) in &**roots.sstables {
-            if scan_table(mmap) {
+            if scan_table(mmap, false) {
                 return true;
             }
         }
         for (mmap, _, _) in &**roots.l1_sstables {
-            if scan_table(mmap) {
+            if scan_table(mmap, false) {
                 return true;
             }
         }
-        scan_table(&roots.base_mmap)
+        scan_table(&roots.base_mmap, allow_legacy_base)
     }
 
     /// Returns `true` if any key in `keys` has a record (put or tombstone)
@@ -4339,11 +4505,14 @@ impl OmniKV {
             }
         }
 
+        let allow_legacy_base =
+            Self::manifest_allows_legacy_zero_base(&roots.manifest, &self.manifest_path);
+
         if best.is_none_or(|(seq, _)| seq < read_seq) {
             for (mmap, bloom, _) in roots.sstables.iter().rev() {
                 if bloom.might_contain(key_hash) {
                     let reader = SSTableReader::from_mmap(mmap.clone());
-                    if let Some((seq, ptr)) = reader.find_with_seq(&target_key, read_seq) {
+                    if let Some((seq, ptr)) = reader.find_with_seq(&target_key, read_seq, false)? {
                         consider(&mut best, seq, ptr);
                     }
                 }
@@ -4354,7 +4523,7 @@ impl OmniKV {
             for (mmap, bloom, _) in roots.l1_sstables.iter().rev() {
                 if bloom.might_contain(key_hash) {
                     let reader = SSTableReader::from_mmap(mmap.clone());
-                    if let Some((seq, ptr)) = reader.find_with_seq(&target_key, read_seq) {
+                    if let Some((seq, ptr)) = reader.find_with_seq(&target_key, read_seq, false)? {
                         consider(&mut best, seq, ptr);
                     }
                 }
@@ -4363,7 +4532,9 @@ impl OmniKV {
 
         if best.is_none_or(|(seq, _)| seq < read_seq) && roots.base_bloom.might_contain(key_hash) {
             let reader = SSTableReader::from_mmap(roots.base_mmap.clone());
-            if let Some((seq, ptr)) = reader.find_with_seq(&target_key, read_seq) {
+            if let Some((seq, ptr)) =
+                reader.find_with_seq(&target_key, read_seq, allow_legacy_base)?
+            {
                 consider(&mut best, seq, ptr);
             }
         }
@@ -4493,12 +4664,15 @@ impl OmniKV {
         }
 
         // L0 SSTables (newest first)
+        let allow_legacy_base =
+            Self::manifest_allows_legacy_zero_base(&roots.manifest, &self.manifest_path);
         let sstables = roots.sstables.clone();
         for (mmap, _, _) in sstables.iter().rev() {
             let reader = SSTableReader::from_mmap(mmap.clone());
             // Sparse-index seeks may rewind before start_key; enforce both
             // bounds before collecting any persisted candidate.
-            for rec in reader.iter_from(&start_key) {
+            let mut iter = reader.try_iter_from(&start_key, false)?;
+            while let Some(rec) = iter.try_next()? {
                 if end_bound.is_past(&rec.key) {
                     break;
                 }
@@ -4519,7 +4693,8 @@ impl OmniKV {
         let l1_sstables = roots.l1_sstables.clone();
         for (mmap, _, _) in &**l1_sstables {
             let reader = SSTableReader::from_mmap(mmap.clone());
-            for rec in reader.iter_from(&start_key) {
+            let mut iter = reader.try_iter_from(&start_key, false)?;
+            while let Some(rec) = iter.try_next()? {
                 if end_bound.is_past(&rec.key) {
                     break;
                 }
@@ -4539,7 +4714,8 @@ impl OmniKV {
         // Base file (oldest data, lowest priority)
         let base_mmap = roots.base_mmap.clone();
         let reader = SSTableReader::from_mmap(base_mmap);
-        for rec in reader.iter_from(&start_key) {
+        let mut base_iter = reader.try_iter_from(&start_key, allow_legacy_base)?;
+        while let Some(rec) = base_iter.try_next()? {
             if end_bound.is_past(&rec.key) {
                 break;
             }
@@ -4615,13 +4791,23 @@ impl OmniKV {
             }
         }
 
+        let allow_legacy_base =
+            Self::manifest_allows_legacy_zero_base(&roots.manifest, &self.manifest_path);
+
         // 3. L0 SSTables
         if best_seq < read_seq {
             for (mmap, bloom, _) in roots.sstables.iter().rev() {
                 if bloom.might_contain(key_hash) {
                     let reader = SSTableReader::from_mmap(mmap.clone());
-                    if let Some((seq, _)) = reader.find_with_seq(&target_key, read_seq) {
-                        best_seq = best_seq.max(seq);
+                    match reader.find_with_seq(&target_key, read_seq, false) {
+                        Ok(Some((seq, _))) => best_seq = best_seq.max(seq),
+                        Ok(None) => {}
+                        Err(err) => {
+                            tracing::error!(
+                                "corrupt L0 SSTable encountered during get_seq_for_key ({err}); failing closed"
+                            );
+                            return u64::MAX;
+                        }
                     }
                 }
             }
@@ -4632,8 +4818,15 @@ impl OmniKV {
             for (mmap, bloom, _) in roots.l1_sstables.iter().rev() {
                 if bloom.might_contain(key_hash) {
                     let reader = SSTableReader::from_mmap(mmap.clone());
-                    if let Some((seq, _)) = reader.find_with_seq(&target_key, read_seq) {
-                        best_seq = best_seq.max(seq);
+                    match reader.find_with_seq(&target_key, read_seq, false) {
+                        Ok(Some((seq, _))) => best_seq = best_seq.max(seq),
+                        Ok(None) => {}
+                        Err(err) => {
+                            tracing::error!(
+                                "corrupt L1 SSTable encountered during get_seq_for_key ({err}); failing closed"
+                            );
+                            return u64::MAX;
+                        }
                     }
                 }
             }
@@ -4642,8 +4835,15 @@ impl OmniKV {
         // 5. Base file
         if best_seq < read_seq && roots.base_bloom.might_contain(key_hash) {
             let reader = SSTableReader::from_mmap(roots.base_mmap.clone());
-            if let Some((seq, _)) = reader.find_with_seq(&target_key, read_seq) {
-                best_seq = best_seq.max(seq);
+            match reader.find_with_seq(&target_key, read_seq, allow_legacy_base) {
+                Ok(Some((seq, _))) => best_seq = best_seq.max(seq),
+                Ok(None) => {}
+                Err(err) => {
+                    tracing::error!(
+                        "corrupt base SSTable encountered during get_seq_for_key ({err}); failing closed"
+                    );
+                    return u64::MAX;
+                }
             }
         }
 
@@ -4828,6 +5028,7 @@ impl OmniKV {
             // before this read-only mapping is created. After publication, OmniKV
             // treats the table as immutable and replaces it only by root swap.
             let mmap = unsafe { MmapOptions::new().map(&file)? };
+            SSTableReader::validate_table_layout(&mmap, false)?;
 
             let _publish_guard = self
                 .write_mutex
@@ -4992,6 +5193,7 @@ impl OmniKV {
         // mapping. Compaction installs the mapping via an atomic root swap and
         // does not mutate the file afterward.
         let mmap = unsafe { MmapOptions::new().map(&file)? };
+        SSTableReader::validate_table_layout(&mmap, false)?;
 
         let mut manifest = self.roots.load().manifest.clone().as_ref().clone();
         manifest.sstables.clear();
@@ -5167,6 +5369,7 @@ impl OmniKV {
         // mapping. Existing readers retain Arc-owned mappings for old files,
         // while new readers see this immutable mapping after the root swap.
         let new_base_mmap = unsafe { MmapOptions::new().map(&file)? };
+        SSTableReader::validate_table_layout(&new_base_mmap, false)?;
 
         // Critical Section: Swap ALL topology in a SINGLE atomic update from
         // the same `cur_roots` snapshot held across `write_mutex`.
@@ -5461,6 +5664,7 @@ impl OmniKV {
         // fsyncs it, maps it read-only, and then publishes it atomically. Old
         // mmap handles remain Arc-owned until all readers release them.
         let new_base_mmap = unsafe { MmapOptions::new().map(&new_base_file)? };
+        SSTableReader::validate_table_layout(&new_base_mmap, false)?;
 
         let new_heap_reader = OpenOptions::new().read(true).open(&new_heap_path)?;
         let old_manifest = cur_roots.manifest.as_ref().clone();
@@ -7215,7 +7419,7 @@ mod tests {
             .expect("valid 24-byte empty OMNIV2** table must pass strict scan")
             .collect::<Result<Vec<_>, _>>()
             .expect("iterate empty v2 sst");
-        assert!(recs.is_empty());
+        assert_eq!(recs, Vec::<OmniRecord>::new());
     }
 
     #[test]
@@ -7268,6 +7472,136 @@ mod tests {
         assert!(
             !Path::new(&l0_bloom).exists(),
             "failed bloom rebuild must not write a poisoned bloom sidecar to disk"
+        );
+    }
+
+    #[test]
+    fn malformed_v2_sstable_fails_closed_on_reads_and_compaction_without_stale_fallthrough() {
+        let dir = TempDir::new().expect("malformed v2 dir");
+        let manifest = dir.path().join("manifest.json");
+        let wal = dir.path().join("wal.bin");
+        let m_str = manifest.to_str().expect("UTF-8 manifest").to_string();
+        let w_str = wal.to_str().expect("UTF-8 wal").to_string();
+        let db = OmniKV::open(&m_str, &w_str).expect("open db");
+
+        // Commit older live values and compact them into the L2 base table.
+        let mut base_batch = WriteBatch::new();
+        base_batch
+            .set("k_del", "stale_deleted_base".into())
+            .expect("stage k_del base");
+        base_batch
+            .set("k_hot", "stale_old_base".into())
+            .expect("stage k_hot base");
+        db.commit_batch(&base_batch).expect("commit base batch");
+        db.compact_sstables().expect("flush base L0");
+        db.compact_l0_to_l1().expect("compact base L1");
+        db.compact_l1_to_l2().expect("compact base L2");
+        let base_seq = db.get_seq_for_key("k_hot", db.get_seq());
+        assert!(base_seq > 0);
+
+        // Commit a newer overwrite for `k_hot` and a newer tombstone for `k_del`
+        // into an L0 table above the base table.
+        let mut l0_batch = WriteBatch::new();
+        l0_batch.delete("k_del").expect("stage k_del delete");
+        l0_batch
+            .set("k_hot", "fresh_l0_val".into())
+            .expect("stage k_hot update");
+        db.commit_batch(&l0_batch).expect("commit l0 batch");
+        db.compact_sstables().expect("flush L0");
+
+        let cur_roots = db.roots.load();
+        let orig_l0_path = cur_roots.sstables[0].2.clone();
+        let orig_l0_bloom = cur_roots.sstables[0].1.clone();
+        let orig_l0_bytes = std::fs::read(&orig_l0_path).expect("read original L0");
+        let (_, rec0_len) = OmniRecord::decode(&orig_l0_bytes).expect("decode first L0 rec");
+
+        // Build two distinct post-load corrupted copies of the L0 table:
+        // 1. Malformed v2 footer (`index_offset = 0` on non-empty table)
+        // 2. Intact v2 footer/index with a corrupted record in the data block
+        let mut bad_footer_bytes = orig_l0_bytes.clone();
+        let blen = bad_footer_bytes.len();
+        bad_footer_bytes[blen - 16..blen - 8].copy_from_slice(&0u64.to_le_bytes());
+
+        let mut bad_record_bytes = orig_l0_bytes;
+        bad_record_bytes[rec0_len..rec0_len + 12].fill(0xFF);
+
+        for (label, corrupt_bytes) in [
+            ("malformed_v2_footer", bad_footer_bytes),
+            ("corrupt_v2_record", bad_record_bytes),
+        ] {
+            let corrupt_path = dir.path().join(format!("{label}.sst"));
+            std::fs::write(&corrupt_path, &corrupt_bytes).expect("write corrupt L0");
+            let file = OpenOptions::new()
+                .read(true)
+                .open(&corrupt_path)
+                .expect("open corrupt L0");
+            // SAFETY: Test-only immutable file mapped for the duration of this loop.
+            let corrupt_mmap = Arc::new(unsafe { MmapOptions::new().map(&file) }.expect("mmap"));
+            db.update_roots(|r| StorageRoots {
+                sstables: Arc::new(vec![(
+                    corrupt_mmap.clone(),
+                    orig_l0_bloom.clone(),
+                    orig_l0_path.clone(),
+                )]),
+                ..r.clone()
+            });
+
+            let seq = db.get_seq();
+            for key in ["k_hot", "k_del"] {
+                assert!(
+                    db.find(key, seq).is_err(),
+                    "{label}: db.find({key}) must fail closed instead of falling through to stale base"
+                );
+                assert_eq!(
+                    db.get_seq_for_key(key, seq),
+                    u64::MAX,
+                    "{label}: get_seq_for_key({key}) must fail closed instead of returning stale base seq {base_seq}"
+                );
+            }
+            assert!(
+                db.scan("k_del", "k_hot", seq).is_err(),
+                "{label}: db.scan must fail closed on corrupt L0 table"
+            );
+            assert!(
+                db.scan_limit("k_del", "k_hot", seq, 10).is_err(),
+                "{label}: db.scan_limit must fail closed on corrupt L0 table"
+            );
+            assert!(
+                db.has_key_in_range_after_seq("k_del", "k_zzz", base_seq),
+                "{label}: range conflict check must fail closed on corrupt L0 table"
+            );
+            assert!(
+                db.compact_l0_to_l1().is_err(),
+                "{label}: compact_l0_to_l1 must fail closed on corrupt L0 table"
+            );
+            assert!(
+                db.run_garbage_collection().is_err(),
+                "{label}: GC must fail closed on corrupt L0 table"
+            );
+        }
+
+        // Also prove direct defense-in-depth when a generated base is replaced
+        // in-memory with 4096 zero bytes: reads, GC, and L1->L2 all fail closed.
+        let zero_base_path = dir.path().join("zero_4096_base.sst");
+        std::fs::write(&zero_base_path, vec![0u8; 4096]).expect("write 4096 zero base");
+        let zero_file = OpenOptions::new()
+            .read(true)
+            .open(&zero_base_path)
+            .expect("open zero base");
+        // SAFETY: Test-only immutable file mapped for the remainder of this test.
+        let zero_mmap = Arc::new(unsafe { MmapOptions::new().map(&zero_file) }.expect("mmap"));
+        db.update_roots(|r| StorageRoots {
+            sstables: Arc::new(Vec::new()),
+            base_mmap: zero_mmap.clone(),
+            ..r.clone()
+        });
+        assert!(
+            db.find("k_hot", db.get_seq()).is_err(),
+            "4096B zeroed generated base must fail closed on point read"
+        );
+        assert!(
+            db.run_garbage_collection().is_err(),
+            "4096B zeroed generated base must fail closed on GC"
         );
     }
 }
