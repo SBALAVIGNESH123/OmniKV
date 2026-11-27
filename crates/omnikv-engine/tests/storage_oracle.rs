@@ -71,44 +71,59 @@ fn oracle_op_strategy() -> impl Strategy<Value = OracleOp> {
     ]
 }
 
-fn expected_range(
-    model: &BTreeMap<String, Option<String>>,
-    start: &str,
-    end: &str,
-) -> Vec<(String, String)> {
+/// Maps `key -> (value_opt, exact_record_seq, may_be_reclaimed)`.
+/// For deleted keys (`None`), `may_be_reclaimed` stays `false` until an
+/// unpinned `CompactL1ToL2` or `RunHeapGc` runs, so `get_seq_for_key` is
+/// strictly required to return the exact tombstone `del_seq` while the
+/// tombstone cannot yet have been reclaimed.
+type OracleModel = BTreeMap<String, (Option<String>, u64, bool)>;
+
+fn expected_range(model: &OracleModel, start: &str, end: &str) -> Vec<(String, String)> {
     model
         .iter()
         .filter(|(k, _)| k.as_str() >= start && k.as_str() <= end)
-        .filter_map(|(k, v)| v.as_ref().map(|val| (k.clone(), val.clone())))
+        .filter_map(|(k, (v, _, _))| v.as_ref().map(|val| (k.clone(), val.clone())))
         .collect()
 }
 
-fn assert_state_matches_model(
-    db: &OmniKV,
-    model: &BTreeMap<String, Option<String>>,
-    read_seq: u64,
-    context: &str,
-) {
+fn assert_state_matches_model(db: &OmniKV, model: &OracleModel, read_seq: u64, context: &str) {
     for id in 0..KEY_COUNT {
         let k = key_name(id);
-        let expected = model.get(&k).and_then(Clone::clone);
+        let entry = model.get(&k);
+        let expected_val = entry.and_then(|(v, _, _)| v.clone());
         let actual = db
             .find(&k, read_seq)
             .unwrap_or_else(|e| panic!("find({k}, {read_seq}) failed ({context}): {e:?}"));
         assert_eq!(
-            actual, expected,
+            actual, expected_val,
             "point-read mismatch for {k} at seq {read_seq} ({context})"
         );
         let key_seq = db.get_seq_for_key(&k, read_seq);
-        assert!(
-            key_seq <= read_seq,
-            "get_seq_for_key({k}, {read_seq}) returned future seq {key_seq} ({context})"
-        );
-        if expected.is_some() {
-            assert!(
-                key_seq > 0,
-                "get_seq_for_key({k}, {read_seq}) returned 0 for live key ({context})"
-            );
+        match entry {
+            Some((Some(_), put_seq, _)) => {
+                assert_eq!(
+                    key_seq, *put_seq,
+                    "get_seq_for_key({k}, {read_seq}) did not match exact winning PUT seq ({context})"
+                );
+            }
+            Some((None, del_seq, false)) => {
+                assert_eq!(
+                    key_seq, *del_seq,
+                    "get_seq_for_key({k}, {read_seq}) must return exact un-reclaimed tombstone seq ({context})"
+                );
+            }
+            Some((None, del_seq, true)) => {
+                assert!(
+                    key_seq == 0 || key_seq == *del_seq,
+                    "get_seq_for_key({k}, {read_seq}) returned {key_seq}, expected 0 (reclaimed) or exact delete seq {del_seq} ({context})"
+                );
+            }
+            None => {
+                assert_eq!(
+                    key_seq, 0,
+                    "get_seq_for_key({k}, {read_seq}) must be 0 for never-written key ({context})"
+                );
+            }
         }
     }
 
@@ -153,8 +168,8 @@ proptest! {
     ) {
         let dir = TempDir::new().expect("temp dir");
         let mut db = open_db(dir.path());
-        let mut latest: BTreeMap<String, Option<String>> = BTreeMap::new();
-        let mut snapshots: Vec<(u64, BTreeMap<String, Option<String>>)> = Vec::new();
+        let mut latest: OracleModel = BTreeMap::new();
+        let mut snapshots: Vec<(u64, OracleModel)> = Vec::new();
 
         for (step, op) in ops.into_iter().enumerate() {
             match op {
@@ -162,34 +177,37 @@ proptest! {
                     let k = key_name(key);
                     let mut batch = WriteBatch::new();
                     batch.set(&k, String::new()).expect("stage empty set");
-                    db.commit_batch(&batch).expect("commit empty set");
-                    latest.insert(k, Some(String::new()));
+                    let commit_seq = db.commit_batch(&batch).expect("commit empty set");
+                    latest.insert(k, (Some(String::new()), commit_seq - 1, false));
                 }
                 OracleOp::SetSmall { key, tag } => {
                     let k = key_name(key);
                     let v = small_val(tag, step);
                     let mut batch = WriteBatch::new();
                     batch.set(&k, v.clone()).expect("stage set");
-                    db.commit_batch(&batch).expect("commit set");
-                    latest.insert(k, Some(v));
+                    let commit_seq = db.commit_batch(&batch).expect("commit set");
+                    latest.insert(k, (Some(v), commit_seq - 1, false));
                 }
                 OracleOp::SetCompressed { key, tag, repeat } => {
                     let k = key_name(key);
                     let v = compressed_val(tag, repeat, step);
                     let mut batch = WriteBatch::new();
                     batch.set(&k, v.clone()).expect("stage large set");
-                    db.commit_batch(&batch).expect("commit large set");
-                    latest.insert(k, Some(v));
+                    let commit_seq = db.commit_batch(&batch).expect("commit large set");
+                    latest.insert(k, (Some(v), commit_seq - 1, false));
                 }
                 OracleOp::Delete { key } => {
                     let k = key_name(key);
                     let mut batch = WriteBatch::new();
                     batch.delete(&k).expect("stage delete");
-                    db.commit_batch(&batch).expect("commit delete");
-                    latest.insert(k, None);
+                    let commit_seq = db.commit_batch(&batch).expect("commit delete");
+                    latest.insert(k, (None, commit_seq - 1, false));
                 }
                 OracleOp::MultiBatch(items) => {
-                    apply_multi_batch(&db, &mut latest, &items, step);
+                    let mut scratch = BTreeMap::new();
+                    for (k, v_opt, op_seq) in apply_multi_batch(&db, &mut scratch, &items, step) {
+                        latest.insert(k, (v_opt, op_seq, false));
+                    }
                 }
                 OracleOp::FlushL0 => {
                     db.compact_sstables().expect("flush L0");
@@ -199,9 +217,23 @@ proptest! {
                 }
                 OracleOp::CompactL1ToL2 => {
                     db.compact_l1_to_l2().expect("compact L1->L2");
+                    if snapshots.is_empty() {
+                        for (val, _, reclaimed) in latest.values_mut() {
+                            if val.is_none() {
+                                *reclaimed = true;
+                            }
+                        }
+                    }
                 }
                 OracleOp::RunHeapGc => {
                     db.run_garbage_collection().expect("run heap GC");
+                    if snapshots.is_empty() {
+                        for (val, _, reclaimed) in latest.values_mut() {
+                            if val.is_none() {
+                                *reclaimed = true;
+                            }
+                        }
+                    }
                 }
                 OracleOp::PinSnapshot => {
                     let snap = db.snapshot();
@@ -1459,12 +1491,14 @@ fn wal_batch_with_missing_or_zeroed_heap_payload_is_rejected_atomically_on_reope
         let heap_path = db.load_roots().manifest.heap_path.clone();
         let heap_len_before = fs::metadata(&heap_path).expect("heap metadata").len();
 
+        let k_keep_new = "unpersisted_new_value";
+        let k_new_val = "unpersisted_new_key";
         let mut unpersisted = WriteBatch::new();
         unpersisted
-            .set("k_keep", "unpersisted_new_value".into())
+            .set("k_keep", k_keep_new.into())
             .expect("stage unpersisted overwrite");
         unpersisted
-            .set("k_new", "unpersisted_new_key".into())
+            .set("k_new", k_new_val.into())
             .expect("stage unpersisted insert");
         unpersisted
             .delete("k_del_target")
@@ -1472,19 +1506,29 @@ fn wal_batch_with_missing_or_zeroed_heap_payload_is_rejected_atomically_on_reope
         db.commit_batch(&unpersisted)
             .expect("write WAL+heap batch before crash simulation");
         let heap_len_after = fs::metadata(&heap_path).expect("heap metadata after").len();
-        assert!(heap_len_after > heap_len_before);
+        // Both values are < 64 bytes (uncompressed) and written contiguously:
+        // keep the first PUT (`k_keep`) 100% intact and damage ONLY the second
+        // PUT (`k_new`) so a buggy replay loop that applies records before
+        // validating the whole batch would overwrite `k_keep` and fail below.
+        let expected_added =
+            u64::try_from(k_keep_new.len() + k_new_val.len()).expect("len fits in u64");
+        assert_eq!(heap_len_after, heap_len_before + expected_added);
         drop(db);
 
-        // Drop the heap payloads of `unpersisted` while leaving the complete
-        // checksummed WAL batch (and `__COMMIT_MARKER__`) intact on disk.
         let mut heap_bytes = fs::read(&heap_path).expect("read heap bytes");
-        let before_usize = usize::try_from(heap_len_before).expect("heap len fits in usize");
+        let k_new_offset =
+            usize::try_from(heap_len_before).expect("heap len fits in usize") + k_keep_new.len();
+        assert_eq!(
+            &heap_bytes[k_new_offset..],
+            k_new_val.as_bytes(),
+            "mutation target must isolate only k_new's payload while keeping k_keep intact"
+        );
         if zero_fill_instead_of_truncate {
-            heap_bytes[before_usize..].fill(0);
+            heap_bytes[k_new_offset..].fill(0);
         } else {
-            heap_bytes.truncate(before_usize);
+            heap_bytes.truncate(k_new_offset);
         }
-        fs::write(&heap_path, &heap_bytes).expect("simulate dropped heap write");
+        fs::write(&heap_path, &heap_bytes).expect("simulate dropped k_new heap write");
 
         let reopened = open_db(dir.path());
         let seq = reopened.get_seq();
@@ -1722,15 +1766,26 @@ fn compaction_and_gc_fail_closed_on_corrupt_sstable() {
         fs::write(&victim, &bytes).expect("corrupt victim sstable");
 
         let reopened = open_db(trial.path());
-        let res = match target {
+        let primary_res = match target {
             "l0" => reopened.compact_l0_to_l1(),
             "l1" => reopened.compact_l1_to_l2(),
             "base" => reopened.run_garbage_collection(),
             _ => unreachable!(),
         };
         assert!(
-            res.is_err(),
-            "{target} (zero_fill={zero_fill}) compaction/GC must fail closed on corrupt SSTable"
+            primary_res.is_err(),
+            "{target} (zero_fill={zero_fill}) primary compaction/GC must fail closed on corrupt SSTable"
+        );
+        // Also exercise the secondary strict-scan consumer of each tier (GC on
+        // corrupt L0/L1 and L1->L2 on corrupt base) so neither path can drift.
+        let secondary_res = match target {
+            "l0" | "l1" => reopened.run_garbage_collection(),
+            "base" => reopened.compact_l1_to_l2(),
+            _ => unreachable!(),
+        };
+        assert!(
+            secondary_res.is_err(),
+            "{target} (zero_fill={zero_fill}) secondary compaction/GC must fail closed on corrupt SSTable"
         );
         let manifest_after = Manifest::load(&manifest_str).expect("reload trial manifest");
         assert_eq!(
@@ -1746,4 +1801,549 @@ fn compaction_and_gc_fail_closed_on_corrupt_sstable() {
             "{target} (zero_fill={zero_fill}): corrupt compaction must not drop L0 manifest pointers"
         );
     }
+}
+
+#[test]
+fn sstable_strict_validation_rejects_zero_and_shifted_footer_offsets() {
+    let dir = TempDir::new().expect("footer corrupt dir");
+    let db = open_db(dir.path());
+
+    // Two distinct keys in a single L0 table so shifting `index_offset` from
+    // `rec0.len() + rec1.len()` down to `rec0.len()` lands on a valid record
+    // boundary and would silently drop `rec1` without full index validation.
+    let mut batch = WriteBatch::new();
+    batch.set("k_first", "val_1".into()).expect("stage first");
+    batch
+        .set("k_second_longer_key", "val_2".into())
+        .expect("stage second");
+    db.commit_batch(&batch).expect("commit two keys");
+    db.compact_sstables().expect("flush L0");
+    drop(db);
+
+    let src_manifest = Manifest::load(dir.path().join("manifest.json").to_string_lossy().as_ref())
+        .expect("load src manifest");
+    let src_l0_bytes = fs::read(&src_manifest.sstables[0]).expect("read L0 bytes");
+    let (rec0, rec0_len) =
+        OmniRecord::decode(&src_l0_bytes).expect("decode first record in L0 table");
+    assert_eq!(rec0.key, b"k_first");
+    let shifted_offset = u64::try_from(rec0_len).expect("rec0 len fits in u64");
+
+    for (label, forged_index_offset) in [("zero_offset", 0u64), ("shifted_to_rec1", shifted_offset)]
+    {
+        let trial = TempDir::new().expect("footer trial dir");
+        copy_isolated_db_dir(dir.path(), trial.path());
+        let manifest_str = trial
+            .path()
+            .join("manifest.json")
+            .to_string_lossy()
+            .to_string();
+        let manifest_before = Manifest::load(&manifest_str).expect("load trial manifest");
+        let l0_path = &manifest_before.sstables[0];
+        let mut bytes = fs::read(l0_path).expect("read trial L0");
+        let len = bytes.len();
+        bytes[len - 16..len - 8].copy_from_slice(&forged_index_offset.to_le_bytes());
+        fs::write(l0_path, &bytes).expect("write forged footer L0");
+
+        let reopened = open_db(trial.path());
+        assert!(
+            reopened.compact_l0_to_l1().is_err(),
+            "{label}: L0->L1 compaction must fail closed instead of dropping records"
+        );
+        let manifest_after = Manifest::load(&manifest_str).expect("reload trial manifest");
+        assert_eq!(
+            manifest_after.sstables, manifest_before.sstables,
+            "{label}: failed compaction must preserve original L0 manifest entry"
+        );
+        assert!(
+            manifest_after.l1_sstables.is_empty(),
+            "{label}: failed compaction must not publish truncated L1 table"
+        );
+    }
+}
+
+#[test]
+fn l1_to_l2_compaction_aborts_on_misaligned_l0_sparse_index_offset() {
+    let dir = TempDir::new().expect("misaligned l0 dir");
+    let db = open_db(dir.path());
+
+    // Reserve an older seq for `k_target` (which will sit in Block 1 of a
+    // multi-block L0 table), then commit a newer DELETE of `k_target` into L1.
+    let older_seq = db.get_seq();
+    let mut del = WriteBatch::new();
+    del.set("k_anchor", "anchor".into()).expect("stage anchor");
+    del.delete("k_target").expect("stage delete");
+    db.commit_batch(&del).expect("commit newer delete");
+    db.compact_sstables().expect("flush delete L0");
+    db.compact_l0_to_l1().expect("compact delete L1");
+
+    // Populate enough keys before `k_target` to push `k_target` into Block 1
+    // of a fresh L0 table, placing the older PUT of `k_target` in L0.
+    for i in 0..100 {
+        let mut b = WriteBatch::new();
+        b.set(&format!("a_pad_{i:04}"), "pad".into())
+            .expect("stage pad");
+        db.commit_batch(&b).expect("commit pad");
+    }
+    let payload = b"stale_older_put";
+    let off = db.append_to_heap(payload).expect("append stale payload");
+    db.insert_replica_record(
+        b"k_target".to_vec(),
+        older_seq,
+        off,
+        UNCOMPRESSED_FLAG | u64::try_from(payload.len()).expect("len fits in u64"),
+        crc32fast::hash(payload),
+        0,
+    );
+    db.compact_sstables().expect("flush multi-block L0");
+    drop(db);
+
+    // Corrupt Block 1's sparse-index offset by +1 byte so a best-effort seek
+    // would fail to decode Block 1 and return `None` for `k_target`.
+    let manifest_str = dir
+        .path()
+        .join("manifest.json")
+        .to_string_lossy()
+        .to_string();
+    let manifest_before = Manifest::load(&manifest_str).expect("load manifest");
+    let l0_path = &manifest_before.sstables[0];
+    let mut bytes = fs::read(l0_path).expect("read L0");
+    let index = parse_sstable_index(&bytes);
+    assert!(index.len() >= 2, "L0 table must span at least 2 blocks");
+    let index_offset = usize::try_from(u64::from_le_bytes(
+        bytes[bytes.len() - 16..bytes.len() - 8]
+            .try_into()
+            .expect("footer index offset"),
+    ))
+    .expect("index offset fits in usize");
+    // Entry 0 occupies `8 + 2 + entry0_key_len + 8`; Entry 1's offset field
+    // sits immediately after `2 + entry1_key_len`.
+    let entry1_off_pos = index_offset + 8 + 2 + index[0].0.len() + 8 + 2 + index[1].0.len();
+    let bad_block1_off = u64::try_from(index[1].1 + 1).expect("offset fits in u64");
+    bytes[entry1_off_pos..entry1_off_pos + 8].copy_from_slice(&bad_block1_off.to_le_bytes());
+    fs::write(l0_path, &bytes).expect("write misaligned L0");
+
+    let reopened = open_db(dir.path());
+    assert!(
+        reopened.compact_l1_to_l2().is_err(),
+        "L1->L2 must fail closed when an L0 sparse-index offset is misaligned instead of dropping tombstones"
+    );
+    let manifest_after = Manifest::load(&manifest_str).expect("reload manifest");
+    assert_eq!(manifest_after.l1_sstables, manifest_before.l1_sstables);
+    assert_eq!(manifest_after.base_path, manifest_before.base_path);
+}
+
+#[test]
+fn zero_filled_4096_byte_generated_base_fails_closed_while_legacy_empty_base_migrates() {
+    // 1. A generated base SSTable with one 2010-byte key has exact length
+    //    `42 + 2010 (record) + 8 + 2 + 2010 + 8 (index) + 16 (footer) = 4096`.
+    //    Zero-filling it in place without changing its length MUST fail closed
+    //    in both GC and L1->L2 compaction.
+    let dir = TempDir::new().expect("gen 4096 base dir");
+    let db = open_db(dir.path());
+    let key_2010 = "b".repeat(2010);
+    let mut b1 = WriteBatch::new();
+    b1.set(&key_2010, "base_live_val".into())
+        .expect("stage 2010B key");
+    db.commit_batch(&b1).expect("commit 2010B key");
+    db.compact_sstables().expect("flush L0");
+    db.compact_l0_to_l1().expect("compact L0->L1");
+    db.compact_l1_to_l2().expect("compact L1->L2");
+
+    let generated_base = db.load_roots().manifest.base_path.clone();
+    assert_eq!(
+        fs::metadata(&generated_base).expect("base meta").len(),
+        4096,
+        "generated 1-record base with 2010-byte key must be exactly 4096 bytes"
+    );
+    // Stage an L1 table so `compact_l1_to_l2()` performs real work too.
+    let mut b2 = WriteBatch::new();
+    b2.set("k_l1", "l1_val".into()).expect("stage l1 key");
+    db.commit_batch(&b2).expect("commit l1 key");
+    db.compact_sstables().expect("flush second L0");
+    db.compact_l0_to_l1().expect("compact second L1");
+    drop(db);
+
+    for op in ["gc", "l1_to_l2"] {
+        let trial = TempDir::new().expect("zero 4096 trial dir");
+        copy_isolated_db_dir(dir.path(), trial.path());
+        let manifest_str = trial
+            .path()
+            .join("manifest.json")
+            .to_string_lossy()
+            .to_string();
+        let manifest_before = Manifest::load(&manifest_str).expect("load trial manifest");
+        assert_eq!(
+            fs::metadata(&manifest_before.base_path)
+                .expect("trial base meta")
+                .len(),
+            4096
+        );
+        fs::write(&manifest_before.base_path, vec![0u8; 4096])
+            .expect("zero-fill 4096B generated base without changing length");
+
+        let reopened = open_db(trial.path());
+        let res = match op {
+            "gc" => reopened.run_garbage_collection(),
+            "l1_to_l2" => reopened.compact_l1_to_l2(),
+            _ => unreachable!(),
+        };
+        assert!(
+            res.is_err(),
+            "{op}: length-preserving zero-fill of a 4096-byte generated base must fail closed"
+        );
+        let manifest_after = Manifest::load(&manifest_str).expect("reload trial manifest");
+        assert_eq!(manifest_after.base_path, manifest_before.base_path);
+        assert_eq!(manifest_after.heap_path, manifest_before.heap_path);
+    }
+
+    // 2. A genuine untouched pre-v2 legacy placeholder (`{manifest_path}_base.bin`
+    //    of 4096 zero bytes, `wal_checkpoint_seq == 0`, `read_seq_floor == 0`)
+    //    must still open and migrate cleanly through L1->L2 and GC.
+    let legacy_dir = TempDir::new().expect("legacy base dir");
+    let db = open_db(legacy_dir.path());
+    let mut lb = WriteBatch::new();
+    lb.set("k_legacy", "migrated_ok".into())
+        .expect("stage legacy key");
+    db.commit_batch(&lb).expect("commit legacy key");
+    db.compact_sstables().expect("flush legacy L0");
+    db.compact_l0_to_l1().expect("compact legacy L1");
+    let legacy_base = db.load_roots().manifest.base_path.clone();
+    drop(db);
+
+    fs::write(&legacy_base, vec![0u8; 4096]).expect("write legacy 4096B zero placeholder");
+
+    // 2a. Direct GC migration of the untouched 4096B legacy placeholder (no
+    //     preceding `compact_l1_to_l2`), plus 2b. L1->L2 followed by GC.
+    let legacy_gc_dir = TempDir::new().expect("legacy direct gc dir");
+    copy_isolated_db_dir(legacy_dir.path(), legacy_gc_dir.path());
+    let direct_gc = open_db(legacy_gc_dir.path());
+    direct_gc
+        .run_garbage_collection()
+        .expect("legacy placeholder must migrate cleanly via direct GC");
+    assert_eq!(
+        direct_gc
+            .find("k_legacy", direct_gc.get_seq())
+            .expect("find direct-gc migrated key"),
+        Some("migrated_ok".into())
+    );
+
+    let migrated = open_db(legacy_dir.path());
+    migrated
+        .compact_l1_to_l2()
+        .expect("legacy placeholder must migrate cleanly via L1->L2");
+    migrated
+        .run_garbage_collection()
+        .expect("migrated legacy DB must pass GC");
+    assert_eq!(
+        migrated
+            .find("k_legacy", migrated.get_seq())
+            .expect("find migrated key"),
+        Some("migrated_ok".into())
+    );
+}
+
+#[test]
+fn oversized_key_above_u16_max_rejected_at_staging_and_commit_boundary_while_u16_max_succeeds() {
+    use omni_engine::wal::WriteAheadLog;
+
+    let dir = TempDir::new().expect("key len dir");
+    let db = open_db(dir.path());
+
+    // Exact maximum representable key (`u16::MAX == 65_535` bytes) must work
+    // end-to-end across commit, compaction, and cold reopen.
+    let max_key = "m".repeat(usize::from(u16::MAX));
+    let mut ok_batch = WriteBatch::new();
+    ok_batch
+        .set(&max_key, "max_key_ok".into())
+        .expect("stage u16::MAX key");
+    db.commit_batch(&ok_batch).expect("commit u16::MAX key");
+
+    // 65,536-byte key (`u16::MAX + 1`) must fail at every staging and commit entry point.
+    let too_long_str = "x".repeat(usize::from(u16::MAX) + 1);
+    let too_long_bytes = too_long_str.as_bytes().to_vec();
+    let mut staging = WriteBatch::new();
+    assert!(staging.set(&too_long_str, "v".into()).is_err());
+    assert!(staging.set_with_ttl(&too_long_str, "v".into(), 60).is_err());
+    assert!(
+        staging
+            .set_with_expiry(&too_long_str, "v".into(), 999)
+            .is_err()
+    );
+    assert!(staging.delete(&too_long_str).is_err());
+
+    let direct_write = WriteBatch {
+        buffered_writes: vec![(too_long_bytes.clone(), "v".into(), 0)],
+        buffered_deletes: Vec::new(),
+    };
+    let direct_delete = WriteBatch {
+        buffered_writes: Vec::new(),
+        buffered_deletes: vec![too_long_bytes.clone()],
+    };
+    assert!(
+        db.commit_batch(&direct_write).is_err(),
+        "commit_batch must reject direct WriteBatch with key > u16::MAX"
+    );
+    assert!(
+        db.commit_batch(&direct_delete).is_err(),
+        "commit_batch must reject direct delete WriteBatch with key > u16::MAX"
+    );
+
+    // Direct WAL and SSTableWriter APIs must also reject > u16::MAX keys.
+    let direct_wal_path = dir.path().join("direct_keylen.wal");
+    let mut wal =
+        WriteAheadLog::new(direct_wal_path.to_string_lossy().as_ref()).expect("open direct wal");
+    let bad_wal_batch = vec![
+        (OmniRecord::new(1, too_long_bytes.clone(), 0, 0, 0, 0), None),
+        (
+            OmniRecord::new(2, b"__COMMIT_MARKER__".to_vec(), 1, 0, 0, 0),
+            None,
+        ),
+    ];
+    assert!(wal.append_batch(&bad_wal_batch).is_err());
+
+    let sst_file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .read(true)
+        .write(true)
+        .open(dir.path().join("direct_keylen.sst"))
+        .expect("create direct sst");
+    let mut sst_writer = SSTableWriter::new(&sst_file);
+    assert!(
+        sst_writer
+            .append(&OmniRecord::new(1, too_long_bytes, 0, 0, 0, 0))
+            .is_err()
+    );
+
+    // A subsequent valid batch must commit and survive cold reopen with `max_key` intact.
+    let mut follow_up = WriteBatch::new();
+    follow_up
+        .set("k_after", "intact".into())
+        .expect("stage follow-up");
+    db.commit_batch(&follow_up).expect("commit follow-up");
+    drop(db);
+
+    let reopened = open_db(dir.path());
+    let seq = reopened.get_seq();
+    assert_eq!(
+        reopened.find(&max_key, seq).expect("find u16::MAX key"),
+        Some("max_key_ok".into())
+    );
+    assert_eq!(
+        reopened.find("k_after", seq).expect("find follow-up key"),
+        Some("intact".into())
+    );
+    reopened.compact_sstables().expect("flush u16::MAX L0");
+    reopened.compact_l0_to_l1().expect("compact u16::MAX L1");
+    reopened.compact_l1_to_l2().expect("compact u16::MAX L2");
+    assert_eq!(
+        reopened
+            .find(&max_key, reopened.get_seq())
+            .expect("find u16::MAX key after L2"),
+        Some("max_key_ok".into())
+    );
+    drop(reopened);
+
+    // Cold reopen after L2 compaction exercises on-disk base/bloom load for u16::MAX key.
+    let reopened2 = open_db(dir.path());
+    assert_eq!(
+        reopened2
+            .find(&max_key, reopened2.get_seq())
+            .expect("find u16::MAX key after cold L2 reopen"),
+        Some("max_key_ok".into())
+    );
+}
+
+#[test]
+fn heap_gc_rejects_oversized_heap_length_before_allocating() {
+    let dir = TempDir::new().expect("gc len cap dir");
+    let db = open_db(dir.path());
+
+    // Flagged empty value + pinned tombstone + normal value must all pass GC cleanly.
+    let mut valid = WriteBatch::new();
+    valid.set("k_live", "ok".into()).expect("stage live");
+    valid.set("k_empty", String::new()).expect("stage empty");
+    valid.set("k_tomb", "gone".into()).expect("stage tomb");
+    db.commit_batch(&valid).expect("commit valid");
+    let snap_before_del = db.snapshot();
+    let mut del = WriteBatch::new();
+    del.delete("k_tomb").expect("stage delete");
+    db.commit_batch(&del).expect("commit delete");
+
+    db.run_garbage_collection()
+        .expect("GC with empty value and pinned tombstone must succeed");
+    let seq = db.get_seq();
+    assert_eq!(db.find("k_live", seq).expect("live"), Some("ok".into()));
+    assert_eq!(db.find("k_empty", seq).expect("empty"), Some(String::new()));
+    assert_eq!(db.find("k_tomb", seq).expect("tomb latest"), None);
+    assert_eq!(
+        db.find("k_tomb", snap_before_del).expect("tomb historical"),
+        Some("gone".into())
+    );
+    db.unregister_snapshot(snap_before_del);
+    db.run_garbage_collection()
+        .expect("GC after releasing snapshot must reclaim tombstone cleanly");
+    assert_eq!(
+        db.find("k_tomb", db.get_seq()).expect("tomb after reclaim"),
+        None
+    );
+
+    // Inject a live record with a valid record checksum (flushed into L0 so
+    // `try_iter_all` yields it) whose encoded heap length exceeds
+    // `MAX_ENCODED_VALUE_SIZE` (20 MiB + 1, both uncompressed and compressed).
+    let huge_len = MAX_VALUE_SIZE * 2 + 1;
+    for (idx, flagged_len) in [UNCOMPRESSED_FLAG | huge_len, huge_len]
+        .into_iter()
+        .enumerate()
+    {
+        let trial = TempDir::new().expect("gc oversized trial");
+        let trial_db = open_db(trial.path());
+        let bad_seq = trial_db.get_seq() + 1;
+        trial_db.insert_replica_record(
+            format!("huge_gc_{idx}").into_bytes(),
+            bad_seq,
+            0,
+            flagged_len,
+            0,
+            0,
+        );
+        trial_db
+            .compact_sstables()
+            .expect("flush forged record to L0");
+        let err = trial_db
+            .run_garbage_collection()
+            .expect_err("GC must reject oversized heap length before allocating");
+        assert!(
+            matches!(err, OmniError::IoError(ref msg) if msg.contains("exceeds maximum")),
+            "expected oversized GC length error, got {err:?}"
+        );
+    }
+}
+
+#[test]
+fn heap_gc_rejects_bad_empty_crc_short_lz4_huge_lz4_and_offset_overflow() {
+    // 1. Bad CRC on flagged empty value (`UNCOMPRESSED_FLAG | 0`).
+    let dir1 = TempDir::new().expect("gc bad empty crc");
+    let db1 = open_db(dir1.path());
+    let seq1 = db1.get_seq() + 1;
+    db1.insert_replica_record(b"bad_empty".to_vec(), seq1, 0, UNCOMPRESSED_FLAG, 0xBAD, 0);
+    db1.compact_sstables().expect("flush bad empty");
+    let err1 = db1
+        .run_garbage_collection()
+        .expect_err("GC must reject corrupt empty-value CRC");
+    assert!(matches!(err1, OmniError::IoError(ref msg) if msg.contains("CRC32")));
+
+    // 2. Compressed payload shorter than 4-byte LZ4 size prefix.
+    let dir2 = TempDir::new().expect("gc short lz4");
+    let db2 = open_db(dir2.path());
+    let short_bytes = [1u8, 2, 3];
+    let off2 = db2.append_to_heap(&short_bytes).expect("append short");
+    let seq2 = db2.get_seq() + 1;
+    db2.insert_replica_record(
+        b"short_lz4".to_vec(),
+        seq2,
+        off2,
+        u64::try_from(short_bytes.len()).expect("len"),
+        crc32fast::hash(&short_bytes),
+        0,
+    );
+    db2.compact_sstables().expect("flush short lz4");
+    let err2 = db2
+        .run_garbage_collection()
+        .expect_err("GC must reject < 4-byte compressed payload");
+    assert!(matches!(err2, OmniError::IoError(ref msg) if msg.contains("LZ4 size prefix")));
+
+    // 3. Valid-CRC compressed payload declaring > MAX_VALUE_SIZE (1 GiB).
+    let dir3 = TempDir::new().expect("gc huge lz4");
+    let db3 = open_db(dir3.path());
+    let mut forged = Vec::new();
+    forged.extend_from_slice(&(1024u32 * 1024 * 1024).to_le_bytes());
+    forged.extend_from_slice(&[0x00, 0x01, 0x02, 0x03]);
+    let off3 = db3.append_to_heap(&forged).expect("append forged lz4");
+    let seq3 = db3.get_seq() + 1;
+    db3.insert_replica_record(
+        b"huge_lz4".to_vec(),
+        seq3,
+        off3,
+        u64::try_from(forged.len()).expect("len"),
+        crc32fast::hash(&forged),
+        0,
+    );
+    db3.compact_sstables().expect("flush huge lz4");
+    let err3 = db3
+        .run_garbage_collection()
+        .expect_err("GC must reject oversized declared LZ4 header");
+    assert!(matches!(err3, OmniError::IoError(ref msg) if msg.contains("exceeds maximum")));
+
+    // 4. Overflowing heap pointer (`u64::MAX - 2 + 8`) must fail before allocating.
+    let dir4 = TempDir::new().expect("gc overflow");
+    let db4 = open_db(dir4.path());
+    let seq4 = db4.get_seq() + 1;
+    let overflow_len = 8u64;
+    db4.insert_replica_record(
+        b"overflow_ptr".to_vec(),
+        seq4,
+        u64::MAX - 2,
+        UNCOMPRESSED_FLAG | overflow_len,
+        0,
+        0,
+    );
+    db4.compact_sstables().expect("flush overflow ptr");
+    let err4 = db4
+        .run_garbage_collection()
+        .expect_err("GC must reject overflowing heap offset + len");
+    assert!(matches!(err4, OmniError::IoError(ref msg) if msg.contains("exceeds heap size")));
+}
+
+#[test]
+fn block_cache_key_includes_length_and_crc_to_prevent_corrupt_alias_hit() {
+    let dir = TempDir::new().expect("cache key dir");
+    let db = open_db(dir.path());
+
+    let payload = b"legitimate_cached_payload";
+    let off = db.append_to_heap(payload).expect("append real payload");
+    let good_len = UNCOMPRESSED_FLAG | u64::try_from(payload.len()).expect("len fits in u64");
+    let good_crc = crc32fast::hash(payload);
+    let seq1 = db.get_seq() + 1;
+    db.insert_replica_record(b"real_k".to_vec(), seq1, off, good_len, good_crc, 0);
+    // Warm `block_cache` for `(heap_generation, off, good_len, good_crc)`.
+    assert_eq!(
+        db.find("real_k", seq1).expect("read real key"),
+        Some("legitimate_cached_payload".into())
+    );
+
+    // Alias pointing at the EXACT same `off` with a corrupted CRC must miss
+    // cache and fail CRC validation instead of returning the cached neighbor.
+    let seq2 = db.get_seq() + 1;
+    db.insert_replica_record(
+        b"bad_crc_alias".to_vec(),
+        seq2,
+        off,
+        good_len,
+        good_crc ^ 1,
+        0,
+    );
+    let err_crc = db
+        .find("bad_crc_alias", seq2)
+        .expect_err("bad CRC at cached offset must not hit block_cache");
+    assert!(matches!(err_crc, OmniError::IoError(ref msg) if msg.contains("CRC32")));
+
+    // Alias pointing at the EXACT same `off` with a shorter length must also miss cache.
+    let short_raw_len = 4u64;
+    let short_len = UNCOMPRESSED_FLAG | short_raw_len;
+    let short_crc = crc32fast::hash(&payload[..4]);
+    let seq3 = db.get_seq() + 1;
+    db.insert_replica_record(
+        b"short_len_alias".to_vec(),
+        seq3,
+        off,
+        short_len,
+        short_crc,
+        0,
+    );
+    assert_eq!(
+        db.find("short_len_alias", seq3).expect("read short alias"),
+        Some("legi".into()),
+        "shorter length at cached offset must not return full neighbor value from block_cache"
+    );
 }

@@ -20,7 +20,7 @@ use std::path::Path;
 //
 // Each record is self-describing via OmniRecord::encode / decode.
 
-const MAX_WAL_BATCH_RECORDS: usize = 100_000;
+pub(crate) const MAX_WAL_BATCH_RECORDS: usize = 100_000;
 const HEAP_CRC_SCRATCH_BYTES: usize = 64 * 1024;
 const MIN_ENCODED_RECORD_BYTES: usize = 42;
 
@@ -666,6 +666,9 @@ impl WriteAheadLog {
                 "WAL batch must terminate with __COMMIT_MARKER__".into(),
             ));
         }
+        for (rec, _) in records {
+            crate::storage::core::validate_key_len(&rec.key)?;
+        }
         let (batch_buf, batch_crc) = Self::encode_batch(records);
         if let Err(err) = self.write_batch_payload(&batch_buf, batch_crc) {
             let complete_end = self.durable_offset + self.pending;
@@ -1054,6 +1057,87 @@ mod tests {
             std::fs::metadata(&wal_path).expect("wal meta").len(),
             original_len,
             "checkpointed batch must not cause WAL truncation"
+        );
+
+        // A batch straddling `wal_checkpoint_seq` (one record `<= cp` and one
+        // record `> cp`) must be rejected and truncated along with any later
+        // batch rather than partially replayed.
+        let straddle_wal = dir.path().join("straddle.wal");
+        let straddle_str = straddle_wal.to_string_lossy().to_string();
+        let mut sw = WriteAheadLog::new(&straddle_str).expect("open straddle wal");
+        sw.append_batch(&batch1).expect("append batch1");
+        drop(sw);
+        let len_after_b1 = std::fs::metadata(&straddle_wal).expect("b1 meta").len();
+
+        let straddling_batch = vec![
+            (
+                OmniRecord::new(
+                    2,
+                    b"straddle_old".to_vec(),
+                    0,
+                    crate::storage::core::UNCOMPRESSED_FLAG | payload2.len() as u64,
+                    crc32fast::hash(payload2),
+                    0,
+                ),
+                None,
+            ),
+            (
+                OmniRecord::new(
+                    3,
+                    b"straddle_new".to_vec(),
+                    0,
+                    crate::storage::core::UNCOMPRESSED_FLAG | payload2.len() as u64,
+                    crc32fast::hash(payload2),
+                    0,
+                ),
+                None,
+            ),
+            (
+                OmniRecord::new(4, b"__COMMIT_MARKER__".to_vec(), 2, 0, 0, 0),
+                None,
+            ),
+        ];
+        let batch3 = vec![
+            (
+                OmniRecord::new(
+                    5,
+                    b"after_straddle".to_vec(),
+                    0,
+                    crate::storage::core::UNCOMPRESSED_FLAG | payload2.len() as u64,
+                    crc32fast::hash(payload2),
+                    0,
+                ),
+                None,
+            ),
+            (
+                OmniRecord::new(6, b"__COMMIT_MARKER__".to_vec(), 1, 0, 0, 0),
+                None,
+            ),
+        ];
+        let mut sw = WriteAheadLog::new(&straddle_str).expect("reopen straddle wal");
+        sw.append_batch(&straddling_batch)
+            .expect("append straddling batch");
+        sw.append_batch(&batch3).expect("append batch3");
+        drop(sw);
+
+        let recovered_straddle =
+            WriteAheadLog::replay_and_heal_since(&straddle_str, &heap_str, Some(2))
+                .expect("heal straddling wal");
+        let straddle_keys: Vec<&[u8]> = recovered_straddle
+            .iter()
+            .map(|r| r.key.as_slice())
+            .collect();
+        assert_eq!(
+            straddle_keys,
+            vec![b"pre_gc_k".as_slice()],
+            "checkpoint-straddling batch and any following batch must be rejected atomically"
+        );
+        assert_eq!(
+            std::fs::metadata(&straddle_wal)
+                .expect("healed straddle meta")
+                .len(),
+            len_after_b1,
+            "healed WAL must truncate at exact end of valid prefix before straddling batch"
         );
     }
 

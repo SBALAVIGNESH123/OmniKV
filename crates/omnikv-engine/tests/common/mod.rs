@@ -86,16 +86,20 @@ pub fn read_db_state(db: &OmniKV) -> BTreeMap<String, Option<String>> {
     state
 }
 
+/// Commits a multi-key batch (deduplicating keys within the batch) and updates
+/// `model`. Returns `(key, value_opt, exact_record_seq)` for every committed
+/// operation in exact engine sequence order.
 pub fn apply_multi_batch(
     db: &OmniKV,
     model: &mut BTreeMap<String, Option<String>>,
     items: &[BatchItem],
     step: usize,
-) {
+) -> Vec<(String, Option<String>, u64)> {
     // Keep keys distinct within one batch so the model's atomic outcome is well-defined.
     let mut seen = BTreeSet::new();
     let mut batch = WriteBatch::new();
-    let mut staged = Vec::new();
+    let mut staged_writes: Vec<(String, String)> = Vec::new();
+    let mut staged_deletes: Vec<String> = Vec::new();
     for (idx, item) in items.iter().enumerate() {
         let k_id = match item {
             BatchItem::SetEmpty { key }
@@ -110,31 +114,46 @@ pub fn apply_multi_batch(
         match item {
             BatchItem::SetEmpty { .. } => {
                 batch.set(&k, String::new()).expect("stage empty set");
-                staged.push((k, Some(String::new())));
+                staged_writes.push((k, String::new()));
             }
             BatchItem::SetSmall { tag, .. } => {
                 let v = small_val(*tag, step * 10 + idx);
                 batch.set(&k, v.clone()).expect("stage small set");
-                staged.push((k, Some(v)));
+                staged_writes.push((k, v));
             }
             BatchItem::SetCompressed { tag, repeat, .. } => {
                 let v = compressed_val(*tag, *repeat, step * 10 + idx);
                 batch.set(&k, v.clone()).expect("stage compressed set");
-                staged.push((k, Some(v)));
+                staged_writes.push((k, v));
             }
             BatchItem::Delete { .. } => {
                 batch.delete(&k).expect("stage delete");
-                staged.push((k, None));
+                staged_deletes.push(k);
             }
         }
     }
     if batch.is_empty() {
-        return;
+        return Vec::new();
     }
-    db.commit_batch(&batch).expect("commit multi-op batch");
-    for (k, v) in staged {
-        model.insert(k, v);
+    // `commit_batch` assigns contiguous sequences: all `buffered_writes` first,
+    // then all `buffered_deletes`, followed by `__COMMIT_MARKER__` at `commit_seq`.
+    let commit_seq = db.commit_batch(&batch).expect("commit multi-op batch");
+    let num_ops = u64::try_from(staged_writes.len() + staged_deletes.len())
+        .expect("batch op count fits in u64");
+    let base_seq = commit_seq - num_ops;
+    let mut applied = Vec::with_capacity(staged_writes.len() + staged_deletes.len());
+    for (i, (k, v)) in staged_writes.into_iter().enumerate() {
+        let op_seq = base_seq + u64::try_from(i).expect("write idx fits in u64");
+        model.insert(k.clone(), Some(v.clone()));
+        applied.push((k, Some(v), op_seq));
     }
+    let write_count = applied.len();
+    for (j, k) in staged_deletes.into_iter().enumerate() {
+        let op_seq = base_seq + u64::try_from(write_count + j).expect("del idx fits in u64");
+        model.insert(k.clone(), None);
+        applied.push((k, None, op_seq));
+    }
+    applied
 }
 
 /// Copies a database directory into an isolated trial directory, skipping

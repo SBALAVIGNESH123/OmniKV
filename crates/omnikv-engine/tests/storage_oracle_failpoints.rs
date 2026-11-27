@@ -119,6 +119,17 @@ fn failpoint_injected_crashes_preserve_durability_and_atomicity() {
             expect_fenced,
             "unexpected write-fence state for {fp} during {phase}"
         );
+        if fp == "manifest::before_rename" && phase == "flush" {
+            // Pre-rename L0 flush failure must restore the frozen memtable back
+            // into the active memtable so records are never orphaned from
+            // subsequent flushes or backups.
+            assert!(
+                db.load_roots().frozen_memtables.is_empty(),
+                "pre-rename flush failure must not leave an orphaned frozen memtable"
+            );
+            db.compact_sstables()
+                .expect("retry flush after pre-rename failure must succeed");
+        }
 
         // Simulate crash + restart: committed state must be 100% intact.
         drop(db);
@@ -404,6 +415,14 @@ fn wal_rotate_sync_failure_after_truncation_fences_wal_and_engine() {
         let dir = TempDir::new().expect("rotate fence dir");
         let db = open_db(dir.path());
         let expected_before = seed_failpoint_state(&db);
+        let wal_path = dir.path().join("wal.bin");
+        let wal_len_before = std::fs::metadata(&wal_path)
+            .expect("wal metadata before rotate")
+            .len();
+        assert!(
+            wal_len_before > 0,
+            "{op}: WAL must be nonempty before rotation so truncation is actually exercised"
+        );
 
         registry.arm("wal::rotate_sync");
         let res = match op {
@@ -413,9 +432,19 @@ fn wal_rotate_sync_failure_after_truncation_fences_wal_and_engine() {
         };
         registry.reset();
 
+        let Err(err) = res else {
+            panic!("{op}: WAL rotation sync failure must not be silently swallowed");
+        };
         assert!(
-            res.is_err(),
-            "{op}: WAL rotation sync failure must not be silently swallowed"
+            err.to_string().contains("wal::rotate_sync"),
+            "{op}: error must identify injected wal::rotate_sync failure, got: {err}"
+        );
+        let wal_len_after = std::fs::metadata(&wal_path)
+            .expect("wal metadata after rotate failure")
+            .len();
+        assert_eq!(
+            wal_len_after, 0,
+            "{op}: WAL must already have been truncated to 0 bytes before wal::rotate_sync failed"
         );
         assert_all_mutators_fenced(&db, op);
         drop(db);

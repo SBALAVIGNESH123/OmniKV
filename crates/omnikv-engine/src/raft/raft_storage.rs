@@ -3218,5 +3218,12 @@ mod tests {
                 .contains("refusing snapshot install on fenced storage"),
             "unexpected fenced install_snapshot error: {err}"
         );
+        assert_eq!(
+            dst_db
+                .find_latest_internal("snap_k")
+                .expect("read snap_k after rejected fenced install"),
+            None,
+            "rejected fenced snapshot install must leave storage state unchanged"
+        );
     }
 }

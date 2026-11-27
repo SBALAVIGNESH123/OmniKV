@@ -14,7 +14,6 @@
     clippy::cast_precision_loss,
     clippy::cast_sign_loss,
     clippy::collapsible_else_if,
-    clippy::collection_is_never_read,
     clippy::derive_partial_eq_without_eq,
     clippy::doc_markdown,
     clippy::explicit_iter_loop,

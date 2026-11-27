@@ -516,7 +516,7 @@ fn resolve_source_path(manifest_dir: &Path, stored_path: &str) -> Result<PathBuf
 }
 
 fn bloom_path_for_sstable(path: &str) -> String {
-    path.replace(".sst", ".bloom")
+    bloom_path_for_base(path)
 }
 
 fn unix_timestamp_secs() -> u64 {
