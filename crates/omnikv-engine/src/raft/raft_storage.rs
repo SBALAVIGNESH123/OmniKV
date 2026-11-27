@@ -1311,6 +1311,9 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
             .transition_guard
             .write()
             .map_err(|_| io_err("transition_guard poisoned"))?;
+        self.db
+            .ensure_writes_not_fenced()
+            .map_err(|e| io_err(&format!("refusing snapshot install on fenced storage: {e}")))?;
 
         let data_dir = std::path::Path::new(&manifest_path)
             .parent()
@@ -3125,7 +3128,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn snapshot_install_preserves_per_key_tombstone_protection_on_installed_roots() {
+    async fn snapshot_install_honors_write_fence_and_preserves_tombstone_protection() {
         let dst_dir = tempfile::tempdir().expect("dst tempdir");
         let dst_db = OmniKV::open(
             dst_dir
@@ -3155,13 +3158,20 @@ mod tests {
         };
         let bytes = serde_json::to_vec(&envelope).expect("encode envelope");
         dst_storage
-            .install_snapshot(&snap_meta, Box::new(Cursor::new(bytes)))
+            .install_snapshot(&snap_meta, Box::new(Cursor::new(bytes.clone())))
             .await
             .expect("install snapshot");
+        assert_eq!(
+            dst_db
+                .find_latest_internal("snap_k")
+                .expect("read installed snap_k"),
+            Some("from_snap".into()),
+            "snapshot must actually install snap_k before tombstone check"
+        );
 
         // After snapshot install replaces `StorageRoots`, verify that a newer
-        // L1 tombstone is NOT dropped while an older version of the same key
-        // resides in the installed topology's L0/memtable.
+        // L1 tombstone is NOT dropped while an older version of `snap_k` sits
+        // in the installed topology's L0.
         let low_seq = dst_db.global_seq.fetch_add(2, Ordering::SeqCst);
         let mut del = WriteBatch::new();
         del.delete("snap_k").expect("stage delete");
@@ -3194,6 +3204,19 @@ mod tests {
                 .expect("find snap_k after L1->L2"),
             None,
             "installed topology L0 must protect L1->L2 tombstone against resurrection"
+        );
+
+        // Once the storage engine enters fail-stop write-fenced state,
+        // `install_snapshot` must refuse to promote a new snapshot directory.
+        dst_db.trip_write_fence("simulated write fence".into());
+        let err = dst_storage
+            .install_snapshot(&snap_meta, Box::new(Cursor::new(bytes)))
+            .await
+            .expect_err("install_snapshot must fail closed when storage is write-fenced");
+        assert!(
+            err.to_string()
+                .contains("refusing snapshot install on fenced storage"),
+            "unexpected fenced install_snapshot error: {err}"
         );
     }
 }

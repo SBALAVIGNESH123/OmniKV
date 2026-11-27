@@ -384,11 +384,11 @@ fn test_sstable_corruption_detected_on_read() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// TEST 5: WAL corruption with valid data interleaved
+// TEST 5: WAL torn/corrupt tail recovery and healing
 //
-// Simulates: valid records, then corrupt bytes, then valid records.
-// The engine must recover valid records and skip corrupted ones
-// without losing the entire WAL.
+// Simulates: valid committed batches followed by trailing garbage/torn bytes.
+// Recovery must replay the valid atomic prefix, heal the corrupt tail, and
+// keep post-recovery writes durable across subsequent restarts.
 // ═══════════════════════════════════════════════════════════════════════
 #[test]
 fn test_wal_corruption_partial_recovery() {

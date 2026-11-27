@@ -5,128 +5,20 @@
 //! hooks cannot race concurrent tests in `storage_oracle.rs` even when run
 //! without `--test-threads=1`.
 
-use omni_engine::failpoints::FailRegistry;
-use omni_engine::{CompactionPolicy, OmniKV, WriteBatch};
-use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
-use std::sync::{Arc, Mutex};
-use tempfile::TempDir;
+mod common;
 
-const KEY_COUNT: u8 = 10;
+use common::{
+    BatchItem, apply_multi_batch, compressed_val, normalize_model, open_db, read_db_state,
+};
+use omni_engine::failpoints::FailRegistry;
+use omni_engine::{OmniKV, WriteBatch};
+use std::collections::BTreeMap;
+use std::sync::Mutex;
+use tempfile::TempDir;
 
 /// Serializes failpoint tests inside this binary because `FailRegistry` is
 /// process-global.
 static FAILPOINT_TEST_LOCK: Mutex<()> = Mutex::new(());
-
-#[derive(Clone, Debug)]
-enum BatchItem {
-    SetSmall { key: u8, tag: u8 },
-    SetCompressed { key: u8, tag: u8, repeat: u8 },
-    Delete { key: u8 },
-}
-
-fn key_name(id: u8) -> String {
-    format!("k{id:02}")
-}
-
-fn small_val(tag: u8, step: usize) -> String {
-    format!("s{tag:02}_{step:03}")
-}
-
-fn compressed_val(tag: u8, repeat: u8, step: usize) -> String {
-    let chunk = format!("blk-{tag:02}-{step:03}-");
-    chunk.repeat(usize::from(repeat).max(4))
-}
-
-fn open_db(dir: &Path) -> Arc<OmniKV> {
-    let manifest = dir.join("manifest.json");
-    let wal = dir.join("wal.bin");
-    let db = OmniKV::open(
-        manifest.to_string_lossy().as_ref(),
-        wal.to_string_lossy().as_ref(),
-    )
-    .expect("open oracle db");
-    db.set_compaction_policy(CompactionPolicy {
-        l0_compaction_trigger: 4,
-        l1_compaction_trigger: 4,
-        l0_write_stall_threshold: 256,
-        write_stall_wait_attempts: 1,
-        write_stall_wait_ms: 1,
-    })
-    .expect("configure oracle compaction policy");
-    db
-}
-
-fn normalize_model(model: &BTreeMap<String, Option<String>>) -> BTreeMap<String, Option<String>> {
-    model
-        .iter()
-        .filter_map(|(k, v)| v.as_ref().map(|s| (k.clone(), Some(s.clone()))))
-        .collect()
-}
-
-fn read_db_state(db: &OmniKV) -> BTreeMap<String, Option<String>> {
-    let seq = db.get_seq();
-    let mut state = BTreeMap::new();
-    for id in 0..KEY_COUNT {
-        let k = key_name(id);
-        let val = db.find(&k, seq).expect("find recovered key");
-        if val.is_some() {
-            state.insert(k, val);
-        }
-    }
-    let scanned = db.scan("k00", "k99", seq).expect("scan recovered db");
-    let expected_scan: Vec<(String, String)> = state
-        .iter()
-        .filter_map(|(k, v)| v.as_ref().map(|s| (k.clone(), s.clone())))
-        .collect();
-    assert_eq!(
-        scanned, expected_scan,
-        "recovered find() and scan() diverged"
-    );
-    state
-}
-
-fn apply_multi_batch(
-    db: &OmniKV,
-    model: &mut BTreeMap<String, Option<String>>,
-    items: &[BatchItem],
-    step: usize,
-) {
-    let mut seen = BTreeSet::new();
-    let mut batch = WriteBatch::new();
-    let mut staged = Vec::new();
-    for (idx, item) in items.iter().enumerate() {
-        let k_id = match item {
-            BatchItem::SetSmall { key, .. }
-            | BatchItem::SetCompressed { key, .. }
-            | BatchItem::Delete { key } => *key,
-        };
-        if !seen.insert(k_id) {
-            continue;
-        }
-        let k = key_name(k_id);
-        match item {
-            BatchItem::SetSmall { tag, .. } => {
-                let v = small_val(*tag, step * 10 + idx);
-                batch.set(&k, v.clone()).expect("stage small set");
-                staged.push((k, Some(v)));
-            }
-            BatchItem::SetCompressed { tag, repeat, .. } => {
-                let v = compressed_val(*tag, *repeat, step * 10 + idx);
-                batch.set(&k, v.clone()).expect("stage compressed set");
-                staged.push((k, Some(v)));
-            }
-            BatchItem::Delete { .. } => {
-                batch.delete(&k).expect("stage delete");
-                staged.push((k, None));
-            }
-        }
-    }
-    db.commit_batch(&batch).expect("commit multi-op batch");
-    for (k, v) in staged {
-        model.insert(k, v);
-    }
-}
 
 fn seed_failpoint_state(db: &OmniKV) -> BTreeMap<String, Option<String>> {
     let mut committed = BTreeMap::new();
@@ -212,12 +104,21 @@ fn failpoint_injected_crashes_preserve_durability_and_atomicity() {
             outcome.is_err(),
             "failpoint {fp} during {phase} must return an error"
         );
-        if fp == "manifest::sync_dir_after_rename" {
-            assert!(
-                db.is_write_fenced(),
-                "post-rename sync failure during {phase} must fence further writes"
-            );
-        }
+        // Live in-memory state must remain untouched on failed commit/compaction.
+        assert_eq!(
+            read_db_state(&db),
+            expected_before,
+            "in-memory state mutated after failpoint {fp} during {phase}"
+        );
+        let expect_fenced = matches!(
+            fp,
+            "wal::sync" | "heap::sync_data" | "manifest::sync_dir_after_rename"
+        );
+        assert_eq!(
+            db.is_write_fenced(),
+            expect_fenced,
+            "unexpected write-fence state for {fp} during {phase}"
+        );
 
         // Simulate crash + restart: committed state must be 100% intact.
         drop(db);
@@ -275,6 +176,19 @@ fn assert_all_mutators_fenced(db: &OmniKV, context: &str) {
         db.run_garbage_collection().is_err(),
         "{context}: run_garbage_collection must reject when fenced"
     );
+    let seq_before = db.get_seq();
+    db.insert_replica_record(b"k09".to_vec(), seq_before + 10, 0, 1u64 << 63, 0, 0);
+    assert_eq!(
+        db.get_seq(),
+        seq_before,
+        "{context}: insert_replica_record must not advance global_seq when fenced"
+    );
+    assert_eq!(
+        db.find("k09", seq_before + 20)
+            .expect("find k09 on fenced db"),
+        None,
+        "{context}: insert_replica_record must not mutate memtable when fenced"
+    );
 }
 
 #[test]
@@ -305,16 +219,36 @@ fn wal_rollback_failure_after_fsync_trips_engine_write_fence() {
             .commit_batch(&failing)
             .expect_err("commit with failed fsync + rollback must fail");
         registry.reset();
-        let _ = err;
+        assert!(
+            err.to_string().contains(sync_fp),
+            "{sync_fp}: failing commit must report injected fsync error, got: {err}"
+        );
+
+        // Before reopening, prove that `discard_undurable()` actually reached
+        // the injected `wal::truncate_open` failure and recorded that rollback
+        // error in the engine write fence (not merely the fsync failure).
+        let mut fenced_probe = WriteBatch::new();
+        fenced_probe
+            .set("k09", "fenced_probe".into())
+            .expect("stage fenced probe");
+        let fenced_err = db
+            .commit_batch(&fenced_probe)
+            .expect_err("fenced engine must reject subsequent commit");
+        let fenced_msg = fenced_err.to_string();
+        assert!(
+            fenced_msg.contains("WAL rollback after fsync failure")
+                && fenced_msg.contains("wal::truncate_open"),
+            "{sync_fp}: fenced mutation must report injected wal::truncate_open rollback failure, got: {fenced_msg}"
+        );
 
         assert_all_mutators_fenced(&db, sync_fp);
         drop(db);
 
         // Reopen must recover atomically (either the exact pre-failure state
         // or the complete atomic failing batch since rollback truncation was
-        // blocked on the live OS page cache) and allow normal writes again.
+        // blocked on the live OS page cache) and allow durable writes again.
         let reopened = open_db(dir.path());
-        let recovered = read_db_state(&reopened);
+        let mut recovered = read_db_state(&reopened);
         let mut expected_with_batch = expected_before.clone();
         expected_with_batch.insert("k06".into(), Some("uncertain_a".into()));
         expected_with_batch.insert("k07".into(), Some("uncertain_b".into()));
@@ -328,6 +262,15 @@ fn wal_rollback_failure_after_fsync_trips_engine_write_fence() {
         reopened
             .commit_batch(&post)
             .expect("post-reopen commit succeeds");
+        recovered.insert("k08".into(), Some("recovered_ok".into()));
+        drop(reopened);
+
+        let reopened2 = open_db(dir.path());
+        assert_eq!(
+            read_db_state(&reopened2),
+            recovered,
+            "{sync_fp}: post-recovery commit must survive a second restart"
+        );
     }
 }
 
@@ -339,33 +282,41 @@ fn fsync_failure_with_successful_wal_rollback_fences_engine_and_stops_phantom_se
     let registry = FailRegistry::new();
     registry.reset();
 
-    let dir = TempDir::new().expect("fsync fence dir");
-    let db = open_db(dir.path());
-    let expected_before = seed_failpoint_state(&db);
+    for sync_fp in ["wal::sync", "heap::sync_data"] {
+        let dir = TempDir::new().expect("fsync fence dir");
+        let db = open_db(dir.path());
+        let expected_before = seed_failpoint_state(&db);
 
-    // Fail `wal::sync` while letting `wal.discard_undurable()` SUCCEED.
-    // Because `group_commit` is now permanently poisoned until reopen, the
-    // engine write fence must ALSO be tripped immediately so subsequent
-    // commits cannot advance `global_seq`, write to heap, or pollute SSI.
-    registry.arm("wal::sync");
-    let mut failing = WriteBatch::new();
-    failing
-        .set("k07", "discarded_write".into())
-        .expect("stage discarded write");
-    assert!(db.commit_batch(&failing).is_err());
-    registry.reset();
+        // Fail fsync while letting `wal.discard_undurable()` SUCCEED.
+        // Because `group_commit` is permanently poisoned until reopen, the
+        // engine write fence must ALSO be tripped immediately so subsequent
+        // commits cannot advance `global_seq`, write to heap, or pollute SSI.
+        registry.arm(sync_fp);
+        let mut failing = WriteBatch::new();
+        failing
+            .set("k07", "discarded_write".into())
+            .expect("stage discarded write");
+        let err = db
+            .commit_batch(&failing)
+            .expect_err("commit with failed fsync must fail");
+        registry.reset();
+        assert!(
+            err.to_string().contains(sync_fp),
+            "{sync_fp}: expected fsync failpoint error, got: {err}"
+        );
 
-    let seq_after_failure = db.get_seq();
-    assert_all_mutators_fenced(&db, "wal::sync with successful discard_undurable");
-    assert_eq!(
-        db.get_seq(),
-        seq_after_failure,
-        "fenced commits must reject before Phase 2 without advancing global_seq"
-    );
-    drop(db);
+        let seq_after_failure = db.get_seq();
+        assert_all_mutators_fenced(&db, sync_fp);
+        assert_eq!(
+            db.get_seq(),
+            seq_after_failure,
+            "{sync_fp}: fenced commits must reject before Phase 2 without advancing global_seq"
+        );
+        drop(db);
 
-    let reopened = open_db(dir.path());
-    assert_eq!(read_db_state(&reopened), expected_before);
+        let reopened = open_db(dir.path());
+        assert_eq!(read_db_state(&reopened), expected_before);
+    }
 }
 
 #[test]
@@ -408,6 +359,25 @@ fn direct_wal_append_batch_rolls_back_when_sync_fails() {
 
     wal.append_batch(&batch("durable_3", 5))
         .expect("subsequent append_batch after clean rollback succeeds");
+
+    // Failing BOTH `wal::sync` and `wal::truncate_open` on direct `append_batch`
+    // must report the rollback error and fence the WAL against further writes.
+    registry.arm("wal::sync");
+    registry.arm("wal::truncate_open");
+    let rb_err = wal
+        .append_batch(&batch("fenced_4", 7))
+        .expect_err("append_batch with failed sync + rollback must error");
+    registry.reset();
+    let rb_msg = rb_err.to_string();
+    assert!(
+        rb_msg.contains("wal::sync") && rb_msg.contains("wal::truncate_open"),
+        "expected combined sync + rollback error, got: {rb_msg}"
+    );
+    assert!(wal.is_fenced(), "WAL must be fenced after failed rollback");
+    assert!(
+        wal.append_batch(&batch("after_fence_5", 9)).is_err(),
+        "fenced WAL must reject all subsequent append_batch calls"
+    );
     drop(wal);
 
     let keys: Vec<String> = WriteAheadLog::replay(&wal_str, "")
@@ -415,10 +385,10 @@ fn direct_wal_append_batch_rolls_back_when_sync_fails() {
         .into_iter()
         .map(|r| String::from_utf8_lossy(&r.key).to_string())
         .collect();
-    assert_eq!(
-        keys,
-        vec!["durable_1", "durable_3"],
-        "rejected batch must be rolled back instead of silently committing with durable_3"
+    assert!(
+        keys == vec!["durable_1", "durable_3"]
+            || keys == vec!["durable_1", "durable_3", "fenced_4"],
+        "rejected_2 must be absent and after_fence_5 must never be written; got {keys:?}"
     );
 }
 
@@ -462,5 +432,15 @@ fn wal_rotate_sync_failure_after_truncation_fences_wal_and_engine() {
         reopened
             .commit_batch(&post)
             .expect("post-reopen commit after rotate fence succeeds");
+        drop(reopened);
+
+        let reopened2 = open_db(dir.path());
+        let mut expected_after = expected_before;
+        expected_after.insert("k08".into(), Some(format!("after_{op}")));
+        assert_eq!(
+            read_db_state(&reopened2),
+            expected_after,
+            "{op}: post-recovery commit must survive a second restart"
+        );
     }
 }

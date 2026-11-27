@@ -2,28 +2,30 @@
 //!
 //! Drives the real `OmniKV` storage engine with randomized multi-step state
 //! machines, exhaustive byte-offset WAL truncation, WAL bit-flip corruption,
-//! and failpoint-injected crashes across L0/L1/L2 compaction, heap GC, MVCC
-//! snapshots, range scans, and cold restarts.
+//! `SSTable` block-straddle & corrupt-input invariants, and concurrent
+//! writer/reader/compactor verification across L0/L1/L2 compaction, heap GC,
+//! MVCC snapshots, range scans, and cold restarts.
+//!
+//! Process-global failpoint crash injection lives in `storage_oracle_failpoints.rs`.
 
+mod common;
+
+use common::{
+    BatchItem, KEY_COUNT, apply_multi_batch, compressed_val, copy_isolated_db_dir, key_name,
+    normalize_model, open_db, read_db_state, small_val,
+};
 use omni_engine::{
-    CompactionPolicy, OmniError, OmniKV, OmniRecord, SSTableReader, SSTableWriter, WriteBatch,
+    Manifest, OmniError, OmniKV, OmniRecord, SSTableReader, SSTableWriter, WriteBatch,
 };
 use proptest::prelude::*;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
 use tempfile::TempDir;
 
-const KEY_COUNT: u8 = 10;
-
-#[derive(Clone, Debug)]
-enum BatchItem {
-    SetEmpty { key: u8 },
-    SetSmall { key: u8, tag: u8 },
-    SetCompressed { key: u8, tag: u8, repeat: u8 },
-    Delete { key: u8 },
-}
+const UNCOMPRESSED_FLAG: u64 = 1 << 63;
+const MAX_VALUE_SIZE: u64 = 10 * 1024 * 1024;
 
 #[derive(Clone, Debug)]
 enum OracleOp {
@@ -45,7 +47,7 @@ fn batch_item_strategy() -> impl Strategy<Value = BatchItem> {
     prop_oneof![
         1 => (0u8..KEY_COUNT).prop_map(|key| BatchItem::SetEmpty { key }),
         4 => (0u8..KEY_COUNT, 0u8..64).prop_map(|(key, tag)| BatchItem::SetSmall { key, tag }),
-        3 => (0u8..KEY_COUNT, 0u8..64, 4u8..24)
+        3 => (0u8..KEY_COUNT, 0u8..64, 6u8..24)
             .prop_map(|(key, tag, repeat)| BatchItem::SetCompressed { key, tag, repeat }),
         2 => (0u8..KEY_COUNT).prop_map(|key| BatchItem::Delete { key }),
     ]
@@ -55,7 +57,7 @@ fn oracle_op_strategy() -> impl Strategy<Value = OracleOp> {
     prop_oneof![
         2 => (0u8..KEY_COUNT).prop_map(|key| OracleOp::SetEmpty { key }),
         5 => (0u8..KEY_COUNT, 0u8..64).prop_map(|(key, tag)| OracleOp::SetSmall { key, tag }),
-        3 => (0u8..KEY_COUNT, 0u8..64, 4u8..24)
+        3 => (0u8..KEY_COUNT, 0u8..64, 6u8..24)
             .prop_map(|(key, tag, repeat)| OracleOp::SetCompressed { key, tag, repeat }),
         3 => (0u8..KEY_COUNT).prop_map(|key| OracleOp::Delete { key }),
         4 => prop::collection::vec(batch_item_strategy(), 2..6).prop_map(OracleOp::MultiBatch),
@@ -67,38 +69,6 @@ fn oracle_op_strategy() -> impl Strategy<Value = OracleOp> {
         1 => Just(OracleOp::ReleaseOldestSnapshot),
         1 => Just(OracleOp::Reopen),
     ]
-}
-
-fn key_name(id: u8) -> String {
-    format!("k{id:02}")
-}
-
-fn small_val(tag: u8, step: usize) -> String {
-    format!("s{tag:02}_{step:03}")
-}
-
-fn compressed_val(tag: u8, repeat: u8, step: usize) -> String {
-    let chunk = format!("blk-{tag:02}-{step:03}-");
-    chunk.repeat(usize::from(repeat).max(4))
-}
-
-fn open_db(dir: &Path) -> Arc<OmniKV> {
-    let manifest = dir.join("manifest.json");
-    let wal = dir.join("wal.bin");
-    let db = OmniKV::open(
-        manifest.to_string_lossy().as_ref(),
-        wal.to_string_lossy().as_ref(),
-    )
-    .expect("open oracle db");
-    db.set_compaction_policy(CompactionPolicy {
-        l0_compaction_trigger: 4,
-        l1_compaction_trigger: 4,
-        l0_write_stall_threshold: 256,
-        write_stall_wait_attempts: 1,
-        write_stall_wait_ms: 1,
-    })
-    .expect("configure oracle compaction policy");
-    db
 }
 
 fn expected_range(
@@ -129,6 +99,17 @@ fn assert_state_matches_model(
             actual, expected,
             "point-read mismatch for {k} at seq {read_seq} ({context})"
         );
+        let key_seq = db.get_seq_for_key(&k, read_seq);
+        assert!(
+            key_seq <= read_seq,
+            "get_seq_for_key({k}, {read_seq}) returned future seq {key_seq} ({context})"
+        );
+        if expected.is_some() {
+            assert!(
+                key_seq > 0,
+                "get_seq_for_key({k}, {read_seq}) returned 0 for live key ({context})"
+            );
+        }
     }
 
     let full_actual = db
@@ -157,97 +138,6 @@ fn assert_state_matches_model(
         lim_actual, lim_expected,
         "scan_limit(3) mismatch at seq {read_seq} ({context})"
     );
-}
-
-fn copy_dir_files(src: &Path, dst: &Path) {
-    for entry in fs::read_dir(src).expect("read src dir") {
-        let entry = entry.expect("dir entry");
-        let path = entry.path();
-        if path.is_file() {
-            let name = entry.file_name();
-            fs::copy(&path, dst.join(name)).expect("copy db file");
-        }
-    }
-}
-
-fn read_db_state(db: &OmniKV) -> BTreeMap<String, Option<String>> {
-    let seq = db.get_seq();
-    let mut state = BTreeMap::new();
-    for id in 0..KEY_COUNT {
-        let k = key_name(id);
-        let val = db.find(&k, seq).expect("find recovered key");
-        if val.is_some() {
-            state.insert(k, val);
-        }
-    }
-    let scanned = db.scan("k00", "k99", seq).expect("scan recovered db");
-    let expected_scan: Vec<(String, String)> = state
-        .iter()
-        .filter_map(|(k, v)| v.as_ref().map(|s| (k.clone(), s.clone())))
-        .collect();
-    assert_eq!(
-        scanned, expected_scan,
-        "recovered find() and scan() diverged"
-    );
-    state
-}
-
-fn normalize_model(model: &BTreeMap<String, Option<String>>) -> BTreeMap<String, Option<String>> {
-    model
-        .iter()
-        .filter_map(|(k, v)| v.as_ref().map(|s| (k.clone(), Some(s.clone()))))
-        .collect()
-}
-
-fn apply_multi_batch(
-    db: &OmniKV,
-    model: &mut BTreeMap<String, Option<String>>,
-    items: &[BatchItem],
-    step: usize,
-) {
-    // Keep keys distinct within one batch so the model's atomic outcome is well-defined.
-    let mut seen = BTreeSet::new();
-    let mut batch = WriteBatch::new();
-    let mut staged = Vec::new();
-    for (idx, item) in items.iter().enumerate() {
-        let k_id = match item {
-            BatchItem::SetEmpty { key }
-            | BatchItem::SetSmall { key, .. }
-            | BatchItem::SetCompressed { key, .. }
-            | BatchItem::Delete { key } => *key,
-        };
-        if !seen.insert(k_id) {
-            continue;
-        }
-        let k = key_name(k_id);
-        match item {
-            BatchItem::SetEmpty { .. } => {
-                batch.set(&k, String::new()).expect("stage empty set");
-                staged.push((k, Some(String::new())));
-            }
-            BatchItem::SetSmall { tag, .. } => {
-                let v = small_val(*tag, step * 10 + idx);
-                batch.set(&k, v.clone()).expect("stage small set");
-                staged.push((k, Some(v)));
-            }
-            BatchItem::SetCompressed { tag, repeat, .. } => {
-                let v = compressed_val(*tag, *repeat, step * 10 + idx);
-                batch.set(&k, v.clone()).expect("stage compressed set");
-                staged.push((k, Some(v)));
-            }
-            BatchItem::Delete { .. } => {
-                batch.delete(&k).expect("stage delete");
-                staged.push((k, None));
-            }
-        }
-    }
-    if batch.is_empty() {
-        return;
-    }
-    db.commit_batch(&batch).expect("commit multi-op batch");
-    for (k, v) in staged {
-        model.insert(k, v);
-    }
 }
 
 proptest! {
@@ -305,12 +195,9 @@ proptest! {
                     db.compact_sstables().expect("flush L0");
                 }
                 OracleOp::CompactL0ToL1 => {
-                    db.compact_sstables().expect("flush before L1");
                     db.compact_l0_to_l1().expect("compact L0->L1");
                 }
                 OracleOp::CompactL1ToL2 => {
-                    db.compact_sstables().expect("flush before L2");
-                    db.compact_l0_to_l1().expect("L0->L1 before L2");
                     db.compact_l1_to_l2().expect("compact L1->L2");
                 }
                 OracleOp::RunHeapGc => {
@@ -356,7 +243,7 @@ fn wal_every_byte_truncation_recovers_exact_atomic_batch_prefix() {
     let db = open_db(dir.path());
     let mut model: BTreeMap<String, Option<String>> = BTreeMap::new();
 
-    // Flush batch 1 + 2 to SSTable so recovery spans SSTables + WAL.
+    // Flush batch 1 to SSTable so recovery spans SSTables + WAL.
     let mut b1 = WriteBatch::new();
     b1.set("k00", "base_a".to_string()).expect("b1 k00");
     b1.set("k01", compressed_val(1, 16, 1)).expect("b1 k01");
@@ -419,7 +306,7 @@ fn wal_every_byte_truncation_recovers_exact_atomic_batch_prefix() {
 
     for cut in 0..=wal_bytes.len() {
         let trial = TempDir::new().expect("trial dir");
-        copy_dir_files(dir.path(), trial.path());
+        copy_isolated_db_dir(dir.path(), trial.path());
         fs::write(trial.path().join("wal.bin"), &wal_bytes[..cut]).expect("truncate wal");
 
         let recovered = open_db(trial.path());
@@ -439,7 +326,7 @@ fn wal_every_byte_truncation_recovers_exact_atomic_batch_prefix() {
     // Verify writing after recovery from a mid-batch truncated WAL stays durable.
     let mid = wal_bytes.len() / 2;
     let trial = TempDir::new().expect("post-truncation write trial");
-    copy_dir_files(dir.path(), trial.path());
+    copy_isolated_db_dir(dir.path(), trial.path());
     fs::write(trial.path().join("wal.bin"), &wal_bytes[..mid]).expect("truncate mid wal");
     let recovered = open_db(trial.path());
     let mut after = read_db_state(&recovered);
@@ -491,7 +378,7 @@ fn wal_tail_bitflip_corruption_never_panics_or_exposes_half_batch() {
     // and corrupted batch 2 must never replay (including CRC trailer flips).
     for pos in wal_after_b1..wal_bytes.len() {
         let trial = TempDir::new().expect("bitflip trial");
-        copy_dir_files(dir.path(), trial.path());
+        copy_isolated_db_dir(dir.path(), trial.path());
         let mut corrupted = wal_bytes.clone();
         corrupted[pos] ^= 0x5A;
         fs::write(trial.path().join("wal.bin"), &corrupted).expect("write corrupted wal");
@@ -670,14 +557,60 @@ fn sstable_multiversion_hot_key_across_blocks_preserves_latest_and_snapshots() {
     );
 }
 
+fn assert_sstable_has_straddling_key(path: &Path, stage: &str) {
+    let bytes = fs::read(path).expect("read sstable for straddle check");
+    let index = parse_sstable_index(&bytes);
+    assert!(
+        index.len() >= 2,
+        "{stage}: sstable must span at least 2 blocks, got {}",
+        index.len()
+    );
+    let data_end = usize::try_from(u64::from_le_bytes(
+        bytes[bytes.len() - 16..bytes.len() - 8]
+            .try_into()
+            .expect("trailer index_offset"),
+    ))
+    .expect("index_offset fits in usize");
+    let mut straddle_count = 0usize;
+    for win in index.windows(2) {
+        let (_, prev_start) = &win[0];
+        let (next_key, next_start) = &win[1];
+        let mut cursor = *prev_start;
+        let mut last_prev: Option<OmniRecord> = None;
+        while cursor < *next_start {
+            let (rec, len) = OmniRecord::decode(&bytes[cursor..*next_start])
+                .expect("decode record before block boundary");
+            cursor += len;
+            last_prev = Some(rec);
+        }
+        assert_eq!(cursor, *next_start, "{stage}: block boundary misaligned");
+        let (first_next, _) = OmniRecord::decode(&bytes[*next_start..data_end])
+            .expect("decode first record of next block");
+        if let Some(prev) = last_prev
+            && prev.key == *next_key
+            && first_next.key == *next_key
+            && first_next.seq > prev.seq
+        {
+            straddle_count += 1;
+        }
+    }
+    assert!(
+        straddle_count >= 1,
+        "{stage}: expected at least one 2-version key to straddle an SSTable block boundary"
+    );
+}
+
 #[test]
 fn sstable_two_version_key_straddling_block_boundary_preserves_both_versions() {
+    // 9-byte keys (`key_00000`) encode to 51-byte records (`42 + 9`), so each
+    // 4096-byte index block holds 81 records (odd), guaranteeing every other
+    // block boundary splits a 2-version key across adjacent blocks.
     let dir = TempDir::new().expect("straddle dir");
     let db = open_db(dir.path());
     for i in 0..200 {
         let mut batch = WriteBatch::new();
         batch
-            .set(&format!("k_{i:04}"), format!("v_{i:04}_a"))
+            .set(&format!("key_{i:05}"), format!("v_{i:04}_a"))
             .expect("stage first version");
         db.commit_batch(&batch).expect("commit first version");
     }
@@ -685,7 +618,7 @@ fn sstable_two_version_key_straddling_block_boundary_preserves_both_versions() {
     for i in 0..200 {
         let mut batch = WriteBatch::new();
         batch
-            .set(&format!("k_{i:04}"), format!("v_{i:04}_b"))
+            .set(&format!("key_{i:05}"), format!("v_{i:04}_b"))
             .expect("stage second version");
         db.commit_batch(&batch).expect("commit second version");
     }
@@ -698,9 +631,17 @@ fn sstable_two_version_key_straddling_block_boundary_preserves_both_versions() {
             "GC" => db.run_garbage_collection().expect("straddle GC"),
             _ => unreachable!(),
         }
+        let roots = db.load_roots();
+        let sst_path = match stage {
+            "L0" => Path::new(&roots.sstables[0].2),
+            "L1" => Path::new(&roots.l1_sstables[0].2),
+            "L2" | "GC" => Path::new(&roots.manifest.base_path),
+            _ => unreachable!(),
+        };
+        assert_sstable_has_straddling_key(sst_path, stage);
         let latest = db.get_seq();
         for i in 0..200 {
-            let key = format!("k_{i:04}");
+            let key = format!("key_{i:05}");
             assert_eq!(
                 db.find(&key, latest).expect("find straddle latest"),
                 Some(format!("v_{i:04}_b")),
@@ -775,10 +716,81 @@ fn assert_snapshot_equivalence(
     scan_map
 }
 
+/// Locates the exact `(winning_seq, tier, backing_id)` (`"memtable"`,
+/// `"frozen"`, `"l0"`, `"l1"`, or `"base"`) holding the winning MVCC version
+/// (`max seq <= snap`) of `key`.
+fn locate_winning_key_tier(
+    db: &OmniKV,
+    key: &str,
+    snap: u64,
+) -> Option<(u64, &'static str, String)> {
+    let key_bytes = key.as_bytes();
+    let roots = db.load_roots();
+    // SkipMap orders entries for `key` by `Reverse(seq)` ascending (descending
+    // `seq`), so an inclusive lower bound at `Reverse(snap)` lands directly on
+    // the highest `seq <= snap` regardless of concurrent writes at `seq > snap`.
+    let start = std::cmp::Reverse(snap);
+    let mut best: Option<(u64, &'static str, String)> = None;
+    let mut consider = |seq: u64, tier: &'static str, id: String| {
+        if best.as_ref().is_none_or(|(best_seq, _, _)| seq > *best_seq) {
+            best = Some((seq, tier, id));
+        }
+    };
+
+    for shard in roots.memtable.iter() {
+        if let Some(entry) = shard.range((key_bytes.to_vec(), start)..).next()
+            && entry.key().0.as_slice() == key_bytes
+            && entry.key().1.0 <= snap
+        {
+            consider(
+                entry.key().1.0,
+                "memtable",
+                format!("{:p}", Arc::as_ptr(&roots.memtable)),
+            );
+        }
+    }
+    for frozen in roots.frozen_memtables.iter() {
+        for shard in frozen.iter() {
+            if let Some(entry) = shard.range((key_bytes.to_vec(), start)..).next()
+                && entry.key().0.as_slice() == key_bytes
+                && entry.key().1.0 <= snap
+            {
+                consider(
+                    entry.key().1.0,
+                    "frozen",
+                    format!("{:p}", Arc::as_ptr(frozen)),
+                );
+            }
+        }
+    }
+    for (tier, tables) in [("l0", &roots.sstables), ("l1", &roots.l1_sstables)] {
+        for (mmap, _, path) in tables.iter() {
+            let reader = SSTableReader::from_mmap(mmap.clone());
+            for rec in reader.iter_from(key_bytes) {
+                if rec.key.as_slice() > key_bytes {
+                    break;
+                }
+                if rec.key.as_slice() == key_bytes && rec.is_valid() && rec.seq <= snap {
+                    consider(rec.seq, tier, path.clone());
+                }
+            }
+        }
+    }
+    let base_reader = SSTableReader::from_mmap(roots.base_mmap.clone());
+    for rec in base_reader.iter_from(key_bytes) {
+        if rec.key.as_slice() > key_bytes {
+            break;
+        }
+        if rec.key.as_slice() == key_bytes && rec.is_valid() && rec.seq <= snap {
+            consider(rec.seq, "base", roots.manifest.base_path.clone());
+        }
+    }
+    best
+}
+
 fn verify_concurrent_reader_loop(
     db: &OmniKV,
     done: &std::sync::atomic::AtomicBool,
-    compactions: &std::sync::atomic::AtomicUsize,
     reader_checks: &std::sync::atomic::AtomicUsize,
     verified_pinned: &std::sync::atomic::AtomicUsize,
     writers: usize,
@@ -792,17 +804,25 @@ fn verify_concurrent_reader_loop(
         let snap = db.snapshot();
         let first_view =
             assert_snapshot_equivalence(db, snap, writers, &mut last_seen_val, &mut last_seen_seq);
-        let compactions_after_first = compactions.load(Ordering::Acquire);
 
-        if !checked_across_compaction {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-            while compactions.load(Ordering::Acquire) == compactions_after_first
-                && !done.load(Ordering::Acquire)
-                && std::time::Instant::now() < deadline
-            {
-                std::thread::yield_now();
+        if !checked_across_compaction
+            && let Some((tracked_key, _)) = first_view.iter().next()
+            && let Some(tier_before) = locate_winning_key_tier(db, tracked_key, snap)
+        {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            let mut tier_moved = false;
+            while !done.load(Ordering::Acquire) && std::time::Instant::now() < deadline {
+                if let Some(tier_after) = locate_winning_key_tier(db, tracked_key, snap)
+                    && tier_after.0 == tier_before.0
+                    && (tier_after.1 != tier_before.1
+                        || (tier_before.1 == "base" && tier_after.2 != tier_before.2))
+                {
+                    tier_moved = true;
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(2));
             }
-            if compactions.load(Ordering::Acquire) > compactions_after_first {
+            if tier_moved {
                 let second_view = assert_snapshot_equivalence(
                     db,
                     snap,
@@ -812,7 +832,7 @@ fn verify_concurrent_reader_loop(
                 );
                 assert_eq!(
                     second_view, first_view,
-                    "pinned snapshot view changed across live compaction at seq {snap}"
+                    "pinned snapshot view changed across live tier migration of {tracked_key} at seq {snap}"
                 );
                 checked_across_compaction = true;
                 verified_pinned.fetch_add(1, Ordering::Release);
@@ -824,11 +844,7 @@ fn verify_concurrent_reader_loop(
     }
 }
 
-fn run_concurrent_compactor_loop(
-    db: &OmniKV,
-    done: &std::sync::atomic::AtomicBool,
-    compactions: &std::sync::atomic::AtomicUsize,
-) {
+fn run_concurrent_compactor_loop(db: &OmniKV, done: &std::sync::atomic::AtomicBool) {
     use std::sync::atomic::Ordering;
 
     let mut round = 1usize;
@@ -844,7 +860,7 @@ fn run_concurrent_compactor_loop(
             db.run_garbage_collection().expect("concurrent GC");
         }
         round += 1;
-        compactions.fetch_add(1, Ordering::Release);
+        std::thread::sleep(std::time::Duration::from_millis(2));
     }
 }
 
@@ -865,12 +881,12 @@ fn run_concurrent_writer_loop(
             .expect("stage concurrent write");
         db.commit_batch(&batch).expect("commit concurrent write");
         if step == updates / 2 {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
             while (verified_pinned.load(Ordering::Acquire) < 1
                 || reader_checks.load(Ordering::Acquire) < 2)
                 && std::time::Instant::now() < deadline
             {
-                std::thread::yield_now();
+                std::thread::sleep(std::time::Duration::from_millis(2));
             }
         }
     }
@@ -888,7 +904,6 @@ fn concurrent_writers_readers_and_compactions_preserve_mvcc_monotonicity_and_fin
     let dir = TempDir::new().expect("concurrent oracle dir");
     let db = open_db(dir.path());
     let done = Arc::new(AtomicBool::new(false));
-    let compactions = Arc::new(AtomicUsize::new(0));
     let reader_checks = Arc::new(AtomicUsize::new(0));
     let verified_pinned = Arc::new(AtomicUsize::new(0));
 
@@ -912,21 +927,18 @@ fn concurrent_writers_readers_and_compactions_preserve_mvcc_monotonicity_and_fin
     let compactor = {
         let db = db.clone();
         let done = done.clone();
-        let compactions = compactions.clone();
-        thread::spawn(move || run_concurrent_compactor_loop(&db, &done, &compactions))
+        thread::spawn(move || run_concurrent_compactor_loop(&db, &done))
     };
     let readers: Vec<_> = (0..2)
         .map(|_| {
             let db = db.clone();
             let done = done.clone();
-            let compactions = compactions.clone();
             let reader_checks = reader_checks.clone();
             let verified_pinned = verified_pinned.clone();
             thread::spawn(move || {
                 verify_concurrent_reader_loop(
                     &db,
                     &done,
-                    &compactions,
                     &reader_checks,
                     &verified_pinned,
                     WRITERS,
@@ -1110,7 +1122,7 @@ fn sstable_decoder_never_reads_past_data_end_into_sparse_index() {
         .open(&sst_path)
         .expect("create boundary sst");
     let mut writer = SSTableWriter::new(&file);
-    let rec1 = OmniRecord::new(1, b"k_a".to_vec(), 0, 4, 11, 0);
+    let rec1 = OmniRecord::new(1, b"k_a_padding_01234567".to_vec(), 0, 4, 11, 0);
     let rec2 = OmniRecord::new(2, b"k_b".to_vec(), 4, 4, 22, 0);
     writer.append(&rec1).expect("append rec1");
     writer.append(&rec2).expect("append rec2");
@@ -1129,18 +1141,24 @@ fn sstable_decoder_never_reads_past_data_end_into_sparse_index() {
     // In `OmniRecord::encode`, `seq` is bytes 0..8, `key_len: u16` is bytes 8..10,
     // and total encoded length is `42 + key_len` (ending with a 4-byte CRC32).
     // Forge a valid-CRC record starting at `rec1_len` whose payload straddles
-    // `index_offset` by 4 bytes into the sparse index: decoding `&data[rec1_len..]`
-    // succeeds and emits sparse-index bytes as a valid record, whereas decoding
-    // strictly from `&data[rec1_len..data_end]` stops cleanly at `data_end`.
+    // `index_offset` by 14 bytes into entry 0's key bytes (keeping `num_entries`,
+    // `key_len`, and `offset` in the sparse index intact): decoding
+    // `&data[rec1_len..]` succeeds and emits sparse-index bytes as a valid
+    // record, whereas decoding `&data[rec1_len..data_end]` stops cleanly.
     let rec2_avail = index_offset - rec1_len;
     assert!(rec2_avail >= 42);
-    let oversized_key_len = u16::try_from(rec2_avail - 42 + 4).expect("key_len fits in u16");
+    let oversized_key_len = u16::try_from(rec2_avail - 42 + 14).expect("key_len fits in u16");
     let straddle_end = rec1_len + 42 + usize::from(oversized_key_len);
     assert!(straddle_end <= bytes.len() - 16);
     bytes[rec1_len + 8..rec1_len + 10].copy_from_slice(&oversized_key_len.to_le_bytes());
     let forged_crc = crc32fast::hash(&bytes[rec1_len..straddle_end - 4]);
     bytes[straddle_end - 4..straddle_end].copy_from_slice(&forged_crc.to_le_bytes());
 
+    assert_eq!(
+        parse_sstable_index(&bytes).len(),
+        1,
+        "sparse index structure must remain intact while forged record straddles into it"
+    );
     // Anti-vacuity precondition: without the `..data_end` slice bound, `decode`
     // WOULD return a forged `is_valid()` record spanning into the sparse index.
     let (forged_rec, _) = OmniRecord::decode(&bytes[rec1_len..])
@@ -1154,8 +1172,11 @@ fn sstable_decoder_never_reads_past_data_end_into_sparse_index() {
         1,
         "decoder must stop at data_end without consuming sparse-index bytes"
     );
-    assert_eq!(decoded[0].key, b"k_a");
-    assert_eq!(reader.find(b"k_a", u64::MAX), Some((0, 4, 11, 0)));
+    assert_eq!(decoded[0].key, b"k_a_padding_01234567");
+    assert_eq!(
+        reader.find(b"k_a_padding_01234567", u64::MAX),
+        Some((0, 4, 11, 0))
+    );
     assert_eq!(reader.find(&forged_rec.key, u64::MAX), None);
 }
 
@@ -1412,4 +1433,317 @@ fn corrupt_lz4_declared_size_above_max_value_size_returns_error_without_oom() {
         matches!(err, OmniError::IoError(ref msg) if msg.contains("exceeds maximum")),
         "expected oversized LZ4 length error, got {err:?}"
     );
+}
+
+#[test]
+fn wal_batch_with_missing_or_zeroed_heap_payload_is_rejected_atomically_on_reopen() {
+    // Simulates a power-loss crash where the kernel persisted a complete
+    // checksummed WAL batch (including `__COMMIT_MARKER__`) before its heap
+    // payloads reached stable storage (either truncated heap EOF or zero-filled
+    // sparse allocation). Recovery must reject the ENTIRE batch atomically —
+    // neither overwriting `k_keep` with a dangling heap pointer nor partially
+    // applying `delete("k_del_target")` — and heal the WAL for future writes.
+    for zero_fill_instead_of_truncate in [false, true] {
+        let dir = TempDir::new().expect("wal heap crash dir");
+        let db = open_db(dir.path());
+
+        let mut durable = WriteBatch::new();
+        durable
+            .set("k_keep", "durable_old".into())
+            .expect("stage durable k_keep");
+        durable
+            .set("k_del_target", "must_survive".into())
+            .expect("stage durable k_del_target");
+        db.commit_batch(&durable).expect("commit durable baseline");
+
+        let heap_path = db.load_roots().manifest.heap_path.clone();
+        let heap_len_before = fs::metadata(&heap_path).expect("heap metadata").len();
+
+        let mut unpersisted = WriteBatch::new();
+        unpersisted
+            .set("k_keep", "unpersisted_new_value".into())
+            .expect("stage unpersisted overwrite");
+        unpersisted
+            .set("k_new", "unpersisted_new_key".into())
+            .expect("stage unpersisted insert");
+        unpersisted
+            .delete("k_del_target")
+            .expect("stage unpersisted delete");
+        db.commit_batch(&unpersisted)
+            .expect("write WAL+heap batch before crash simulation");
+        let heap_len_after = fs::metadata(&heap_path).expect("heap metadata after").len();
+        assert!(heap_len_after > heap_len_before);
+        drop(db);
+
+        // Drop the heap payloads of `unpersisted` while leaving the complete
+        // checksummed WAL batch (and `__COMMIT_MARKER__`) intact on disk.
+        let mut heap_bytes = fs::read(&heap_path).expect("read heap bytes");
+        let before_usize = usize::try_from(heap_len_before).expect("heap len fits in usize");
+        if zero_fill_instead_of_truncate {
+            heap_bytes[before_usize..].fill(0);
+        } else {
+            heap_bytes.truncate(before_usize);
+        }
+        fs::write(&heap_path, &heap_bytes).expect("simulate dropped heap write");
+
+        let reopened = open_db(dir.path());
+        let seq = reopened.get_seq();
+        assert_eq!(
+            reopened.find("k_keep", seq).expect("find k_keep"),
+            Some("durable_old".into()),
+            "k_keep must retain prior durable value (zero_fill={zero_fill_instead_of_truncate})"
+        );
+        assert_eq!(
+            reopened
+                .find("k_del_target", seq)
+                .expect("find k_del_target"),
+            Some("must_survive".into()),
+            "DELETE in rejected batch must NOT apply partially (zero_fill={zero_fill_instead_of_truncate})"
+        );
+        assert_eq!(
+            reopened.find("k_new", seq).expect("find k_new"),
+            None,
+            "unpersisted insert must be absent (zero_fill={zero_fill_instead_of_truncate})"
+        );
+
+        // Post-recovery writes must commit cleanly and survive a second reopen,
+        // proving `replay_and_heal_since` truncated the rejected WAL batch.
+        let mut post = WriteBatch::new();
+        post.set("k_post", "survived_heal".into())
+            .expect("stage post write");
+        reopened
+            .commit_batch(&post)
+            .expect("commit after heap-validated WAL heal");
+        drop(reopened);
+
+        let reopened2 = open_db(dir.path());
+        assert_eq!(
+            reopened2
+                .find("k_post", reopened2.get_seq())
+                .expect("find k_post after second reopen"),
+            Some("survived_heal".into())
+        );
+        assert_eq!(
+            reopened2
+                .find("k_del_target", reopened2.get_seq())
+                .expect("find k_del_target after second reopen"),
+            Some("must_survive".into())
+        );
+    }
+}
+
+#[test]
+fn corrupt_heap_payload_guards_reject_bad_empty_crc_oversized_and_short_lz4() {
+    let dir = TempDir::new().expect("heap guards dir");
+    let db = open_db(dir.path());
+
+    // 1. Empty uncompressed payload with a corrupted CRC must NOT short-circuit to Ok("").
+    let seq1 = db.get_seq() + 1;
+    db.insert_replica_record(
+        b"bad_empty_crc".to_vec(),
+        seq1,
+        0,
+        UNCOMPRESSED_FLAG,
+        0xDEAD_BEEF,
+        0,
+    );
+    let err1 = db
+        .find("bad_empty_crc", seq1)
+        .expect_err("corrupt empty-value CRC must fail closed");
+    assert!(
+        matches!(err1, OmniError::IoError(ref msg) if msg.contains("CRC32")),
+        "expected CRC32 mismatch for bad empty payload, got {err1:?}"
+    );
+
+    // 2. Encoded lengths above `2 * MAX_VALUE_SIZE` (both raw and compressed) must fail
+    //    upfront before allocating or seeking.
+    let oversized_len = MAX_VALUE_SIZE * 2 + 1;
+    for (idx, length_with_flag) in [UNCOMPRESSED_FLAG | oversized_len, oversized_len]
+        .into_iter()
+        .enumerate()
+    {
+        let key = format!("oversized_{idx}");
+        let seq = db.get_seq() + 1;
+        db.insert_replica_record(key.as_bytes().to_vec(), seq, 0, length_with_flag, 0, 0);
+        let err = db
+            .find(&key, seq)
+            .expect_err("oversized heap length must fail closed without OOM");
+        assert!(
+            matches!(err, OmniError::IoError(ref msg) if msg.contains("exceeds maximum")),
+            "expected oversized length error, got {err:?}"
+        );
+    }
+
+    // 3. Compressed payload shorter than the 4-byte LZ4 size prefix must fail upfront.
+    let short_payload = [0x11u8, 0x22, 0x33];
+    let short_off = db
+        .append_to_heap(&short_payload)
+        .expect("append short payload");
+    let seq3 = db.get_seq() + 1;
+    db.insert_replica_record(
+        b"short_lz4".to_vec(),
+        seq3,
+        short_off,
+        short_payload.len() as u64,
+        crc32fast::hash(&short_payload),
+        0,
+    );
+    let err3 = db
+        .find("short_lz4", seq3)
+        .expect_err("sub-4-byte compressed payload must fail closed");
+    assert!(
+        matches!(err3, OmniError::IoError(ref msg) if msg.contains("LZ4 size prefix")),
+        "expected missing LZ4 size prefix error, got {err3:?}"
+    );
+}
+
+#[test]
+fn wal_mid_stream_dropped_heap_stops_at_atomic_prefix_and_does_not_apply_later_batch() {
+    let dir = TempDir::new().expect("mid-stream heap dir");
+    let db = open_db(dir.path());
+    let mut model = BTreeMap::new();
+
+    // Batch 1 (valid durable prefix)
+    apply_multi_batch(
+        &db,
+        &mut model,
+        &[BatchItem::SetSmall { key: 0, tag: 1 }],
+        1,
+    );
+    let expected_b1 = normalize_model(&model);
+    let heap_path = db.load_roots().manifest.heap_path.clone();
+    let heap_after_b1 = usize::try_from(fs::metadata(&heap_path).expect("heap meta b1").len())
+        .expect("heap offset fits in usize");
+
+    // Batch 2 (whose heap range will be zeroed to simulate an unpersisted heap write)
+    apply_multi_batch(
+        &db,
+        &mut model,
+        &[
+            BatchItem::SetCompressed {
+                key: 1,
+                tag: 2,
+                repeat: 8,
+            },
+            BatchItem::Delete { key: 0 },
+        ],
+        2,
+    );
+    let heap_after_b2 = usize::try_from(fs::metadata(&heap_path).expect("heap meta b2").len())
+        .expect("heap offset fits in usize");
+    assert!(heap_after_b2 > heap_after_b1);
+
+    // Batch 3 (intact WAL + intact heap — must NOT replay past invalid Batch 2!)
+    apply_multi_batch(
+        &db,
+        &mut model,
+        &[BatchItem::SetSmall { key: 2, tag: 3 }],
+        3,
+    );
+    db.sync_all().expect("sync all batches");
+    drop(db);
+
+    let mut heap_bytes = fs::read(&heap_path).expect("read heap bytes");
+    heap_bytes[heap_after_b1..heap_after_b2].fill(0);
+    fs::write(&heap_path, &heap_bytes).expect("zero batch 2 heap range");
+
+    let recovered = open_db(dir.path());
+    assert_eq!(
+        read_db_state(&recovered),
+        expected_b1,
+        "WAL replay must stop at Batch 1 and must not apply Batch 3 past invalid Batch 2"
+    );
+
+    let mut post = WriteBatch::new();
+    post.set("k09", "post_mid_heap_heal".into())
+        .expect("stage post write");
+    recovered.commit_batch(&post).expect("commit post write");
+    drop(recovered);
+
+    let reopened = open_db(dir.path());
+    let mut expected_final = expected_b1;
+    expected_final.insert("k09".into(), Some("post_mid_heap_heal".into()));
+    assert_eq!(read_db_state(&reopened), expected_final);
+}
+
+#[test]
+fn compaction_and_gc_fail_closed_on_corrupt_sstable() {
+    let dir = TempDir::new().expect("corrupt sst dir");
+    let db = open_db(dir.path());
+
+    let mut b_base = WriteBatch::new();
+    b_base.set("k00", "in_base".into()).expect("stage base");
+    db.commit_batch(&b_base).expect("commit base");
+    db.compact_sstables().expect("flush base L0");
+    db.compact_l0_to_l1().expect("compact base L1");
+    db.compact_l1_to_l2().expect("compact base L2");
+
+    let mut b_l1 = WriteBatch::new();
+    b_l1.set("k01", "in_l1".into()).expect("stage l1");
+    db.commit_batch(&b_l1).expect("commit l1");
+    db.compact_sstables().expect("flush l1 L0");
+    db.compact_l0_to_l1().expect("compact l1");
+
+    let mut b_l0 = WriteBatch::new();
+    b_l0.set("k02", "in_l0".into()).expect("stage l0");
+    db.commit_batch(&b_l0).expect("commit l0");
+    db.compact_sstables().expect("flush l0");
+    drop(db);
+
+    for (target, zero_fill) in [
+        ("l0", false),
+        ("l1", false),
+        ("base", false),
+        ("l0", true),
+        ("l1", true),
+        ("base", true),
+    ] {
+        let trial = TempDir::new().expect("corrupt trial dir");
+        copy_isolated_db_dir(dir.path(), trial.path());
+        let manifest_path = trial.path().join("manifest.json");
+        let manifest_str = manifest_path.to_string_lossy().to_string();
+        let manifest_before = Manifest::load(&manifest_str).expect("load trial manifest");
+        let victim = match target {
+            "l0" => manifest_before.sstables[0].clone(),
+            "l1" => manifest_before.l1_sstables[0].clone(),
+            "base" => manifest_before.base_path.clone(),
+            _ => unreachable!(),
+        };
+        let bytes = if zero_fill {
+            // 4096-byte zeroed L0/L1 and 8192-byte zeroed base must all fail
+            // closed rather than being mistaken for an empty base placeholder.
+            let zero_len = if target == "base" { 8192 } else { 4096 };
+            vec![0u8; zero_len]
+        } else {
+            let mut raw = fs::read(&victim).expect("read victim sstable");
+            raw[..12].fill(0xFF);
+            raw
+        };
+        fs::write(&victim, &bytes).expect("corrupt victim sstable");
+
+        let reopened = open_db(trial.path());
+        let res = match target {
+            "l0" => reopened.compact_l0_to_l1(),
+            "l1" => reopened.compact_l1_to_l2(),
+            "base" => reopened.run_garbage_collection(),
+            _ => unreachable!(),
+        };
+        assert!(
+            res.is_err(),
+            "{target} (zero_fill={zero_fill}) compaction/GC must fail closed on corrupt SSTable"
+        );
+        let manifest_after = Manifest::load(&manifest_str).expect("reload trial manifest");
+        assert_eq!(
+            manifest_after.base_path, manifest_before.base_path,
+            "{target} (zero_fill={zero_fill}): corrupt compaction must not overwrite base manifest pointer"
+        );
+        assert_eq!(
+            manifest_after.l1_sstables, manifest_before.l1_sstables,
+            "{target} (zero_fill={zero_fill}): corrupt compaction must not drop L1 manifest pointers"
+        );
+        assert_eq!(
+            manifest_after.sstables, manifest_before.sstables,
+            "{target} (zero_fill={zero_fill}): corrupt compaction must not drop L0 manifest pointers"
+        );
+    }
 }
