@@ -156,40 +156,94 @@ pub fn apply_multi_batch(
     applied
 }
 
-/// Copies a database directory into an isolated trial directory, skipping
-/// `LOCK` and rewriting absolute `Manifest` paths (`heap_path`, `base_path`,
-/// `sstables`, `l1_sstables`) from `src` to `dst` so trial opens and writes
-/// can never mutate `src`.
+fn bloom_sidecar_for_table(path: &Path) -> std::path::PathBuf {
+    if path
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("sst") || ext.eq_ignore_ascii_case("bin"))
+    {
+        path.with_extension("bloom")
+    } else {
+        let mut s = path.as_os_str().to_os_string();
+        s.push(".bloom");
+        std::path::PathBuf::from(s)
+    }
+}
+
+/// Copies only live database files (manifest, WAL, manifest-referenced heap,
+/// base, L0/L1 `SSTables`, and their existing Bloom sidecars) into an isolated
+/// trial directory, rewriting `Manifest` paths from `src` to `dst`.
+///
+/// Avoiding a full `read_dir` scan prevents races with 5-second background
+/// cleanup threads deleting obsolete `SSTables` in `src` while still failing on
+/// any missing required live file.
 pub fn copy_isolated_db_dir(src: &Path, dst: &Path) {
-    let rewrite = |stored: &str| -> String {
-        let name = Path::new(stored)
+    let resolve_src = |stored: &str| -> std::path::PathBuf {
+        let p = Path::new(stored);
+        if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            src.join(p)
+        }
+    };
+    let copy_required = |source: &Path| -> String {
+        let name = source.file_name().expect("source file path has filename");
+        let target = dst.join(name);
+        fs::copy(source, &target).unwrap_or_else(|e| {
+            panic!(
+                "copy required live db file '{}' -> '{}': {e}",
+                source.display(),
+                target.display()
+            )
+        });
+        target.to_string_lossy().to_string()
+    };
+    let copy_optional_bloom = |table_path: &Path| {
+        let bloom_path = bloom_sidecar_for_table(table_path);
+        let name = bloom_path
             .file_name()
-            .expect("manifest file path has filename");
-        dst.join(name).to_string_lossy().to_string()
+            .expect("bloom sidecar path has filename");
+        let target = dst.join(name);
+        if let Err(err) = fs::copy(&bloom_path, &target)
+            && err.kind() != std::io::ErrorKind::NotFound
+        {
+            panic!(
+                "copy live bloom sidecar '{}' -> '{}': {err}",
+                bloom_path.display(),
+                target.display()
+            );
+        }
     };
 
-    for entry in fs::read_dir(src).expect("read src dir") {
-        let entry = entry.expect("dir entry");
-        let path = entry.path();
-        if !path.is_file() {
-            continue;
-        }
-        let name = entry.file_name();
-        if name == "LOCK" {
-            continue;
-        }
-        fs::copy(&path, dst.join(&name)).expect("copy db file");
-    }
+    let _ = copy_required(&src.join("wal.bin"));
 
-    let manifest_dst = dst.join("manifest.json");
-    if manifest_dst.exists() {
-        let manifest_str = manifest_dst.to_string_lossy().to_string();
-        let mut manifest = Manifest::load(&manifest_str).expect("load copied manifest");
-        manifest.heap_path = rewrite(&manifest.heap_path);
-        manifest.base_path = rewrite(&manifest.base_path);
-        manifest.sstables = manifest.sstables.iter().map(|p| rewrite(p)).collect();
-        manifest.l1_sstables = manifest.l1_sstables.iter().map(|p| rewrite(p)).collect();
-        let encoded = serde_json::to_vec(&manifest).expect("serialize isolated manifest");
-        fs::write(&manifest_dst, encoded).expect("write rewritten isolated manifest");
-    }
+    let manifest_src = src.join("manifest.json");
+    let manifest_src_str = manifest_src.to_string_lossy().to_string();
+    let mut manifest = Manifest::load(&manifest_src_str).expect("load source manifest");
+
+    let heap_src = resolve_src(&manifest.heap_path);
+    manifest.heap_path = copy_required(&heap_src);
+    let base_src = resolve_src(&manifest.base_path);
+    copy_optional_bloom(&base_src);
+    manifest.base_path = copy_required(&base_src);
+    manifest.sstables = manifest
+        .sstables
+        .iter()
+        .map(|path| {
+            let src_path = resolve_src(path);
+            copy_optional_bloom(&src_path);
+            copy_required(&src_path)
+        })
+        .collect();
+    manifest.l1_sstables = manifest
+        .l1_sstables
+        .iter()
+        .map(|path| {
+            let src_path = resolve_src(path);
+            copy_optional_bloom(&src_path);
+            copy_required(&src_path)
+        })
+        .collect();
+
+    let encoded = serde_json::to_vec(&manifest).expect("serialize isolated manifest");
+    fs::write(dst.join("manifest.json"), encoded).expect("write rewritten isolated manifest");
 }

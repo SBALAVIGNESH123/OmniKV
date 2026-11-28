@@ -464,12 +464,18 @@ fn create_backup_rejects_corrupt_source_tables_without_leaving_partial_archive()
             !out_path.exists(),
             "{label}: failed backup must not leave partial archive at output path"
         );
-        assert!(
-            !source_dir
-                .path()
-                .join(format!("{label}.tar.gz.writing.tmp"))
-                .exists(),
-            "{label}: failed backup must clean up temporary writing file"
+        let staged_leftovers: Vec<String> = std::fs::read_dir(source_dir.path())
+            .expect("read source dir")
+            .filter_map(|entry| {
+                let name = entry.ok()?.file_name().to_string_lossy().to_string();
+                name.starts_with(&format!("{label}.tar.gz."))
+                    .then_some(name)
+            })
+            .collect();
+        assert_eq!(
+            staged_leftovers,
+            Vec::<String>::new(),
+            "{label}: failed backup must clean up temporary staging files"
         );
     }
     orig_manifest

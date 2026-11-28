@@ -10,11 +10,14 @@ use flate2::Compression;
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 use serde::{Deserialize, Serialize};
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::{Cursor, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tar::{Archive, Builder, Header};
+
+static NEXT_STAGING_TOKEN: AtomicU64 = AtomicU64::new(1);
 
 const BACKUP_FORMAT_VERSION: u32 = 1;
 const MANIFEST_ENTRY: &str = "manifest.json";
@@ -70,12 +73,52 @@ pub fn create_backup_with_wal(
     create_backup_internal(db, manifest_path, Some(wal_path), output_path)
 }
 
-fn create_backup_internal(
+fn create_unique_staging_file(output_path: &str, label: &str) -> Result<(String, File), String> {
+    let pid = std::process::id();
+    for _ in 0..64 {
+        let token = NEXT_STAGING_TOKEN.fetch_add(1, Ordering::Relaxed);
+        let candidate = format!("{output_path}.{label}.{pid}.{token}.tmp");
+        match OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&candidate)
+        {
+            Ok(file) => return Ok((candidate, file)),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(err) => {
+                return Err(format!(
+                    "Cannot create temporary backup file {candidate}: {err}"
+                ));
+            }
+        }
+    }
+    Err(format!(
+        "Cannot allocate unique temporary backup file for {output_path}"
+    ))
+}
+
+fn publish_staged_file(staged_path: &str, output_path: &str, kind: &str) -> Result<(), String> {
+    std::fs::rename(staged_path, output_path)
+        .map_err(|e| format!("Publish {kind} {output_path}: {e}"))?;
+    #[cfg(unix)]
+    {
+        let parent = Path::new(output_path)
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        File::open(parent)
+            .and_then(|dir| dir.sync_all())
+            .map_err(|e| format!("Sync {kind} parent directory: {e}"))?;
+    }
+    Ok(())
+}
+
+fn write_backup_archive_to_file(
     db: &Arc<OmniKV>,
     manifest_path: &str,
     wal_path: Option<&str>,
-    output_path: &str,
-) -> Result<String, String> {
+    file: File,
+) -> Result<(), String> {
     let _backup_guard = db
         .transition_guard
         .write()
@@ -97,11 +140,6 @@ fn create_backup_internal(
 
     let allow_legacy_base =
         OmniKV::manifest_allows_legacy_zero_base(&source_manifest, manifest_path);
-    let temp_output = format!("{output_path}.writing.tmp");
-    let _temp_cleanup = TempFileCleanup::new(temp_output.clone());
-
-    let file = File::create(&temp_output)
-        .map_err(|e| format!("Cannot create temporary backup file: {e}"))?;
     let encoder = GzEncoder::new(file, Compression::default());
     let mut tar = Builder::new(encoder);
 
@@ -142,20 +180,19 @@ fn create_backup_internal(
         .map_err(|e| format!("Finalize compressed backup: {e}"))?;
     file.sync_all()
         .map_err(|e| format!("Sync backup archive: {e}"))?;
-    drop(file);
-    std::fs::rename(&temp_output, output_path)
-        .map_err(|e| format!("Publish backup archive {output_path}: {e}"))?;
-    #[cfg(unix)]
-    {
-        let parent = Path::new(output_path)
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-            .unwrap_or_else(|| Path::new("."));
-        File::open(parent)
-            .and_then(|dir| dir.sync_all())
-            .map_err(|e| format!("Sync backup parent directory: {e}"))?;
-    }
+    Ok(())
+}
 
+fn create_backup_internal(
+    db: &Arc<OmniKV>,
+    manifest_path: &str,
+    wal_path: Option<&str>,
+    output_path: &str,
+) -> Result<String, String> {
+    let (temp_output, file) = create_unique_staging_file(output_path, "writing")?;
+    let _temp_cleanup = TempFileCleanup::new(temp_output.clone());
+    write_backup_archive_to_file(db, manifest_path, wal_path, file)?;
+    publish_staged_file(&temp_output, output_path, "backup archive")?;
     Ok(output_path.to_string())
 }
 
@@ -318,21 +355,19 @@ fn create_encrypted_backup_internal(
     output_path: &str,
     passphrase: &str,
 ) -> Result<String, String> {
-    let temp_path = format!("{output_path}.tmp");
-    let _cleanup = TempFileCleanup::new(temp_path.clone());
-    create_backup_internal(db, manifest_path, wal_path, &temp_path)?;
+    let (plain_temp_path, plain_file) = create_unique_staging_file(output_path, "plain")?;
+    let _plain_cleanup = TempFileCleanup::new(plain_temp_path.clone());
+    write_backup_archive_to_file(db, manifest_path, wal_path, plain_file)?;
 
     let mut data = Vec::new();
-    File::open(&temp_path)
+    File::open(&plain_temp_path)
         .and_then(|mut f| f.read_to_end(&mut data))
         .map_err(|e| format!("Read temporary backup: {e}"))?;
 
     let encrypted = crate::crypto::encrypt(&data, passphrase)?;
 
-    let enc_temp_path = format!("{output_path}.enc.tmp");
+    let (enc_temp_path, mut enc_file) = create_unique_staging_file(output_path, "enc")?;
     let _enc_cleanup = TempFileCleanup::new(enc_temp_path.clone());
-    let mut enc_file =
-        File::create(&enc_temp_path).map_err(|e| format!("Write encrypted backup: {e}"))?;
     enc_file
         .write_all(&encrypted)
         .map_err(|e| format!("Write encrypted backup: {e}"))?;
@@ -340,18 +375,7 @@ fn create_encrypted_backup_internal(
         .sync_all()
         .map_err(|e| format!("Sync encrypted backup: {e}"))?;
     drop(enc_file);
-    std::fs::rename(&enc_temp_path, output_path)
-        .map_err(|e| format!("Publish encrypted backup {output_path}: {e}"))?;
-    #[cfg(unix)]
-    {
-        let parent = Path::new(output_path)
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-            .unwrap_or_else(|| Path::new("."));
-        File::open(parent)
-            .and_then(|dir| dir.sync_all())
-            .map_err(|e| format!("Sync encrypted backup parent directory: {e}"))?;
-    }
+    publish_staged_file(&enc_temp_path, output_path, "encrypted backup")?;
 
     Ok(output_path.to_string())
 }

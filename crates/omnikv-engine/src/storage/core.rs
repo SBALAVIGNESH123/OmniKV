@@ -3512,21 +3512,22 @@ impl OmniKV {
         })
     }
 
-    /// Returns `true` if any record (put or tombstone) in `[range_start, range_end)`
-    /// has a sequence number `> after_seq` across memtables and persisted tables.
+    /// Returns `Ok(true)` if any record (put or tombstone) in `[range_start, range_end)`
+    /// has a sequence number `> after_seq` across memtables and persisted tables,
+    /// or `Err` if reading/decoding a persisted SSTable fails.
     fn has_key_in_range_after_seq(
         &self,
         range_start: &str,
         range_end: &str,
         after_seq: u64,
-    ) -> bool {
+    ) -> Result<bool, OmniError> {
         if self.global_seq.load(Ordering::SeqCst).saturating_sub(1) <= after_seq {
-            return false;
+            return Ok(false);
         }
         let start_bytes = range_start.as_bytes().to_vec();
         let end_bytes = range_end.as_bytes().to_vec();
         if start_bytes >= end_bytes {
-            return false;
+            return Ok(false);
         }
         let roots = self.roots.load();
         let mem_range_start = (start_bytes.clone(), Reverse(u64::MAX));
@@ -3535,7 +3536,7 @@ impl OmniKV {
         for shard in roots.memtable.iter() {
             for entry in shard.range(mem_range_start.clone()..mem_range_end.clone()) {
                 if entry.key().1.0 > after_seq {
-                    return true;
+                    return Ok(true);
                 }
             }
         }
@@ -3543,53 +3544,34 @@ impl OmniKV {
             for shard in frozen.iter() {
                 for entry in shard.range(mem_range_start.clone()..mem_range_end.clone()) {
                     if entry.key().1.0 > after_seq {
-                        return true;
+                        return Ok(true);
                     }
                 }
             }
         }
         let allow_legacy_base =
             Self::manifest_allows_legacy_zero_base(&roots.manifest, &self.manifest_path);
-        let scan_table = |mmap: &Arc<Mmap>, allow_legacy: bool| -> bool {
+        let scan_table = |mmap: &Arc<Mmap>, allow_legacy: bool| -> Result<bool, OmniError> {
             let reader = SSTableReader::from_mmap(mmap.clone());
-            let mut iter = match reader.try_iter_from(&start_bytes, allow_legacy) {
-                Ok(iter) => iter,
-                Err(err) => {
-                    tracing::error!(
-                        "corrupt SSTable encountered during range conflict check ({err}); failing closed"
-                    );
-                    return true;
+            let mut iter = reader.try_iter_from(&start_bytes, allow_legacy)?;
+            while let Some(rec) = iter.try_next()? {
+                if rec.key >= end_bytes {
+                    break;
                 }
-            };
-            loop {
-                match iter.try_next() {
-                    Ok(Some(rec)) => {
-                        if rec.key >= end_bytes {
-                            break;
-                        }
-                        if rec.key >= start_bytes && rec.is_valid() && rec.seq > after_seq {
-                            return true;
-                        }
-                    }
-                    Ok(None) => break,
-                    Err(err) => {
-                        tracing::error!(
-                            "corrupt SSTable record encountered during range conflict check ({err}); failing closed"
-                        );
-                        return true;
-                    }
+                if rec.key >= start_bytes && rec.is_valid() && rec.seq > after_seq {
+                    return Ok(true);
                 }
             }
-            false
+            Ok(false)
         };
         for (mmap, _, _) in &**roots.sstables {
-            if scan_table(mmap, false) {
-                return true;
+            if scan_table(mmap, false)? {
+                return Ok(true);
             }
         }
         for (mmap, _, _) in &**roots.l1_sstables {
-            if scan_table(mmap, false) {
-                return true;
+            if scan_table(mmap, false)? {
+                return Ok(true);
             }
         }
         scan_table(&roots.base_mmap, allow_legacy_base)
@@ -3732,7 +3714,10 @@ impl OmniKV {
                         .transition_guard
                         .write()
                         .map_err(|_| "transition_guard poisoned".to_string())?;
-                    if self.has_key_in_range_after_seq(range_start, range_end, read_seq) {
+                    if self
+                        .has_key_in_range_after_seq(range_start, range_end, read_seq)
+                        .map_err(|e| e.to_string())?
+                    {
                         return Err(RANGE_CHANGED_SENTINEL.to_string());
                     }
                 }
@@ -3753,7 +3738,7 @@ impl OmniKV {
             .write()
             .map_err(|_| OmniError::LockPoisoned("transition_guard".into()))?;
         self.ensure_writes_not_fenced()?;
-        if self.has_key_in_range_after_seq(range_start, range_end, read_seq) {
+        if self.has_key_in_range_after_seq(range_start, range_end, read_seq)? {
             return Ok(Err(()));
         }
         if tx.is_empty() {
@@ -7576,6 +7561,22 @@ mod tests {
         db.commit_batch(&l0_batch).expect("commit l0 batch");
         db.compact_sstables().expect("flush L0");
 
+        // Record a baseline at or above the intact L0 records, then commit an
+        // unrelated write outside `[k_hot, k_zzz)` so `has_key_in_range_after_seq`
+        // cannot short-circuit on `global_seq` while the intact L0 control
+        // proves no real conflict exists in `[k_hot, k_zzz)`.
+        let clean_l0_seq = db.get_seq().saturating_sub(1);
+        let mut outside_batch = WriteBatch::new();
+        outside_batch
+            .set("a_outside", "keep_range_scan_open".into())
+            .expect("stage outside key");
+        db.commit_batch(&outside_batch).expect("commit outside key");
+        assert!(
+            !db.has_key_in_range_after_seq("k_hot", "k_zzz", clean_l0_seq)
+                .expect("intact L0 range check"),
+            "intact L0 table must report no conflict in [k_hot, k_zzz) after clean_l0_seq"
+        );
+
         let cur_roots = db.roots.load();
         let orig_l0_path = cur_roots.sstables[0].2.clone();
         let orig_l0_bloom = cur_roots.sstables[0].1.clone();
@@ -7634,8 +7635,18 @@ mod tests {
                 "{label}: db.scan_limit must fail closed on corrupt L0 table"
             );
             assert!(
-                db.has_key_in_range_after_seq("k_del", "k_zzz", base_seq),
-                "{label}: range conflict check must fail closed on corrupt L0 table"
+                db.has_key_in_range_after_seq("k_hot", "k_zzz", clean_l0_seq)
+                    .is_err(),
+                "{label}: range conflict check must return storage error on corrupt L0 table"
+            );
+            let mut cond_batch = WriteBatch::new();
+            cond_batch
+                .set("k_hot", "cond_write".into())
+                .expect("stage conditional write");
+            assert!(
+                db.commit_batch_if_range_unchanged(cond_batch, "k_hot", "k_zzz", clean_l0_seq)
+                    .is_err(),
+                "{label}: commit_batch_if_range_unchanged must return storage error instead of catch-up retry"
             );
             assert!(
                 db.compact_l0_to_l1().is_err(),
