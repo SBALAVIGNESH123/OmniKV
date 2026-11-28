@@ -1735,7 +1735,7 @@ fn assert_corrupt_sstable_tier_fails_closed(src_dir: &Path, target: &str, zero_f
         let mut raw = fs::read(&victim).expect("read victim sstable");
         let (_, rec0_len) = OmniRecord::decode(&raw).expect("decode first record in victim");
         // Corrupt Record 1 inside Block 0 while leaving Block 0's start record,
-        // sparse index, and footer intact. Full-table `table_crc32` binding
+        // sparse index, and footer intact. Full-table `table_sha256` binding
         // detects the tamper immediately on `OmniKV::open` and fails closed.
         raw[rec0_len..rec0_len + 12].fill(0xFF);
         fs::write(&victim, &raw).expect("corrupt mid-block record");
@@ -1950,7 +1950,7 @@ fn l1_to_l2_compaction_aborts_on_misaligned_l0_sparse_index_offset() {
     assert_misaligned_l0_index_rejected_on_open(dir.path());
 
     // Trial 2: Mid-block corruption (Record 1 inside Block 0) is also caught
-    // immediately on `OmniKV::open` via full-table `table_crc32` sidecar
+    // immediately on `OmniKV::open` via full-table `table_sha256` sidecar
     // binding, leaving manifest `l1_sstables` and `base_path` untouched so L1
     // tombstones can never be dropped against an unreadable L0 table.
     let trial_mid = TempDir::new().expect("mid-block l0 trial dir");

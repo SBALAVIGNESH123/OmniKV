@@ -341,46 +341,23 @@ fn test_sstable_corruption_detected_on_read() {
         }
     }
 
-    // Reopen: engine must not panic on corrupted SSTables
-    let db2 = reopen(&dir);
-    let snap = db2.snapshot();
-
-    let mut corruption_detected = false;
-    let mut silent_wrong_data = false;
-
-    for i in 0u64..50 {
-        let key = format!("crc:{i:06}");
-        let expected = format!("val_{i}");
-        match db2.find(&key, snap) {
-            Ok(Some(val)) => {
-                if val != expected {
-                    silent_wrong_data = true;
-                    eprintln!(
-                        "CRITICAL: key='{key}' returned wrong data: expected='{expected}' got='{val}'"
-                    );
-                }
-            }
-            Ok(None) => {
-                // Corruption detected — key treated as absent
-                corruption_detected = true;
-            }
-            Err(_) => {
-                // CRC error surfaced
-                corruption_detected = true;
-            }
-        }
-    }
-    db2.unregister_snapshot(snap);
-
+    // Reopen: engine must fail closed immediately on the corrupted SSTable
+    // without panicking or silently serving corrupted data.
+    let manifest = dir
+        .path()
+        .join("manifest.json")
+        .to_string_lossy()
+        .to_string();
+    let wal = dir.path().join("data.wal").to_string_lossy().to_string();
+    let err = OmniKV::open(&manifest, &wal)
+        .err()
+        .expect("OmniKV::open must fail closed on mid-SSTable byte corruption");
+    let msg = err.to_string();
     assert!(
-        !silent_wrong_data,
-        "CRITICAL: Engine returned wrong data without detecting corruption!"
+        msg.contains("corrupt"),
+        "expected corrupt SSTable error on open, got: {msg}"
     );
-    assert!(
-        corruption_detected,
-        "Engine should detect at least some corruption in the flipped SSTable"
-    );
-    println!("✓ SSTable corruption detected, no silent data corruption");
+    println!("✓ SSTable corruption detected on open without panic or silent data corruption");
 }
 
 // ═══════════════════════════════════════════════════════════════════════

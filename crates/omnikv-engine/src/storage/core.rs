@@ -464,17 +464,21 @@ impl OmniRecord {
     }
 }
 
+const BLOOM_BINDING_VERSION: u8 = 2;
+
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct BloomFilter {
     bitset: Vec<u64>,
     num_bits: usize,
     num_hashes: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    digest_version: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     table_len: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    table_crc32: Option<u32>,
+    table_sha256: Option<[u8; 32]>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    bloom_crc32: Option<u32>,
+    bloom_sha256: Option<[u8; 32]>,
 }
 
 #[derive(Debug)]
@@ -600,37 +604,43 @@ impl BloomFilter {
         self.bitset.iter().any(|&word| word != 0)
     }
 
-    fn compute_integrity_crc32(&self, table_len: u64, table_crc32: u32) -> u32 {
-        let mut hasher = crc32fast::Hasher::new();
-        hasher.update(&(self.num_bits as u64).to_le_bytes());
-        hasher.update(&(self.num_hashes as u64).to_le_bytes());
-        hasher.update(&(self.bitset.len() as u64).to_le_bytes());
+    fn compute_integrity_sha256(&self, table_len: u64, table_sha256: [u8; 32]) -> [u8; 32] {
+        use sha2::{Digest, Sha256};
+
+        let mut hasher = Sha256::new();
+        hasher.update(b"omnikv-bloom-v2");
+        hasher.update([BLOOM_BINDING_VERSION]);
+        hasher.update((self.num_bits as u64).to_le_bytes());
+        hasher.update((self.num_hashes as u64).to_le_bytes());
+        hasher.update((self.bitset.len() as u64).to_le_bytes());
         for &word in &self.bitset {
-            hasher.update(&word.to_le_bytes());
+            hasher.update(word.to_le_bytes());
         }
-        hasher.update(&table_len.to_le_bytes());
-        hasher.update(&table_crc32.to_le_bytes());
-        hasher.finalize()
+        hasher.update(table_len.to_le_bytes());
+        hasher.update(table_sha256);
+        hasher.finalize().into()
     }
 
-    pub(crate) fn bind_to_table(&mut self, table_len: u64, table_crc32: u32) {
+    pub(crate) fn bind_to_table(&mut self, table_len: u64, table_sha256: [u8; 32]) {
+        self.digest_version = Some(BLOOM_BINDING_VERSION);
         self.table_len = Some(table_len);
-        self.table_crc32 = Some(table_crc32);
-        self.bloom_crc32 = Some(self.compute_integrity_crc32(table_len, table_crc32));
+        self.table_sha256 = Some(table_sha256);
+        self.bloom_sha256 = Some(self.compute_integrity_sha256(table_len, table_sha256));
     }
 
     pub(crate) fn matches_table(
         &self,
         has_records: bool,
         table_len: u64,
-        table_crc32: u32,
+        table_sha256: [u8; 32],
     ) -> bool {
         if has_records && !self.has_any_bit_set() {
             return false;
         }
-        self.table_len == Some(table_len)
-            && self.table_crc32 == Some(table_crc32)
-            && self.bloom_crc32 == Some(self.compute_integrity_crc32(table_len, table_crc32))
+        self.digest_version == Some(BLOOM_BINDING_VERSION)
+            && self.table_len == Some(table_len)
+            && self.table_sha256 == Some(table_sha256)
+            && self.bloom_sha256 == Some(self.compute_integrity_sha256(table_len, table_sha256))
     }
 
     pub fn new(expected_elements: usize) -> Self {
@@ -645,9 +655,10 @@ impl BloomFilter {
             bitset,
             num_bits: num_bits_total,
             num_hashes,
+            digest_version: None,
             table_len: None,
-            table_crc32: None,
-            bloom_crc32: None,
+            table_sha256: None,
+            bloom_sha256: None,
         }
     }
 
@@ -1293,7 +1304,7 @@ pub struct SSTableReader {
 pub(crate) struct ValidatedTableSummary {
     pub has_records: bool,
     pub table_len: u64,
-    pub table_crc32: u32,
+    pub table_sha256: [u8; 32],
 }
 
 impl SSTableReader {
@@ -1484,12 +1495,14 @@ impl SSTableReader {
     /// `StorageRoots`.
     ///
     /// Returns a [`ValidatedTableSummary`] containing whether the table holds
-    /// records along with its byte length and full-table CRC32 digest for
-    /// sidecar binding.
+    /// records along with its byte length and full-table SHA-256 digest for
+    /// versioned sidecar binding.
     pub(crate) fn validate_table_layout(
         data: &[u8],
         allow_legacy_zero_base: bool,
     ) -> Result<ValidatedTableSummary, OmniError> {
+        use sha2::{Digest, Sha256};
+
         let layout = Self::parse_strict_sstable_layout(data, allow_legacy_zero_base)?;
         for (idx, (key_range, entry_offset)) in layout.index_entries.iter().enumerate() {
             let block_end = layout
@@ -1510,8 +1523,24 @@ impl SSTableReader {
         Ok(ValidatedTableSummary {
             has_records: layout.data_end > 0,
             table_len: data.len() as u64,
-            table_crc32: crc32fast::hash(data),
+            table_sha256: Sha256::digest(data).into(),
         })
+    }
+
+    /// Validates the SSTable layout and exhaustively decodes every record
+    /// (verifying every per-record CRC32 and `data_end` boundary), preserving
+    /// the legacy 4096-byte zero base exception when `allow_legacy_zero_base`
+    /// is `true`.
+    pub(crate) fn validate_all_records(
+        data: &[u8],
+        allow_legacy_zero_base: bool,
+    ) -> Result<ValidatedTableSummary, OmniError> {
+        let summary = Self::validate_table_layout(data, allow_legacy_zero_base)?;
+        let reader = Self::new(data);
+        for rec in reader.try_iter_all(allow_legacy_zero_base)? {
+            let _ = rec?;
+        }
+        Ok(summary)
     }
 
     /// Resolves `(data_end, start_offset)` for strict internal read paths
@@ -2634,7 +2663,7 @@ impl OmniKV {
             for hash in hashes {
                 bloom.add(hash);
             }
-            bloom.bind_to_table(summary.table_len, summary.table_crc32);
+            bloom.bind_to_table(summary.table_len, summary.table_sha256);
             Ok(bloom)
         };
 
@@ -2652,7 +2681,7 @@ impl OmniKV {
                 if b.matches_table(
                     base_summary.has_records,
                     base_summary.table_len,
-                    base_summary.table_crc32,
+                    base_summary.table_sha256,
                 ) =>
             {
                 b
@@ -2696,7 +2725,7 @@ impl OmniKV {
                     if b.matches_table(
                         l0_summary.has_records,
                         l0_summary.table_len,
-                        l0_summary.table_crc32,
+                        l0_summary.table_sha256,
                     ) =>
                 {
                     b
@@ -2742,7 +2771,7 @@ impl OmniKV {
                     if b.matches_table(
                         l1_summary.has_records,
                         l1_summary.table_len,
-                        l1_summary.table_crc32,
+                        l1_summary.table_sha256,
                     ) =>
                 {
                     b
@@ -5159,7 +5188,7 @@ impl OmniKV {
             // treats the table as immutable and replaces it only by root swap.
             let mmap = unsafe { MmapOptions::new().map(&file)? };
             let summary = SSTableReader::validate_table_layout(&mmap, false)?;
-            bloom.bind_to_table(summary.table_len, summary.table_crc32);
+            bloom.bind_to_table(summary.table_len, summary.table_sha256);
             bloom.save(&bloom_path)?;
 
             let _publish_guard = self
@@ -5325,7 +5354,7 @@ impl OmniKV {
         // does not mutate the file afterward.
         let mmap = unsafe { MmapOptions::new().map(&file)? };
         let summary = SSTableReader::validate_table_layout(&mmap, false)?;
-        bloom.bind_to_table(summary.table_len, summary.table_crc32);
+        bloom.bind_to_table(summary.table_len, summary.table_sha256);
         bloom.save(&bloom_path)?;
 
         let mut manifest = self.roots.load().manifest.clone().as_ref().clone();
@@ -5502,7 +5531,7 @@ impl OmniKV {
         // while new readers see this immutable mapping after the root swap.
         let new_base_mmap = unsafe { MmapOptions::new().map(&file)? };
         let summary = SSTableReader::validate_table_layout(&new_base_mmap, false)?;
-        bloom.bind_to_table(summary.table_len, summary.table_crc32);
+        bloom.bind_to_table(summary.table_len, summary.table_sha256);
         bloom.save(&bloom_path)?;
 
         // Critical Section: Swap ALL topology in a SINGLE atomic update from
@@ -5799,7 +5828,7 @@ impl OmniKV {
         // mmap handles remain Arc-owned until all readers release them.
         let new_base_mmap = unsafe { MmapOptions::new().map(&new_base_file)? };
         let summary = SSTableReader::validate_table_layout(&new_base_mmap, false)?;
-        bloom.bind_to_table(summary.table_len, summary.table_crc32);
+        bloom.bind_to_table(summary.table_len, summary.table_sha256);
 
         let new_heap_reader = OpenOptions::new().read(true).open(&new_heap_path)?;
         let old_manifest = cur_roots.manifest.as_ref().clone();
@@ -7880,22 +7909,37 @@ mod tests {
         db.compact_l0_to_l1().expect("compact base L1");
         db.compact_l1_to_l2().expect("compact base L2");
 
-        // Create an unrelated L0 first so we also have a genuine bound sidecar
-        // from a different SSTable to swap onto the tombstone/overwrite L0.
-        let mut decoy_batch = WriteBatch::new();
-        decoy_batch
-            .set("k_decoy_only", "decoy_val".into())
-            .expect("stage decoy");
-        db.commit_batch(&decoy_batch).expect("commit decoy");
-        db.compact_sstables().expect("flush decoy L0");
+        // Create a donor L0 table with the EXACT same record lengths, sparse
+        // index, footer, and IEEE CRC-32 residue as the target L0 table below
+        // (shared Block 0 start key `"a_idx"`, three 5-byte non-indexed keys),
+        // so copying its bound sidecar proves SHA-256 distinguishes tables that
+        // collide under per-record-CRC32 full-table CRC32.
+        let mut donor_batch = WriteBatch::new();
+        donor_batch
+            .set("a_idx", "same_block0".into())
+            .expect("stage donor block0");
+        donor_batch
+            .set("k_dc1", "donor_val1".into())
+            .expect("stage donor 1");
+        donor_batch
+            .set("k_dc2", "donor_val2".into())
+            .expect("stage donor 2");
+        donor_batch
+            .set("k_dc3", "donor_val3".into())
+            .expect("stage donor 3");
+        db.commit_batch(&donor_batch).expect("commit donor");
+        db.compact_sstables().expect("flush donor L0");
 
         let mut l0_batch = WriteBatch::new();
+        l0_batch
+            .set("a_idx", "same_block0".into())
+            .expect("stage target block0");
         l0_batch.delete("k_del").expect("stage delete");
         l0_batch
             .set("k_upd", "new_l0_val".into())
             .expect("stage overwrite");
         l0_batch
-            .set("k_other", "other_val".into())
+            .set("k_oth", "other_val".into())
             .expect("stage other");
         db.commit_batch(&l0_batch).expect("commit L0 updates");
         let l0_del_seq = db.get_seq_for_key("k_del", db.get_seq());
@@ -7905,28 +7949,53 @@ mod tests {
 
         let roots = db.roots.load();
         assert_eq!(roots.manifest.sstables.len(), 2);
-        let decoy_bloom_path = bloom_path_for_base(&roots.manifest.sstables[0]);
+        let donor_sst_path = roots.manifest.sstables[0].clone();
+        let donor_bloom_path = bloom_path_for_base(&donor_sst_path);
         let target_sst_path = roots.manifest.sstables[1].clone();
         let target_bloom_path = bloom_path_for_base(&target_sst_path);
-        let decoy_bloom = BloomFilter::load(&decoy_bloom_path).expect("load decoy bloom");
-        assert!(decoy_bloom.bloom_crc32.is_some());
-        let decoy_bloom_bytes = std::fs::read(&decoy_bloom_path).expect("read decoy bloom");
+        let donor_bloom = BloomFilter::load(&donor_bloom_path).expect("load donor bloom");
+        assert_eq!(donor_bloom.digest_version, Some(BLOOM_BINDING_VERSION));
+        assert!(donor_bloom.bloom_sha256.is_some());
+        let donor_bloom_bytes = std::fs::read(&donor_bloom_path).expect("read donor bloom");
         let orig_target_bloom =
             BloomFilter::load(&target_bloom_path).expect("load original bound target bloom");
-        assert!(orig_target_bloom.bloom_crc32.is_some());
+        assert_eq!(
+            orig_target_bloom.digest_version,
+            Some(BLOOM_BINDING_VERSION)
+        );
+        assert!(orig_target_bloom.bloom_sha256.is_some());
         drop(db);
 
+        let donor_sst_bytes = std::fs::read(&donor_sst_path).expect("read donor L0");
         let target_sst_bytes = std::fs::read(&target_sst_path).expect("read target L0");
+        let donor_summary =
+            SSTableReader::validate_table_layout(&donor_sst_bytes, false).expect("donor summary");
         let target_summary =
             SSTableReader::validate_table_layout(&target_sst_bytes, false).expect("target summary");
+        let donor_layout =
+            SSTableReader::parse_strict_sstable_layout(&donor_sst_bytes, false).expect("donor");
+        let target_layout =
+            SSTableReader::parse_strict_sstable_layout(&target_sst_bytes, false).expect("target");
+        // Prove the donor and target tables have identical length, identical
+        // sparse index + footer, and colliding IEEE CRC-32 — yet distinct SHA-256.
+        assert_eq!(donor_sst_bytes.len(), target_sst_bytes.len());
+        assert_eq!(
+            &donor_sst_bytes[donor_layout.data_end..],
+            &target_sst_bytes[target_layout.data_end..]
+        );
+        assert_eq!(
+            crc32fast::hash(&donor_sst_bytes),
+            crc32fast::hash(&target_sst_bytes)
+        );
+        assert_ne!(donor_summary.table_sha256, target_summary.table_sha256);
         assert!(orig_target_bloom.matches_table(
             target_summary.has_records,
             target_summary.table_len,
-            target_summary.table_crc32,
+            target_summary.table_sha256,
         ));
 
         // 1. Bit-flip valid-JSON non-empty sidecar: clear bits for `k_del` and
-        //    `k_upd` while leaving `k_other` set (keeping stale CRC fields).
+        //    `k_upd` while leaving `k_oth` set (keeping stale SHA-256 fields).
         let mut bit_flipped =
             BloomFilter::load(&target_bloom_path).expect("reload target bloom for bit-flip");
         for key in ["k_del", "k_upd"] {
@@ -7951,11 +8020,25 @@ mod tests {
             })
             .expect("single-bit 64-bit bloom missing k_del and k_upd");
 
-        // 3. Genuine bound `.bloom` swapped from another SSTable (`decoy_bloom_bytes`).
-        let cases: [(&str, Vec<u8>); 3] = [
+        // 3. Legacy CRC32-style sidecar (missing `digest_version`/SHA-256 fields)
+        //    carrying a stale bitset that misses both `k_del` and `k_upd`.
+        let legacy_crc32_json = format!(
+            r#"{{"bitset":{},"num_bits":{},"num_hashes":{},"table_len":{},"table_crc32":{},"bloom_crc32":12345}}"#,
+            serde_json::to_string(&bit_flipped.bitset).expect("bitset json"),
+            bit_flipped.num_bits,
+            bit_flipped.num_hashes,
+            target_summary.table_len,
+            crc32fast::hash(&target_sst_bytes),
+        )
+        .into_bytes();
+
+        // 4. Genuine v2 SHA-256 bound `.bloom` swapped from the same-length,
+        //    same-index, CRC32-colliding donor SSTable (`donor_bloom_bytes`).
+        let cases: [(&str, Vec<u8>); 4] = [
             ("bit_flipped_valid_json", bit_flipped_json),
             ("crafted_minimal_unverified", crafted_json),
-            ("swapped_other_sstable_bloom", decoy_bloom_bytes),
+            ("legacy_crc32_binding", legacy_crc32_json),
+            ("swapped_same_len_same_index_donor_bloom", donor_bloom_bytes),
         ];
 
         for (label, tampered_bytes) in cases {
@@ -7985,7 +8068,7 @@ mod tests {
                 "{label}: tampered bloom must not skip L0 overwrite"
             );
             assert_eq!(
-                reopened.find("k_other", seq).expect("find other key"),
+                reopened.find("k_oth", seq).expect("find other key"),
                 Some("other_val".into()),
                 "{label}: untouched L0 key must remain visible"
             );
@@ -8006,11 +8089,11 @@ mod tests {
                 healed.matches_table(
                     target_summary.has_records,
                     target_summary.table_len,
-                    target_summary.table_crc32,
+                    target_summary.table_sha256,
                 ),
-                "{label}: healed bloom must be bound to target SSTable"
+                "{label}: healed bloom must be bound to target SSTable via v2 SHA-256"
             );
-            for key in ["k_del", "k_upd", "k_other"] {
+            for key in ["a_idx", "k_del", "k_upd", "k_oth"] {
                 assert!(
                     healed.might_contain(key_hash(key)),
                     "{label}: healed bloom must match '{key}'"

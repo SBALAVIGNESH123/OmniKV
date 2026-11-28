@@ -10,6 +10,7 @@ use flate2::Compression;
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
 use std::io::{Cursor, Read, Write};
 use std::path::{Component, Path, PathBuf};
@@ -259,7 +260,7 @@ fn append_validated_backup_entry<W: Write>(
     if archive_path == BASE_ENTRY {
         let base_bytes = std::fs::read(source)
             .map_err(|e| format!("Read backup source {}: {e}", source.display()))?;
-        SSTableReader::validate_table_layout(&base_bytes, allow_legacy_base).map_err(|e| {
+        SSTableReader::validate_all_records(&base_bytes, allow_legacy_base).map_err(|e| {
             format!(
                 "Validate source base SSTable {} for backup: {e}",
                 source.display()
@@ -278,7 +279,7 @@ fn append_validated_backup_entry<W: Write>(
     {
         let sst_bytes = std::fs::read(source)
             .map_err(|e| format!("Read backup source {}: {e}", source.display()))?;
-        SSTableReader::validate_table_layout(&sst_bytes, false).map_err(|e| {
+        SSTableReader::validate_all_records(&sst_bytes, false).map_err(|e| {
             format!(
                 "Validate source SSTable {} for backup: {e}",
                 source.display()
@@ -514,6 +515,7 @@ fn restore_backup_reader<R: Read>(
 
     let decoder = GzDecoder::new(reader);
     let mut archive = Archive::new(decoder);
+    let mut extracted_files = HashSet::new();
 
     for entry in archive
         .entries()
@@ -525,7 +527,7 @@ fn restore_backup_reader<R: Read>(
             .map_err(|e| format!("Read backup entry path: {e}"))?
             .into_owned();
         let safe_path = validate_archive_path(&entry_path)?;
-        let output_path = restore_root.join(safe_path);
+        let output_path = restore_root.join(&safe_path);
 
         if entry.header().entry_type().is_dir() {
             std::fs::create_dir_all(&output_path)
@@ -547,18 +549,20 @@ fn restore_backup_reader<R: Read>(
         entry
             .unpack(&output_path)
             .map_err(|e| format!("Unpack {}: {e}", entry_path.display()))?;
+        extracted_files.insert(extracted_path_key(&safe_path));
     }
 
-    let metadata = verify_restored_metadata(&restore_root)?;
+    let metadata = verify_restored_metadata(&restore_root, &extracted_files)?;
     let archive_generation = match metadata {
         Some(meta) if meta.base_format_v2 => BackupArchiveGeneration::ModernV2,
         Some(meta) => {
             let has_verified_entry = |target: &str| {
-                let target_path = Path::new(target);
-                meta.files.iter().any(|file| {
-                    validate_archive_path(Path::new(&file.path)).ok().as_deref()
-                        == Some(target_path)
-                })
+                let target_key = extracted_path_key(Path::new(target));
+                extracted_files.contains(&target_key)
+                    && meta.files.iter().any(|file| {
+                        validate_archive_path(Path::new(&file.path))
+                            .is_ok_and(|rel| extracted_path_key(&rel) == target_key)
+                    })
             };
             let base_bloom_verified = has_verified_entry(MANIFEST_ENTRY)
                 && has_verified_entry(BASE_ENTRY)
@@ -571,11 +575,37 @@ fn restore_backup_reader<R: Read>(
     };
     rewrite_restored_manifest(
         &restore_root,
+        &extracted_files,
         archive_generation,
         allow_bloomless_legacy_zero_base,
     )?;
 
     Ok(())
+}
+
+fn extracted_path_key(relative: &Path) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let mut normalized = PathBuf::new();
+        for component in relative.components() {
+            if let Component::Normal(part) = component {
+                if let Some(s) = part.to_str() {
+                    normalized.push(s.to_ascii_lowercase());
+                } else {
+                    normalized.push(part);
+                }
+            }
+        }
+        normalized
+    }
+    #[cfg(not(windows))]
+    {
+        relative.to_path_buf()
+    }
+}
+
+fn extracted_files_contains(extracted_files: &HashSet<PathBuf>, relative: &Path) -> bool {
+    extracted_files.contains(&extracted_path_key(relative))
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -622,12 +652,15 @@ fn append_bytes<W: Write>(
     Ok(())
 }
 
-fn verify_restored_metadata(restore_root: &Path) -> Result<Option<BackupMetadata>, String> {
-    let metadata_path = restore_root.join(METADATA_ENTRY);
-    if !metadata_path.exists() {
+fn verify_restored_metadata(
+    restore_root: &Path,
+    extracted_files: &HashSet<PathBuf>,
+) -> Result<Option<BackupMetadata>, String> {
+    if !extracted_files_contains(extracted_files, Path::new(METADATA_ENTRY)) {
         return Ok(None);
     }
 
+    let metadata_path = restore_root.join(METADATA_ENTRY);
     let metadata_bytes =
         std::fs::read(&metadata_path).map_err(|e| format!("Read backup metadata: {e}"))?;
     let metadata: BackupMetadata = serde_json::from_slice(&metadata_bytes)
@@ -646,6 +679,12 @@ fn verify_restored_metadata(restore_root: &Path) -> Result<Option<BackupMetadata
         }
 
         let relative = validate_archive_path(Path::new(&file.path))?;
+        if !extracted_files_contains(extracted_files, &relative) {
+            return Err(format!(
+                "Restored archive is missing file {} declared in metadata",
+                file.path
+            ));
+        }
         let restored_path = restore_root.join(relative);
         let bytes = std::fs::read(&restored_path)
             .map_err(|e| format!("Read restored file {}: {e}", file.path))?;
@@ -673,9 +712,13 @@ fn verify_restored_metadata(restore_root: &Path) -> Result<Option<BackupMetadata
 
 fn rewrite_restored_manifest(
     restore_root: &Path,
+    extracted_files: &HashSet<PathBuf>,
     archive_generation: BackupArchiveGeneration,
     allow_bloomless_legacy_zero_base: bool,
 ) -> Result<(), String> {
+    if !extracted_files_contains(extracted_files, Path::new(MANIFEST_ENTRY)) {
+        return Err(format!("Backup archive is missing {MANIFEST_ENTRY}"));
+    }
     let manifest_path = restore_root.join(MANIFEST_ENTRY);
     let manifest_path_str = manifest_path
         .to_str()
@@ -697,7 +740,9 @@ fn rewrite_restored_manifest(
         .collect::<Result<Vec<_>, String>>()?;
 
     maybe_upgrade_legacy_zero_base(
+        restore_root,
         &manifest,
+        extracted_files,
         archive_generation,
         allow_bloomless_legacy_zero_base,
     )?;
@@ -711,64 +756,65 @@ fn rewrite_restored_manifest(
 
 /// Upgrades a restored pre-v2 untouched 4096-byte zero placeholder `base.bin`
 /// into a valid 24-byte `OMNIV2**` empty SSTable only when positive evidence
-/// confirms the archive is a legacy empty-base placeholder.
+/// from the current archive confirms the archive is a legacy empty-base
+/// placeholder.
 ///
 /// Never upgrades:
 /// - modern backups (`BackupArchiveGeneration::ModernV2`),
-/// - backups with `wal_checkpoint_seq != 0`, or
-/// - backups whose `base.bloom` records any key or is corrupt.
+/// - backups with `wal_checkpoint_seq != 0`,
+/// - bases that are not the canonical top-level `base.bin` extracted by the
+///   current archive, or
+/// - backups whose current-archive `base.bloom` records any key or is corrupt.
 ///
-/// When `base.bloom` is absent (or when `omnikv-backup.json` metadata is
-/// absent), upgrades only if the manifest itself proves an empty database
-/// (`max_seq == 0` with no L0/L1 tables) or the caller explicitly opted in via
-/// [`restore_legacy_backup_allowing_zero_base`]. Otherwise leaves the
+/// When `base.bloom` is absent from the current archive (or was not
+/// authenticated by the current archive's `omnikv-backup.json`), upgrades only
+/// if the manifest itself proves an empty database (`max_seq == 0`,
+/// `read_seq_floor == 0`, and no L0/L1 tables) or the caller explicitly opted
+/// in via [`restore_legacy_backup_allowing_zero_base`]. Otherwise leaves the
 /// 4096-byte zero file untouched so `OmniKV::open` fails closed.
 fn maybe_upgrade_legacy_zero_base(
+    restore_root: &Path,
     manifest: &Manifest,
+    extracted_files: &HashSet<PathBuf>,
     archive_generation: BackupArchiveGeneration,
     allow_bloomless_legacy_zero_base: bool,
 ) -> Result<(), String> {
     if archive_generation == BackupArchiveGeneration::ModernV2 || manifest.wal_checkpoint_seq != 0 {
         return Ok(());
     }
-    let Some(base_name) = Path::new(&manifest.base_path).file_name() else {
-        return Ok(());
-    };
-    let is_restored_base = {
-        #[cfg(windows)]
-        {
-            base_name
-                .to_str()
-                .is_some_and(|name| name.eq_ignore_ascii_case(BASE_ENTRY))
-        }
-        #[cfg(not(windows))]
-        {
-            base_name == std::ffi::OsStr::new(BASE_ENTRY)
-        }
-    };
-    if !is_restored_base {
+    if !extracted_files_contains(extracted_files, Path::new(MANIFEST_ENTRY))
+        || !extracted_files_contains(extracted_files, Path::new(BASE_ENTRY))
+    {
         return Ok(());
     }
     let base_path = Path::new(&manifest.base_path);
+    let is_canonical_top_level_base = base_path
+        .strip_prefix(restore_root)
+        .is_ok_and(|rel| extracted_path_key(rel) == Path::new(BASE_ENTRY));
+    if !is_canonical_top_level_base {
+        return Ok(());
+    }
     let bloom_path = bloom_path_for_base(&manifest.base_path);
     let manifest_proves_empty_db = manifest.max_seq == 0
         && manifest.read_seq_floor == 0
         && manifest.sstables.is_empty()
         && manifest.l1_sstables.is_empty();
-    let verified_pre_v2_bloom = matches!(
-        archive_generation,
-        BackupArchiveGeneration::VerifiedPreV2 {
-            base_bloom_verified: true
-        }
-    );
+    let bloom_extracted = extracted_files_contains(extracted_files, Path::new(BASE_BLOOM_ENTRY));
+    let verified_pre_v2_bloom = bloom_extracted
+        && matches!(
+            archive_generation,
+            BackupArchiveGeneration::VerifiedPreV2 {
+                base_bloom_verified: true
+            }
+        );
 
-    if Path::new(&bloom_path).exists() {
+    if bloom_extracted && Path::new(&bloom_path).exists() {
         match BloomFilter::load(&bloom_path) {
             Ok(bloom) if !bloom.has_any_bit_set() => {
-                // Only trust an empty `base.bloom` automatically when
-                // CRC-verified pre-v2 metadata authenticated `manifest.json`,
-                // `base.bin`, and `base.bloom`. Leftover or untracked
-                // `base.bloom` files cannot authorize silent base conversion.
+                // Only trust an empty `base.bloom` automatically when the
+                // current archive extracted and CRC-verified `manifest.json`,
+                // canonical top-level `base.bin`, and `base.bloom`. Leftover or
+                // untracked `base.bloom` files cannot authorize conversion.
                 if !verified_pre_v2_bloom
                     && !manifest_proves_empty_db
                     && !allow_bloomless_legacy_zero_base

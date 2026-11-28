@@ -341,6 +341,34 @@ fn assert_restored_legacy_archive_runs_gc_and_l1_to_l2(
     }
 }
 
+fn assert_zero_base_untouched_and_open_fails_base_validation(
+    restore_dir: &std::path::Path,
+    base_rel: &str,
+    reason: &str,
+) {
+    let base_bytes = std::fs::read(restore_dir.join(base_rel)).expect("read restored zero base");
+    assert_eq!(
+        base_bytes.len(),
+        4096,
+        "{reason}: restored {base_rel} must remain 4096 bytes untouched"
+    );
+    assert!(
+        base_bytes.iter().all(|&b| b == 0),
+        "{reason}: restored {base_rel} must remain all-zero bytes"
+    );
+    let err = OmniKV::open(
+        restore_dir.join("manifest.json").to_str().unwrap(),
+        restore_dir.join("wal.bin").to_str().unwrap(),
+    )
+    .err()
+    .expect(reason);
+    let msg = err.to_string();
+    assert!(
+        msg.contains("corrupt base SSTable"),
+        "{reason}: expected base SSTable validation error, got {msg}"
+    );
+}
+
 fn assert_corrupt_archive_fails_closed_on_open(
     archive: &std::path::Path,
     also_reject_legacy_opt_in: bool,
@@ -352,13 +380,10 @@ fn assert_corrupt_archive_fails_closed_on_open(
         default_dir.path().to_str().unwrap(),
     )
     .expect("unpack archive with matching CRCs");
-    assert!(
-        OmniKV::open(
-            default_dir.path().join("manifest.json").to_str().unwrap(),
-            default_dir.path().join("wal.bin").to_str().unwrap(),
-        )
-        .is_err(),
-        "default restore: {reason}"
+    assert_zero_base_untouched_and_open_fails_base_validation(
+        default_dir.path(),
+        "base.bin",
+        &format!("default restore: {reason}"),
     );
 
     if also_reject_legacy_opt_in {
@@ -368,13 +393,10 @@ fn assert_corrupt_archive_fails_closed_on_open(
             opt_in_dir.path().to_str().unwrap(),
         )
         .expect("unpack archive under legacy opt-in");
-        assert!(
-            OmniKV::open(
-                opt_in_dir.path().join("manifest.json").to_str().unwrap(),
-                opt_in_dir.path().join("wal.bin").to_str().unwrap(),
-            )
-            .is_err(),
-            "legacy opt-in restore: {reason}"
+        assert_zero_base_untouched_and_open_fails_base_validation(
+            opt_in_dir.path(),
+            "base.bin",
+            &format!("legacy opt-in restore: {reason}"),
         );
     }
 }
@@ -459,14 +481,16 @@ fn restored_pre_v2_legacy_zero_base_backup_with_l0_and_l1_opens_compacts_and_run
     assert_leftover_bloom_and_encrypted_legacy_restore(
         source_dir.path(),
         &source_dir.path().join("legacy_bloomless_0.tar.gz"),
+        &legacy_with_empty_bloom,
     );
 }
 
 fn assert_leftover_bloom_and_encrypted_legacy_restore(
     scratch_dir: &std::path::Path,
     bloomless_archive: &std::path::Path,
+    verified_pre_v2_archive: &std::path::Path,
 ) {
-    // Leftover empty `base.bloom` in `restore_dir` must not bypass `base_bloom_verified`.
+    // 1. Leftover empty `base.bloom` in `restore_dir` must not bypass `base_bloom_verified`.
     let dirty_restore_dir = tempfile::tempdir().expect("dirty restore dir");
     omni_engine::BloomFilter::new(100)
         .save(
@@ -482,20 +506,48 @@ fn assert_leftover_bloom_and_encrypted_legacy_restore(
         dirty_restore_dir.path().to_str().unwrap(),
     )
     .expect("unpack into dirty restore dir");
-    assert!(
-        OmniKV::open(
-            dirty_restore_dir
-                .path()
-                .join("manifest.json")
-                .to_str()
-                .unwrap(),
-            dirty_restore_dir.path().join("wal.bin").to_str().unwrap(),
-        )
-        .is_err(),
-        "untracked leftover empty base.bloom must not authorize silent zero-base upgrade"
+    assert_zero_base_untouched_and_open_fails_base_validation(
+        dirty_restore_dir.path(),
+        "base.bin",
+        "untracked leftover empty base.bloom must not authorize silent zero-base upgrade",
     );
 
-    // Encrypted bloom-less pre-v2 archive: default fails closed, opt-in restores.
+    // 2. Leftover `omnikv-backup.json` + empty `base.bloom` from a prior pre-v2
+    //    restore must NOT be inherited by a later metadata-less, bloom-less archive.
+    let retained_meta_dir = tempfile::tempdir().expect("retained metadata restore dir");
+    let prev_meta = read_archive_entry(verified_pre_v2_archive, "omnikv-backup.json");
+    let prev_bloom = read_archive_entry(verified_pre_v2_archive, "base.bloom");
+    std::fs::write(
+        retained_meta_dir.path().join("omnikv-backup.json"),
+        prev_meta,
+    )
+    .expect("plant retained pre-v2 metadata");
+    std::fs::write(retained_meta_dir.path().join("base.bloom"), prev_bloom)
+        .expect("plant retained empty base.bloom");
+    let metadata_less_bloomless = scratch_dir.join("metadata_less_bloomless.tar.gz");
+    repack_backup_archive_with_overrides(
+        bloomless_archive,
+        &metadata_less_bloomless,
+        &RepackOverrides {
+            omit_base_bloom: true,
+            omit_metadata: true,
+            ..RepackOverrides::default()
+        },
+    );
+    restore_backup(
+        metadata_less_bloomless.to_str().unwrap(),
+        retained_meta_dir.path().to_str().unwrap(),
+    )
+    .expect("unpack metadata-less archive into dirty dir");
+    assert_zero_base_untouched_and_open_fails_base_validation(
+        retained_meta_dir.path(),
+        "base.bin",
+        "retained metadata and sidecar from prior restore must not qualify current archive",
+    );
+
+    assert_dirty_dir_opt_in_and_manifest_less_reject(scratch_dir, bloomless_archive);
+
+    // 4. Encrypted bloom-less pre-v2 archive: default fails closed, opt-in restores.
     let encrypted_legacy = scratch_dir.join("legacy_bloomless.omnikv.enc");
     let plain_bytes = std::fs::read(bloomless_archive).expect("read bloomless archive");
     let enc_bytes = omni_engine::crypto::encrypt(&plain_bytes, "legacy-pass").expect("encrypt");
@@ -508,17 +560,10 @@ fn assert_leftover_bloom_and_encrypted_legacy_restore(
         "legacy-pass",
     )
     .expect("unpack encrypted legacy archive");
-    assert!(
-        OmniKV::open(
-            enc_default_dir
-                .path()
-                .join("manifest.json")
-                .to_str()
-                .unwrap(),
-            enc_default_dir.path().join("wal.bin").to_str().unwrap(),
-        )
-        .is_err(),
-        "default encrypted restore must fail closed on bloom-less pre-v2 archive"
+    assert_zero_base_untouched_and_open_fails_base_validation(
+        enc_default_dir.path(),
+        "base.bin",
+        "default encrypted restore must fail closed on bloom-less pre-v2 archive",
     );
 
     let enc_opt_in_dir = tempfile::tempdir().expect("enc opt-in dir");
@@ -539,6 +584,60 @@ fn assert_leftover_bloom_and_encrypted_legacy_restore(
     .expect("open opt-in encrypted legacy restore");
     verify_keys(&restored, "l1_data", 16);
     verify_keys(&restored, "l0_data", 16);
+}
+
+fn assert_dirty_dir_opt_in_and_manifest_less_reject(
+    scratch_dir: &std::path::Path,
+    bloomless_archive: &std::path::Path,
+) {
+    // Retained populated `base.bloom` from an earlier DB must NOT block
+    // explicit opt-in restore of a bloom-less pre-v2 archive, and a
+    // manifest-less archive must never silently reuse a retained manifest.
+    let populated_dirty_dir = tempfile::tempdir().expect("populated dirty dir");
+    let mut populated_bloom = omni_engine::BloomFilter::new(100);
+    populated_bloom.add(0xDEAD_BEEF);
+    populated_bloom
+        .save(
+            populated_dirty_dir
+                .path()
+                .join("base.bloom")
+                .to_str()
+                .unwrap(),
+        )
+        .expect("plant leftover populated base.bloom");
+    restore_legacy_backup_allowing_zero_base(
+        bloomless_archive.to_str().unwrap(),
+        populated_dirty_dir.path().to_str().unwrap(),
+    )
+    .expect("opt-in restore ignores retained populated base.bloom");
+    let recovered = OmniKV::open(
+        populated_dirty_dir
+            .path()
+            .join("manifest.json")
+            .to_str()
+            .unwrap(),
+        populated_dirty_dir.path().join("wal.bin").to_str().unwrap(),
+    )
+    .expect("open opt-in restore over dirty populated bloom");
+    verify_keys(&recovered, "l1_data", 16);
+    verify_keys(&recovered, "l0_data", 16);
+    drop(recovered);
+
+    let manifest_less_archive = scratch_dir.join("manifest_less.tar.gz");
+    let file = std::fs::File::create(&manifest_less_archive).expect("create manifest-less tar");
+    let mut tar = Builder::new(GzEncoder::new(file, Compression::default()));
+    append_repacked_entry(&mut tar, "base.bin", &[0u8; 4096]);
+    tar.finish().expect("finish manifest-less tar");
+    tar.into_inner().expect("inner").finish().expect("gzip");
+    let missing_manifest_err = restore_backup(
+        manifest_less_archive.to_str().unwrap(),
+        populated_dirty_dir.path().to_str().unwrap(),
+    )
+    .expect_err("manifest-less archive must not reuse retained manifest.json");
+    assert!(
+        missing_manifest_err.contains("missing manifest.json"),
+        "expected missing manifest.json error, got {missing_manifest_err}"
+    );
 }
 
 #[test]
@@ -613,34 +712,75 @@ fn create_backup_rejects_corrupt_source_tables_without_leaving_partial_archive()
 
     let orig_manifest = omni_engine::Manifest::load(&manifest_str).expect("load orig manifest");
 
-    for (label, mutate_l0) in [("corrupt_base", false), ("corrupt_l0", true)] {
+    // Also build a table whose Block 0 start record, sparse index, and footer
+    // remain intact, while non-indexed Record 1 inside Block 0 is corrupted.
+    let mut mid_block_corrupt =
+        std::fs::read(&orig_manifest.sstables[0]).expect("read live L0 table");
+    let (_, rec0_len) =
+        omni_engine::OmniRecord::decode(&mid_block_corrupt).expect("decode indexed first record");
+    mid_block_corrupt[rec0_len..rec0_len + 12].fill(0xFF);
+    let mid_corrupt_file = source_dir.path().join("mid_block_corrupt.sst");
+    std::fs::write(&mid_corrupt_file, &mid_block_corrupt).expect("write mid-block corrupt table");
+
+    // Pre-create a healthy backup at `existing_out` to prove failed validation
+    // never overwrites an existing good backup archive.
+    let existing_out = source_dir.path().join("existing_good.tar.gz");
+    create_backup_with_wal(&db, &manifest_str, &wal_str, existing_out.to_str().unwrap())
+        .expect("create initial healthy backup");
+    let existing_good_bytes = std::fs::read(&existing_out).expect("read healthy backup");
+
+    for (label, mutate_l0, victim_path, target_out) in [
+        ("corrupt_base", false, &corrupt_file, None),
+        ("corrupt_l0", true, &corrupt_file, None),
+        (
+            "corrupt_l0_non_indexed_record",
+            true,
+            &mid_corrupt_file,
+            Some(&existing_out),
+        ),
+        (
+            "corrupt_base_non_indexed_record",
+            false,
+            &mid_corrupt_file,
+            Some(&existing_out),
+        ),
+    ] {
         let mut tampered = orig_manifest.clone();
         if mutate_l0 {
-            tampered.sstables[0] = corrupt_file.to_string_lossy().to_string();
+            tampered.sstables[0] = victim_path.to_string_lossy().to_string();
         } else {
-            tampered.base_path = corrupt_file.to_string_lossy().to_string();
+            tampered.base_path = victim_path.to_string_lossy().to_string();
         }
         tampered
             .save(&manifest_str)
             .expect("save tampered manifest");
 
-        let out_path = source_dir.path().join(format!("{label}.tar.gz"));
+        let fresh_out = source_dir.path().join(format!("{label}.tar.gz"));
+        let out_path = target_out.unwrap_or(&fresh_out);
         let err = create_backup_with_wal(&db, &manifest_str, &wal_str, out_path.to_str().unwrap())
             .expect_err("backup must reject corrupt source SSTable");
         assert!(
             err.contains("Validate source"),
             "{label}: expected source SSTable validation error, got {err}"
         );
-        assert!(
-            !out_path.exists(),
-            "{label}: failed backup must not leave partial archive at output path"
-        );
+        if target_out.is_some() {
+            assert_eq!(
+                std::fs::read(out_path).expect("read preserved backup"),
+                existing_good_bytes,
+                "{label}: failed backup must not overwrite existing good archive"
+            );
+        } else {
+            assert!(
+                !out_path.exists(),
+                "{label}: failed backup must not leave partial archive at output path"
+            );
+        }
+        let prefix = format!("{}.", out_path.file_name().unwrap().to_string_lossy());
         let staged_leftovers: Vec<String> = std::fs::read_dir(source_dir.path())
             .expect("read source dir")
             .filter_map(|entry| {
                 let name = entry.ok()?.file_name().to_string_lossy().to_string();
-                name.starts_with(&format!("{label}.tar.gz."))
-                    .then_some(name)
+                name.starts_with(&prefix).then_some(name)
             })
             .collect();
         assert_eq!(
@@ -751,6 +891,104 @@ fn restore_does_not_upgrade_corrupted_zero_filled_4096_byte_generated_base() {
         source_dir.path(),
         &source_dir.path().join("modern_missing_bloom.tar.gz"),
     );
+    assert_nested_zero_base_not_authorized_by_top_level_bloom(
+        source_dir.path(),
+        &valid_backup,
+        &zero_base,
+        &empty_bloom_json,
+    );
+}
+
+fn assert_nested_zero_base_not_authorized_by_top_level_bloom(
+    scratch_dir: &std::path::Path,
+    valid_backup: &std::path::Path,
+    zero_base: &[u8],
+    empty_bloom_json: &[u8],
+) {
+    use flate2::read::GzDecoder;
+    use omni_engine::backup::BackupMetadata;
+    use std::io::Read;
+    use tar::Archive;
+
+    // Build a pre-v2 archive containing verified top-level `base.bin` + empty
+    // `base.bloom`, while `manifest.json` points to `nested/base.bin` alongside
+    // an unverified empty `nested/base.bloom`. Top-level verification must NOT
+    // authorize converting `nested/base.bin`.
+    let src_file = std::fs::File::open(valid_backup).expect("open valid backup");
+    let mut archive = Archive::new(GzDecoder::new(src_file));
+    let mut entries: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut meta: Option<BackupMetadata> = None;
+    for entry in archive.entries().expect("entries") {
+        let mut entry = entry.expect("entry");
+        let path = entry
+            .path()
+            .expect("path")
+            .to_string_lossy()
+            .replace('\\', "/");
+        let mut bytes = Vec::new();
+        entry.read_to_end(&mut bytes).expect("read");
+        if path == "omnikv-backup.json" {
+            meta = Some(serde_json::from_slice(&bytes).expect("parse meta"));
+            continue;
+        }
+        if path == "manifest.json" {
+            let mut m: omni_engine::Manifest = serde_json::from_slice(&bytes).expect("manifest");
+            m.base_path = "nested/base.bin".to_string();
+            bytes = serde_json::to_vec_pretty(&m).expect("serialize manifest");
+        } else if path == "base.bloom" {
+            empty_bloom_json.clone_into(&mut bytes);
+        }
+        entries.push((path, bytes));
+    }
+
+    let mut metadata = meta.expect("meta");
+    metadata.base_format_v2 = false;
+    metadata.files.clear();
+
+    let nested_archive = scratch_dir.join("nested_zero_base.tar.gz");
+    let dst_file = std::fs::File::create(&nested_archive).expect("create nested archive");
+    let mut tar = Builder::new(GzEncoder::new(dst_file, Compression::default()));
+    for (path, bytes) in &entries {
+        append_repacked_entry(&mut tar, path, bytes);
+        metadata
+            .files
+            .push(omni_engine::backup::BackupFileMetadata {
+                path: path.clone(),
+                bytes: bytes.len() as u64,
+                crc32: crc32fast::hash(bytes),
+            });
+    }
+    // Add unverified `nested/base.bin` (4096 zeros) and `nested/base.bloom` (empty).
+    append_repacked_entry(&mut tar, "nested/base.bin", zero_base);
+    append_repacked_entry(&mut tar, "nested/base.bloom", empty_bloom_json);
+    let meta_bytes = serde_json::to_vec_pretty(&metadata).expect("serialize nested metadata");
+    append_repacked_entry(&mut tar, "omnikv-backup.json", &meta_bytes);
+    tar.finish().expect("finish tar");
+    tar.into_inner().expect("inner").finish().expect("gzip");
+
+    for opt_in in [false, true] {
+        let restore_dir = tempfile::tempdir().expect("nested restore dir");
+        if opt_in {
+            restore_legacy_backup_allowing_zero_base(
+                nested_archive.to_str().unwrap(),
+                restore_dir.path().to_str().unwrap(),
+            )
+            .expect("restore nested archive under opt-in");
+        } else {
+            restore_backup(
+                nested_archive.to_str().unwrap(),
+                restore_dir.path().to_str().unwrap(),
+            )
+            .expect("restore nested archive");
+        }
+        assert_zero_base_untouched_and_open_fails_base_validation(
+            restore_dir.path(),
+            "nested/base.bin",
+            &format!(
+                "nested base must not be converted using top-level evidence (opt_in={opt_in})"
+            ),
+        );
+    }
 }
 
 fn assert_encrypted_modern_missing_bloom_fails_closed(
@@ -779,13 +1017,10 @@ fn assert_encrypted_modern_missing_bloom_fails_closed(
             )
             .expect("unpack encrypted modern");
         }
-        assert!(
-            OmniKV::open(
-                restore_dir.path().join("manifest.json").to_str().unwrap(),
-                restore_dir.path().join("wal.bin").to_str().unwrap(),
-            )
-            .is_err(),
-            "encrypted modern missing-bloom archive must fail closed (opt_in={opt_in})"
+        assert_zero_base_untouched_and_open_fails_base_validation(
+            restore_dir.path(),
+            "base.bin",
+            &format!("encrypted modern missing-bloom archive must fail closed (opt_in={opt_in})"),
         );
     }
 }
