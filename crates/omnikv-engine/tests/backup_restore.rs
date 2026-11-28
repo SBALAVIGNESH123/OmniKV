@@ -2,7 +2,8 @@ use flate2::Compression;
 use flate2::write::GzEncoder;
 use omni_engine::backup::{
     create_backup_with_wal, create_encrypted_backup_with_wal, restore_backup,
-    restore_encrypted_backup,
+    restore_encrypted_backup, restore_encrypted_legacy_backup_allowing_zero_base,
+    restore_legacy_backup_allowing_zero_base,
 };
 use omni_engine::{OmniKV, WriteBatch};
 use tar::{Builder, EntryType, Header};
@@ -159,13 +160,30 @@ fn restore_rejects_path_traversal_entries() {
     assert!(!evil_path.exists(), "restore must not write outside target");
 }
 
+#[derive(Default)]
+struct RepackOverrides<'a> {
+    replace_base: Option<&'a [u8]>,
+    replace_base_bloom: Option<&'a [u8]>,
+    omit_base_bloom: bool,
+    omit_metadata: bool,
+    force_legacy_format: bool,
+    force_wal_checkpoint_seq: Option<u64>,
+    force_read_seq_floor: Option<u64>,
+}
+
+fn append_repacked_entry<W: std::io::Write>(tar: &mut Builder<W>, path: &str, bytes: &[u8]) {
+    let mut header = Header::new_gnu();
+    header.set_size(bytes.len() as u64);
+    header.set_mode(0o600);
+    header.set_cksum();
+    tar.append_data(&mut header, path, bytes)
+        .expect("append repacked entry");
+}
+
 fn repack_backup_archive_with_overrides(
     src_archive: &std::path::Path,
     dst_archive: &std::path::Path,
-    replace_base: Option<&[u8]>,
-    omit_base_bloom: bool,
-    force_wal_checkpoint_seq: Option<u64>,
-    force_read_seq_floor: Option<u64>,
+    overrides: &RepackOverrides<'_>,
 ) {
     use flate2::read::GzDecoder;
     use omni_engine::backup::BackupMetadata;
@@ -190,23 +208,29 @@ fn repack_backup_archive_with_overrides(
             orig_meta = Some(serde_json::from_slice(&bytes).expect("parse src metadata"));
             continue;
         }
-        if omit_base_bloom && path == "base.bloom" {
+        if overrides.omit_base_bloom && path == "base.bloom" {
             continue;
         }
+        if path == "base.bloom"
+            && let Some(replacement) = overrides.replace_base_bloom
+        {
+            replacement.clone_into(&mut bytes);
+        }
         if path == "base.bin"
-            && let Some(replacement) = replace_base
+            && let Some(replacement) = overrides.replace_base
         {
             replacement.clone_into(&mut bytes);
         }
         if path == "manifest.json"
-            && (force_wal_checkpoint_seq.is_some() || force_read_seq_floor.is_some())
+            && (overrides.force_wal_checkpoint_seq.is_some()
+                || overrides.force_read_seq_floor.is_some())
         {
             let mut manifest: omni_engine::Manifest =
                 serde_json::from_slice(&bytes).expect("parse archive manifest");
-            if let Some(checkpoint_seq) = force_wal_checkpoint_seq {
+            if let Some(checkpoint_seq) = overrides.force_wal_checkpoint_seq {
                 manifest.wal_checkpoint_seq = checkpoint_seq;
             }
-            if let Some(read_seq_floor) = force_read_seq_floor {
+            if let Some(read_seq_floor) = overrides.force_read_seq_floor {
                 manifest.read_seq_floor = read_seq_floor;
             }
             bytes = serde_json::to_vec_pretty(&manifest).expect("serialize archive manifest");
@@ -215,19 +239,15 @@ fn repack_backup_archive_with_overrides(
     }
 
     let mut metadata = orig_meta.expect("src metadata");
+    if overrides.force_legacy_format {
+        metadata.base_format_v2 = false;
+    }
     metadata.files.clear();
 
     let dst_file = std::fs::File::create(dst_archive).expect("create dst archive");
-    let encoder = GzEncoder::new(dst_file, Compression::default());
-    let mut tar = Builder::new(encoder);
-
+    let mut tar = Builder::new(GzEncoder::new(dst_file, Compression::default()));
     for (path, bytes) in &entries {
-        let mut header = Header::new_gnu();
-        header.set_size(bytes.len() as u64);
-        header.set_mode(0o600);
-        header.set_cksum();
-        tar.append_data(&mut header, path, bytes.as_slice())
-            .expect("append repacked entry");
+        append_repacked_entry(&mut tar, path, bytes);
         metadata
             .files
             .push(omni_engine::backup::BackupFileMetadata {
@@ -236,18 +256,10 @@ fn repack_backup_archive_with_overrides(
                 crc32: crc32fast::hash(bytes),
             });
     }
-
-    let meta_bytes = serde_json::to_vec_pretty(&metadata).expect("serialize repacked metadata");
-    let mut meta_header = Header::new_gnu();
-    meta_header.set_size(meta_bytes.len() as u64);
-    meta_header.set_mode(0o600);
-    meta_header.set_cksum();
-    tar.append_data(
-        &mut meta_header,
-        "omnikv-backup.json",
-        meta_bytes.as_slice(),
-    )
-    .expect("append repacked metadata");
+    if !overrides.omit_metadata {
+        let meta_bytes = serde_json::to_vec_pretty(&metadata).expect("serialize repacked metadata");
+        append_repacked_entry(&mut tar, "omnikv-backup.json", &meta_bytes);
+    }
 
     tar.finish().expect("finish repacked tar");
     tar.into_inner()
@@ -279,14 +291,25 @@ fn read_archive_entry(archive_path: &std::path::Path, target_path: &str) -> Vec<
     panic!("archive missing expected entry {target_path}");
 }
 
-fn assert_restored_legacy_archive_runs_gc_and_l1_to_l2(legacy_archive: &std::path::Path) {
+fn assert_restored_legacy_archive_runs_gc_and_l1_to_l2(
+    legacy_archive: &std::path::Path,
+    use_legacy_opt_in: bool,
+) {
     for op in ["gc", "l1_to_l2"] {
         let restore_dir = tempfile::tempdir().expect("legacy restore dir");
-        restore_backup(
-            legacy_archive.to_str().unwrap(),
-            restore_dir.path().to_str().unwrap(),
-        )
-        .expect("restore pre-v2 archive");
+        if use_legacy_opt_in {
+            restore_legacy_backup_allowing_zero_base(
+                legacy_archive.to_str().unwrap(),
+                restore_dir.path().to_str().unwrap(),
+            )
+            .expect("restore bloom-less pre-v2 archive via explicit opt-in");
+        } else {
+            restore_backup(
+                legacy_archive.to_str().unwrap(),
+                restore_dir.path().to_str().unwrap(),
+            )
+            .expect("restore pre-v2 archive");
+        }
 
         let upgraded_base =
             std::fs::read(restore_dir.path().join("base.bin")).expect("read restored base");
@@ -318,6 +341,44 @@ fn assert_restored_legacy_archive_runs_gc_and_l1_to_l2(legacy_archive: &std::pat
     }
 }
 
+fn assert_corrupt_archive_fails_closed_on_open(
+    archive: &std::path::Path,
+    also_reject_legacy_opt_in: bool,
+    reason: &str,
+) {
+    let default_dir = tempfile::tempdir().expect("default corrupt restore dir");
+    restore_backup(
+        archive.to_str().unwrap(),
+        default_dir.path().to_str().unwrap(),
+    )
+    .expect("unpack archive with matching CRCs");
+    assert!(
+        OmniKV::open(
+            default_dir.path().join("manifest.json").to_str().unwrap(),
+            default_dir.path().join("wal.bin").to_str().unwrap(),
+        )
+        .is_err(),
+        "default restore: {reason}"
+    );
+
+    if also_reject_legacy_opt_in {
+        let opt_in_dir = tempfile::tempdir().expect("opt-in corrupt restore dir");
+        restore_legacy_backup_allowing_zero_base(
+            archive.to_str().unwrap(),
+            opt_in_dir.path().to_str().unwrap(),
+        )
+        .expect("unpack archive under legacy opt-in");
+        assert!(
+            OmniKV::open(
+                opt_in_dir.path().join("manifest.json").to_str().unwrap(),
+                opt_in_dir.path().join("wal.bin").to_str().unwrap(),
+            )
+            .is_err(),
+            "legacy opt-in restore: {reason}"
+        );
+    }
+}
+
 #[test]
 fn restored_pre_v2_legacy_zero_base_backup_with_l0_and_l1_opens_compacts_and_runs_gc() {
     let source_dir = tempfile::tempdir().expect("source dir");
@@ -337,7 +398,8 @@ fn restored_pre_v2_legacy_zero_base_backup_with_l0_and_l1_opens_compacts_and_run
     std::fs::write(&source_base_path, vec![0u8; 4096]).expect("write legacy 4096B zero base");
     let db = OmniKV::open(&manifest, &wal).expect("reopen pre-v2 source DB");
 
-    // 1. Fresh backup of the pre-v2 DB writes a valid 24-byte `OMNIV2**` `base.bin`.
+    // 1. Fresh backup of the pre-v2 DB writes a valid 24-byte `OMNIV2**` `base.bin`
+    //    and records `base_format_v2: true`.
     let fresh_backup = source_dir.path().join("fresh_legacy_backup.tar.gz");
     create_backup_with_wal(&db, &manifest, &wal, fresh_backup.to_str().unwrap())
         .expect("create backup from pre-v2 DB");
@@ -346,28 +408,137 @@ fn restored_pre_v2_legacy_zero_base_backup_with_l0_and_l1_opens_compacts_and_run
     let archived_base = read_archive_entry(&fresh_backup, "base.bin");
     assert_eq!(archived_base.len(), 24);
     assert_eq!(&archived_base[16..24], b"OMNIV2**");
-    assert_restored_legacy_archive_runs_gc_and_l1_to_l2(&fresh_backup);
+    let fresh_meta: omni_engine::backup::BackupMetadata =
+        serde_json::from_slice(&read_archive_entry(&fresh_backup, "omnikv-backup.json"))
+            .expect("parse fresh metadata");
+    assert!(fresh_meta.base_format_v2);
+    assert_restored_legacy_archive_runs_gc_and_l1_to_l2(&fresh_backup, false);
 
-    // 2. Pre-existing pre-v2 archive whose `base.bin` is 4096 all-zero bytes
-    //    alongside L0 and L1 tables — tested WITH empty `base.bloom`, WITHOUT
-    //    `base.bloom`, and with `read_seq_floor > 0` (pre-v2 Raft snapshot
-    //    `data_base.bin` backup), exercising both GC and L1->L2 compaction.
+    // 2. Pre-existing pre-v2 archive (`base_format_v2: false`) with positive
+    //    empty `base.bloom` evidence auto-upgrades via default `restore_backup`.
     let zero_base = vec![0u8; 4096];
-    for (idx, (omit_base_bloom, read_seq_floor)) in [(false, None), (true, None), (true, Some(10))]
-        .into_iter()
-        .enumerate()
-    {
-        let legacy_archive = source_dir.path().join(format!("legacy_case_{idx}.tar.gz"));
+    let legacy_with_empty_bloom = source_dir.path().join("legacy_empty_bloom.tar.gz");
+    repack_backup_archive_with_overrides(
+        &fresh_backup,
+        &legacy_with_empty_bloom,
+        &RepackOverrides {
+            replace_base: Some(&zero_base),
+            force_legacy_format: true,
+            ..RepackOverrides::default()
+        },
+    );
+    assert_restored_legacy_archive_runs_gc_and_l1_to_l2(&legacy_with_empty_bloom, false);
+
+    // 3. Pre-v2 archives WITHOUT `base.bloom` lack positive empty-base metadata
+    //    when L0/L1 tables exist: default `restore_backup` fails closed on open
+    //    (even if a leftover empty `base.bloom` already sits in `restore_dir`),
+    //    while explicit opt-in restores both plain and encrypted archives.
+    for (idx, read_seq_floor) in [None, Some(10)].into_iter().enumerate() {
+        let legacy_archive = source_dir
+            .path()
+            .join(format!("legacy_bloomless_{idx}.tar.gz"));
         repack_backup_archive_with_overrides(
             &fresh_backup,
             &legacy_archive,
-            Some(&zero_base),
-            omit_base_bloom,
-            None,
-            read_seq_floor,
+            &RepackOverrides {
+                replace_base: Some(&zero_base),
+                omit_base_bloom: true,
+                force_legacy_format: true,
+                force_read_seq_floor: read_seq_floor,
+                ..RepackOverrides::default()
+            },
         );
-        assert_restored_legacy_archive_runs_gc_and_l1_to_l2(&legacy_archive);
+        assert_corrupt_archive_fails_closed_on_open(
+            &legacy_archive,
+            false,
+            "bloom-less non-empty pre-v2 archive must not auto-upgrade without opt-in",
+        );
+        assert_restored_legacy_archive_runs_gc_and_l1_to_l2(&legacy_archive, true);
     }
+
+    assert_leftover_bloom_and_encrypted_legacy_restore(
+        source_dir.path(),
+        &source_dir.path().join("legacy_bloomless_0.tar.gz"),
+    );
+}
+
+fn assert_leftover_bloom_and_encrypted_legacy_restore(
+    scratch_dir: &std::path::Path,
+    bloomless_archive: &std::path::Path,
+) {
+    // Leftover empty `base.bloom` in `restore_dir` must not bypass `base_bloom_verified`.
+    let dirty_restore_dir = tempfile::tempdir().expect("dirty restore dir");
+    omni_engine::BloomFilter::new(100)
+        .save(
+            dirty_restore_dir
+                .path()
+                .join("base.bloom")
+                .to_str()
+                .unwrap(),
+        )
+        .expect("plant leftover empty base.bloom");
+    restore_backup(
+        bloomless_archive.to_str().unwrap(),
+        dirty_restore_dir.path().to_str().unwrap(),
+    )
+    .expect("unpack into dirty restore dir");
+    assert!(
+        OmniKV::open(
+            dirty_restore_dir
+                .path()
+                .join("manifest.json")
+                .to_str()
+                .unwrap(),
+            dirty_restore_dir.path().join("wal.bin").to_str().unwrap(),
+        )
+        .is_err(),
+        "untracked leftover empty base.bloom must not authorize silent zero-base upgrade"
+    );
+
+    // Encrypted bloom-less pre-v2 archive: default fails closed, opt-in restores.
+    let encrypted_legacy = scratch_dir.join("legacy_bloomless.omnikv.enc");
+    let plain_bytes = std::fs::read(bloomless_archive).expect("read bloomless archive");
+    let enc_bytes = omni_engine::crypto::encrypt(&plain_bytes, "legacy-pass").expect("encrypt");
+    std::fs::write(&encrypted_legacy, enc_bytes).expect("write encrypted legacy archive");
+
+    let enc_default_dir = tempfile::tempdir().expect("enc default dir");
+    restore_encrypted_backup(
+        encrypted_legacy.to_str().unwrap(),
+        enc_default_dir.path().to_str().unwrap(),
+        "legacy-pass",
+    )
+    .expect("unpack encrypted legacy archive");
+    assert!(
+        OmniKV::open(
+            enc_default_dir
+                .path()
+                .join("manifest.json")
+                .to_str()
+                .unwrap(),
+            enc_default_dir.path().join("wal.bin").to_str().unwrap(),
+        )
+        .is_err(),
+        "default encrypted restore must fail closed on bloom-less pre-v2 archive"
+    );
+
+    let enc_opt_in_dir = tempfile::tempdir().expect("enc opt-in dir");
+    restore_encrypted_legacy_backup_allowing_zero_base(
+        encrypted_legacy.to_str().unwrap(),
+        enc_opt_in_dir.path().to_str().unwrap(),
+        "legacy-pass",
+    )
+    .expect("opt-in encrypted legacy restore");
+    let restored = OmniKV::open(
+        enc_opt_in_dir
+            .path()
+            .join("manifest.json")
+            .to_str()
+            .unwrap(),
+        enc_opt_in_dir.path().join("wal.bin").to_str().unwrap(),
+    )
+    .expect("open opt-in encrypted legacy restore");
+    verify_keys(&restored, "l1_data", 16);
+    verify_keys(&restored, "l0_data", 16);
 }
 
 #[test]
@@ -513,58 +684,110 @@ fn restore_does_not_upgrade_corrupted_zero_filled_4096_byte_generated_base() {
     drop(db);
 
     let zero_base = vec![0u8; 4096];
+    let empty_bloom_json =
+        serde_json::to_vec(&omni_engine::BloomFilter::new(100)).expect("serialize empty bloom");
 
-    // Case A: Zero-filled 4096B generated base with populated `base.bloom`
-    // (L1->L2 base where `wal_checkpoint_seq == 0`) must NOT be upgraded.
-    let corrupt_with_bloom = source_dir.path().join("corrupt_with_bloom.tar.gz");
-    repack_backup_archive_with_overrides(
-        &valid_backup,
-        &corrupt_with_bloom,
-        Some(&zero_base),
-        false,
-        None,
-        None,
-    );
-    let restore_a = tempfile::tempdir().expect("restore a");
-    restore_backup(
-        corrupt_with_bloom.to_str().unwrap(),
-        restore_a.path().to_str().unwrap(),
-    )
-    .expect("unpack archive with matching CRCs");
-    assert!(
-        OmniKV::open(
-            restore_a.path().join("manifest.json").to_str().unwrap(),
-            restore_a.path().join("wal.bin").to_str().unwrap(),
-        )
-        .is_err(),
-        "zero-filled 4096B generated base with populated bloom must fail closed on open"
-    );
+    let cases: [(&str, RepackOverrides<'_>, bool); 5] = [
+        (
+            "modern_populated_bloom",
+            RepackOverrides {
+                replace_base: Some(&zero_base),
+                ..RepackOverrides::default()
+            },
+            true,
+        ),
+        (
+            "modern_missing_bloom",
+            RepackOverrides {
+                replace_base: Some(&zero_base),
+                omit_base_bloom: true,
+                ..RepackOverrides::default()
+            },
+            true,
+        ),
+        (
+            "modern_empty_bloom",
+            RepackOverrides {
+                replace_base: Some(&zero_base),
+                replace_base_bloom: Some(&empty_bloom_json),
+                ..RepackOverrides::default()
+            },
+            true,
+        ),
+        (
+            "legacy_nonzero_checkpoint",
+            RepackOverrides {
+                replace_base: Some(&zero_base),
+                omit_base_bloom: true,
+                force_legacy_format: true,
+                force_wal_checkpoint_seq: Some(5),
+                ..RepackOverrides::default()
+            },
+            true,
+        ),
+        (
+            "metadata_stripped_empty_bloom",
+            RepackOverrides {
+                replace_base: Some(&zero_base),
+                replace_base_bloom: Some(&empty_bloom_json),
+                omit_metadata: true,
+                ..RepackOverrides::default()
+            },
+            false,
+        ),
+    ];
 
-    // Case B: Zero-filled 4096B base with `wal_checkpoint_seq > 0` (GC base)
-    // even when `base.bloom` is omitted must NOT be upgraded.
-    let corrupt_gc_base = source_dir.path().join("corrupt_gc_base.tar.gz");
-    repack_backup_archive_with_overrides(
-        &valid_backup,
-        &corrupt_gc_base,
-        Some(&zero_base),
-        true,
-        Some(5),
-        None,
+    for (label, overrides, also_reject_opt_in) in cases {
+        let archive = source_dir.path().join(format!("{label}.tar.gz"));
+        repack_backup_archive_with_overrides(&valid_backup, &archive, &overrides);
+        assert_corrupt_archive_fails_closed_on_open(
+            &archive,
+            also_reject_opt_in,
+            &format!("{label}: zero-filled 4096B generated base must fail closed on open"),
+        );
+    }
+
+    assert_encrypted_modern_missing_bloom_fails_closed(
+        source_dir.path(),
+        &source_dir.path().join("modern_missing_bloom.tar.gz"),
     );
-    let restore_b = tempfile::tempdir().expect("restore b");
-    restore_backup(
-        corrupt_gc_base.to_str().unwrap(),
-        restore_b.path().to_str().unwrap(),
-    )
-    .expect("unpack gc archive");
-    assert!(
-        OmniKV::open(
-            restore_b.path().join("manifest.json").to_str().unwrap(),
-            restore_b.path().join("wal.bin").to_str().unwrap(),
-        )
-        .is_err(),
-        "zero-filled 4096B base with non-zero wal_checkpoint_seq must fail closed on open"
-    );
+}
+
+fn assert_encrypted_modern_missing_bloom_fails_closed(
+    scratch_dir: &std::path::Path,
+    modern_missing_archive: &std::path::Path,
+) {
+    let enc_modern_missing = scratch_dir.join("modern_missing_bloom.omnikv.enc");
+    let raw_missing = std::fs::read(modern_missing_archive).expect("read modern_missing_bloom");
+    let enc_missing =
+        omni_engine::crypto::encrypt(&raw_missing, "modern-pass").expect("encrypt modern");
+    std::fs::write(&enc_modern_missing, enc_missing).expect("write encrypted modern");
+    for opt_in in [false, true] {
+        let restore_dir = tempfile::tempdir().expect("enc modern restore dir");
+        if opt_in {
+            restore_encrypted_legacy_backup_allowing_zero_base(
+                enc_modern_missing.to_str().unwrap(),
+                restore_dir.path().to_str().unwrap(),
+                "modern-pass",
+            )
+            .expect("unpack encrypted modern under opt-in");
+        } else {
+            restore_encrypted_backup(
+                enc_modern_missing.to_str().unwrap(),
+                restore_dir.path().to_str().unwrap(),
+                "modern-pass",
+            )
+            .expect("unpack encrypted modern");
+        }
+        assert!(
+            OmniKV::open(
+                restore_dir.path().join("manifest.json").to_str().unwrap(),
+                restore_dir.path().join("wal.bin").to_str().unwrap(),
+            )
+            .is_err(),
+            "encrypted modern missing-bloom archive must fail closed (opt_in={opt_in})"
+        );
+    }
 }
 
 #[cfg(unix)]

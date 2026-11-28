@@ -35,6 +35,11 @@ pub struct BackupMetadata {
     pub includes_wal: bool,
     pub source_manifest_path: String,
     pub source_wal_path: Option<String>,
+    /// Indicates that the backup was created after `OMNIV2**` base tables
+    /// became mandatory, so a 4096-byte zero `base.bin` can never be a valid
+    /// untouched legacy placeholder.
+    #[serde(default)]
+    pub base_format_v2: bool,
     pub files: Vec<BackupFileMetadata>,
 }
 
@@ -192,6 +197,7 @@ fn write_backup_archive_to_file(
         includes_wal: wal_path.is_some(),
         source_manifest_path: manifest_path.to_string(),
         source_wal_path: wal_path.map(ToOwned::to_owned),
+        base_format_v2: true,
         files: Vec::new(),
     };
 
@@ -367,7 +373,21 @@ fn build_backup_plan(
 /// Restore a database from a compressed backup.
 pub fn restore_backup(backup_path: &str, restore_dir: &str) -> Result<(), String> {
     let file = File::open(backup_path).map_err(|e| format!("Cannot open backup: {e}"))?;
-    restore_backup_reader(file, restore_dir)
+    restore_backup_reader(file, restore_dir, false)
+}
+
+/// Explicitly restores a pre-v2 compressed backup whose untouched 4096-byte
+/// zero `base.bin` placeholder has no accompanying `base.bloom` sidecar.
+///
+/// Modern backups (`base_format_v2 == true`), backups with
+/// `wal_checkpoint_seq > 0`, and archives whose `base.bloom` records keys or is
+/// corrupt still fail closed.
+pub fn restore_legacy_backup_allowing_zero_base(
+    backup_path: &str,
+    restore_dir: &str,
+) -> Result<(), String> {
+    let file = File::open(backup_path).map_err(|e| format!("Cannot open backup: {e}"))?;
+    restore_backup_reader(file, restore_dir, true)
 }
 
 /// Create an encrypted backup.
@@ -462,10 +482,30 @@ pub fn restore_encrypted_backup(
         .map_err(|e| format!("Read encrypted backup: {e}"))?;
 
     let plaintext = crate::crypto::decrypt(&encrypted, passphrase)?;
-    restore_backup_reader(Cursor::new(plaintext), restore_dir)
+    restore_backup_reader(Cursor::new(plaintext), restore_dir, false)
 }
 
-fn restore_backup_reader<R: Read>(reader: R, restore_dir: &str) -> Result<(), String> {
+/// Explicitly restores an encrypted pre-v2 backup whose untouched 4096-byte
+/// zero `base.bin` placeholder has no accompanying `base.bloom` sidecar.
+pub fn restore_encrypted_legacy_backup_allowing_zero_base(
+    encrypted_backup_path: &str,
+    restore_dir: &str,
+    passphrase: &str,
+) -> Result<(), String> {
+    let mut encrypted = Vec::new();
+    File::open(encrypted_backup_path)
+        .and_then(|mut f| f.read_to_end(&mut encrypted))
+        .map_err(|e| format!("Read encrypted backup: {e}"))?;
+
+    let plaintext = crate::crypto::decrypt(&encrypted, passphrase)?;
+    restore_backup_reader(Cursor::new(plaintext), restore_dir, true)
+}
+
+fn restore_backup_reader<R: Read>(
+    reader: R,
+    restore_dir: &str,
+    allow_bloomless_legacy_zero_base: bool,
+) -> Result<(), String> {
     std::fs::create_dir_all(restore_dir)
         .map_err(|e| format!("Cannot create restore directory: {e}"))?;
     let restore_root = Path::new(restore_dir)
@@ -509,10 +549,40 @@ fn restore_backup_reader<R: Read>(reader: R, restore_dir: &str) -> Result<(), St
             .map_err(|e| format!("Unpack {}: {e}", entry_path.display()))?;
     }
 
-    verify_restored_metadata(&restore_root)?;
-    rewrite_restored_manifest(&restore_root)?;
+    let metadata = verify_restored_metadata(&restore_root)?;
+    let archive_generation = match metadata {
+        Some(meta) if meta.base_format_v2 => BackupArchiveGeneration::ModernV2,
+        Some(meta) => {
+            let has_verified_entry = |target: &str| {
+                let target_path = Path::new(target);
+                meta.files.iter().any(|file| {
+                    validate_archive_path(Path::new(&file.path)).ok().as_deref()
+                        == Some(target_path)
+                })
+            };
+            let base_bloom_verified = has_verified_entry(MANIFEST_ENTRY)
+                && has_verified_entry(BASE_ENTRY)
+                && has_verified_entry(BASE_BLOOM_ENTRY);
+            BackupArchiveGeneration::VerifiedPreV2 {
+                base_bloom_verified,
+            }
+        }
+        None => BackupArchiveGeneration::MetadataMissing,
+    };
+    rewrite_restored_manifest(
+        &restore_root,
+        archive_generation,
+        allow_bloomless_legacy_zero_base,
+    )?;
 
     Ok(())
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BackupArchiveGeneration {
+    ModernV2,
+    VerifiedPreV2 { base_bloom_verified: bool },
+    MetadataMissing,
 }
 
 fn append_existing_file<W: Write>(
@@ -552,10 +622,10 @@ fn append_bytes<W: Write>(
     Ok(())
 }
 
-fn verify_restored_metadata(restore_root: &Path) -> Result<(), String> {
+fn verify_restored_metadata(restore_root: &Path) -> Result<Option<BackupMetadata>, String> {
     let metadata_path = restore_root.join(METADATA_ENTRY);
     if !metadata_path.exists() {
-        return Ok(());
+        return Ok(None);
     }
 
     let metadata_bytes =
@@ -570,7 +640,7 @@ fn verify_restored_metadata(restore_root: &Path) -> Result<(), String> {
         ));
     }
 
-    for file in metadata.files {
+    for file in &metadata.files {
         if file.path == METADATA_ENTRY {
             continue;
         }
@@ -598,10 +668,14 @@ fn verify_restored_metadata(restore_root: &Path) -> Result<(), String> {
         }
     }
 
-    Ok(())
+    Ok(Some(metadata))
 }
 
-fn rewrite_restored_manifest(restore_root: &Path) -> Result<(), String> {
+fn rewrite_restored_manifest(
+    restore_root: &Path,
+    archive_generation: BackupArchiveGeneration,
+    allow_bloomless_legacy_zero_base: bool,
+) -> Result<(), String> {
     let manifest_path = restore_root.join(MANIFEST_ENTRY);
     let manifest_path_str = manifest_path
         .to_str()
@@ -622,7 +696,11 @@ fn rewrite_restored_manifest(restore_root: &Path) -> Result<(), String> {
         .map(|path| rebase_restored_path(restore_root, path))
         .collect::<Result<Vec<_>, String>>()?;
 
-    maybe_upgrade_legacy_zero_base(&manifest)?;
+    maybe_upgrade_legacy_zero_base(
+        &manifest,
+        archive_generation,
+        allow_bloomless_legacy_zero_base,
+    )?;
 
     manifest
         .save(manifest_path_str)
@@ -632,22 +710,25 @@ fn rewrite_restored_manifest(restore_root: &Path) -> Result<(), String> {
 }
 
 /// Upgrades a restored pre-v2 untouched 4096-byte zero placeholder `base.bin`
-/// into a valid 24-byte `OMNIV2**` empty SSTable so pre-v2 backups containing
-/// L0/L1 tables open, compact, and run GC cleanly without loosening strict
-/// base-table validation for live databases.
+/// into a valid 24-byte `OMNIV2**` empty SSTable only when positive evidence
+/// confirms the archive is a legacy empty-base placeholder.
 ///
-/// Only triggers when:
-/// - `wal_checkpoint_seq == 0` (covers both untouched initial `_base.bin` and
-///   pre-v2 Raft snapshot `data_base.bin` placeholders where `read_seq_floor > 0`),
-/// - `manifest.base_path` names a regular file `base.bin` containing 4096
-///   all-zero bytes, and
-/// - `base.bloom` is either absent (omitted by pre-v2 backups of `.bin` bases)
-///   or valid with no bits set.
+/// Never upgrades:
+/// - modern backups (`BackupArchiveGeneration::ModernV2`),
+/// - backups with `wal_checkpoint_seq != 0`, or
+/// - backups whose `base.bloom` records any key or is corrupt.
 ///
-/// A zero-filled 4096-byte generated base whose `base.bloom` records live keys
-/// (or is corrupt) is left untouched so `OmniKV::open` fails closed.
-fn maybe_upgrade_legacy_zero_base(manifest: &Manifest) -> Result<(), String> {
-    if manifest.wal_checkpoint_seq != 0 {
+/// When `base.bloom` is absent (or when `omnikv-backup.json` metadata is
+/// absent), upgrades only if the manifest itself proves an empty database
+/// (`max_seq == 0` with no L0/L1 tables) or the caller explicitly opted in via
+/// [`restore_legacy_backup_allowing_zero_base`]. Otherwise leaves the
+/// 4096-byte zero file untouched so `OmniKV::open` fails closed.
+fn maybe_upgrade_legacy_zero_base(
+    manifest: &Manifest,
+    archive_generation: BackupArchiveGeneration,
+    allow_bloomless_legacy_zero_base: bool,
+) -> Result<(), String> {
+    if archive_generation == BackupArchiveGeneration::ModernV2 || manifest.wal_checkpoint_seq != 0 {
         return Ok(());
     }
     let Some(base_name) = Path::new(&manifest.base_path).file_name() else {
@@ -670,11 +751,35 @@ fn maybe_upgrade_legacy_zero_base(manifest: &Manifest) -> Result<(), String> {
     }
     let base_path = Path::new(&manifest.base_path);
     let bloom_path = bloom_path_for_base(&manifest.base_path);
+    let manifest_proves_empty_db = manifest.max_seq == 0
+        && manifest.read_seq_floor == 0
+        && manifest.sstables.is_empty()
+        && manifest.l1_sstables.is_empty();
+    let verified_pre_v2_bloom = matches!(
+        archive_generation,
+        BackupArchiveGeneration::VerifiedPreV2 {
+            base_bloom_verified: true
+        }
+    );
+
     if Path::new(&bloom_path).exists() {
         match BloomFilter::load(&bloom_path) {
-            Ok(bloom) if !bloom.has_any_bit_set() => {}
+            Ok(bloom) if !bloom.has_any_bit_set() => {
+                // Only trust an empty `base.bloom` automatically when
+                // CRC-verified pre-v2 metadata authenticated `manifest.json`,
+                // `base.bin`, and `base.bloom`. Leftover or untracked
+                // `base.bloom` files cannot authorize silent base conversion.
+                if !verified_pre_v2_bloom
+                    && !manifest_proves_empty_db
+                    && !allow_bloomless_legacy_zero_base
+                {
+                    return Ok(());
+                }
+            }
             _ => return Ok(()),
         }
+    } else if !manifest_proves_empty_db && !allow_bloomless_legacy_zero_base {
+        return Ok(());
     }
 
     OmniKV::upgrade_legacy_zero_base_file(base_path)

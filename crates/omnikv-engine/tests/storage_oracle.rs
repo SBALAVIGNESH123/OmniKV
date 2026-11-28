@@ -1720,10 +1720,10 @@ fn assert_corrupt_sstable_tier_fails_closed(src_dir: &Path, target: &str, zero_f
         .to_string();
     let wal_str = trial.path().join("wal.bin").to_string_lossy().to_string();
     let manifest_before = Manifest::load(&manifest_str).expect("load trial manifest");
-    let (victim, corrupt_key) = match target {
-        "l0" => (manifest_before.sstables[0].clone(), "k02_b"),
-        "l1" => (manifest_before.l1_sstables[0].clone(), "k01_b"),
-        "base" => (manifest_before.base_path.clone(), "k00_b"),
+    let victim = match target {
+        "l0" => manifest_before.sstables[0].clone(),
+        "l1" => manifest_before.l1_sstables[0].clone(),
+        "base" => manifest_before.base_path.clone(),
         _ => unreachable!(),
     };
     if zero_fill {
@@ -1731,74 +1731,35 @@ fn assert_corrupt_sstable_tier_fails_closed(src_dir: &Path, target: &str, zero_f
         // closed immediately at load time on `OmniKV::open`.
         let zero_len = if target == "base" { 8192 } else { 4096 };
         fs::write(&victim, vec![0u8; zero_len]).expect("zero-fill victim sstable");
-        let err = OmniKV::open(&manifest_str, &wal_str)
-            .err()
-            .expect("OmniKV::open must reject zero-filled SSTable at load time");
-        assert!(
-            err.to_string().contains("corrupt"),
-            "{target} (zero_fill=true): expected corrupt SSTable error, got {err}"
-        );
-        return;
+    } else {
+        let mut raw = fs::read(&victim).expect("read victim sstable");
+        let (_, rec0_len) = OmniRecord::decode(&raw).expect("decode first record in victim");
+        // Corrupt Record 1 inside Block 0 while leaving Block 0's start record,
+        // sparse index, and footer intact. Full-table `table_crc32` binding
+        // detects the tamper immediately on `OmniKV::open` and fails closed.
+        raw[rec0_len..rec0_len + 12].fill(0xFF);
+        fs::write(&victim, &raw).expect("corrupt mid-block record");
     }
 
-    let mut raw = fs::read(&victim).expect("read victim sstable");
-    let (_, rec0_len) = OmniRecord::decode(&raw).expect("decode first record in victim");
-    // Corrupt Record 1 inside Block 0 while leaving Block 0's start record,
-    // sparse index, and footer intact.
-    raw[rec0_len..rec0_len + 12].fill(0xFF);
-    fs::write(&victim, &raw).expect("corrupt mid-block record");
-
-    let reopened = open_db(trial.path());
-    let read_seq = reopened.get_seq();
+    let err = OmniKV::open(&manifest_str, &wal_str)
+        .err()
+        .expect("OmniKV::open must fail closed on corrupt SSTable");
     assert!(
-        reopened.find(corrupt_key, read_seq).is_err(),
-        "{target}: point read reaching corrupt mid-block record must fail closed"
-    );
-    assert!(
-        reopened.scan("k00_a", "k99_z", read_seq).is_err(),
-        "{target}: scan reaching corrupt mid-block record must fail closed"
-    );
-    assert!(
-        reopened.scan_limit("k00_a", "k99_z", read_seq, 32).is_err(),
-        "{target}: scan_limit reaching corrupt mid-block record must fail closed"
-    );
-    assert_eq!(
-        reopened.get_seq_for_key(corrupt_key, read_seq),
-        u64::MAX,
-        "{target}: get_seq_for_key reaching corrupt mid-block record must fail closed"
-    );
-
-    let primary_res = match target {
-        "l0" => reopened.compact_l0_to_l1(),
-        "l1" => reopened.compact_l1_to_l2(),
-        "base" => reopened.run_garbage_collection(),
-        _ => unreachable!(),
-    };
-    assert!(
-        primary_res.is_err(),
-        "{target} (zero_fill=false) primary compaction/GC must fail closed on corrupt SSTable"
-    );
-    let secondary_res = match target {
-        "l0" | "l1" => reopened.run_garbage_collection(),
-        "base" => reopened.compact_l1_to_l2(),
-        _ => unreachable!(),
-    };
-    assert!(
-        secondary_res.is_err(),
-        "{target} (zero_fill=false) secondary compaction/GC must fail closed on corrupt SSTable"
+        err.to_string().contains("corrupt"),
+        "{target} (zero_fill={zero_fill}): expected corrupt SSTable error, got {err}"
     );
     let manifest_after = Manifest::load(&manifest_str).expect("reload trial manifest");
     assert_eq!(
         manifest_after.base_path, manifest_before.base_path,
-        "{target}: corrupt compaction must not overwrite base manifest pointer"
+        "{target}: corrupt open must not overwrite base manifest pointer"
     );
     assert_eq!(
         manifest_after.l1_sstables, manifest_before.l1_sstables,
-        "{target}: corrupt compaction must not drop L1 manifest pointers"
+        "{target}: corrupt open must not drop L1 manifest pointers"
     );
     assert_eq!(
         manifest_after.sstables, manifest_before.sstables,
-        "{target}: corrupt compaction must not drop L0 manifest pointers"
+        "{target}: corrupt open must not drop L0 manifest pointers"
     );
 }
 
@@ -1988,14 +1949,20 @@ fn l1_to_l2_compaction_aborts_on_misaligned_l0_sparse_index_offset() {
     // Trial 1: Misaligned Block 1 sparse-index offset fails closed on open.
     assert_misaligned_l0_index_rejected_on_open(dir.path());
 
-    // Trial 2: Mid-block corruption (Record 1 inside Block 0) passes open's
-    // block-start check, then `compact_l1_to_l2()` -> `collect_l0_min_seqs`
-    // fails closed without dropping the L1 tombstone or resurrecting `k_target`.
+    // Trial 2: Mid-block corruption (Record 1 inside Block 0) is also caught
+    // immediately on `OmniKV::open` via full-table `table_crc32` sidecar
+    // binding, leaving manifest `l1_sstables` and `base_path` untouched so L1
+    // tombstones can never be dropped against an unreadable L0 table.
     let trial_mid = TempDir::new().expect("mid-block l0 trial dir");
     copy_isolated_db_dir(dir.path(), trial_mid.path());
     let m2 = trial_mid
         .path()
         .join("manifest.json")
+        .to_string_lossy()
+        .to_string();
+    let w2 = trial_mid
+        .path()
+        .join("wal.bin")
         .to_string_lossy()
         .to_string();
     let m2_before = Manifest::load(&m2).expect("load mid-block trial manifest");
@@ -2004,24 +1971,16 @@ fn l1_to_l2_compaction_aborts_on_misaligned_l0_sparse_index_offset() {
     mid_bytes[rec0_len..rec0_len + 12].fill(0xFF);
     fs::write(&m2_before.sstables[0], &mid_bytes).expect("corrupt mid-block L0 record");
 
-    let reopened = open_db(trial_mid.path());
-    let compact_err = reopened
-        .compact_l1_to_l2()
-        .expect_err("L1->L2 must fail closed via collect_l0_min_seqs on mid-block corrupt L0");
+    let open_err = OmniKV::open(&m2, &w2)
+        .err()
+        .expect("OmniKV::open must fail closed on mid-block corrupt L0 record");
     assert!(
-        compact_err.to_string().contains("corrupt"),
-        "expected corrupt SSTable error from L1->L2, got {compact_err}"
+        open_err.to_string().contains("corrupt"),
+        "expected corrupt SSTable error on open, got {open_err}"
     );
     let m2_after = Manifest::load(&m2).expect("reload mid-block manifest");
     assert_eq!(m2_after.l1_sstables, m2_before.l1_sstables);
     assert_eq!(m2_after.base_path, m2_before.base_path);
-    assert_eq!(
-        reopened
-            .find("k_target", reopened.get_seq())
-            .expect("find k_target"),
-        None,
-        "L1 tombstone must stay intact so k_target is never resurrected"
-    );
 }
 
 #[test]

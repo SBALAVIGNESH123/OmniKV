@@ -469,6 +469,12 @@ pub struct BloomFilter {
     bitset: Vec<u64>,
     num_bits: usize,
     num_hashes: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    table_len: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    table_crc32: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    bloom_crc32: Option<u32>,
 }
 
 #[derive(Debug)]
@@ -594,6 +600,39 @@ impl BloomFilter {
         self.bitset.iter().any(|&word| word != 0)
     }
 
+    fn compute_integrity_crc32(&self, table_len: u64, table_crc32: u32) -> u32 {
+        let mut hasher = crc32fast::Hasher::new();
+        hasher.update(&(self.num_bits as u64).to_le_bytes());
+        hasher.update(&(self.num_hashes as u64).to_le_bytes());
+        hasher.update(&(self.bitset.len() as u64).to_le_bytes());
+        for &word in &self.bitset {
+            hasher.update(&word.to_le_bytes());
+        }
+        hasher.update(&table_len.to_le_bytes());
+        hasher.update(&table_crc32.to_le_bytes());
+        hasher.finalize()
+    }
+
+    pub(crate) fn bind_to_table(&mut self, table_len: u64, table_crc32: u32) {
+        self.table_len = Some(table_len);
+        self.table_crc32 = Some(table_crc32);
+        self.bloom_crc32 = Some(self.compute_integrity_crc32(table_len, table_crc32));
+    }
+
+    pub(crate) fn matches_table(
+        &self,
+        has_records: bool,
+        table_len: u64,
+        table_crc32: u32,
+    ) -> bool {
+        if has_records && !self.has_any_bit_set() {
+            return false;
+        }
+        self.table_len == Some(table_len)
+            && self.table_crc32 == Some(table_crc32)
+            && self.bloom_crc32 == Some(self.compute_integrity_crc32(table_len, table_crc32))
+    }
+
     pub fn new(expected_elements: usize) -> Self {
         let elements = expected_elements.max(1);
         let p = 0.01_f64;
@@ -606,6 +645,9 @@ impl BloomFilter {
             bitset,
             num_bits: num_bits_total,
             num_hashes,
+            table_len: None,
+            table_crc32: None,
+            bloom_crc32: None,
         }
     }
 
@@ -1247,6 +1289,13 @@ pub struct SSTableReader {
     data: SSTableData,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct ValidatedTableSummary {
+    pub has_records: bool,
+    pub table_len: u64,
+    pub table_crc32: u32,
+}
+
 impl SSTableReader {
     /// Creates a reader from arbitrary bytes.
     ///
@@ -1434,12 +1483,13 @@ impl SSTableReader {
     /// publication time so malformed tables fail closed before entering
     /// `StorageRoots`.
     ///
-    /// Returns `Ok(true)` when the table contains record data (`data_end > 0`)
-    /// and `Ok(false)` when it is an empty table or allowed legacy placeholder.
+    /// Returns a [`ValidatedTableSummary`] containing whether the table holds
+    /// records along with its byte length and full-table CRC32 digest for
+    /// sidecar binding.
     pub(crate) fn validate_table_layout(
         data: &[u8],
         allow_legacy_zero_base: bool,
-    ) -> Result<bool, OmniError> {
+    ) -> Result<ValidatedTableSummary, OmniError> {
         let layout = Self::parse_strict_sstable_layout(data, allow_legacy_zero_base)?;
         for (idx, (key_range, entry_offset)) in layout.index_entries.iter().enumerate() {
             let block_end = layout
@@ -1457,7 +1507,11 @@ impl SSTableReader {
                 )));
             }
         }
-        Ok(layout.data_end > 0)
+        Ok(ValidatedTableSummary {
+            has_records: layout.data_end > 0,
+            table_len: data.len() as u64,
+            table_crc32: crc32fast::hash(data),
+        })
     }
 
     /// Resolves `(data_end, start_offset)` for strict internal read paths
@@ -2565,25 +2619,28 @@ impl OmniKV {
             ))
         })?);
 
-        let rebuild_bloom_checked =
-            |reader: &SSTableReader, allow_legacy_base: bool| -> Result<BloomFilter, OmniError> {
-                let mut hashes = Vec::new();
-                for rec in reader.try_iter_all(allow_legacy_base)? {
-                    let rec = rec?;
-                    let mut h = FnvHasher::default();
-                    rec.key.hash(&mut h);
-                    hashes.push(h.finish());
-                }
-                let mut bloom = BloomFilter::new(hashes.len().max(100));
-                for hash in hashes {
-                    bloom.add(hash);
-                }
-                Ok(bloom)
-            };
+        let rebuild_bloom_checked = |reader: &SSTableReader,
+                                     allow_legacy_base: bool,
+                                     summary: ValidatedTableSummary|
+         -> Result<BloomFilter, OmniError> {
+            let mut hashes = Vec::new();
+            for rec in reader.try_iter_all(allow_legacy_base)? {
+                let rec = rec?;
+                let mut h = FnvHasher::default();
+                rec.key.hash(&mut h);
+                hashes.push(h.finish());
+            }
+            let mut bloom = BloomFilter::new(hashes.len().max(100));
+            for hash in hashes {
+                bloom.add(hash);
+            }
+            bloom.bind_to_table(summary.table_len, summary.table_crc32);
+            Ok(bloom)
+        };
 
         let reader = SSTableReader::from_mmap(base_mmap.clone());
         let base_bloom_path = bloom_path_for_base(&manifest.base_path);
-        let base_has_records = SSTableReader::validate_table_layout(&base_mmap, allow_legacy_base)
+        let base_summary = SSTableReader::validate_table_layout(&base_mmap, allow_legacy_base)
             .map_err(|e| {
                 OmniError::IoError(format!(
                     "corrupt base SSTable '{}' referenced by manifest: {e}",
@@ -2591,9 +2648,17 @@ impl OmniKV {
                 ))
             })?;
         let base_bloom = match BloomFilter::load(&base_bloom_path) {
-            Ok(b) if !base_has_records || b.has_any_bit_set() => b,
+            Ok(b)
+                if b.matches_table(
+                    base_summary.has_records,
+                    base_summary.table_len,
+                    base_summary.table_crc32,
+                ) =>
+            {
+                b
+            }
             _ => {
-                let bloom = rebuild_bloom_checked(&reader, allow_legacy_base)?;
+                let bloom = rebuild_bloom_checked(&reader, allow_legacy_base, base_summary)?;
                 let _ = bloom.save(&base_bloom_path);
                 bloom
             }
@@ -2619,18 +2684,25 @@ impl OmniKV {
                     "failed to memory-map L0 SSTable '{sst_path}' referenced by manifest: {e}"
                 ))
             })?);
-            let l0_has_records =
-                SSTableReader::validate_table_layout(&mmap, false).map_err(|e| {
-                    OmniError::IoError(format!(
-                        "corrupt L0 SSTable '{sst_path}' referenced by manifest: {e}"
-                    ))
-                })?;
+            let l0_summary = SSTableReader::validate_table_layout(&mmap, false).map_err(|e| {
+                OmniError::IoError(format!(
+                    "corrupt L0 SSTable '{sst_path}' referenced by manifest: {e}"
+                ))
+            })?;
             let reader = SSTableReader::from_mmap(mmap.clone());
             let bloom_path = bloom_path_for_base(sst_path);
             let bloom = match BloomFilter::load(&bloom_path) {
-                Ok(b) if !l0_has_records || b.has_any_bit_set() => b,
+                Ok(b)
+                    if b.matches_table(
+                        l0_summary.has_records,
+                        l0_summary.table_len,
+                        l0_summary.table_crc32,
+                    ) =>
+                {
+                    b
+                }
                 _ => {
-                    let b = rebuild_bloom_checked(&reader, false)?;
+                    let b = rebuild_bloom_checked(&reader, false, l0_summary)?;
                     let _ = b.save(&bloom_path);
                     b
                 }
@@ -2658,18 +2730,25 @@ impl OmniKV {
                     "failed to memory-map L1 SSTable '{sst_path}' referenced by manifest: {e}"
                 ))
             })?);
-            let l1_has_records =
-                SSTableReader::validate_table_layout(&mmap, false).map_err(|e| {
-                    OmniError::IoError(format!(
-                        "corrupt L1 SSTable '{sst_path}' referenced by manifest: {e}"
-                    ))
-                })?;
+            let l1_summary = SSTableReader::validate_table_layout(&mmap, false).map_err(|e| {
+                OmniError::IoError(format!(
+                    "corrupt L1 SSTable '{sst_path}' referenced by manifest: {e}"
+                ))
+            })?;
             let reader = SSTableReader::from_mmap(mmap.clone());
             let bloom_path = bloom_path_for_base(sst_path);
             let bloom = match BloomFilter::load(&bloom_path) {
-                Ok(b) if !l1_has_records || b.has_any_bit_set() => b,
+                Ok(b)
+                    if b.matches_table(
+                        l1_summary.has_records,
+                        l1_summary.table_len,
+                        l1_summary.table_crc32,
+                    ) =>
+                {
+                    b
+                }
                 _ => {
-                    let b = rebuild_bloom_checked(&reader, false)?;
+                    let b = rebuild_bloom_checked(&reader, false, l1_summary)?;
                     let _ = b.save(&bloom_path);
                     b
                 }
@@ -5074,13 +5153,14 @@ impl OmniKV {
             writer.finish()?;
 
             file.sync_all()?;
-            bloom.save(&bloom_path)?;
 
             // SAFETY: The new L0 SSTable is fully written, flushed, and fsynced
             // before this read-only mapping is created. After publication, OmniKV
             // treats the table as immutable and replaces it only by root swap.
             let mmap = unsafe { MmapOptions::new().map(&file)? };
-            SSTableReader::validate_table_layout(&mmap, false)?;
+            let summary = SSTableReader::validate_table_layout(&mmap, false)?;
+            bloom.bind_to_table(summary.table_len, summary.table_crc32);
+            bloom.save(&bloom_path)?;
 
             let _publish_guard = self
                 .write_mutex
@@ -5239,13 +5319,14 @@ impl OmniKV {
         }
         writer.finish()?;
         file.sync_all()?;
-        bloom.save(&bloom_path)?;
 
         // SAFETY: The new L1 SSTable is fully materialized and synced before
         // mapping. Compaction installs the mapping via an atomic root swap and
         // does not mutate the file afterward.
         let mmap = unsafe { MmapOptions::new().map(&file)? };
-        SSTableReader::validate_table_layout(&mmap, false)?;
+        let summary = SSTableReader::validate_table_layout(&mmap, false)?;
+        bloom.bind_to_table(summary.table_len, summary.table_crc32);
+        bloom.save(&bloom_path)?;
 
         let mut manifest = self.roots.load().manifest.clone().as_ref().clone();
         manifest.sstables.clear();
@@ -5415,13 +5496,14 @@ impl OmniKV {
         }
         writer.finish()?;
         file.sync_all()?;
-        bloom.save(&bloom_path)?;
 
         // SAFETY: The replacement base SSTable is complete and fsynced before
         // mapping. Existing readers retain Arc-owned mappings for old files,
         // while new readers see this immutable mapping after the root swap.
         let new_base_mmap = unsafe { MmapOptions::new().map(&file)? };
-        SSTableReader::validate_table_layout(&new_base_mmap, false)?;
+        let summary = SSTableReader::validate_table_layout(&new_base_mmap, false)?;
+        bloom.bind_to_table(summary.table_len, summary.table_crc32);
+        bloom.save(&bloom_path)?;
 
         // Critical Section: Swap ALL topology in a SINGLE atomic update from
         // the same `cur_roots` snapshot held across `write_mutex`.
@@ -5716,7 +5798,8 @@ impl OmniKV {
         // fsyncs it, maps it read-only, and then publishes it atomically. Old
         // mmap handles remain Arc-owned until all readers release them.
         let new_base_mmap = unsafe { MmapOptions::new().map(&new_base_file)? };
-        SSTableReader::validate_table_layout(&new_base_mmap, false)?;
+        let summary = SSTableReader::validate_table_layout(&new_base_mmap, false)?;
+        bloom.bind_to_table(summary.table_len, summary.table_crc32);
 
         let new_heap_reader = OpenOptions::new().read(true).open(&new_heap_path)?;
         let old_manifest = cur_roots.manifest.as_ref().clone();
@@ -7658,13 +7741,15 @@ mod tests {
             );
         }
 
-        // Also prove direct defense-in-depth when a generated base is replaced
-        // in-memory with 4096 zero bytes (with an L1 table present so L1->L2
-        // runs for real): reads, L1->L2, and GC all fail closed.
+        // Also prove direct defense-in-depth when an already-open DB holds:
+        // (a) an L1 tombstone alongside a corrupt in-memory L0 table (so
+        //     `compact_l1_to_l2()` -> `collect_l0_min_seqs` fails closed), and
+        // (b) a generated base replaced in-memory with 4096 zero bytes.
         let mut l1_seed = WriteBatch::new();
         l1_seed
             .set("k_l1_trigger", "l1_val".into())
             .expect("stage l1 trigger");
+        l1_seed.delete("k_l1_tomb").expect("stage l1 tombstone");
         db.update_roots(|r| StorageRoots {
             sstables: Arc::new(Vec::new()),
             ..r.clone()
@@ -7672,6 +7757,30 @@ mod tests {
         db.commit_batch(&l1_seed).expect("commit l1 trigger");
         db.compact_sstables().expect("flush l1 trigger L0");
         db.compact_l0_to_l1().expect("compact l1 trigger to L1");
+
+        let corrupt_l0_file = OpenOptions::new()
+            .read(true)
+            .open(dir.path().join("corrupt_v2_record.sst"))
+            .expect("reopen corrupt_v2_record.sst");
+        // SAFETY: Test-only immutable file mapped for the L1->L2 check below.
+        let corrupt_l0_mmap =
+            Arc::new(unsafe { MmapOptions::new().map(&corrupt_l0_file) }.expect("mmap"));
+        db.update_roots(|r| StorageRoots {
+            sstables: Arc::new(vec![(
+                corrupt_l0_mmap.clone(),
+                orig_l0_bloom.clone(),
+                orig_l0_path.clone(),
+            )]),
+            ..r.clone()
+        });
+        assert!(
+            db.compact_l1_to_l2().is_err(),
+            "L1->L2 must fail closed via collect_l0_min_seqs on corrupt in-memory L0"
+        );
+        db.update_roots(|r| StorageRoots {
+            sstables: Arc::new(Vec::new()),
+            ..r.clone()
+        });
 
         let zero_base_path = dir.path().join("zero_4096_base.sst");
         std::fs::write(&zero_base_path, vec![0u8; 4096]).expect("write 4096 zero base");
@@ -7741,6 +7850,181 @@ mod tests {
         assert!(
             reopened.commit_batch(&post).is_err(),
             "writes must fail closed after fence_and_poison_group_commit"
+        );
+    }
+
+    #[test]
+    fn tampered_valid_shape_bloom_sidecar_cannot_hide_tombstone_or_overwrite() {
+        let dir = TempDir::new().expect("tampered bloom dir");
+        let manifest = dir.path().join("manifest.json");
+        let wal = dir.path().join("wal.bin");
+        let m_str = manifest.to_str().expect("UTF-8 manifest").to_string();
+        let w_str = wal.to_str().expect("UTF-8 wal").to_string();
+
+        let key_hash = |key: &str| {
+            let mut h = FnvHasher::default();
+            key.as_bytes().hash(&mut h);
+            h.finish()
+        };
+
+        let db = OmniKV::open(&m_str, &w_str).expect("open db");
+        let mut base_batch = WriteBatch::new();
+        base_batch
+            .set("k_del", "old_base_val".into())
+            .expect("stage base k_del");
+        base_batch
+            .set("k_upd", "old_base_val".into())
+            .expect("stage base k_upd");
+        db.commit_batch(&base_batch).expect("commit base batch");
+        db.compact_sstables().expect("flush base L0");
+        db.compact_l0_to_l1().expect("compact base L1");
+        db.compact_l1_to_l2().expect("compact base L2");
+
+        // Create an unrelated L0 first so we also have a genuine bound sidecar
+        // from a different SSTable to swap onto the tombstone/overwrite L0.
+        let mut decoy_batch = WriteBatch::new();
+        decoy_batch
+            .set("k_decoy_only", "decoy_val".into())
+            .expect("stage decoy");
+        db.commit_batch(&decoy_batch).expect("commit decoy");
+        db.compact_sstables().expect("flush decoy L0");
+
+        let mut l0_batch = WriteBatch::new();
+        l0_batch.delete("k_del").expect("stage delete");
+        l0_batch
+            .set("k_upd", "new_l0_val".into())
+            .expect("stage overwrite");
+        l0_batch
+            .set("k_other", "other_val".into())
+            .expect("stage other");
+        db.commit_batch(&l0_batch).expect("commit L0 updates");
+        let l0_del_seq = db.get_seq_for_key("k_del", db.get_seq());
+        let l0_upd_seq = db.get_seq_for_key("k_upd", db.get_seq());
+        assert!(l0_del_seq > 0 && l0_upd_seq > 0);
+        db.compact_sstables().expect("flush target L0");
+
+        let roots = db.roots.load();
+        assert_eq!(roots.manifest.sstables.len(), 2);
+        let decoy_bloom_path = bloom_path_for_base(&roots.manifest.sstables[0]);
+        let target_sst_path = roots.manifest.sstables[1].clone();
+        let target_bloom_path = bloom_path_for_base(&target_sst_path);
+        let decoy_bloom = BloomFilter::load(&decoy_bloom_path).expect("load decoy bloom");
+        assert!(decoy_bloom.bloom_crc32.is_some());
+        let decoy_bloom_bytes = std::fs::read(&decoy_bloom_path).expect("read decoy bloom");
+        let orig_target_bloom =
+            BloomFilter::load(&target_bloom_path).expect("load original bound target bloom");
+        assert!(orig_target_bloom.bloom_crc32.is_some());
+        drop(db);
+
+        let target_sst_bytes = std::fs::read(&target_sst_path).expect("read target L0");
+        let target_summary =
+            SSTableReader::validate_table_layout(&target_sst_bytes, false).expect("target summary");
+        assert!(orig_target_bloom.matches_table(
+            target_summary.has_records,
+            target_summary.table_len,
+            target_summary.table_crc32,
+        ));
+
+        // 1. Bit-flip valid-JSON non-empty sidecar: clear bits for `k_del` and
+        //    `k_upd` while leaving `k_other` set (keeping stale CRC fields).
+        let mut bit_flipped =
+            BloomFilter::load(&target_bloom_path).expect("reload target bloom for bit-flip");
+        for key in ["k_del", "k_upd"] {
+            for idx in bit_flipped.hashes(key_hash(key)) {
+                bit_flipped.bitset[idx / 64] &= !(1u64 << (idx % 64));
+            }
+        }
+        let bit_flipped_json = serde_json::to_vec(&bit_flipped).expect("serialize bit-flipped");
+
+        // 2. Crafted minimal structurally valid unverified JSON with 1 bit set
+        //    chosen specifically to miss both `k_del` and `k_upd`.
+        let crafted_json = (0u32..64)
+            .find_map(|bit| {
+                let candidate = format!(
+                    r#"{{"bitset":[{}],"num_bits":64,"num_hashes":1}}"#,
+                    1u64 << bit
+                );
+                let parsed: BloomFilter = serde_json::from_str(&candidate).expect("parse crafted");
+                (!parsed.might_contain(key_hash("k_del"))
+                    && !parsed.might_contain(key_hash("k_upd")))
+                .then_some(candidate.into_bytes())
+            })
+            .expect("single-bit 64-bit bloom missing k_del and k_upd");
+
+        // 3. Genuine bound `.bloom` swapped from another SSTable (`decoy_bloom_bytes`).
+        let cases: [(&str, Vec<u8>); 3] = [
+            ("bit_flipped_valid_json", bit_flipped_json),
+            ("crafted_minimal_unverified", crafted_json),
+            ("swapped_other_sstable_bloom", decoy_bloom_bytes),
+        ];
+
+        for (label, tampered_bytes) in cases {
+            std::fs::write(&target_bloom_path, &tampered_bytes)
+                .expect("overwrite target bloom with tampered bytes");
+            let loaded_tampered =
+                BloomFilter::load(&target_bloom_path).expect("tampered bloom must parse cleanly");
+            assert!(
+                loaded_tampered.has_any_bit_set(),
+                "{label}: tampered bloom must have at least one bit set"
+            );
+            assert!(
+                !loaded_tampered.might_contain(key_hash("k_del"))
+                    && !loaded_tampered.might_contain(key_hash("k_upd")),
+                "{label}: tampered bloom must false-negative both k_del and k_upd before healing"
+            );
+            let reopened = OmniKV::open(&m_str, &w_str).expect("reopen after bloom tamper");
+            let seq = reopened.get_seq();
+            assert_eq!(
+                reopened.find("k_del", seq).expect("find deleted key"),
+                None,
+                "{label}: tampered bloom must not skip tombstone and resurrect old_base_val"
+            );
+            assert_eq!(
+                reopened.find("k_upd", seq).expect("find overwritten key"),
+                Some("new_l0_val".into()),
+                "{label}: tampered bloom must not skip L0 overwrite"
+            );
+            assert_eq!(
+                reopened.find("k_other", seq).expect("find other key"),
+                Some("other_val".into()),
+                "{label}: untouched L0 key must remain visible"
+            );
+            assert_eq!(
+                reopened.get_seq_for_key("k_del", seq),
+                l0_del_seq,
+                "{label}: get_seq_for_key must observe L0 tombstone seq"
+            );
+            assert_eq!(
+                reopened.get_seq_for_key("k_upd", seq),
+                l0_upd_seq,
+                "{label}: get_seq_for_key must observe L0 overwrite seq"
+            );
+            drop(reopened);
+
+            let healed = BloomFilter::load(&target_bloom_path).expect("load healed bloom");
+            assert!(
+                healed.matches_table(
+                    target_summary.has_records,
+                    target_summary.table_len,
+                    target_summary.table_crc32,
+                ),
+                "{label}: healed bloom must be bound to target SSTable"
+            );
+            for key in ["k_del", "k_upd", "k_other"] {
+                assert!(
+                    healed.might_contain(key_hash(key)),
+                    "{label}: healed bloom must match '{key}'"
+                );
+            }
+        }
+
+        // Verify a healthy reopen reuses the healed bound sidecar cleanly.
+        let clean = OmniKV::open(&m_str, &w_str).expect("clean reopen with healed bloom");
+        let seq = clean.get_seq();
+        assert_eq!(clean.find("k_del", seq).expect("clean k_del"), None);
+        assert_eq!(
+            clean.find("k_upd", seq).expect("clean k_upd"),
+            Some("new_l0_val".into())
         );
     }
 }
