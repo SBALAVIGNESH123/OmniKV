@@ -566,3 +566,86 @@ fn restore_does_not_upgrade_corrupted_zero_filled_4096_byte_generated_base() {
         "zero-filled 4096B base with non-zero wal_checkpoint_seq must fail closed on open"
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn backup_preserves_existing_destination_mode_without_forcing_new_mode() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let source_dir = tempfile::tempdir().expect("source dir");
+    let (db, manifest, wal) = open_db(&source_dir);
+    put_keys(&db, "perm", 4);
+
+    // Reference mode produced by default process umask.
+    let ref_file = source_dir.path().join("umask_ref");
+    std::fs::File::create(&ref_file).expect("create reference file");
+    let default_mode = std::fs::metadata(&ref_file)
+        .expect("ref metadata")
+        .permissions()
+        .mode()
+        & 0o777;
+
+    // New plain and encrypted backups keep the default umask mode.
+    let plain_path = source_dir.path().join("plain.tar.gz");
+    let enc_path = source_dir.path().join("enc.omnikv.enc");
+    create_backup_with_wal(&db, &manifest, &wal, plain_path.to_str().unwrap())
+        .expect("create new plain backup");
+    create_encrypted_backup_with_wal(
+        &db,
+        &manifest,
+        &wal,
+        enc_path.to_str().unwrap(),
+        "passphrase",
+    )
+    .expect("create new encrypted backup");
+    assert_eq!(
+        std::fs::metadata(&plain_path)
+            .expect("new plain metadata")
+            .permissions()
+            .mode()
+            & 0o777,
+        default_mode
+    );
+    assert_eq!(
+        std::fs::metadata(&enc_path)
+            .expect("new encrypted metadata")
+            .permissions()
+            .mode()
+            & 0o777,
+        default_mode
+    );
+
+    // Overwriting existing `0o600` destinations preserves `0o600` for both.
+    std::fs::set_permissions(&plain_path, std::fs::Permissions::from_mode(0o600))
+        .expect("chmod plain 0600");
+    std::fs::set_permissions(&enc_path, std::fs::Permissions::from_mode(0o600))
+        .expect("chmod encrypted 0600");
+
+    create_backup_with_wal(&db, &manifest, &wal, plain_path.to_str().unwrap())
+        .expect("overwrite 0600 plain backup");
+    create_encrypted_backup_with_wal(
+        &db,
+        &manifest,
+        &wal,
+        enc_path.to_str().unwrap(),
+        "passphrase",
+    )
+    .expect("overwrite 0600 encrypted backup");
+
+    assert_eq!(
+        std::fs::metadata(&plain_path)
+            .expect("overwritten plain metadata")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+    assert_eq!(
+        std::fs::metadata(&enc_path)
+            .expect("overwritten encrypted metadata")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+}

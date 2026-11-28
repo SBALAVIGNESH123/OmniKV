@@ -73,17 +73,60 @@ pub fn create_backup_with_wal(
     create_backup_internal(db, manifest_path, Some(wal_path), output_path)
 }
 
-fn create_unique_staging_file(output_path: &str, label: &str) -> Result<(String, File), String> {
+#[cfg_attr(not(unix), allow(dead_code))]
+enum StagingModePolicy<'a> {
+    /// Preserve an existing regular destination file's Unix mode bits (`& 0o777`);
+    /// for new destinations, keep the process default umask mode.
+    PreserveDestination(&'a str),
+    /// Internal transient staging file (never published): owner-only `0o600` on Unix.
+    OwnerOnly,
+}
+
+fn create_unique_staging_file(
+    output_path: &str,
+    label: &str,
+    mode_policy: StagingModePolicy<'_>,
+) -> Result<(String, File), String> {
+    #[cfg(unix)]
+    let explicit_mode: Option<u32> = {
+        use std::os::unix::fs::PermissionsExt;
+        match mode_policy {
+            StagingModePolicy::PreserveDestination(dest) => std::fs::symlink_metadata(dest)
+                .ok()
+                .filter(std::fs::Metadata::is_file)
+                .map(|meta| meta.permissions().mode() & 0o777),
+            StagingModePolicy::OwnerOnly => Some(0o600),
+        }
+    };
+    #[cfg(not(unix))]
+    let _ = mode_policy;
+
     let pid = std::process::id();
     for _ in 0..64 {
         let token = NEXT_STAGING_TOKEN.fetch_add(1, Ordering::Relaxed);
         let candidate = format!("{output_path}.{label}.{pid}.{token}.tmp");
-        match OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&candidate)
-        {
-            Ok(file) => return Ok((candidate, file)),
+        let mut options = OpenOptions::new();
+        options.create_new(true).write(true);
+        #[cfg(unix)]
+        if let Some(mode) = explicit_mode {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(mode);
+        }
+        match options.open(&candidate) {
+            Ok(file) => {
+                #[cfg(unix)]
+                if let Some(mode) = explicit_mode {
+                    use std::os::unix::fs::PermissionsExt;
+                    if let Err(err) = file.set_permissions(std::fs::Permissions::from_mode(mode)) {
+                        drop(file);
+                        let _ = std::fs::remove_file(&candidate);
+                        return Err(format!(
+                            "Set permissions on temporary backup file {candidate}: {err}"
+                        ));
+                    }
+                }
+                return Ok((candidate, file));
+            }
             Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(err) => {
                 return Err(format!(
@@ -189,7 +232,11 @@ fn create_backup_internal(
     wal_path: Option<&str>,
     output_path: &str,
 ) -> Result<String, String> {
-    let (temp_output, file) = create_unique_staging_file(output_path, "writing")?;
+    let (temp_output, file) = create_unique_staging_file(
+        output_path,
+        "writing",
+        StagingModePolicy::PreserveDestination(output_path),
+    )?;
     let _temp_cleanup = TempFileCleanup::new(temp_output.clone());
     write_backup_archive_to_file(db, manifest_path, wal_path, file)?;
     publish_staged_file(&temp_output, output_path, "backup archive")?;
@@ -355,7 +402,8 @@ fn create_encrypted_backup_internal(
     output_path: &str,
     passphrase: &str,
 ) -> Result<String, String> {
-    let (plain_temp_path, plain_file) = create_unique_staging_file(output_path, "plain")?;
+    let (plain_temp_path, plain_file) =
+        create_unique_staging_file(output_path, "plain", StagingModePolicy::OwnerOnly)?;
     let _plain_cleanup = TempFileCleanup::new(plain_temp_path.clone());
     write_backup_archive_to_file(db, manifest_path, wal_path, plain_file)?;
 
@@ -366,7 +414,11 @@ fn create_encrypted_backup_internal(
 
     let encrypted = crate::crypto::encrypt(&data, passphrase)?;
 
-    let (enc_temp_path, enc_file) = create_unique_staging_file(output_path, "enc")?;
+    let (enc_temp_path, enc_file) = create_unique_staging_file(
+        output_path,
+        "enc",
+        StagingModePolicy::PreserveDestination(output_path),
+    )?;
     let _enc_cleanup = TempFileCleanup::new(enc_temp_path.clone());
     {
         let mut enc_file = enc_file;
