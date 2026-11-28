@@ -341,54 +341,31 @@ fn test_sstable_corruption_detected_on_read() {
         }
     }
 
-    // Reopen: engine must not panic on corrupted SSTables
-    let db2 = reopen(&dir);
-    let snap = db2.snapshot();
-
-    let mut corruption_detected = false;
-    let mut silent_wrong_data = false;
-
-    for i in 0u64..50 {
-        let key = format!("crc:{i:06}");
-        let expected = format!("val_{i}");
-        match db2.find(&key, snap) {
-            Ok(Some(val)) => {
-                if val != expected {
-                    silent_wrong_data = true;
-                    eprintln!(
-                        "CRITICAL: key='{key}' returned wrong data: expected='{expected}' got='{val}'"
-                    );
-                }
-            }
-            Ok(None) => {
-                // Corruption detected — key treated as absent
-                corruption_detected = true;
-            }
-            Err(_) => {
-                // CRC error surfaced
-                corruption_detected = true;
-            }
-        }
-    }
-    db2.unregister_snapshot(snap);
-
+    // Reopen: engine must fail closed immediately on the corrupted SSTable
+    // without panicking or silently serving corrupted data.
+    let manifest = dir
+        .path()
+        .join("manifest.json")
+        .to_string_lossy()
+        .to_string();
+    let wal = dir.path().join("data.wal").to_string_lossy().to_string();
+    let err = OmniKV::open(&manifest, &wal)
+        .err()
+        .expect("OmniKV::open must fail closed on mid-SSTable byte corruption");
+    let msg = err.to_string();
     assert!(
-        !silent_wrong_data,
-        "CRITICAL: Engine returned wrong data without detecting corruption!"
+        msg.contains("corrupt"),
+        "expected corrupt SSTable error on open, got: {msg}"
     );
-    assert!(
-        corruption_detected,
-        "Engine should detect at least some corruption in the flipped SSTable"
-    );
-    println!("✓ SSTable corruption detected, no silent data corruption");
+    println!("✓ SSTable corruption detected on open without panic or silent data corruption");
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// TEST 5: WAL corruption with valid data interleaved
+// TEST 5: WAL torn/corrupt tail recovery and healing
 //
-// Simulates: valid records, then corrupt bytes, then valid records.
-// The engine must recover valid records and skip corrupted ones
-// without losing the entire WAL.
+// Simulates: valid committed batches followed by trailing garbage/torn bytes.
+// Recovery must replay the valid atomic prefix, heal the corrupt tail, and
+// keep post-recovery writes durable across subsequent restarts.
 // ═══════════════════════════════════════════════════════════════════════
 #[test]
 fn test_wal_corruption_partial_recovery() {
@@ -419,11 +396,16 @@ fn test_wal_corruption_partial_recovery() {
     // All 50 valid keys must be present
     verify_all_keys(&db2, 50, "wal_ok");
 
-    // New writes must work after recovery
+    // New writes must work after recovery and survive a subsequent restart.
     put(&db2, "after_corruption", "works");
     assert_get(&db2, "after_corruption", "works");
+    drop(db2);
 
-    println!("✓ WAL partial corruption: 50 valid keys recovered, new writes work");
+    let db3 = reopen(&dir);
+    verify_all_keys(&db3, 50, "wal_ok");
+    assert_get(&db3, "after_corruption", "works");
+
+    println!("✓ WAL partial corruption: 50 valid keys recovered, new writes survive restart");
 }
 
 // ═══════════════════════════════════════════════════════════════════════

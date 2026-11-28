@@ -1311,6 +1311,9 @@ impl RaftStorage<TypeConfig> for OmniRaftStorage {
             .transition_guard
             .write()
             .map_err(|_| io_err("transition_guard poisoned"))?;
+        self.db
+            .ensure_writes_not_fenced()
+            .map_err(|e| io_err(&format!("refusing snapshot install on fenced storage: {e}")))?;
 
         let data_dir = std::path::Path::new(&manifest_path)
             .parent()
@@ -3121,6 +3124,106 @@ mod tests {
                 .expect("read preserved key"),
             Some("local_ok".into()),
             "live DB must remain untouched after rejected snapshot"
+        );
+    }
+
+    #[tokio::test]
+    async fn snapshot_install_honors_write_fence_and_preserves_tombstone_protection() {
+        let dst_dir = tempfile::tempdir().expect("dst tempdir");
+        let dst_db = OmniKV::open(
+            dst_dir
+                .path()
+                .join("manifest.json")
+                .to_str()
+                .expect("dst manifest"),
+            dst_dir.path().join("wal.bin").to_str().expect("dst wal"),
+        )
+        .expect("open dst db");
+
+        let mut dst_storage = OmniRaftStorage::new(dst_db.clone());
+        let snap_log = LogId::new(CommittedLeaderId::new(1, 1), 15);
+        let envelope = SnapshotEnvelope {
+            version: SNAPSHOT_VERSION,
+            last_log_id: Some(snap_log),
+            membership: StoredMembership::default(),
+            max_seq: 100,
+            entries: vec![("snap_k".into(), "from_snap".into())],
+            ssi_history: Vec::new(),
+            ssi_eviction_floor: 0,
+        };
+        let snap_meta = SnapshotMeta {
+            last_log_id: Some(snap_log),
+            last_membership: StoredMembership::default(),
+            snapshot_id: "tombstone-install-snap".into(),
+        };
+        let bytes = serde_json::to_vec(&envelope).expect("encode envelope");
+        dst_storage
+            .install_snapshot(&snap_meta, Box::new(Cursor::new(bytes.clone())))
+            .await
+            .expect("install snapshot");
+        assert_eq!(
+            dst_db
+                .find_latest_internal("snap_k")
+                .expect("read installed snap_k"),
+            Some("from_snap".into()),
+            "snapshot must actually install snap_k before tombstone check"
+        );
+
+        // After snapshot install replaces `StorageRoots`, verify that a newer
+        // L1 tombstone is NOT dropped while an older version of `snap_k` sits
+        // in the installed topology's L0.
+        let low_seq = dst_db.global_seq.fetch_add(2, Ordering::SeqCst);
+        let mut del = WriteBatch::new();
+        del.delete("snap_k").expect("stage delete");
+        let del_marker = dst_db.commit_batch_local(&del).expect("commit delete");
+        assert!(del_marker > low_seq);
+        dst_db.compact_sstables().expect("flush delete to L0");
+        dst_db.compact_l0_to_l1().expect("compact delete to L1");
+
+        let offset = dst_db
+            .append_to_heap(b"stale_resurrect")
+            .expect("append stale payload");
+        dst_db.insert_replica_record(
+            b"snap_k".to_vec(),
+            low_seq,
+            offset,
+            crate::storage::core::UNCOMPRESSED_FLAG | b"stale_resurrect".len() as u64,
+            crc32fast::hash(b"stale_resurrect"),
+            0,
+        );
+        dst_db
+            .compact_sstables()
+            .expect("flush older put into installed roots L0");
+        dst_db
+            .compact_l1_to_l2()
+            .expect("compact L1->L2 must see installed L0 older put");
+
+        assert_eq!(
+            dst_db
+                .find_latest_internal("snap_k")
+                .expect("find snap_k after L1->L2"),
+            None,
+            "installed topology L0 must protect L1->L2 tombstone against resurrection"
+        );
+
+        // Once the storage engine enters fail-stop write-fenced state,
+        // `install_snapshot` must refuse to promote a new snapshot directory.
+        dst_db.trip_write_fence("simulated write fence".into());
+        let err = dst_storage
+            .install_snapshot(&snap_meta, Box::new(Cursor::new(bytes)))
+            .await
+            .expect_err("install_snapshot must fail closed when storage is write-fenced");
+        assert!(
+            err.to_string()
+                .contains("refusing snapshot install on fenced storage"),
+            "unexpected fenced install_snapshot error: {err}"
+        );
+        assert_eq!(
+            dst_db
+                .find_latest_internal("snap_k")
+                .expect("read snap_k after rejected fenced install"),
+            None,
+            "rejected fenced snapshot install must leave storage state unchanged"
         );
     }
 }

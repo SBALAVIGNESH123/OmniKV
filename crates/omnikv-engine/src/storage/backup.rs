@@ -4,17 +4,21 @@
 //! database manifest, the storage files referenced by that manifest, an optional
 //! WAL, and a small metadata file used for restore-time verification.
 
-use crate::storage::core::bloom_path_for_base;
+use crate::storage::core::{BloomFilter, SSTableReader, SSTableWriter, bloom_path_for_base};
 use crate::{Manifest, OmniKV};
 use flate2::Compression;
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 use serde::{Deserialize, Serialize};
-use std::fs::File;
+use std::collections::{HashMap, HashSet};
+use std::fs::{File, OpenOptions};
 use std::io::{Cursor, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tar::{Archive, Builder, Header};
+
+static NEXT_STAGING_TOKEN: AtomicU64 = AtomicU64::new(1);
 
 const BACKUP_FORMAT_VERSION: u32 = 1;
 const MANIFEST_ENTRY: &str = "manifest.json";
@@ -32,6 +36,11 @@ pub struct BackupMetadata {
     pub includes_wal: bool,
     pub source_manifest_path: String,
     pub source_wal_path: Option<String>,
+    /// Indicates that the backup was created after `OMNIV2**` base tables
+    /// became mandatory, so a 4096-byte zero `base.bin` can never be a valid
+    /// untouched legacy placeholder.
+    #[serde(default)]
+    pub base_format_v2: bool,
     pub files: Vec<BackupFileMetadata>,
 }
 
@@ -70,12 +79,95 @@ pub fn create_backup_with_wal(
     create_backup_internal(db, manifest_path, Some(wal_path), output_path)
 }
 
-fn create_backup_internal(
+#[cfg_attr(not(unix), allow(dead_code))]
+enum StagingModePolicy<'a> {
+    /// Preserve an existing regular destination file's Unix mode bits (`& 0o777`);
+    /// for new destinations, keep the process default umask mode.
+    PreserveDestination(&'a str),
+    /// Internal transient staging file (never published): owner-only `0o600` on Unix.
+    OwnerOnly,
+}
+
+fn create_unique_staging_file(
+    output_path: &str,
+    label: &str,
+    mode_policy: StagingModePolicy<'_>,
+) -> Result<(String, File), String> {
+    #[cfg(unix)]
+    let explicit_mode: Option<u32> = {
+        use std::os::unix::fs::PermissionsExt;
+        match mode_policy {
+            StagingModePolicy::PreserveDestination(dest) => std::fs::symlink_metadata(dest)
+                .ok()
+                .filter(std::fs::Metadata::is_file)
+                .map(|meta| meta.permissions().mode() & 0o777),
+            StagingModePolicy::OwnerOnly => Some(0o600),
+        }
+    };
+    #[cfg(not(unix))]
+    let _ = mode_policy;
+
+    let pid = std::process::id();
+    for _ in 0..64 {
+        let token = NEXT_STAGING_TOKEN.fetch_add(1, Ordering::Relaxed);
+        let candidate = format!("{output_path}.{label}.{pid}.{token}.tmp");
+        let mut options = OpenOptions::new();
+        options.create_new(true).write(true);
+        #[cfg(unix)]
+        if let Some(mode) = explicit_mode {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(mode);
+        }
+        match options.open(&candidate) {
+            Ok(file) => {
+                #[cfg(unix)]
+                if let Some(mode) = explicit_mode {
+                    use std::os::unix::fs::PermissionsExt;
+                    if let Err(err) = file.set_permissions(std::fs::Permissions::from_mode(mode)) {
+                        drop(file);
+                        let _ = std::fs::remove_file(&candidate);
+                        return Err(format!(
+                            "Set permissions on temporary backup file {candidate}: {err}"
+                        ));
+                    }
+                }
+                return Ok((candidate, file));
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(err) => {
+                return Err(format!(
+                    "Cannot create temporary backup file {candidate}: {err}"
+                ));
+            }
+        }
+    }
+    Err(format!(
+        "Cannot allocate unique temporary backup file for {output_path}"
+    ))
+}
+
+fn publish_staged_file(staged_path: &str, output_path: &str, kind: &str) -> Result<(), String> {
+    std::fs::rename(staged_path, output_path)
+        .map_err(|e| format!("Publish {kind} {output_path}: {e}"))?;
+    #[cfg(unix)]
+    {
+        let parent = Path::new(output_path)
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        File::open(parent)
+            .and_then(|dir| dir.sync_all())
+            .map_err(|e| format!("Sync {kind} parent directory: {e}"))?;
+    }
+    Ok(())
+}
+
+fn write_backup_archive_to_file(
     db: &Arc<OmniKV>,
     manifest_path: &str,
     wal_path: Option<&str>,
-    output_path: &str,
-) -> Result<String, String> {
+    file: File,
+) -> Result<(), String> {
     let _backup_guard = db
         .transition_guard
         .write()
@@ -95,7 +187,8 @@ fn create_backup_internal(
     let (backup_manifest, file_plan) =
         build_backup_plan(&source_manifest, source_manifest_dir, wal_path)?;
 
-    let file = File::create(output_path).map_err(|e| format!("Cannot create backup file: {e}"))?;
+    let allow_legacy_base =
+        OmniKV::manifest_allows_legacy_zero_base(&source_manifest, manifest_path);
     let encoder = GzEncoder::new(file, Compression::default());
     let mut tar = Builder::new(encoder);
 
@@ -105,6 +198,7 @@ fn create_backup_internal(
         includes_wal: wal_path.is_some(),
         source_manifest_path: manifest_path.to_string(),
         source_wal_path: wal_path.map(ToOwned::to_owned),
+        base_format_v2: true,
         files: Vec::new(),
     };
 
@@ -113,7 +207,13 @@ fn create_backup_internal(
     append_bytes(&mut tar, MANIFEST_ENTRY, &manifest_bytes, &mut metadata)?;
 
     for (source, archive_path) in file_plan {
-        append_existing_file(&mut tar, &source, &archive_path, &mut metadata)?;
+        append_validated_backup_entry(
+            &mut tar,
+            &source,
+            &archive_path,
+            allow_legacy_base,
+            &mut metadata,
+        )?;
     }
 
     let metadata_bytes = serde_json::to_vec_pretty(&metadata)
@@ -125,11 +225,69 @@ fn create_backup_internal(
     let encoder = tar
         .into_inner()
         .map_err(|e| format!("Finalize backup tar stream: {e}"))?;
-    encoder
+    let file = encoder
         .finish()
         .map_err(|e| format!("Finalize compressed backup: {e}"))?;
+    file.sync_all()
+        .map_err(|e| format!("Sync backup archive: {e}"))?;
+    Ok(())
+}
 
+fn create_backup_internal(
+    db: &Arc<OmniKV>,
+    manifest_path: &str,
+    wal_path: Option<&str>,
+    output_path: &str,
+) -> Result<String, String> {
+    let (temp_output, file) = create_unique_staging_file(
+        output_path,
+        "writing",
+        StagingModePolicy::PreserveDestination(output_path),
+    )?;
+    let _temp_cleanup = TempFileCleanup::new(temp_output.clone());
+    write_backup_archive_to_file(db, manifest_path, wal_path, file)?;
+    publish_staged_file(&temp_output, output_path, "backup archive")?;
     Ok(output_path.to_string())
+}
+
+fn append_validated_backup_entry<W: Write>(
+    tar: &mut Builder<W>,
+    source: &Path,
+    archive_path: &str,
+    allow_legacy_base: bool,
+    metadata: &mut BackupMetadata,
+) -> Result<(), String> {
+    if archive_path == BASE_ENTRY {
+        let base_bytes = std::fs::read(source)
+            .map_err(|e| format!("Read backup source {}: {e}", source.display()))?;
+        SSTableReader::validate_all_records(&base_bytes, allow_legacy_base).map_err(|e| {
+            format!(
+                "Validate source base SSTable {} for backup: {e}",
+                source.display()
+            )
+        })?;
+        if allow_legacy_base && base_bytes.len() == 4096 && base_bytes.iter().all(|&b| b == 0) {
+            let empty_v2 = SSTableWriter::empty_table_bytes();
+            return append_bytes(tar, archive_path, &empty_v2, metadata);
+        }
+        return append_bytes(tar, archive_path, &base_bytes, metadata);
+    }
+    if archive_path.starts_with("sstables/")
+        && Path::new(archive_path)
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("sst"))
+    {
+        let sst_bytes = std::fs::read(source)
+            .map_err(|e| format!("Read backup source {}: {e}", source.display()))?;
+        SSTableReader::validate_all_records(&sst_bytes, false).map_err(|e| {
+            format!(
+                "Validate source SSTable {} for backup: {e}",
+                source.display()
+            )
+        })?;
+        return append_bytes(tar, archive_path, &sst_bytes, metadata);
+    }
+    append_existing_file(tar, source, archive_path, metadata)
 }
 
 fn build_backup_plan(
@@ -216,7 +374,21 @@ fn build_backup_plan(
 /// Restore a database from a compressed backup.
 pub fn restore_backup(backup_path: &str, restore_dir: &str) -> Result<(), String> {
     let file = File::open(backup_path).map_err(|e| format!("Cannot open backup: {e}"))?;
-    restore_backup_reader(file, restore_dir)
+    restore_backup_reader(file, restore_dir, false)
+}
+
+/// Explicitly restores a pre-v2 compressed backup whose untouched 4096-byte
+/// zero `base.bin` placeholder has no accompanying `base.bloom` sidecar.
+///
+/// Modern backups (`base_format_v2 == true`), backups with
+/// `wal_checkpoint_seq > 0`, and archives whose `base.bloom` records keys or is
+/// corrupt still fail closed.
+pub fn restore_legacy_backup_allowing_zero_base(
+    backup_path: &str,
+    restore_dir: &str,
+) -> Result<(), String> {
+    let file = File::open(backup_path).map_err(|e| format!("Cannot open backup: {e}"))?;
+    restore_backup_reader(file, restore_dir, true)
 }
 
 /// Create an encrypted backup.
@@ -251,20 +423,34 @@ fn create_encrypted_backup_internal(
     output_path: &str,
     passphrase: &str,
 ) -> Result<String, String> {
-    let temp_path = format!("{output_path}.tmp");
-    create_backup_internal(db, manifest_path, wal_path, &temp_path)?;
-    let _cleanup = TempFileCleanup::new(temp_path.clone());
+    let (plain_temp_path, plain_file) =
+        create_unique_staging_file(output_path, "plain", StagingModePolicy::OwnerOnly)?;
+    let _plain_cleanup = TempFileCleanup::new(plain_temp_path.clone());
+    write_backup_archive_to_file(db, manifest_path, wal_path, plain_file)?;
 
     let mut data = Vec::new();
-    File::open(&temp_path)
+    File::open(&plain_temp_path)
         .and_then(|mut f| f.read_to_end(&mut data))
         .map_err(|e| format!("Read temporary backup: {e}"))?;
 
     let encrypted = crate::crypto::encrypt(&data, passphrase)?;
 
-    File::create(output_path)
-        .and_then(|mut f| f.write_all(&encrypted))
-        .map_err(|e| format!("Write encrypted backup: {e}"))?;
+    let (enc_temp_path, enc_file) = create_unique_staging_file(
+        output_path,
+        "enc",
+        StagingModePolicy::PreserveDestination(output_path),
+    )?;
+    let _enc_cleanup = TempFileCleanup::new(enc_temp_path.clone());
+    {
+        let mut enc_file = enc_file;
+        enc_file
+            .write_all(&encrypted)
+            .map_err(|e| format!("Write encrypted backup: {e}"))?;
+        enc_file
+            .sync_all()
+            .map_err(|e| format!("Sync encrypted backup: {e}"))?;
+    }
+    publish_staged_file(&enc_temp_path, output_path, "encrypted backup")?;
 
     Ok(output_path.to_string())
 }
@@ -297,10 +483,30 @@ pub fn restore_encrypted_backup(
         .map_err(|e| format!("Read encrypted backup: {e}"))?;
 
     let plaintext = crate::crypto::decrypt(&encrypted, passphrase)?;
-    restore_backup_reader(Cursor::new(plaintext), restore_dir)
+    restore_backup_reader(Cursor::new(plaintext), restore_dir, false)
 }
 
-fn restore_backup_reader<R: Read>(reader: R, restore_dir: &str) -> Result<(), String> {
+/// Explicitly restores an encrypted pre-v2 backup whose untouched 4096-byte
+/// zero `base.bin` placeholder has no accompanying `base.bloom` sidecar.
+pub fn restore_encrypted_legacy_backup_allowing_zero_base(
+    encrypted_backup_path: &str,
+    restore_dir: &str,
+    passphrase: &str,
+) -> Result<(), String> {
+    let mut encrypted = Vec::new();
+    File::open(encrypted_backup_path)
+        .and_then(|mut f| f.read_to_end(&mut encrypted))
+        .map_err(|e| format!("Read encrypted backup: {e}"))?;
+
+    let plaintext = crate::crypto::decrypt(&encrypted, passphrase)?;
+    restore_backup_reader(Cursor::new(plaintext), restore_dir, true)
+}
+
+fn restore_backup_reader<R: Read>(
+    reader: R,
+    restore_dir: &str,
+    allow_bloomless_legacy_zero_base: bool,
+) -> Result<(), String> {
     std::fs::create_dir_all(restore_dir)
         .map_err(|e| format!("Cannot create restore directory: {e}"))?;
     let restore_root = Path::new(restore_dir)
@@ -309,28 +515,46 @@ fn restore_backup_reader<R: Read>(reader: R, restore_dir: &str) -> Result<(), St
 
     let decoder = GzDecoder::new(reader);
     let mut archive = Archive::new(decoder);
+    let mut extracted_files: HashMap<PathBuf, PathBuf> = HashMap::new();
 
     for entry in archive
         .entries()
         .map_err(|e| format!("Read backup archive: {e}"))?
     {
         let mut entry = entry.map_err(|e| format!("Read backup entry: {e}"))?;
+        let raw_path_ends_with_slash = entry.path_bytes().ends_with(b"/");
         let entry_path = entry
             .path()
             .map_err(|e| format!("Read backup entry path: {e}"))?
             .into_owned();
         let safe_path = validate_archive_path(&entry_path)?;
-        let output_path = restore_root.join(safe_path);
+        let output_path = restore_root.join(&safe_path);
 
         if entry.header().entry_type().is_dir() {
             std::fs::create_dir_all(&output_path)
                 .map_err(|e| format!("Create restore directory entry: {e}"))?;
+            let canonical_dir = std::fs::canonicalize(&output_path)
+                .map_err(|e| format!("Canonicalize restore directory entry: {e}"))?;
+            if !canonical_dir.starts_with(&restore_root) {
+                return Err(format!(
+                    "Backup directory entry escapes restore directory: {}",
+                    entry_path.display()
+                ));
+            }
             continue;
         }
 
-        if !entry.header().entry_type().is_file() {
+        if !entry.header().entry_type().is_file() || raw_path_ends_with_slash {
             return Err(format!(
                 "Unsupported backup entry type for {}",
+                entry_path.display()
+            ));
+        }
+
+        let path_key = extracted_path_key(&safe_path);
+        if extracted_files.contains_key(&path_key) {
+            return Err(format!(
+                "Duplicate backup archive entry: {}",
                 entry_path.display()
             ));
         }
@@ -338,16 +562,89 @@ fn restore_backup_reader<R: Read>(reader: R, restore_dir: &str) -> Result<(), St
         if let Some(parent) = output_path.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|e| format!("Create restore parent directory: {e}"))?;
+            let canonical_parent = std::fs::canonicalize(parent)
+                .map_err(|e| format!("Canonicalize restore parent directory: {e}"))?;
+            if !canonical_parent.starts_with(&restore_root) {
+                return Err(format!(
+                    "Backup entry parent escapes restore directory: {}",
+                    entry_path.display()
+                ));
+            }
         }
         entry
             .unpack(&output_path)
             .map_err(|e| format!("Unpack {}: {e}", entry_path.display()))?;
+        extracted_files.insert(path_key, safe_path);
     }
 
-    verify_restored_metadata(&restore_root)?;
-    rewrite_restored_manifest(&restore_root)?;
+    let metadata = verify_restored_metadata(&restore_root, &extracted_files)?;
+    let archive_generation = match metadata {
+        Some(meta) if meta.base_format_v2 => BackupArchiveGeneration::ModernV2,
+        Some(meta) => {
+            let has_verified_entry = |target: &str| {
+                let target_key = extracted_path_key(Path::new(target));
+                extracted_files.contains_key(&target_key)
+                    && meta.files.iter().any(|file| {
+                        validate_archive_path(Path::new(&file.path))
+                            .is_ok_and(|rel| extracted_path_key(&rel) == target_key)
+                    })
+            };
+            let base_bloom_verified = has_verified_entry(MANIFEST_ENTRY)
+                && has_verified_entry(BASE_ENTRY)
+                && has_verified_entry(BASE_BLOOM_ENTRY);
+            BackupArchiveGeneration::VerifiedPreV2 {
+                base_bloom_verified,
+            }
+        }
+        None => BackupArchiveGeneration::MetadataMissing,
+    };
+    rewrite_restored_manifest(
+        &restore_root,
+        &extracted_files,
+        archive_generation,
+        allow_bloomless_legacy_zero_base,
+    )?;
 
     Ok(())
+}
+
+fn extracted_path_key(relative: &Path) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let mut normalized = PathBuf::new();
+        for component in relative.components() {
+            if let Component::Normal(part) = component {
+                if let Some(s) = part.to_str() {
+                    normalized.push(s.to_ascii_lowercase());
+                } else {
+                    normalized.push(part);
+                }
+            }
+        }
+        normalized
+    }
+    #[cfg(not(windows))]
+    {
+        relative.to_path_buf()
+    }
+}
+
+fn extracted_files_get<'a>(
+    extracted_files: &'a HashMap<PathBuf, PathBuf>,
+    relative: &Path,
+) -> Option<&'a PathBuf> {
+    extracted_files.get(&extracted_path_key(relative))
+}
+
+fn extracted_files_contains(extracted_files: &HashMap<PathBuf, PathBuf>, relative: &Path) -> bool {
+    extracted_files.contains_key(&extracted_path_key(relative))
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BackupArchiveGeneration {
+    ModernV2,
+    VerifiedPreV2 { base_bloom_verified: bool },
+    MetadataMissing,
 }
 
 fn append_existing_file<W: Write>(
@@ -387,12 +684,16 @@ fn append_bytes<W: Write>(
     Ok(())
 }
 
-fn verify_restored_metadata(restore_root: &Path) -> Result<(), String> {
-    let metadata_path = restore_root.join(METADATA_ENTRY);
-    if !metadata_path.exists() {
-        return Ok(());
-    }
+fn verify_restored_metadata(
+    restore_root: &Path,
+    extracted_files: &HashMap<PathBuf, PathBuf>,
+) -> Result<Option<BackupMetadata>, String> {
+    let Some(metadata_rel) = extracted_files_get(extracted_files, Path::new(METADATA_ENTRY)) else {
+        return Ok(None);
+    };
+    let metadata_key = extracted_path_key(Path::new(METADATA_ENTRY));
 
+    let metadata_path = restore_root.join(metadata_rel);
     let metadata_bytes =
         std::fs::read(&metadata_path).map_err(|e| format!("Read backup metadata: {e}"))?;
     let metadata: BackupMetadata = serde_json::from_slice(&metadata_bytes)
@@ -405,13 +706,20 @@ fn verify_restored_metadata(restore_root: &Path) -> Result<(), String> {
         ));
     }
 
-    for file in metadata.files {
-        if file.path == METADATA_ENTRY {
+    let mut verified_keys = HashSet::new();
+    for file in &metadata.files {
+        let relative = validate_archive_path(Path::new(&file.path))?;
+        let key = extracted_path_key(&relative);
+        if key == metadata_key {
             continue;
         }
-
-        let relative = validate_archive_path(Path::new(&file.path))?;
-        let restored_path = restore_root.join(relative);
+        let Some(extracted_rel) = extracted_files.get(&key) else {
+            return Err(format!(
+                "Restored archive is missing file {} declared in metadata",
+                file.path
+            ));
+        };
+        let restored_path = restore_root.join(extracted_rel);
         let bytes = std::fs::read(&restored_path)
             .map_err(|e| format!("Read restored file {}: {e}", file.path))?;
 
@@ -431,31 +739,80 @@ fn verify_restored_metadata(restore_root: &Path) -> Result<(), String> {
                 file.path, actual_crc, file.crc32
             ));
         }
+        verified_keys.insert(key);
     }
 
-    Ok(())
+    for (key, rel) in extracted_files {
+        if *key != metadata_key && !verified_keys.contains(key) {
+            return Err(format!(
+                "Restored archive contains unverified entry {} absent from metadata",
+                rel.display()
+            ));
+        }
+    }
+
+    Ok(Some(metadata))
 }
 
-fn rewrite_restored_manifest(restore_root: &Path) -> Result<(), String> {
-    let manifest_path = restore_root.join(MANIFEST_ENTRY);
+fn rewrite_restored_manifest(
+    restore_root: &Path,
+    extracted_files: &HashMap<PathBuf, PathBuf>,
+    archive_generation: BackupArchiveGeneration,
+    allow_bloomless_legacy_zero_base: bool,
+) -> Result<(), String> {
+    let Some(manifest_rel) = extracted_files_get(extracted_files, Path::new(MANIFEST_ENTRY)) else {
+        return Err(format!("Backup archive is missing {MANIFEST_ENTRY}"));
+    };
+    let manifest_path = restore_root.join(manifest_rel);
     let manifest_path_str = manifest_path
         .to_str()
         .ok_or_else(|| "Restore manifest path is not valid UTF-8".to_string())?;
     let mut manifest =
         Manifest::load(manifest_path_str).map_err(|e| format!("Load restored manifest: {e}"))?;
 
+    let ensure_extracted = |rebased: &str, label: &str| -> Result<(), String> {
+        let rel = Path::new(rebased)
+            .strip_prefix(restore_root)
+            .map_err(|_| format!("Restored {label} path escapes restore root: {rebased}"))?;
+        if !extracted_files_contains(extracted_files, rel) {
+            return Err(format!(
+                "Backup archive is missing {label} referenced by manifest: {}",
+                rel.display()
+            ));
+        }
+        Ok(())
+    };
+
     manifest.heap_path = rebase_restored_path(restore_root, &manifest.heap_path)?;
+    ensure_extracted(&manifest.heap_path, "heap file")?;
     manifest.base_path = rebase_restored_path(restore_root, &manifest.base_path)?;
+    ensure_extracted(&manifest.base_path, "base SSTable")?;
     manifest.sstables = manifest
         .sstables
         .iter()
-        .map(|path| rebase_restored_path(restore_root, path))
+        .map(|path| {
+            let rebased = rebase_restored_path(restore_root, path)?;
+            ensure_extracted(&rebased, "L0 SSTable")?;
+            Ok(rebased)
+        })
         .collect::<Result<Vec<_>, String>>()?;
     manifest.l1_sstables = manifest
         .l1_sstables
         .iter()
-        .map(|path| rebase_restored_path(restore_root, path))
+        .map(|path| {
+            let rebased = rebase_restored_path(restore_root, path)?;
+            ensure_extracted(&rebased, "L1 SSTable")?;
+            Ok(rebased)
+        })
         .collect::<Result<Vec<_>, String>>()?;
+
+    maybe_upgrade_legacy_zero_base(
+        restore_root,
+        &manifest,
+        extracted_files,
+        archive_generation,
+        allow_bloomless_legacy_zero_base,
+    )?;
 
     manifest
         .save(manifest_path_str)
@@ -464,12 +821,108 @@ fn rewrite_restored_manifest(restore_root: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Upgrades a restored pre-v2 untouched 4096-byte zero placeholder `base.bin`
+/// into a valid 24-byte `OMNIV2**` empty SSTable only when positive evidence
+/// from the current archive confirms the archive is a legacy empty-base
+/// placeholder.
+///
+/// Never upgrades:
+/// - modern backups (`BackupArchiveGeneration::ModernV2`),
+/// - backups with `wal_checkpoint_seq != 0`,
+/// - bases that are not the canonical top-level `base.bin` extracted by the
+///   current archive, or
+/// - backups whose current-archive `base.bloom` records any key or is corrupt.
+///
+/// When `base.bloom` is absent from the current archive (or was not
+/// authenticated by the current archive's `omnikv-backup.json`), upgrades only
+/// if the manifest itself proves an empty database (`max_seq == 0`,
+/// `read_seq_floor == 0`, and no L0/L1 tables) or the caller explicitly opted
+/// in via [`restore_legacy_backup_allowing_zero_base`]. Otherwise leaves the
+/// 4096-byte zero file untouched so `OmniKV::open` fails closed.
+fn maybe_upgrade_legacy_zero_base(
+    restore_root: &Path,
+    manifest: &Manifest,
+    extracted_files: &HashMap<PathBuf, PathBuf>,
+    archive_generation: BackupArchiveGeneration,
+    allow_bloomless_legacy_zero_base: bool,
+) -> Result<(), String> {
+    if archive_generation == BackupArchiveGeneration::ModernV2 || manifest.wal_checkpoint_seq != 0 {
+        return Ok(());
+    }
+    if !extracted_files_contains(extracted_files, Path::new(MANIFEST_ENTRY))
+        || !extracted_files_contains(extracted_files, Path::new(BASE_ENTRY))
+    {
+        return Ok(());
+    }
+    let base_path = Path::new(&manifest.base_path);
+    let is_canonical_top_level_base = base_path
+        .strip_prefix(restore_root)
+        .is_ok_and(|rel| extracted_path_key(rel) == Path::new(BASE_ENTRY));
+    if !is_canonical_top_level_base {
+        return Ok(());
+    }
+    let manifest_proves_empty_db = manifest.max_seq == 0
+        && manifest.read_seq_floor == 0
+        && manifest.sstables.is_empty()
+        && manifest.l1_sstables.is_empty();
+    let extracted_bloom_rel = extracted_files_get(extracted_files, Path::new(BASE_BLOOM_ENTRY));
+    let verified_pre_v2_bloom = extracted_bloom_rel.is_some()
+        && matches!(
+            archive_generation,
+            BackupArchiveGeneration::VerifiedPreV2 {
+                base_bloom_verified: true
+            }
+        );
+
+    if let Some(bloom_rel) = extracted_bloom_rel {
+        let bloom_path = restore_root.join(bloom_rel);
+        let Some(bloom_path_str) = bloom_path.to_str() else {
+            return Ok(());
+        };
+        match BloomFilter::load(bloom_path_str) {
+            Ok(bloom) if !bloom.has_any_bit_set() => {
+                // Only trust an empty `base.bloom` automatically when the
+                // current archive extracted and CRC-verified `manifest.json`,
+                // canonical top-level `base.bin`, and `base.bloom`. Leftover or
+                // untracked `base.bloom` files cannot authorize conversion.
+                if !verified_pre_v2_bloom
+                    && !manifest_proves_empty_db
+                    && !allow_bloomless_legacy_zero_base
+                {
+                    return Ok(());
+                }
+            }
+            _ => return Ok(()),
+        }
+    } else if !manifest_proves_empty_db && !allow_bloomless_legacy_zero_base {
+        return Ok(());
+    }
+
+    OmniKV::upgrade_legacy_zero_base_file(base_path)
+        .map(|_| ())
+        .map_err(|e| {
+            format!(
+                "Upgrade restored legacy empty base {}: {e}",
+                base_path.display()
+            )
+        })
+}
+
 fn rebase_restored_path(restore_root: &Path, stored_path: &str) -> Result<String, String> {
+    let bytes = stored_path.as_bytes();
+    let is_windows_abs = bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && (bytes[2] == b'\\' || bytes[2] == b'/');
+    let is_unix_abs = stored_path.starts_with('/');
     let path = Path::new(stored_path);
-    let relative = if path.is_absolute() {
-        path.file_name()
-            .map(PathBuf::from)
-            .ok_or_else(|| format!("Cannot rebase absolute restored path {stored_path}"))?
+
+    let relative = if path.is_absolute() || is_unix_abs || is_windows_abs {
+        let base_name = stored_path
+            .rsplit(['/', '\\'])
+            .find(|seg| !seg.is_empty())
+            .ok_or_else(|| format!("Cannot rebase absolute restored path {stored_path}"))?;
+        validate_archive_path(Path::new(base_name))?
     } else {
         validate_archive_path(path)?
     };
@@ -516,7 +969,7 @@ fn resolve_source_path(manifest_dir: &Path, stored_path: &str) -> Result<PathBuf
 }
 
 fn bloom_path_for_sstable(path: &str) -> String {
-    path.replace(".sst", ".bloom")
+    bloom_path_for_base(path)
 }
 
 fn unix_timestamp_secs() -> u64 {
