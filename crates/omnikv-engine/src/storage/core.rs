@@ -1433,10 +1433,13 @@ impl SSTableReader {
     /// sparse-index block-start record alignment once at table load or
     /// publication time so malformed tables fail closed before entering
     /// `StorageRoots`.
+    ///
+    /// Returns `Ok(true)` when the table contains record data (`data_end > 0`)
+    /// and `Ok(false)` when it is an empty table or allowed legacy placeholder.
     pub(crate) fn validate_table_layout(
         data: &[u8],
         allow_legacy_zero_base: bool,
-    ) -> Result<(), OmniError> {
+    ) -> Result<bool, OmniError> {
         let layout = Self::parse_strict_sstable_layout(data, allow_legacy_zero_base)?;
         for (idx, (key_range, entry_offset)) in layout.index_entries.iter().enumerate() {
             let block_end = layout
@@ -1454,7 +1457,7 @@ impl SSTableReader {
                 )));
             }
         }
-        Ok(())
+        Ok(layout.data_end > 0)
     }
 
     /// Resolves `(data_end, start_offset)` for strict internal read paths
@@ -2389,7 +2392,7 @@ impl OmniKV {
                 let reason = format!(
                     "manifest publication durability uncertain after rename ({err}); writes halted until database reopen"
                 );
-                self.trip_write_fence(reason.clone());
+                self.fence_and_poison_group_commit(reason.clone(), None);
                 Err(OmniError::IoError(reason))
             }
         }
@@ -2447,6 +2450,56 @@ impl OmniKV {
         Ok(())
     }
 
+    /// Atomically upgrades a genuine untouched pre-v2 4096-byte all-zero base
+    /// placeholder file in place to a valid 24-byte `OMNIV2**` empty SSTable.
+    ///
+    /// Callers must invoke this only after proving via manifest or restore-time
+    /// bloom evidence that `base_path` is an untouched legacy placeholder, while
+    /// holding exclusive ownership and BEFORE memory-mapping the file.
+    pub(crate) fn upgrade_legacy_zero_base_file(base_path: &Path) -> Result<bool, OmniError> {
+        let Ok(meta) = std::fs::metadata(base_path) else {
+            return Ok(false);
+        };
+        if !meta.is_file() || meta.len() != 4096 {
+            return Ok(false);
+        }
+        let base_bytes = std::fs::read(base_path)?;
+        if base_bytes.len() != 4096 || !base_bytes.iter().all(|&b| b == 0) {
+            return Ok(false);
+        }
+
+        let empty_v2 = SSTableWriter::empty_table_bytes();
+        let tmp_path = format!("{}.upgrade.tmp", base_path.display());
+        let write_res: Result<(), std::io::Error> = (|| {
+            let mut tmp = OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .write(true)
+                .open(&tmp_path)?;
+            tmp.write_all(&empty_v2)?;
+            tmp.sync_all()?;
+            drop(tmp);
+            std::fs::rename(&tmp_path, base_path)?;
+            #[cfg(unix)]
+            {
+                let parent = base_path
+                    .parent()
+                    .filter(|parent| !parent.as_os_str().is_empty())
+                    .unwrap_or_else(|| Path::new("."));
+                File::open(parent)?.sync_all()?;
+            }
+            Ok(())
+        })();
+        if let Err(err) = write_res {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(OmniError::IoError(format!(
+                "failed to upgrade legacy empty base '{}': {err}",
+                base_path.display()
+            )));
+        }
+        Ok(true)
+    }
+
     /// Pure storage recovery — no threads, no side effects.
     /// Returns raw storage handles that can be atomically installed.
     /// Used by install_snapshot to swap topology without restarting the engine.
@@ -2471,6 +2524,16 @@ impl OmniKV {
             m.save(manifest_path)?;
             m
         };
+
+        // Upgrade any genuine untouched pre-v2 4096-byte zero placeholder base
+        // in place to a valid 24-byte `OMNIV2**` empty SSTable BEFORE opening
+        // or mapping it. This guarantees that a restored empty `base.bin`
+        // (Case 3) remains a valid v2 table after the first L0 flush/backup
+        // flips `manifest.sstables` non-empty.
+        let allow_legacy_base = Self::manifest_allows_legacy_zero_base(&manifest, manifest_path);
+        if allow_legacy_base {
+            Self::upgrade_legacy_zero_base_file(Path::new(&manifest.base_path))?;
+        }
 
         // Every file referenced by an existing manifest must be present and
         // readable; never fabricate an empty base/heap or silently skip missing
@@ -2520,16 +2583,16 @@ impl OmniKV {
 
         let reader = SSTableReader::from_mmap(base_mmap.clone());
         let base_bloom_path = bloom_path_for_base(&manifest.base_path);
-        let allow_legacy_base = Self::manifest_allows_legacy_zero_base(&manifest, manifest_path);
-        SSTableReader::validate_table_layout(&base_mmap, allow_legacy_base).map_err(|e| {
-            OmniError::IoError(format!(
-                "corrupt base SSTable '{}' referenced by manifest: {e}",
-                manifest.base_path
-            ))
-        })?;
+        let base_has_records = SSTableReader::validate_table_layout(&base_mmap, allow_legacy_base)
+            .map_err(|e| {
+                OmniError::IoError(format!(
+                    "corrupt base SSTable '{}' referenced by manifest: {e}",
+                    manifest.base_path
+                ))
+            })?;
         let base_bloom = match BloomFilter::load(&base_bloom_path) {
-            Ok(b) => b,
-            Err(_) => {
+            Ok(b) if !base_has_records || b.has_any_bit_set() => b,
+            _ => {
                 let bloom = rebuild_bloom_checked(&reader, allow_legacy_base)?;
                 let _ = bloom.save(&base_bloom_path);
                 bloom
@@ -2556,16 +2619,17 @@ impl OmniKV {
                     "failed to memory-map L0 SSTable '{sst_path}' referenced by manifest: {e}"
                 ))
             })?);
-            SSTableReader::validate_table_layout(&mmap, false).map_err(|e| {
-                OmniError::IoError(format!(
-                    "corrupt L0 SSTable '{sst_path}' referenced by manifest: {e}"
-                ))
-            })?;
+            let l0_has_records =
+                SSTableReader::validate_table_layout(&mmap, false).map_err(|e| {
+                    OmniError::IoError(format!(
+                        "corrupt L0 SSTable '{sst_path}' referenced by manifest: {e}"
+                    ))
+                })?;
             let reader = SSTableReader::from_mmap(mmap.clone());
             let bloom_path = bloom_path_for_base(sst_path);
             let bloom = match BloomFilter::load(&bloom_path) {
-                Ok(b) => b,
-                Err(_) => {
+                Ok(b) if !l0_has_records || b.has_any_bit_set() => b,
+                _ => {
                     let b = rebuild_bloom_checked(&reader, false)?;
                     let _ = b.save(&bloom_path);
                     b
@@ -2594,16 +2658,17 @@ impl OmniKV {
                     "failed to memory-map L1 SSTable '{sst_path}' referenced by manifest: {e}"
                 ))
             })?);
-            SSTableReader::validate_table_layout(&mmap, false).map_err(|e| {
-                OmniError::IoError(format!(
-                    "corrupt L1 SSTable '{sst_path}' referenced by manifest: {e}"
-                ))
-            })?;
+            let l1_has_records =
+                SSTableReader::validate_table_layout(&mmap, false).map_err(|e| {
+                    OmniError::IoError(format!(
+                        "corrupt L1 SSTable '{sst_path}' referenced by manifest: {e}"
+                    ))
+                })?;
             let reader = SSTableReader::from_mmap(mmap.clone());
             let bloom_path = bloom_path_for_base(sst_path);
             let bloom = match BloomFilter::load(&bloom_path) {
-                Ok(b) => b,
-                Err(_) => {
+                Ok(b) if !l1_has_records || b.has_any_bit_set() => b,
+                _ => {
                     let b = rebuild_bloom_checked(&reader, false)?;
                     let _ = b.save(&bloom_path);
                     b
@@ -4153,6 +4218,7 @@ impl OmniKV {
                 .heap_file
                 .lock()
                 .map_err(|_| OmniError::LockPoisoned("heap lock".into()))?;
+            self.ensure_writes_not_fenced()?;
 
             let mut write_offset = reserved_offset;
             for (_, payload) in &wal_records {
@@ -4193,6 +4259,7 @@ impl OmniKV {
                 .wal
                 .lock()
                 .map_err(|_| OmniError::LockPoisoned("wal lock".into()))?;
+            self.ensure_writes_not_fenced()?;
             if self.group_commit.is_poisoned() {
                 return Err(OmniError::IoError(
                     "group commit engine poisoned by an earlier fsync failure".into(),
@@ -7581,7 +7648,20 @@ mod tests {
         }
 
         // Also prove direct defense-in-depth when a generated base is replaced
-        // in-memory with 4096 zero bytes: reads, GC, and L1->L2 all fail closed.
+        // in-memory with 4096 zero bytes (with an L1 table present so L1->L2
+        // runs for real): reads, L1->L2, and GC all fail closed.
+        let mut l1_seed = WriteBatch::new();
+        l1_seed
+            .set("k_l1_trigger", "l1_val".into())
+            .expect("stage l1 trigger");
+        db.update_roots(|r| StorageRoots {
+            sstables: Arc::new(Vec::new()),
+            ..r.clone()
+        });
+        db.commit_batch(&l1_seed).expect("commit l1 trigger");
+        db.compact_sstables().expect("flush l1 trigger L0");
+        db.compact_l0_to_l1().expect("compact l1 trigger to L1");
+
         let zero_base_path = dir.path().join("zero_4096_base.sst");
         std::fs::write(&zero_base_path, vec![0u8; 4096]).expect("write 4096 zero base");
         let zero_file = OpenOptions::new()
@@ -7591,7 +7671,6 @@ mod tests {
         // SAFETY: Test-only immutable file mapped for the remainder of this test.
         let zero_mmap = Arc::new(unsafe { MmapOptions::new().map(&zero_file) }.expect("mmap"));
         db.update_roots(|r| StorageRoots {
-            sstables: Arc::new(Vec::new()),
             base_mmap: zero_mmap.clone(),
             ..r.clone()
         });
@@ -7600,8 +7679,57 @@ mod tests {
             "4096B zeroed generated base must fail closed on point read"
         );
         assert!(
+            db.compact_l1_to_l2().is_err(),
+            "4096B zeroed generated base must fail closed on L1->L2 compaction"
+        );
+        assert!(
             db.run_garbage_collection().is_err(),
             "4096B zeroed generated base must fail closed on GC"
+        );
+    }
+
+    #[test]
+    fn corrupt_zeroed_bloom_is_rebuilt_on_open_and_fenced_publish_poisons_group_commit() {
+        let dir = TempDir::new().expect("bloom rebuild + fence dir");
+        let manifest = dir.path().join("manifest.json");
+        let wal = dir.path().join("wal.bin");
+        let m_str = manifest.to_str().expect("UTF-8 manifest").to_string();
+        let w_str = wal.to_str().expect("UTF-8 wal").to_string();
+
+        let db = OmniKV::open(&m_str, &w_str).expect("open db");
+        let mut b = WriteBatch::new();
+        b.set("bloom_key", "bloom_val".into())
+            .expect("stage bloom key");
+        db.commit_batch(&b).expect("commit bloom key");
+        db.compact_sstables().expect("flush L0");
+        let l0_bloom_path = bloom_path_for_base(&db.roots.load().manifest.sstables[0]);
+        drop(db);
+
+        // Overwrite the non-empty L0's bloom with a syntactically valid all-zero
+        // bloom; reopen must detect `has_records && !has_any_bit_set()` and
+        // rebuild it so point reads never silently miss persisted keys.
+        BloomFilter::new(100)
+            .save(&l0_bloom_path)
+            .expect("write all-zero bloom");
+        let reopened = OmniKV::open(&m_str, &w_str).expect("reopen with zeroed bloom");
+        assert_eq!(
+            reopened
+                .find("bloom_key", reopened.get_seq())
+                .expect("find rebuilt bloom key"),
+            Some("bloom_val".into())
+        );
+
+        // Fencing via `fence_and_poison_group_commit` (used by post-rename
+        // manifest sync failure) must poison group_commit and reject further writes.
+        reopened.fence_and_poison_group_commit("simulated post-rename fence".into(), None);
+        assert!(reopened.is_write_fenced());
+        assert!(reopened.group_commit.is_poisoned());
+        let mut post = WriteBatch::new();
+        post.set("after_fence", "nope".into())
+            .expect("stage post-fence write");
+        assert!(
+            reopened.commit_batch(&post).is_err(),
+            "writes must fail closed after fence_and_poison_group_commit"
         );
     }
 }

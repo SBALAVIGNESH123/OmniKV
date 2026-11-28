@@ -95,32 +95,13 @@ fn create_backup_internal(
     let (backup_manifest, file_plan) =
         build_backup_plan(&source_manifest, source_manifest_dir, wal_path)?;
 
-    // Read and validate the source base table BEFORE creating/truncating
-    // `output_path` so an invalid base never leaves a partial archive behind.
     let allow_legacy_base =
         OmniKV::manifest_allows_legacy_zero_base(&source_manifest, manifest_path);
-    let prepared_base_bytes = if let Some((source, _)) = file_plan
-        .iter()
-        .find(|(_, archive_path)| archive_path == BASE_ENTRY)
-    {
-        let base_bytes = std::fs::read(source)
-            .map_err(|e| format!("Read backup source {}: {e}", source.display()))?;
-        SSTableReader::validate_table_layout(&base_bytes, allow_legacy_base).map_err(|e| {
-            format!(
-                "Validate source base SSTable {} for backup: {e}",
-                source.display()
-            )
-        })?;
-        if allow_legacy_base && base_bytes.len() == 4096 && base_bytes.iter().all(|&b| b == 0) {
-            Some(SSTableWriter::empty_table_bytes().to_vec())
-        } else {
-            Some(base_bytes)
-        }
-    } else {
-        None
-    };
+    let temp_output = format!("{output_path}.writing.tmp");
+    let _temp_cleanup = TempFileCleanup::new(temp_output.clone());
 
-    let file = File::create(output_path).map_err(|e| format!("Cannot create backup file: {e}"))?;
+    let file = File::create(&temp_output)
+        .map_err(|e| format!("Cannot create temporary backup file: {e}"))?;
     let encoder = GzEncoder::new(file, Compression::default());
     let mut tar = Builder::new(encoder);
 
@@ -138,13 +119,13 @@ fn create_backup_internal(
     append_bytes(&mut tar, MANIFEST_ENTRY, &manifest_bytes, &mut metadata)?;
 
     for (source, archive_path) in file_plan {
-        if archive_path == BASE_ENTRY
-            && let Some(ref base_bytes) = prepared_base_bytes
-        {
-            append_bytes(&mut tar, &archive_path, base_bytes, &mut metadata)?;
-        } else {
-            append_existing_file(&mut tar, &source, &archive_path, &mut metadata)?;
-        }
+        append_validated_backup_entry(
+            &mut tar,
+            &source,
+            &archive_path,
+            allow_legacy_base,
+            &mut metadata,
+        )?;
     }
 
     let metadata_bytes = serde_json::to_vec_pretty(&metadata)
@@ -156,11 +137,66 @@ fn create_backup_internal(
     let encoder = tar
         .into_inner()
         .map_err(|e| format!("Finalize backup tar stream: {e}"))?;
-    encoder
+    let file = encoder
         .finish()
         .map_err(|e| format!("Finalize compressed backup: {e}"))?;
+    file.sync_all()
+        .map_err(|e| format!("Sync backup archive: {e}"))?;
+    drop(file);
+    std::fs::rename(&temp_output, output_path)
+        .map_err(|e| format!("Publish backup archive {output_path}: {e}"))?;
+    #[cfg(unix)]
+    {
+        let parent = Path::new(output_path)
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        File::open(parent)
+            .and_then(|dir| dir.sync_all())
+            .map_err(|e| format!("Sync backup parent directory: {e}"))?;
+    }
 
     Ok(output_path.to_string())
+}
+
+fn append_validated_backup_entry<W: Write>(
+    tar: &mut Builder<W>,
+    source: &Path,
+    archive_path: &str,
+    allow_legacy_base: bool,
+    metadata: &mut BackupMetadata,
+) -> Result<(), String> {
+    if archive_path == BASE_ENTRY {
+        let base_bytes = std::fs::read(source)
+            .map_err(|e| format!("Read backup source {}: {e}", source.display()))?;
+        SSTableReader::validate_table_layout(&base_bytes, allow_legacy_base).map_err(|e| {
+            format!(
+                "Validate source base SSTable {} for backup: {e}",
+                source.display()
+            )
+        })?;
+        if allow_legacy_base && base_bytes.len() == 4096 && base_bytes.iter().all(|&b| b == 0) {
+            let empty_v2 = SSTableWriter::empty_table_bytes();
+            return append_bytes(tar, archive_path, &empty_v2, metadata);
+        }
+        return append_bytes(tar, archive_path, &base_bytes, metadata);
+    }
+    if archive_path.starts_with("sstables/")
+        && Path::new(archive_path)
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("sst"))
+    {
+        let sst_bytes = std::fs::read(source)
+            .map_err(|e| format!("Read backup source {}: {e}", source.display()))?;
+        SSTableReader::validate_table_layout(&sst_bytes, false).map_err(|e| {
+            format!(
+                "Validate source SSTable {} for backup: {e}",
+                source.display()
+            )
+        })?;
+        return append_bytes(tar, archive_path, &sst_bytes, metadata);
+    }
+    append_existing_file(tar, source, archive_path, metadata)
 }
 
 fn build_backup_plan(
@@ -293,9 +329,29 @@ fn create_encrypted_backup_internal(
 
     let encrypted = crate::crypto::encrypt(&data, passphrase)?;
 
-    File::create(output_path)
-        .and_then(|mut f| f.write_all(&encrypted))
+    let enc_temp_path = format!("{output_path}.enc.tmp");
+    let _enc_cleanup = TempFileCleanup::new(enc_temp_path.clone());
+    let mut enc_file =
+        File::create(&enc_temp_path).map_err(|e| format!("Write encrypted backup: {e}"))?;
+    enc_file
+        .write_all(&encrypted)
         .map_err(|e| format!("Write encrypted backup: {e}"))?;
+    enc_file
+        .sync_all()
+        .map_err(|e| format!("Sync encrypted backup: {e}"))?;
+    drop(enc_file);
+    std::fs::rename(&enc_temp_path, output_path)
+        .map_err(|e| format!("Publish encrypted backup {output_path}: {e}"))?;
+    #[cfg(unix)]
+    {
+        let parent = Path::new(output_path)
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        File::open(parent)
+            .and_then(|dir| dir.sync_all())
+            .map_err(|e| format!("Sync encrypted backup parent directory: {e}"))?;
+    }
 
     Ok(output_path.to_string())
 }
@@ -535,17 +591,6 @@ fn maybe_upgrade_legacy_zero_base(manifest: &Manifest) -> Result<(), String> {
         return Ok(());
     }
     let base_path = Path::new(&manifest.base_path);
-    let Ok(meta) = std::fs::metadata(base_path) else {
-        return Ok(());
-    };
-    if !meta.is_file() || meta.len() != 4096 {
-        return Ok(());
-    }
-    let base_bytes = std::fs::read(base_path)
-        .map_err(|e| format!("Read restored base SSTable {}: {e}", base_path.display()))?;
-    if base_bytes.len() != 4096 || !base_bytes.iter().all(|&b| b == 0) {
-        return Ok(());
-    }
     let bloom_path = bloom_path_for_base(&manifest.base_path);
     if Path::new(&bloom_path).exists() {
         match BloomFilter::load(&bloom_path) {
@@ -554,34 +599,14 @@ fn maybe_upgrade_legacy_zero_base(manifest: &Manifest) -> Result<(), String> {
         }
     }
 
-    let empty_v2 = SSTableWriter::empty_table_bytes();
-    let tmp_path = format!("{}.upgrade.tmp", manifest.base_path);
-    let write_res: Result<(), std::io::Error> = (|| {
-        let mut tmp = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .open(&tmp_path)?;
-        tmp.write_all(&empty_v2)?;
-        tmp.sync_all()?;
-        drop(tmp);
-        std::fs::rename(&tmp_path, base_path)?;
-        #[cfg(unix)]
-        if let Some(parent) = base_path.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            File::open(parent)?.sync_all()?;
-        }
-        Ok(())
-    })();
-    if let Err(err) = write_res {
-        let _ = std::fs::remove_file(&tmp_path);
-        return Err(format!(
-            "Upgrade restored legacy empty base {}: {err}",
-            base_path.display()
-        ));
-    }
-    Ok(())
+    OmniKV::upgrade_legacy_zero_base_file(base_path)
+        .map(|_| ())
+        .map_err(|e| {
+            format!(
+                "Upgrade restored legacy empty base {}: {e}",
+                base_path.display()
+            )
+        })
 }
 
 fn rebase_restored_path(restore_root: &Path, stored_path: &str) -> Result<String, String> {

@@ -1731,9 +1731,12 @@ fn assert_corrupt_sstable_tier_fails_closed(src_dir: &Path, target: &str, zero_f
         // closed immediately at load time on `OmniKV::open`.
         let zero_len = if target == "base" { 8192 } else { 4096 };
         fs::write(&victim, vec![0u8; zero_len]).expect("zero-fill victim sstable");
+        let err = OmniKV::open(&manifest_str, &wal_str)
+            .err()
+            .expect("OmniKV::open must reject zero-filled SSTable at load time");
         assert!(
-            OmniKV::open(&manifest_str, &wal_str).is_err(),
-            "{target} (zero_fill=true): OmniKV::open must reject zero-filled SSTable at load time"
+            err.to_string().contains("corrupt"),
+            "{target} (zero_fill=true): expected corrupt SSTable error, got {err}"
         );
         return;
     }
@@ -1888,9 +1891,12 @@ fn sstable_strict_validation_rejects_zero_and_shifted_footer_offsets() {
         bytes[len - 16..len - 8].copy_from_slice(&forged_index_offset.to_le_bytes());
         fs::write(l0_path, &bytes).expect("write forged footer L0");
 
+        let open_err = OmniKV::open(&manifest_str, &wal_str)
+            .err()
+            .expect("OmniKV::open must fail closed immediately on forged v2 footer offset");
         assert!(
-            OmniKV::open(&manifest_str, &wal_str).is_err(),
-            "{label}: OmniKV::open must fail closed immediately on forged v2 footer offset"
+            open_err.to_string().contains("corrupt"),
+            "{label}: expected corrupt SSTable error, got {open_err}"
         );
         let manifest_after = Manifest::load(&manifest_str).expect("reload trial manifest");
         assert_eq!(
@@ -1903,6 +1909,44 @@ fn sstable_strict_validation_rejects_zero_and_shifted_footer_offsets() {
             "{label}: failed open must not modify L1 manifest entries"
         );
     }
+}
+
+fn assert_misaligned_l0_index_rejected_on_open(src_dir: &Path) {
+    let trial = TempDir::new().expect("misaligned trial dir");
+    copy_isolated_db_dir(src_dir, trial.path());
+    let manifest_str = trial
+        .path()
+        .join("manifest.json")
+        .to_string_lossy()
+        .to_string();
+    let wal_str = trial.path().join("wal.bin").to_string_lossy().to_string();
+    let manifest_before = Manifest::load(&manifest_str).expect("load misaligned trial manifest");
+    let mut bytes = fs::read(&manifest_before.sstables[0]).expect("read L0");
+    let index = parse_sstable_index(&bytes);
+    assert!(index.len() >= 2, "L0 table must span at least 2 blocks");
+    let index_offset = usize::try_from(u64::from_le_bytes(
+        bytes[bytes.len() - 16..bytes.len() - 8]
+            .try_into()
+            .expect("footer index offset"),
+    ))
+    .expect("index offset fits in usize");
+    // Entry 0 occupies `8 + 2 + entry0_key_len + 8`; Entry 1's offset field
+    // sits immediately after `2 + entry1_key_len`.
+    let entry1_off_pos = index_offset + 8 + 2 + index[0].0.len() + 8 + 2 + index[1].0.len();
+    let bad_block1_off = u64::try_from(index[1].1 + 1).expect("offset fits in u64");
+    bytes[entry1_off_pos..entry1_off_pos + 8].copy_from_slice(&bad_block1_off.to_le_bytes());
+    fs::write(&manifest_before.sstables[0], &bytes).expect("write misaligned L0");
+
+    let open_err = OmniKV::open(&manifest_str, &wal_str)
+        .err()
+        .expect("OmniKV::open must reject misaligned L0 sparse-index block offset");
+    assert!(
+        open_err.to_string().contains("corrupt"),
+        "expected corrupt sparse-index error on open, got {open_err}"
+    );
+    let manifest_after = Manifest::load(&manifest_str).expect("reload misaligned manifest");
+    assert_eq!(manifest_after.l1_sstables, manifest_before.l1_sstables);
+    assert_eq!(manifest_after.base_path, manifest_before.base_path);
 }
 
 #[test]
@@ -1941,39 +1985,43 @@ fn l1_to_l2_compaction_aborts_on_misaligned_l0_sparse_index_offset() {
     db.compact_sstables().expect("flush multi-block L0");
     drop(db);
 
-    // Corrupt Block 1's sparse-index offset by +1 byte so a best-effort seek
-    // would fail to decode Block 1 and return `None` for `k_target`.
-    let manifest_str = dir
+    // Trial 1: Misaligned Block 1 sparse-index offset fails closed on open.
+    assert_misaligned_l0_index_rejected_on_open(dir.path());
+
+    // Trial 2: Mid-block corruption (Record 1 inside Block 0) passes open's
+    // block-start check, then `compact_l1_to_l2()` -> `collect_l0_min_seqs`
+    // fails closed without dropping the L1 tombstone or resurrecting `k_target`.
+    let trial_mid = TempDir::new().expect("mid-block l0 trial dir");
+    copy_isolated_db_dir(dir.path(), trial_mid.path());
+    let m2 = trial_mid
         .path()
         .join("manifest.json")
         .to_string_lossy()
         .to_string();
-    let wal_str = dir.path().join("wal.bin").to_string_lossy().to_string();
-    let manifest_before = Manifest::load(&manifest_str).expect("load manifest");
-    let l0_path = &manifest_before.sstables[0];
-    let mut bytes = fs::read(l0_path).expect("read L0");
-    let index = parse_sstable_index(&bytes);
-    assert!(index.len() >= 2, "L0 table must span at least 2 blocks");
-    let index_offset = usize::try_from(u64::from_le_bytes(
-        bytes[bytes.len() - 16..bytes.len() - 8]
-            .try_into()
-            .expect("footer index offset"),
-    ))
-    .expect("index offset fits in usize");
-    // Entry 0 occupies `8 + 2 + entry0_key_len + 8`; Entry 1's offset field
-    // sits immediately after `2 + entry1_key_len`.
-    let entry1_off_pos = index_offset + 8 + 2 + index[0].0.len() + 8 + 2 + index[1].0.len();
-    let bad_block1_off = u64::try_from(index[1].1 + 1).expect("offset fits in u64");
-    bytes[entry1_off_pos..entry1_off_pos + 8].copy_from_slice(&bad_block1_off.to_le_bytes());
-    fs::write(l0_path, &bytes).expect("write misaligned L0");
+    let m2_before = Manifest::load(&m2).expect("load mid-block trial manifest");
+    let mut mid_bytes = fs::read(&m2_before.sstables[0]).expect("read mid-block L0");
+    let (_, rec0_len) = OmniRecord::decode(&mid_bytes).expect("decode first L0 record");
+    mid_bytes[rec0_len..rec0_len + 12].fill(0xFF);
+    fs::write(&m2_before.sstables[0], &mid_bytes).expect("corrupt mid-block L0 record");
 
+    let reopened = open_db(trial_mid.path());
+    let compact_err = reopened
+        .compact_l1_to_l2()
+        .expect_err("L1->L2 must fail closed via collect_l0_min_seqs on mid-block corrupt L0");
     assert!(
-        OmniKV::open(&manifest_str, &wal_str).is_err(),
-        "OmniKV::open must fail closed immediately when an L0 sparse-index block offset is misaligned"
+        compact_err.to_string().contains("corrupt"),
+        "expected corrupt SSTable error from L1->L2, got {compact_err}"
     );
-    let manifest_after = Manifest::load(&manifest_str).expect("reload manifest");
-    assert_eq!(manifest_after.l1_sstables, manifest_before.l1_sstables);
-    assert_eq!(manifest_after.base_path, manifest_before.base_path);
+    let m2_after = Manifest::load(&m2).expect("reload mid-block manifest");
+    assert_eq!(m2_after.l1_sstables, m2_before.l1_sstables);
+    assert_eq!(m2_after.base_path, m2_before.base_path);
+    assert_eq!(
+        reopened
+            .find("k_target", reopened.get_seq())
+            .expect("find k_target"),
+        None,
+        "L1 tombstone must stay intact so k_target is never resurrected"
+    );
 }
 
 #[test]
@@ -2025,9 +2073,12 @@ fn zero_filled_4096_byte_generated_base_fails_closed_while_legacy_empty_base_mig
     fs::write(&manifest_before.base_path, vec![0u8; 4096])
         .expect("zero-fill 4096B generated base without changing length");
 
+    let open_err = OmniKV::open(&manifest_str, &wal_str).err().expect(
+        "length-preserving zero-fill of a 4096-byte generated base must fail closed on open",
+    );
     assert!(
-        OmniKV::open(&manifest_str, &wal_str).is_err(),
-        "length-preserving zero-fill of a 4096-byte generated base must fail closed on open"
+        open_err.to_string().contains("corrupt"),
+        "expected corrupt base SSTable error on open, got {open_err}"
     );
     let manifest_after = Manifest::load(&manifest_str).expect("reload trial manifest");
     assert_eq!(manifest_after.base_path, manifest_before.base_path);

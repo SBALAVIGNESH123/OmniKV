@@ -256,6 +256,68 @@ fn repack_backup_archive_with_overrides(
         .expect("finish repacked gzip");
 }
 
+fn read_archive_entry(archive_path: &std::path::Path, target_path: &str) -> Vec<u8> {
+    use flate2::read::GzDecoder;
+    use std::io::Read;
+    use tar::Archive;
+
+    let file = std::fs::File::open(archive_path).expect("open archive for inspection");
+    let mut archive = Archive::new(GzDecoder::new(file));
+    for entry in archive.entries().expect("inspect archive entries") {
+        let mut entry = entry.expect("inspect entry");
+        let path = entry
+            .path()
+            .expect("inspect entry path")
+            .to_string_lossy()
+            .replace('\\', "/");
+        if path == target_path {
+            let mut bytes = Vec::new();
+            entry.read_to_end(&mut bytes).expect("read archive entry");
+            return bytes;
+        }
+    }
+    panic!("archive missing expected entry {target_path}");
+}
+
+fn assert_restored_legacy_archive_runs_gc_and_l1_to_l2(legacy_archive: &std::path::Path) {
+    for op in ["gc", "l1_to_l2"] {
+        let restore_dir = tempfile::tempdir().expect("legacy restore dir");
+        restore_backup(
+            legacy_archive.to_str().unwrap(),
+            restore_dir.path().to_str().unwrap(),
+        )
+        .expect("restore pre-v2 archive");
+
+        let upgraded_base =
+            std::fs::read(restore_dir.path().join("base.bin")).expect("read restored base");
+        assert_eq!(upgraded_base.len(), 24);
+        assert_eq!(&upgraded_base[16..24], b"OMNIV2**");
+
+        let restored = OmniKV::open(
+            restore_dir.path().join("manifest.json").to_str().unwrap(),
+            restore_dir.path().join("wal.bin").to_str().unwrap(),
+        )
+        .expect("open restored pre-v2 archive");
+
+        match op {
+            "gc" => restored
+                .run_garbage_collection()
+                .expect("restored pre-v2 archive with L0/L1 must run GC"),
+            "l1_to_l2" => {
+                restored
+                    .compact_l1_to_l2()
+                    .expect("restored pre-v2 archive with L0/L1 must run L1->L2");
+                restored
+                    .run_garbage_collection()
+                    .expect("restored pre-v2 archive must pass GC after L1->L2");
+            }
+            _ => unreachable!(),
+        }
+        verify_keys(&restored, "l1_data", 16);
+        verify_keys(&restored, "l0_data", 16);
+    }
+}
+
 #[test]
 fn restored_pre_v2_legacy_zero_base_backup_with_l0_and_l1_opens_compacts_and_runs_gc() {
     let source_dir = tempfile::tempdir().expect("source dir");
@@ -275,29 +337,16 @@ fn restored_pre_v2_legacy_zero_base_backup_with_l0_and_l1_opens_compacts_and_run
     std::fs::write(&source_base_path, vec![0u8; 4096]).expect("write legacy 4096B zero base");
     let db = OmniKV::open(&manifest, &wal).expect("reopen pre-v2 source DB");
 
-    // 1. Fresh backup of the pre-v2 DB upgrades `base.bin` cleanly on creation.
+    // 1. Fresh backup of the pre-v2 DB writes a valid 24-byte `OMNIV2**` `base.bin`.
     let fresh_backup = source_dir.path().join("fresh_legacy_backup.tar.gz");
     create_backup_with_wal(&db, &manifest, &wal, fresh_backup.to_str().unwrap())
         .expect("create backup from pre-v2 DB");
     drop(db);
 
-    let fresh_restore = tempfile::tempdir().expect("fresh restore dir");
-    restore_backup(
-        fresh_backup.to_str().unwrap(),
-        fresh_restore.path().to_str().unwrap(),
-    )
-    .expect("restore fresh backup");
-    let fresh_db = OmniKV::open(
-        fresh_restore.path().join("manifest.json").to_str().unwrap(),
-        fresh_restore.path().join("wal.bin").to_str().unwrap(),
-    )
-    .expect("open fresh restored DB");
-    fresh_db
-        .run_garbage_collection()
-        .expect("fresh restored DB must pass GC");
-    verify_keys(&fresh_db, "l1_data", 16);
-    verify_keys(&fresh_db, "l0_data", 16);
-    drop(fresh_db);
+    let archived_base = read_archive_entry(&fresh_backup, "base.bin");
+    assert_eq!(archived_base.len(), 24);
+    assert_eq!(&archived_base[16..24], b"OMNIV2**");
+    assert_restored_legacy_archive_runs_gc_and_l1_to_l2(&fresh_backup);
 
     // 2. Pre-existing pre-v2 archive whose `base.bin` is 4096 all-zero bytes
     //    alongside L0 and L1 tables — tested WITH empty `base.bloom`, WITHOUT
@@ -317,41 +366,115 @@ fn restored_pre_v2_legacy_zero_base_backup_with_l0_and_l1_opens_compacts_and_run
             None,
             read_seq_floor,
         );
-
-        for op in ["gc", "l1_to_l2"] {
-            let restore_dir = tempfile::tempdir().expect("legacy restore dir");
-            restore_backup(
-                legacy_archive.to_str().unwrap(),
-                restore_dir.path().to_str().unwrap(),
-            )
-            .expect("restore pre-v2 archive");
-
-            let restored_manifest = restore_dir.path().join("manifest.json");
-            let restored_wal = restore_dir.path().join("wal.bin");
-            let restored = OmniKV::open(
-                restored_manifest.to_str().unwrap(),
-                restored_wal.to_str().unwrap(),
-            )
-            .expect("open restored pre-v2 archive");
-
-            match op {
-                "gc" => restored
-                    .run_garbage_collection()
-                    .expect("restored pre-v2 archive with L0/L1 must run GC"),
-                "l1_to_l2" => {
-                    restored
-                        .compact_l1_to_l2()
-                        .expect("restored pre-v2 archive with L0/L1 must run L1->L2");
-                    restored
-                        .run_garbage_collection()
-                        .expect("restored pre-v2 archive must pass GC after L1->L2");
-                }
-                _ => unreachable!(),
-            }
-            verify_keys(&restored, "l1_data", 16);
-            verify_keys(&restored, "l0_data", 16);
-        }
+        assert_restored_legacy_archive_runs_gc_and_l1_to_l2(&legacy_archive);
     }
+}
+
+#[test]
+fn already_restored_legacy_empty_backup_upgrades_on_open_and_survives_flush_backup_and_reopen() {
+    let dir = tempfile::tempdir().expect("pre-restored legacy empty backup dir");
+    let manifest_path = dir.path().join("manifest.json");
+    let base_path = dir.path().join("base.bin");
+    let heap_path = dir.path().join("heap.bin");
+    let wal_path = dir.path().join("wal.bin");
+
+    std::fs::write(&base_path, vec![0u8; 4096]).expect("write legacy 4096B zero base.bin");
+    std::fs::write(&heap_path, b"").expect("write empty heap.bin");
+    let manifest = omni_engine::Manifest {
+        format_version: omni_engine::MANIFEST_FORMAT_VERSION,
+        heap_path: heap_path.to_string_lossy().to_string(),
+        base_path: base_path.to_string_lossy().to_string(),
+        sstables: Vec::new(),
+        l1_sstables: Vec::new(),
+        max_seq: 0,
+        wal_checkpoint_seq: 0,
+        read_seq_floor: 0,
+    };
+    manifest
+        .save(manifest_path.to_str().unwrap())
+        .expect("save legacy empty restored manifest");
+
+    let db = OmniKV::open(manifest_path.to_str().unwrap(), wal_path.to_str().unwrap())
+        .expect("open already-restored empty pre-v2 backup");
+    let upgraded_base = std::fs::read(&base_path).expect("read upgraded base.bin");
+    assert_eq!(upgraded_base.len(), 24);
+    assert_eq!(&upgraded_base[16..24], b"OMNIV2**");
+
+    // Committing and flushing to L0 must NOT self-brick live reads, backup,
+    // compaction, GC, or reopen when `manifest.sstables` becomes non-empty.
+    put_keys(&db, "post_open", 8);
+    db.compact_sstables().expect("first L0 flush must succeed");
+    assert_eq!(
+        db.scan("post_open:", "post_open:~", db.get_seq())
+            .expect("scan after first L0 flush")
+            .len(),
+        8
+    );
+
+    let backup_out = dir.path().join("after_flush.tar.gz");
+    create_backup_with_wal(
+        &db,
+        manifest_path.to_str().unwrap(),
+        wal_path.to_str().unwrap(),
+        backup_out.to_str().unwrap(),
+    )
+    .expect("backup after first L0 flush must succeed");
+    drop(db);
+
+    let reopened = OmniKV::open(manifest_path.to_str().unwrap(), wal_path.to_str().unwrap())
+        .expect("reopen after first L0 flush must not self-brick");
+    reopened.compact_l0_to_l1().expect("L0->L1 after reopen");
+    reopened.compact_l1_to_l2().expect("L1->L2 after reopen");
+    reopened.run_garbage_collection().expect("GC after reopen");
+    verify_keys(&reopened, "post_open", 8);
+}
+
+#[test]
+fn create_backup_rejects_corrupt_source_tables_without_leaving_partial_archive() {
+    let source_dir = tempfile::tempdir().expect("corrupt backup source dir");
+    let (db, manifest_str, wal_str) = open_db(&source_dir);
+
+    put_keys(&db, "live", 8);
+    db.compact_sstables().expect("flush L0");
+
+    let corrupt_file = source_dir.path().join("corrupt_table.sst");
+    std::fs::write(&corrupt_file, vec![0xFF; 64]).expect("write corrupt table");
+
+    let orig_manifest = omni_engine::Manifest::load(&manifest_str).expect("load orig manifest");
+
+    for (label, mutate_l0) in [("corrupt_base", false), ("corrupt_l0", true)] {
+        let mut tampered = orig_manifest.clone();
+        if mutate_l0 {
+            tampered.sstables[0] = corrupt_file.to_string_lossy().to_string();
+        } else {
+            tampered.base_path = corrupt_file.to_string_lossy().to_string();
+        }
+        tampered
+            .save(&manifest_str)
+            .expect("save tampered manifest");
+
+        let out_path = source_dir.path().join(format!("{label}.tar.gz"));
+        let err = create_backup_with_wal(&db, &manifest_str, &wal_str, out_path.to_str().unwrap())
+            .expect_err("backup must reject corrupt source SSTable");
+        assert!(
+            err.contains("Validate source"),
+            "{label}: expected source SSTable validation error, got {err}"
+        );
+        assert!(
+            !out_path.exists(),
+            "{label}: failed backup must not leave partial archive at output path"
+        );
+        assert!(
+            !source_dir
+                .path()
+                .join(format!("{label}.tar.gz.writing.tmp"))
+                .exists(),
+            "{label}: failed backup must clean up temporary writing file"
+        );
+    }
+    orig_manifest
+        .save(&manifest_str)
+        .expect("restore original manifest");
 }
 
 #[test]
