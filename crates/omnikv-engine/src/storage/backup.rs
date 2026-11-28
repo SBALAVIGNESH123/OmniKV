@@ -366,15 +366,17 @@ fn create_encrypted_backup_internal(
 
     let encrypted = crate::crypto::encrypt(&data, passphrase)?;
 
-    let (enc_temp_path, mut enc_file) = create_unique_staging_file(output_path, "enc")?;
+    let (enc_temp_path, enc_file) = create_unique_staging_file(output_path, "enc")?;
     let _enc_cleanup = TempFileCleanup::new(enc_temp_path.clone());
-    enc_file
-        .write_all(&encrypted)
-        .map_err(|e| format!("Write encrypted backup: {e}"))?;
-    enc_file
-        .sync_all()
-        .map_err(|e| format!("Sync encrypted backup: {e}"))?;
-    drop(enc_file);
+    {
+        let mut enc_file = enc_file;
+        enc_file
+            .write_all(&encrypted)
+            .map_err(|e| format!("Write encrypted backup: {e}"))?;
+        enc_file
+            .sync_all()
+            .map_err(|e| format!("Sync encrypted backup: {e}"))?;
+    }
     publish_staged_file(&enc_temp_path, output_path, "encrypted backup")?;
 
     Ok(output_path.to_string())
