@@ -158,6 +158,24 @@ fn restore_rejects_path_traversal_entries() {
         "unexpected restore error: {err}"
     );
     assert!(!evil_path.exists(), "restore must not write outside target");
+
+    // Also reject duplicate normalized tar entries and extra unverified entries.
+    let dup_archive = archive_dir.path().join("duplicate.tar.gz");
+    let dup_file = std::fs::File::create(&dup_archive).expect("dup archive");
+    let mut dup_tar = Builder::new(GzEncoder::new(dup_file, Compression::default()));
+    append_repacked_entry(&mut dup_tar, "base.bin", b"first");
+    append_repacked_entry(&mut dup_tar, "./base.bin", b"second");
+    dup_tar.finish().expect("finish dup tar");
+    dup_tar.into_inner().expect("inner").finish().expect("gzip");
+    let dup_err = restore_backup(
+        dup_archive.to_str().unwrap(),
+        restore_dir.path().to_str().unwrap(),
+    )
+    .expect_err("duplicate tar entries must be rejected");
+    assert!(
+        dup_err.contains("Duplicate backup archive entry"),
+        "unexpected duplicate error: {dup_err}"
+    );
 }
 
 #[derive(Default)]
@@ -827,66 +845,12 @@ fn restore_does_not_upgrade_corrupted_zero_filled_4096_byte_generated_base() {
     let empty_bloom_json =
         serde_json::to_vec(&omni_engine::BloomFilter::new(100)).expect("serialize empty bloom");
 
-    let cases: [(&str, RepackOverrides<'_>, bool); 5] = [
-        (
-            "modern_populated_bloom",
-            RepackOverrides {
-                replace_base: Some(&zero_base),
-                ..RepackOverrides::default()
-            },
-            true,
-        ),
-        (
-            "modern_missing_bloom",
-            RepackOverrides {
-                replace_base: Some(&zero_base),
-                omit_base_bloom: true,
-                ..RepackOverrides::default()
-            },
-            true,
-        ),
-        (
-            "modern_empty_bloom",
-            RepackOverrides {
-                replace_base: Some(&zero_base),
-                replace_base_bloom: Some(&empty_bloom_json),
-                ..RepackOverrides::default()
-            },
-            true,
-        ),
-        (
-            "legacy_nonzero_checkpoint",
-            RepackOverrides {
-                replace_base: Some(&zero_base),
-                omit_base_bloom: true,
-                force_legacy_format: true,
-                force_wal_checkpoint_seq: Some(5),
-                ..RepackOverrides::default()
-            },
-            true,
-        ),
-        (
-            "metadata_stripped_empty_bloom",
-            RepackOverrides {
-                replace_base: Some(&zero_base),
-                replace_base_bloom: Some(&empty_bloom_json),
-                omit_metadata: true,
-                ..RepackOverrides::default()
-            },
-            false,
-        ),
-    ];
-
-    for (label, overrides, also_reject_opt_in) in cases {
-        let archive = source_dir.path().join(format!("{label}.tar.gz"));
-        repack_backup_archive_with_overrides(&valid_backup, &archive, &overrides);
-        assert_corrupt_archive_fails_closed_on_open(
-            &archive,
-            also_reject_opt_in,
-            &format!("{label}: zero-filled 4096B generated base must fail closed on open"),
-        );
-    }
-
+    assert_corrupt_4096_base_cases(
+        source_dir.path(),
+        &valid_backup,
+        &zero_base,
+        &empty_bloom_json,
+    );
     assert_encrypted_modern_missing_bloom_fails_closed(
         source_dir.path(),
         &source_dir.path().join("modern_missing_bloom.tar.gz"),
@@ -897,6 +861,94 @@ fn restore_does_not_upgrade_corrupted_zero_filled_4096_byte_generated_base() {
         &zero_base,
         &empty_bloom_json,
     );
+}
+
+fn assert_corrupt_4096_base_cases(
+    scratch_dir: &std::path::Path,
+    valid_backup: &std::path::Path,
+    zero_base: &[u8],
+    empty_bloom_json: &[u8],
+) {
+    let corrupt_bloom_json = br#"{"bitset":[],"num_bits":0,"num_hashes":0}"#;
+
+    let cases: [(&str, RepackOverrides<'_>, bool); 7] = [
+        (
+            "modern_populated_bloom",
+            RepackOverrides {
+                replace_base: Some(zero_base),
+                ..RepackOverrides::default()
+            },
+            true,
+        ),
+        (
+            "modern_missing_bloom",
+            RepackOverrides {
+                replace_base: Some(zero_base),
+                omit_base_bloom: true,
+                ..RepackOverrides::default()
+            },
+            true,
+        ),
+        (
+            "modern_empty_bloom",
+            RepackOverrides {
+                replace_base: Some(zero_base),
+                replace_base_bloom: Some(empty_bloom_json),
+                ..RepackOverrides::default()
+            },
+            true,
+        ),
+        (
+            "legacy_populated_bloom",
+            RepackOverrides {
+                replace_base: Some(zero_base),
+                force_legacy_format: true,
+                ..RepackOverrides::default()
+            },
+            true,
+        ),
+        (
+            "legacy_corrupt_bloom",
+            RepackOverrides {
+                replace_base: Some(zero_base),
+                replace_base_bloom: Some(corrupt_bloom_json),
+                force_legacy_format: true,
+                ..RepackOverrides::default()
+            },
+            true,
+        ),
+        (
+            "legacy_nonzero_checkpoint",
+            RepackOverrides {
+                replace_base: Some(zero_base),
+                omit_base_bloom: true,
+                force_legacy_format: true,
+                force_wal_checkpoint_seq: Some(5),
+                ..RepackOverrides::default()
+            },
+            true,
+        ),
+        (
+            "metadata_stripped_empty_bloom",
+            RepackOverrides {
+                replace_base: Some(zero_base),
+                replace_base_bloom: Some(empty_bloom_json),
+                omit_metadata: true,
+                ..RepackOverrides::default()
+            },
+            false,
+        ),
+    ];
+
+    for (label, overrides, also_reject_opt_in) in cases {
+        let archive = scratch_dir.join(format!("{label}.tar.gz"));
+        repack_backup_archive_with_overrides(valid_backup, &archive, &overrides);
+        assert_corrupt_archive_fails_closed_on_open(
+            &archive,
+            also_reject_opt_in,
+            &format!("{label}: zero-filled 4096B generated base must fail closed on open"),
+        );
+    }
 }
 
 fn assert_nested_zero_base_not_authorized_by_top_level_bloom(
@@ -958,9 +1010,22 @@ fn assert_nested_zero_base_not_authorized_by_top_level_bloom(
                 crc32: crc32fast::hash(bytes),
             });
     }
-    // Add unverified `nested/base.bin` (4096 zeros) and `nested/base.bloom` (empty).
-    append_repacked_entry(&mut tar, "nested/base.bin", zero_base);
-    append_repacked_entry(&mut tar, "nested/base.bloom", empty_bloom_json);
+    // Include `nested/base.bin` (4096 zeros) and `nested/base.bloom` (empty)
+    // in the archive and metadata so metadata verification succeeds while
+    // canonical top-level path binding still refuses to convert `nested/base.bin`.
+    for (nested_path, nested_bytes) in [
+        ("nested/base.bin", zero_base),
+        ("nested/base.bloom", empty_bloom_json),
+    ] {
+        append_repacked_entry(&mut tar, nested_path, nested_bytes);
+        metadata
+            .files
+            .push(omni_engine::backup::BackupFileMetadata {
+                path: nested_path.to_string(),
+                bytes: nested_bytes.len() as u64,
+                crc32: crc32fast::hash(nested_bytes),
+            });
+    }
     let meta_bytes = serde_json::to_vec_pretty(&metadata).expect("serialize nested metadata");
     append_repacked_entry(&mut tar, "omnikv-backup.json", &meta_bytes);
     tar.finish().expect("finish tar");
@@ -1073,14 +1138,16 @@ fn backup_preserves_existing_destination_mode_without_forcing_new_mode() {
         default_mode
     );
 
-    // Overwriting existing `0o600` destinations preserves `0o600` for both.
-    std::fs::set_permissions(&plain_path, std::fs::Permissions::from_mode(0o600))
-        .expect("chmod plain 0600");
-    std::fs::set_permissions(&enc_path, std::fs::Permissions::from_mode(0o600))
-        .expect("chmod encrypted 0600");
+    // Overwriting existing destinations preserves their mode (choose a mode
+    // distinct from `default_mode` so the check is non-vacuous even under umask 0077).
+    let target_mode = if default_mode == 0o600 { 0o640 } else { 0o600 };
+    std::fs::set_permissions(&plain_path, std::fs::Permissions::from_mode(target_mode))
+        .expect("chmod plain target_mode");
+    std::fs::set_permissions(&enc_path, std::fs::Permissions::from_mode(target_mode))
+        .expect("chmod encrypted target_mode");
 
     create_backup_with_wal(&db, &manifest, &wal, plain_path.to_str().unwrap())
-        .expect("overwrite 0600 plain backup");
+        .expect("overwrite custom-mode plain backup");
     create_encrypted_backup_with_wal(
         &db,
         &manifest,
@@ -1088,7 +1155,7 @@ fn backup_preserves_existing_destination_mode_without_forcing_new_mode() {
         enc_path.to_str().unwrap(),
         "passphrase",
     )
-    .expect("overwrite 0600 encrypted backup");
+    .expect("overwrite custom-mode encrypted backup");
 
     assert_eq!(
         std::fs::metadata(&plain_path)
@@ -1096,7 +1163,7 @@ fn backup_preserves_existing_destination_mode_without_forcing_new_mode() {
             .permissions()
             .mode()
             & 0o777,
-        0o600
+        target_mode
     );
     assert_eq!(
         std::fs::metadata(&enc_path)
@@ -1104,6 +1171,6 @@ fn backup_preserves_existing_destination_mode_without_forcing_new_mode() {
             .permissions()
             .mode()
             & 0o777,
-        0o600
+        target_mode
     );
 }

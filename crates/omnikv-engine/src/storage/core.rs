@@ -464,6 +464,16 @@ impl OmniRecord {
     }
 }
 
+/// Platform-independent fixed-width little-endian FNV-1a key hash for Bloom
+/// filters so SHA-256-bound `.bloom` sidecars remain portable across 32-bit,
+/// 64-bit, endianness, and future Rust stdlib `Hash` changes.
+pub(crate) fn bloom_key_hash(key: &[u8]) -> u64 {
+    let mut h = FnvHasher::default();
+    h.write(&(key.len() as u64).to_le_bytes());
+    h.write(key);
+    h.finish()
+}
+
 const BLOOM_BINDING_VERSION: u8 = 2;
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -646,11 +656,20 @@ impl BloomFilter {
     pub fn new(expected_elements: usize) -> Self {
         let elements = expected_elements.max(1);
         let p = 0.01_f64;
-        let num_bits = (-(elements as f64) * p.ln() / (2.0_f64.ln().powi(2))).ceil() as usize;
-        let num_hashes = ((2.0_f64.ln() * (num_bits as f64) / (elements as f64)).ceil() as usize)
+        let max_bits = MAX_BLOOM_WORDS * 64;
+        let ideal_bits = (-(elements as f64) * p.ln() / (2.0_f64.ln().powi(2))).ceil();
+        let words = if !ideal_bits.is_finite() || ideal_bits >= max_bits as f64 {
+            MAX_BLOOM_WORDS
+        } else {
+            (ideal_bits.max(1.0) as usize)
+                .div_ceil(64)
+                .clamp(1, MAX_BLOOM_WORDS)
+        };
+        let num_bits_total = words * 64;
+        let num_hashes = ((2.0_f64.ln() * (num_bits_total as f64) / (elements as f64)).ceil()
+            as usize)
             .clamp(1, MAX_BLOOM_HASHES);
-        let bitset = vec![0; num_bits.max(1).div_ceil(64)];
-        let num_bits_total = bitset.len() * 64;
+        let bitset = vec![0; words];
         Self {
             bitset,
             num_bits: num_bits_total,
@@ -664,11 +683,11 @@ impl BloomFilter {
 
     fn hashes(&self, key: u64) -> Vec<usize> {
         let mut h = FnvHasher::default();
-        key.hash(&mut h);
+        h.write(&key.to_le_bytes());
         let hash1 = h.finish();
 
         let mut h2 = FnvHasher::default();
-        hash1.hash(&mut h2);
+        h2.write(&hash1.to_le_bytes());
         let hash2 = h2.finish();
 
         let count = self.num_hashes.min(MAX_BLOOM_HASHES);
@@ -1527,20 +1546,74 @@ impl SSTableReader {
         })
     }
 
-    /// Validates the SSTable layout and exhaustively decodes every record
-    /// (verifying every per-record CRC32 and `data_end` boundary), preserving
-    /// the legacy 4096-byte zero base exception when `allow_legacy_zero_base`
-    /// is `true`.
+    /// Validates the SSTable layout and exhaustively decodes every record in
+    /// place (verifying sparse-index alignment, every per-record CRC32,
+    /// `data_end` boundary, and non-decreasing key order), preserving the
+    /// legacy 4096-byte zero base exception when `allow_legacy_zero_base` is
+    /// `true`.
     pub(crate) fn validate_all_records(
         data: &[u8],
         allow_legacy_zero_base: bool,
-    ) -> Result<ValidatedTableSummary, OmniError> {
-        let summary = Self::validate_table_layout(data, allow_legacy_zero_base)?;
-        let reader = Self::new(data);
-        for rec in reader.try_iter_all(allow_legacy_zero_base)? {
-            let _ = rec?;
+    ) -> Result<(), OmniError> {
+        let layout = Self::parse_strict_sstable_layout(data, allow_legacy_zero_base)?;
+        let mut offset = 0usize;
+        let mut next_index_pos = 0usize;
+        let mut prev_key: Option<&[u8]> = None;
+
+        while offset < layout.data_end {
+            if let Some((_, expected_off)) = layout.index_entries.get(next_index_pos)
+                && offset > *expected_off
+            {
+                return Err(OmniError::IoError(format!(
+                    "corrupt SSTable sparse index: block offset {expected_off} does not align with a record boundary"
+                )));
+            }
+            let Some((rec, len)) = OmniRecord::decode(&data[offset..layout.data_end]) else {
+                return Err(OmniError::IoError(format!(
+                    "corrupt SSTable record at byte offset {offset} (data_end={})",
+                    layout.data_end
+                )));
+            };
+            let rec_start = offset;
+            let rec_end = offset + len;
+            let key_start = rec_start + 10;
+            let key_slice = &data[key_start..key_start + rec.key.len()];
+            if let Some(prev) = prev_key
+                && key_slice < prev
+            {
+                return Err(OmniError::IoError(format!(
+                    "corrupt SSTable record at byte offset {rec_start}: out-of-order key"
+                )));
+            }
+            prev_key = Some(key_slice);
+
+            if let Some((expected_key_range, expected_off)) =
+                layout.index_entries.get(next_index_pos)
+                && rec_start == *expected_off
+            {
+                if key_slice != &data[expected_key_range.clone()] {
+                    return Err(OmniError::IoError(format!(
+                        "corrupt SSTable sparse index: key mismatch at block offset {rec_start}"
+                    )));
+                }
+                next_index_pos += 1;
+            }
+            if let Some((_, next_off)) = layout.index_entries.get(next_index_pos)
+                && *next_off < rec_end
+            {
+                return Err(OmniError::IoError(format!(
+                    "corrupt SSTable sparse index: block offset {next_off} falls inside record [{rec_start}..{rec_end})"
+                )));
+            }
+            offset = rec_end;
         }
-        Ok(summary)
+
+        if next_index_pos != layout.index_entries.len() {
+            return Err(OmniError::IoError(
+                "corrupt SSTable sparse index: unmatched trailing index entries".into(),
+            ));
+        }
+        Ok(())
     }
 
     /// Resolves `(data_end, start_offset)` for strict internal read paths
@@ -1739,6 +1812,7 @@ impl SSTableReader {
             data_end: layout.data_end,
             index_entries: layout.index_entries,
             next_index_pos: 0,
+            prev_key: None,
             failed: false,
         })
     }
@@ -1750,6 +1824,7 @@ pub(crate) struct SSTableCheckedIterator {
     data_end: usize,
     index_entries: Vec<(std::ops::Range<usize>, usize)>,
     next_index_pos: usize,
+    prev_key: Option<Vec<u8>>,
     failed: bool,
 }
 
@@ -1790,6 +1865,14 @@ impl Iterator for SSTableCheckedIterator {
 
         let rec_start = self.offset;
         let rec_end = self.offset + len;
+        if let Some(prev) = self.prev_key.as_deref()
+            && rec.key.as_slice() < prev
+        {
+            self.failed = true;
+            return Some(Err(OmniError::IoError(format!(
+                "corrupt SSTable record at byte offset {rec_start}: out-of-order key"
+            ))));
+        }
         if let Some((expected_key_range, expected_off)) =
             self.index_entries.get(self.next_index_pos)
             && rec_start == *expected_off
@@ -1811,6 +1894,7 @@ impl Iterator for SSTableCheckedIterator {
             ))));
         }
 
+        self.prev_key = Some(rec.key.clone());
         self.offset = rec_end;
         if self.offset == self.data_end && self.next_index_pos != self.index_entries.len() {
             self.failed = true;
@@ -2552,13 +2636,37 @@ impl OmniKV {
         }
 
         let empty_v2 = SSTableWriter::empty_table_bytes();
-        let tmp_path = format!("{}.upgrade.tmp", base_path.display());
-        let write_res: Result<(), std::io::Error> = (|| {
-            let mut tmp = OpenOptions::new()
-                .create(true)
-                .truncate(true)
+        static NEXT_UPGRADE_TOKEN: AtomicU64 = AtomicU64::new(1);
+        let pid = std::process::id();
+        let mut created: Option<(String, File)> = None;
+        for _ in 0..64 {
+            let token = NEXT_UPGRADE_TOKEN.fetch_add(1, Ordering::Relaxed);
+            let candidate = format!("{}.upgrade.{pid}.{token}.tmp", base_path.display());
+            match OpenOptions::new()
+                .create_new(true)
                 .write(true)
-                .open(&tmp_path)?;
+                .open(&candidate)
+            {
+                Ok(file) => {
+                    created = Some((candidate, file));
+                    break;
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(err) => {
+                    return Err(OmniError::IoError(format!(
+                        "failed to upgrade legacy empty base '{}': {err}",
+                        base_path.display()
+                    )));
+                }
+            }
+        }
+        let (tmp_path, mut tmp) = created.ok_or_else(|| {
+            OmniError::IoError(format!(
+                "failed to allocate unique upgrade staging file for '{}'",
+                base_path.display()
+            ))
+        })?;
+        let write_res: Result<(), std::io::Error> = (|| {
             tmp.write_all(&empty_v2)?;
             tmp.sync_all()?;
             drop(tmp);
@@ -2655,9 +2763,7 @@ impl OmniKV {
             let mut hashes = Vec::new();
             for rec in reader.try_iter_all(allow_legacy_base)? {
                 let rec = rec?;
-                let mut h = FnvHasher::default();
-                rec.key.hash(&mut h);
-                hashes.push(h.finish());
+                hashes.push(bloom_key_hash(&rec.key));
             }
             let mut bloom = BloomFilter::new(hashes.len().max(100));
             for hash in hashes {
@@ -4620,9 +4726,7 @@ impl OmniKV {
             });
         }
 
-        let mut key_hasher = FnvHasher::default();
-        target_key.hash(&mut key_hasher);
-        let key_hash = key_hasher.finish();
+        let key_hash = bloom_key_hash(&target_key);
 
         // Pick the highest sequence <= read_seq across every level of this
         // single atomic `StorageRoots` snapshot. Concurrent writers release
@@ -4916,9 +5020,7 @@ impl OmniKV {
         let target_key = target_key.as_bytes().to_vec();
         let shard = shard_idx(&target_key);
         let roots = self.roots.load();
-        let mut key_hasher = FnvHasher::default();
-        target_key.hash(&mut key_hasher);
-        let key_hash = key_hasher.finish();
+        let key_hash = bloom_key_hash(&target_key);
 
         let mut best_seq = 0u64;
         let memtable_start = Reverse(read_seq);
@@ -5155,9 +5257,7 @@ impl OmniKV {
 
             let mut bloom = BloomFilter::new(records.len().max(100));
             for rec in &records {
-                let mut h = FnvHasher::default();
-                rec.key.hash(&mut h);
-                bloom.add(h.finish());
+                bloom.add(bloom_key_hash(&rec.key));
             }
 
             let (sst_path, file) = self.create_unique_output(|token| {
@@ -5323,9 +5423,7 @@ impl OmniKV {
 
         let mut bloom = BloomFilter::new(records.len().max(100));
         for rec in &records {
-            let mut h = FnvHasher::default();
-            rec.key.hash(&mut h);
-            bloom.add(h.finish());
+            bloom.add(bloom_key_hash(&rec.key));
         }
 
         let (sst_path, file) = self.create_unique_output(|token| {
@@ -5500,9 +5598,7 @@ impl OmniKV {
 
         let mut bloom = BloomFilter::new(records.len().max(100));
         for rec in &records {
-            let mut h = FnvHasher::default();
-            rec.key.hash(&mut h);
-            bloom.add(h.finish());
+            bloom.add(bloom_key_hash(&rec.key));
         }
 
         let (new_base_path, file) = self.create_unique_output(|token| {
@@ -5725,9 +5821,7 @@ impl OmniKV {
                 if length == 0 {
                     stats.tombstones += 1;
                     if preserve_deletion_markers {
-                        let mut h = FnvHasher::default();
-                        k.hash(&mut h);
-                        bloom.add(h.finish());
+                        bloom.add(bloom_key_hash(&k));
 
                         let rec = OmniRecord::new(seq, k.clone(), 0, 0, crc, expiry);
                         base_sst_writer.append(&rec)?;
@@ -5745,9 +5839,7 @@ impl OmniKV {
                     if crc32fast::hash(b"") != crc {
                         return Err(OmniError::IoError("GC CRC32 mismatch!".into()));
                     }
-                    let mut h = FnvHasher::default();
-                    k.hash(&mut h);
-                    bloom.add(h.finish());
+                    bloom.add(bloom_key_hash(&k));
 
                     let rec = OmniRecord::new(seq, k.clone(), current_offset, length, crc, expiry);
                     base_sst_writer.append(&rec)?;
@@ -5805,9 +5897,7 @@ impl OmniKV {
 
                 new_heap_writer.write_all(&final_bytes)?;
 
-                let mut h = FnvHasher::default();
-                k.hash(&mut h);
-                bloom.add(h.finish());
+                bloom.add(bloom_key_hash(&k));
 
                 let rec =
                     OmniRecord::new(seq, k.clone(), current_offset, new_length, new_crc, expiry);
@@ -7890,11 +7980,7 @@ mod tests {
         let m_str = manifest.to_str().expect("UTF-8 manifest").to_string();
         let w_str = wal.to_str().expect("UTF-8 wal").to_string();
 
-        let key_hash = |key: &str| {
-            let mut h = FnvHasher::default();
-            key.as_bytes().hash(&mut h);
-            h.finish()
-        };
+        let key_hash = |key: &str| bloom_key_hash(key.as_bytes());
 
         let db = OmniKV::open(&m_str, &w_str).expect("open db");
         let mut base_batch = WriteBatch::new();
@@ -8109,5 +8195,79 @@ mod tests {
             clean.find("k_upd", seq).expect("clean k_upd"),
             Some("new_l0_val".into())
         );
+    }
+
+    #[test]
+    fn out_of_order_sstable_records_fail_validation_and_bloom_new_respects_word_cap() {
+        let dir = TempDir::new().expect("out-of-order sst dir");
+
+        // 1. Intra-block out-of-order: `["a", "z", "b"]` in Block 0.
+        let intra_path = dir.path().join("intra_ooo.sst");
+        let intra_file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&intra_path)
+            .expect("create intra sst");
+        let mut writer = SSTableWriter::new(&intra_file);
+        writer
+            .append(&OmniRecord::new(1, b"a".to_vec(), 0, 0, 0, 0))
+            .expect("append a");
+        writer
+            .append(&OmniRecord::new(2, b"z".to_vec(), 0, 0, 0, 0))
+            .expect("append z");
+        writer
+            .append(&OmniRecord::new(3, b"b".to_vec(), 0, 0, 0, 0))
+            .expect("append b");
+        writer.finish().expect("finish intra sst");
+        drop(intra_file);
+
+        let intra_bytes = std::fs::read(&intra_path).expect("read intra sst");
+        let intra_err = SSTableReader::validate_all_records(&intra_bytes, false)
+            .expect_err("intra-block out-of-order SSTable must fail validation");
+        assert!(intra_err.to_string().contains("out-of-order"));
+        let intra_iter_err = SSTableReader::new(&intra_bytes)
+            .try_iter_all(false)
+            .expect("start checked iter")
+            .collect::<Result<Vec<_>, _>>()
+            .expect_err("try_iter_all must reject intra-block out-of-order SSTable");
+        assert!(intra_iter_err.to_string().contains("out-of-order"));
+
+        // 2. Cross-block out-of-order: Block 0 `["a", "m_..."]` (>=4096B) then
+        //    Block 1 `["d", "e"]` (sparse index keys `["a", "d"]` are sorted!).
+        let cross_path = dir.path().join("cross_ooo.sst");
+        let cross_file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&cross_path)
+            .expect("create cross sst");
+        let mut writer = SSTableWriter::new(&cross_file);
+        let big_m = format!("m_{}", "x".repeat(4200)).into_bytes();
+        writer
+            .append(&OmniRecord::new(1, b"a".to_vec(), 0, 0, 0, 0))
+            .expect("append block0 a");
+        writer
+            .append(&OmniRecord::new(2, big_m, 0, 0, 0, 0))
+            .expect("append block0 m");
+        writer
+            .append(&OmniRecord::new(3, b"d".to_vec(), 0, 0, 0, 0))
+            .expect("append block1 d");
+        writer
+            .append(&OmniRecord::new(4, b"e".to_vec(), 0, 0, 0, 0))
+            .expect("append block1 e");
+        writer.finish().expect("finish cross sst");
+        drop(cross_file);
+
+        let cross_bytes = std::fs::read(&cross_path).expect("read cross sst");
+        let cross_err = SSTableReader::validate_all_records(&cross_bytes, false)
+            .expect_err("cross-block out-of-order SSTable must fail validation");
+        assert!(cross_err.to_string().contains("out-of-order"));
+
+        // 3. `BloomFilter::new` caps at `MAX_BLOOM_WORDS` without overflowing.
+        let capped = BloomFilter::new(usize::MAX);
+        assert_eq!(capped.bitset.len(), MAX_BLOOM_WORDS);
+        assert_eq!(capped.num_bits, MAX_BLOOM_WORDS * 64);
+        assert!((1..=MAX_BLOOM_HASHES).contains(&capped.num_hashes));
     }
 }

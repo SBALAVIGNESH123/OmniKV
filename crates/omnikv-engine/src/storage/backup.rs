@@ -10,7 +10,7 @@ use flate2::Compression;
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{Cursor, Read, Write};
 use std::path::{Component, Path, PathBuf};
@@ -515,13 +515,14 @@ fn restore_backup_reader<R: Read>(
 
     let decoder = GzDecoder::new(reader);
     let mut archive = Archive::new(decoder);
-    let mut extracted_files = HashSet::new();
+    let mut extracted_files: HashMap<PathBuf, PathBuf> = HashMap::new();
 
     for entry in archive
         .entries()
         .map_err(|e| format!("Read backup archive: {e}"))?
     {
         let mut entry = entry.map_err(|e| format!("Read backup entry: {e}"))?;
+        let raw_path_ends_with_slash = entry.path_bytes().ends_with(b"/");
         let entry_path = entry
             .path()
             .map_err(|e| format!("Read backup entry path: {e}"))?
@@ -532,12 +533,28 @@ fn restore_backup_reader<R: Read>(
         if entry.header().entry_type().is_dir() {
             std::fs::create_dir_all(&output_path)
                 .map_err(|e| format!("Create restore directory entry: {e}"))?;
+            let canonical_dir = std::fs::canonicalize(&output_path)
+                .map_err(|e| format!("Canonicalize restore directory entry: {e}"))?;
+            if !canonical_dir.starts_with(&restore_root) {
+                return Err(format!(
+                    "Backup directory entry escapes restore directory: {}",
+                    entry_path.display()
+                ));
+            }
             continue;
         }
 
-        if !entry.header().entry_type().is_file() {
+        if !entry.header().entry_type().is_file() || raw_path_ends_with_slash {
             return Err(format!(
                 "Unsupported backup entry type for {}",
+                entry_path.display()
+            ));
+        }
+
+        let path_key = extracted_path_key(&safe_path);
+        if extracted_files.contains_key(&path_key) {
+            return Err(format!(
+                "Duplicate backup archive entry: {}",
                 entry_path.display()
             ));
         }
@@ -545,11 +562,19 @@ fn restore_backup_reader<R: Read>(
         if let Some(parent) = output_path.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|e| format!("Create restore parent directory: {e}"))?;
+            let canonical_parent = std::fs::canonicalize(parent)
+                .map_err(|e| format!("Canonicalize restore parent directory: {e}"))?;
+            if !canonical_parent.starts_with(&restore_root) {
+                return Err(format!(
+                    "Backup entry parent escapes restore directory: {}",
+                    entry_path.display()
+                ));
+            }
         }
         entry
             .unpack(&output_path)
             .map_err(|e| format!("Unpack {}: {e}", entry_path.display()))?;
-        extracted_files.insert(extracted_path_key(&safe_path));
+        extracted_files.insert(path_key, safe_path);
     }
 
     let metadata = verify_restored_metadata(&restore_root, &extracted_files)?;
@@ -558,7 +583,7 @@ fn restore_backup_reader<R: Read>(
         Some(meta) => {
             let has_verified_entry = |target: &str| {
                 let target_key = extracted_path_key(Path::new(target));
-                extracted_files.contains(&target_key)
+                extracted_files.contains_key(&target_key)
                     && meta.files.iter().any(|file| {
                         validate_archive_path(Path::new(&file.path))
                             .is_ok_and(|rel| extracted_path_key(&rel) == target_key)
@@ -604,8 +629,15 @@ fn extracted_path_key(relative: &Path) -> PathBuf {
     }
 }
 
-fn extracted_files_contains(extracted_files: &HashSet<PathBuf>, relative: &Path) -> bool {
-    extracted_files.contains(&extracted_path_key(relative))
+fn extracted_files_get<'a>(
+    extracted_files: &'a HashMap<PathBuf, PathBuf>,
+    relative: &Path,
+) -> Option<&'a PathBuf> {
+    extracted_files.get(&extracted_path_key(relative))
+}
+
+fn extracted_files_contains(extracted_files: &HashMap<PathBuf, PathBuf>, relative: &Path) -> bool {
+    extracted_files.contains_key(&extracted_path_key(relative))
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -654,13 +686,14 @@ fn append_bytes<W: Write>(
 
 fn verify_restored_metadata(
     restore_root: &Path,
-    extracted_files: &HashSet<PathBuf>,
+    extracted_files: &HashMap<PathBuf, PathBuf>,
 ) -> Result<Option<BackupMetadata>, String> {
-    if !extracted_files_contains(extracted_files, Path::new(METADATA_ENTRY)) {
+    let Some(metadata_rel) = extracted_files_get(extracted_files, Path::new(METADATA_ENTRY)) else {
         return Ok(None);
-    }
+    };
+    let metadata_key = extracted_path_key(Path::new(METADATA_ENTRY));
 
-    let metadata_path = restore_root.join(METADATA_ENTRY);
+    let metadata_path = restore_root.join(metadata_rel);
     let metadata_bytes =
         std::fs::read(&metadata_path).map_err(|e| format!("Read backup metadata: {e}"))?;
     let metadata: BackupMetadata = serde_json::from_slice(&metadata_bytes)
@@ -673,19 +706,20 @@ fn verify_restored_metadata(
         ));
     }
 
+    let mut verified_keys = HashSet::new();
     for file in &metadata.files {
-        if file.path == METADATA_ENTRY {
+        let relative = validate_archive_path(Path::new(&file.path))?;
+        let key = extracted_path_key(&relative);
+        if key == metadata_key {
             continue;
         }
-
-        let relative = validate_archive_path(Path::new(&file.path))?;
-        if !extracted_files_contains(extracted_files, &relative) {
+        let Some(extracted_rel) = extracted_files.get(&key) else {
             return Err(format!(
                 "Restored archive is missing file {} declared in metadata",
                 file.path
             ));
-        }
-        let restored_path = restore_root.join(relative);
+        };
+        let restored_path = restore_root.join(extracted_rel);
         let bytes = std::fs::read(&restored_path)
             .map_err(|e| format!("Read restored file {}: {e}", file.path))?;
 
@@ -705,6 +739,16 @@ fn verify_restored_metadata(
                 file.path, actual_crc, file.crc32
             ));
         }
+        verified_keys.insert(key);
+    }
+
+    for (key, rel) in extracted_files {
+        if *key != metadata_key && !verified_keys.contains(key) {
+            return Err(format!(
+                "Restored archive contains unverified entry {} absent from metadata",
+                rel.display()
+            ));
+        }
     }
 
     Ok(Some(metadata))
@@ -712,31 +756,54 @@ fn verify_restored_metadata(
 
 fn rewrite_restored_manifest(
     restore_root: &Path,
-    extracted_files: &HashSet<PathBuf>,
+    extracted_files: &HashMap<PathBuf, PathBuf>,
     archive_generation: BackupArchiveGeneration,
     allow_bloomless_legacy_zero_base: bool,
 ) -> Result<(), String> {
-    if !extracted_files_contains(extracted_files, Path::new(MANIFEST_ENTRY)) {
+    let Some(manifest_rel) = extracted_files_get(extracted_files, Path::new(MANIFEST_ENTRY)) else {
         return Err(format!("Backup archive is missing {MANIFEST_ENTRY}"));
-    }
-    let manifest_path = restore_root.join(MANIFEST_ENTRY);
+    };
+    let manifest_path = restore_root.join(manifest_rel);
     let manifest_path_str = manifest_path
         .to_str()
         .ok_or_else(|| "Restore manifest path is not valid UTF-8".to_string())?;
     let mut manifest =
         Manifest::load(manifest_path_str).map_err(|e| format!("Load restored manifest: {e}"))?;
 
+    let ensure_extracted = |rebased: &str, label: &str| -> Result<(), String> {
+        let rel = Path::new(rebased)
+            .strip_prefix(restore_root)
+            .map_err(|_| format!("Restored {label} path escapes restore root: {rebased}"))?;
+        if !extracted_files_contains(extracted_files, rel) {
+            return Err(format!(
+                "Backup archive is missing {label} referenced by manifest: {}",
+                rel.display()
+            ));
+        }
+        Ok(())
+    };
+
     manifest.heap_path = rebase_restored_path(restore_root, &manifest.heap_path)?;
+    ensure_extracted(&manifest.heap_path, "heap file")?;
     manifest.base_path = rebase_restored_path(restore_root, &manifest.base_path)?;
+    ensure_extracted(&manifest.base_path, "base SSTable")?;
     manifest.sstables = manifest
         .sstables
         .iter()
-        .map(|path| rebase_restored_path(restore_root, path))
+        .map(|path| {
+            let rebased = rebase_restored_path(restore_root, path)?;
+            ensure_extracted(&rebased, "L0 SSTable")?;
+            Ok(rebased)
+        })
         .collect::<Result<Vec<_>, String>>()?;
     manifest.l1_sstables = manifest
         .l1_sstables
         .iter()
-        .map(|path| rebase_restored_path(restore_root, path))
+        .map(|path| {
+            let rebased = rebase_restored_path(restore_root, path)?;
+            ensure_extracted(&rebased, "L1 SSTable")?;
+            Ok(rebased)
+        })
         .collect::<Result<Vec<_>, String>>()?;
 
     maybe_upgrade_legacy_zero_base(
@@ -775,7 +842,7 @@ fn rewrite_restored_manifest(
 fn maybe_upgrade_legacy_zero_base(
     restore_root: &Path,
     manifest: &Manifest,
-    extracted_files: &HashSet<PathBuf>,
+    extracted_files: &HashMap<PathBuf, PathBuf>,
     archive_generation: BackupArchiveGeneration,
     allow_bloomless_legacy_zero_base: bool,
 ) -> Result<(), String> {
@@ -794,13 +861,12 @@ fn maybe_upgrade_legacy_zero_base(
     if !is_canonical_top_level_base {
         return Ok(());
     }
-    let bloom_path = bloom_path_for_base(&manifest.base_path);
     let manifest_proves_empty_db = manifest.max_seq == 0
         && manifest.read_seq_floor == 0
         && manifest.sstables.is_empty()
         && manifest.l1_sstables.is_empty();
-    let bloom_extracted = extracted_files_contains(extracted_files, Path::new(BASE_BLOOM_ENTRY));
-    let verified_pre_v2_bloom = bloom_extracted
+    let extracted_bloom_rel = extracted_files_get(extracted_files, Path::new(BASE_BLOOM_ENTRY));
+    let verified_pre_v2_bloom = extracted_bloom_rel.is_some()
         && matches!(
             archive_generation,
             BackupArchiveGeneration::VerifiedPreV2 {
@@ -808,8 +874,12 @@ fn maybe_upgrade_legacy_zero_base(
             }
         );
 
-    if bloom_extracted && Path::new(&bloom_path).exists() {
-        match BloomFilter::load(&bloom_path) {
+    if let Some(bloom_rel) = extracted_bloom_rel {
+        let bloom_path = restore_root.join(bloom_rel);
+        let Some(bloom_path_str) = bloom_path.to_str() else {
+            return Ok(());
+        };
+        match BloomFilter::load(bloom_path_str) {
             Ok(bloom) if !bloom.has_any_bit_set() => {
                 // Only trust an empty `base.bloom` automatically when the
                 // current archive extracted and CRC-verified `manifest.json`,
@@ -839,11 +909,20 @@ fn maybe_upgrade_legacy_zero_base(
 }
 
 fn rebase_restored_path(restore_root: &Path, stored_path: &str) -> Result<String, String> {
+    let bytes = stored_path.as_bytes();
+    let is_windows_abs = bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && (bytes[2] == b'\\' || bytes[2] == b'/');
+    let is_unix_abs = stored_path.starts_with('/');
     let path = Path::new(stored_path);
-    let relative = if path.is_absolute() {
-        path.file_name()
-            .map(PathBuf::from)
-            .ok_or_else(|| format!("Cannot rebase absolute restored path {stored_path}"))?
+
+    let relative = if path.is_absolute() || is_unix_abs || is_windows_abs {
+        let base_name = stored_path
+            .rsplit(['/', '\\'])
+            .find(|seg| !seg.is_empty())
+            .ok_or_else(|| format!("Cannot rebase absolute restored path {stored_path}"))?;
+        validate_archive_path(Path::new(base_name))?
     } else {
         validate_archive_path(path)?
     };
